@@ -60,6 +60,7 @@ from vllm.platforms import current_platform
 from vllm.scalar_type import scalar_types
 from vllm.transformers_utils.config import get_safetensors_params_metadata
 from vllm.utils.collection_utils import is_list_of
+from vllm.utils.math_utils import cdiv
 
 logger = init_logger(__name__)
 
@@ -395,12 +396,12 @@ class GPTQMarlinLinearMethod(LinearMethodBase):
             # By setting scale_dim == None, weight_loader will
             # repeat the scales on each GPU in TP>1 case.
             scales_and_zp_input_dim = None
-            scales_and_zp_size = input_size // group_size
+            scales_and_zp_size = cdiv(input_size, group_size)
         else:
             # By setting scale_dim == 0, weight_loader will
             # shard the scales in TP>1 case.
             scales_and_zp_input_dim = 0
-            scales_and_zp_size = input_size_per_partition // group_size
+            scales_and_zp_size = cdiv(input_size_per_partition, group_size)
 
         # Quantized weights
         qweight = PackedvLLMParameter(
