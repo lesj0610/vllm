@@ -19,6 +19,11 @@ FP8_MIN, FP8_MAX = get_fp8_min_max()
 
 
 @triton.jit
+def _round_to_int32(x):
+    return tl.where(x >= 0, tl.floor(x + 0.5), tl.ceil(x - 0.5)).to(tl.int32)
+
+
+@triton.jit
 def reshape_and_cache_kernel_flash(
     key_ptr,  # [num_tokens, num_heads, head_size]
     value_ptr,  # [num_tokens, num_heads, head_size]
@@ -108,12 +113,8 @@ def reshape_and_cache_kernel_flash(
             & ((cur_dim * 2 + 1) < head_size),
             other=0.0,
         )
-        q_key_lo = tl.extra.cuda.libdevice.llrint(key_lo / tl.load(k_scale)).to(
-            tl.int32
-        )
-        q_key_hi = tl.extra.cuda.libdevice.llrint(key_hi / tl.load(k_scale)).to(
-            tl.int32
-        )
+        q_key_lo = _round_to_int32(key_lo / tl.load(k_scale))
+        q_key_hi = _round_to_int32(key_hi / tl.load(k_scale))
         q_key_lo = tl.maximum(tl.minimum(q_key_lo, 7), -8)
         q_key_hi = tl.maximum(tl.minimum(q_key_hi, 7), -8)
         key_tile = ((q_key_lo & 0xF) | ((q_key_hi & 0xF) << 4)).to(tl.uint8)
@@ -144,12 +145,8 @@ def reshape_and_cache_kernel_flash(
             & ((cur_dim * 2 + 1) < head_size),
             other=0.0,
         )
-        q_value_lo = tl.extra.cuda.libdevice.llrint(value_lo / tl.load(v_scale)).to(
-            tl.int32
-        )
-        q_value_hi = tl.extra.cuda.libdevice.llrint(value_hi / tl.load(v_scale)).to(
-            tl.int32
-        )
+        q_value_lo = _round_to_int32(value_lo / tl.load(v_scale))
+        q_value_hi = _round_to_int32(value_hi / tl.load(v_scale))
         q_value_lo = tl.maximum(tl.minimum(q_value_lo, 7), -8)
         q_value_hi = tl.maximum(tl.minimum(q_value_hi, 7), -8)
         value_tile = ((q_value_lo & 0xF) | ((q_value_hi & 0xF) << 4)).to(tl.uint8)
@@ -376,8 +373,8 @@ def _reshape_cache_int4_per_token_head(
         mask=k_elem1 < head_size,
         other=0.0,
     ).to(tl.float32)
-    q_key_lo = tl.extra.cuda.libdevice.llrint(k_lo / k_scale).to(tl.int32)
-    q_key_hi = tl.extra.cuda.libdevice.llrint(k_hi / k_scale).to(tl.int32)
+    q_key_lo = _round_to_int32(k_lo / k_scale)
+    q_key_hi = _round_to_int32(k_hi / k_scale)
     q_key_lo = tl.maximum(tl.minimum(q_key_lo, 7), -8)
     q_key_hi = tl.maximum(tl.minimum(q_key_hi, 7), -8)
     key_packed = ((q_key_lo & 0xF) | ((q_key_hi & 0xF) << 4)).to(tl.uint8)
@@ -420,8 +417,8 @@ def _reshape_cache_int4_per_token_head(
         mask=v_elem1 < head_size_v,
         other=0.0,
     ).to(tl.float32)
-    q_value_lo = tl.extra.cuda.libdevice.llrint(v_lo / v_scale).to(tl.int32)
-    q_value_hi = tl.extra.cuda.libdevice.llrint(v_hi / v_scale).to(tl.int32)
+    q_value_lo = _round_to_int32(v_lo / v_scale)
+    q_value_hi = _round_to_int32(v_hi / v_scale)
     q_value_lo = tl.maximum(tl.minimum(q_value_lo, 7), -8)
     q_value_hi = tl.maximum(tl.minimum(q_value_hi, 7), -8)
     value_packed = ((q_value_lo & 0xF) | ((q_value_hi & 0xF) << 4)).to(tl.uint8)

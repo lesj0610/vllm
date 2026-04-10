@@ -1424,7 +1424,7 @@ def test_get_max_concurrency_for_kv_cache_config():
     assert max_concurrency_hybrid_model == 3
 
 
-def test_estimate_token_capacity_for_kv_cache_config_uses_group_fit_logic():
+def test_estimate_token_capacity_for_kv_cache_config_reports_total_cached_tokens():
     model_id = "Qwen/Qwen1.5-7B"
     max_model_len = 32768
     model_config = ModelConfig(
@@ -1478,9 +1478,9 @@ def test_estimate_token_capacity_for_kv_cache_config_uses_group_fit_logic():
         ],
     )
 
-    allocated_kv_memory = sum(tensor.size for tensor in kv_cache_config.kv_cache_tensors)
-    expected_capacity = kv_cache_utils._estimate_max_model_len_from_groups(
-        vllm_config, kv_cache_config.kv_cache_groups, allocated_kv_memory
+    expected_capacity = int(
+        get_max_concurrency_for_kv_cache_config(vllm_config, kv_cache_config)
+        * vllm_config.model_config.max_model_len
     )
 
     assert (
@@ -1488,10 +1488,7 @@ def test_estimate_token_capacity_for_kv_cache_config_uses_group_fit_logic():
         == expected_capacity
     )
 
-    old_heuristic_capacity = (
-        kv_cache_config.num_blocks // len(kv_cache_config.kv_cache_groups)
-    ) * min(group.kv_cache_spec.block_size for group in kv_cache_config.kv_cache_groups)
-    assert expected_capacity != old_heuristic_capacity
+    assert expected_capacity > vllm_config.model_config.max_model_len
 
 
 def test_allocate_with_lookahead():

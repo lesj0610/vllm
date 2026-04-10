@@ -1350,23 +1350,24 @@ def _report_kv_cache_config(
 def estimate_token_capacity_for_kv_cache_config(
     vllm_config: VllmConfig, kv_cache_config: KVCacheConfig
 ) -> int:
-    """Estimate the maximum request length supported by the current KV config.
+    """Estimate total KV tokens that fit in the current GPU cache allocation.
 
-    This reuses the same group-aware fit logic used during initialization,
-    instead of the older heuristic based on ``num_blocks`` and the minimum
-    block size. That heuristic can significantly under-report token capacity
-    for hybrid attention models, including int4 KV-cache cases where page-size
-    padding is used to keep groups compatible.
+    The log line reports the total number of tokens that can be cached across
+    all concurrent requests, not the maximum request length for a single
+    sequence. Reuse the concurrency calculation so the reported token capacity
+    can exceed ``max_model_len`` when the cache holds multiple full-length
+    requests.
     """
     if not kv_cache_config.kv_cache_groups:
         return 0
 
-    allocated_kv_memory = sum(tensor.size for tensor in kv_cache_config.kv_cache_tensors)
-    if allocated_kv_memory <= 0:
+    max_model_len = vllm_config.model_config.max_model_len
+    if max_model_len <= 0:
         return 0
 
-    return _estimate_max_model_len_from_groups(
-        vllm_config, kv_cache_config.kv_cache_groups, allocated_kv_memory
+    return int(
+        get_max_concurrency_for_kv_cache_config(vllm_config, kv_cache_config)
+        * max_model_len
     )
 
 
