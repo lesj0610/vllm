@@ -212,11 +212,6 @@ class SchedulerOutput:
     # freed from the encoder cache.
     free_encoder_mm_hashes: list[str]
 
-    # Request IDs that were ignored during scheduling because they can never
-    # satisfy the scheduler's full-sequence admission check. Grouped by client
-    # so update_from_output can emit terminal outputs even on an empty step.
-    ignored_reqs_by_client: dict[int, list[str]] | None = None
-
     # Request IDs that are preempted in this step.
     # Only used for v2 model runner.
     preempted_req_ids: set[str] | None = None
@@ -255,7 +250,6 @@ class SchedulerOutput:
             num_common_prefix_blocks=[],
             finished_req_ids=set(),
             free_encoder_mm_hashes=[],
-            ignored_reqs_by_client=None,
         )
 
 
