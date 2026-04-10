@@ -11,7 +11,10 @@ import torch
 
 from vllm.model_executor.layers.attention import Attention
 from vllm.platforms import current_platform
-from vllm.utils.torch_utils import is_quantized_kv_cache
+from vllm.utils.torch_utils import (
+    is_quantized_kv_cache,
+    kv_cache_uses_fp8_storage,
+)
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionImpl,
@@ -184,7 +187,10 @@ class FlashAttentionBackend(AttentionBackend):
         if kv_cache_dtype is None:
             return True
         if is_quantized_kv_cache(kv_cache_dtype):
-            return flash_attn_supports_fp8()
+            return (
+                kv_cache_uses_fp8_storage(kv_cache_dtype)
+                and flash_attn_supports_fp8()
+            )
         return kv_cache_dtype in ["auto", "float16", "bfloat16"]
 
     @classmethod

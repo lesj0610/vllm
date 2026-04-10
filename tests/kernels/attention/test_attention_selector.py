@@ -368,6 +368,23 @@ def test_auto_backend_selection_behavior():
     assert backend_auto.get_name() == backend_none.get_name()
 
 
+def test_flash_attn_rejects_int4_kv_cache(monkeypatch: pytest.MonkeyPatch):
+    try:
+        from vllm.v1.attention.backends.flash_attn import FlashAttentionBackend
+    except ImportError:
+        pytest.skip("vllm_flash_attn extension is not available in this env")
+
+    monkeypatch.setattr(
+        "vllm.v1.attention.backends.flash_attn.flash_attn_supports_fp8",
+        lambda: True,
+    )
+
+    assert FlashAttentionBackend.supports_kv_cache_dtype("fp8")
+    assert not FlashAttentionBackend.supports_kv_cache_dtype(
+        "int4_per_token_head"
+    )
+
+
 @pytest.mark.parametrize(
     "backend_name,flash_attn_version,should_succeed",
     [
