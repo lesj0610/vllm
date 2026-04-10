@@ -24,6 +24,13 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+def _backend_name(backend) -> str | None:
+    try:
+        return backend.get_name()
+    except NotImplementedError:
+        return None
+
+
 def kernel_warmup(worker: "Worker"):
     # Deep GEMM warmup
     do_deep_gemm_warmup = (
@@ -49,10 +56,10 @@ def kernel_warmup(worker: "Worker"):
     # Only warmup if the model has FlashInfer attention groups
     # and is not a pooling model
     def _is_flashinfer_backend(backend):
-        try:
-            return backend.get_name() == "FLASHINFER"
-        except NotImplementedError:
-            return False
+        return _backend_name(backend) == "FLASHINFER"
+
+    def _is_triton_backend(backend):
+        return _backend_name(backend) == "TRITON_ATTN"
 
     if (
         not worker.model_runner.is_pooling_model
@@ -75,6 +82,34 @@ def kernel_warmup(worker: "Worker"):
             is_profile=True,
             force_attention=True,
             create_mixed_batch=True,
+        )
+
+    # Triton unified attention warmup
+    # We warm up prefill and decode separately because grouped int4 uses
+    # different constexpr combinations for the two paths.
+    if (
+        not worker.model_runner.is_pooling_model
+        and worker.model_runner.attn_groups
+        and all(
+            _is_triton_backend(group.backend)
+            for groups in worker.model_runner.attn_groups
+            for group in groups
+        )
+    ):
+        logger.info("Warming up Triton unified attention (prefill).")
+        worker.model_runner._dummy_run(
+            num_tokens=16,
+            skip_eplb=True,
+            is_profile=True,
+            force_attention=True,
+        )
+        logger.info("Warming up Triton unified attention (decode).")
+        worker.model_runner._dummy_run(
+            num_tokens=min(worker.scheduler_config.max_num_seqs, 16),
+            skip_eplb=True,
+            is_profile=True,
+            force_attention=True,
+            uniform_decode=True,
         )
 
 
