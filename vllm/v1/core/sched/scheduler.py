@@ -51,7 +51,12 @@ from vllm.v1.core.sched.request_queue import (
     create_request_queue,
 )
 from vllm.v1.core.sched.utils import check_stop, remove_all
-from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
+from vllm.v1.engine import (
+    EngineCoreEventType,
+    EngineCoreOutput,
+    EngineCoreOutputs,
+    FinishReason,
+)
 from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheConfig
 from vllm.v1.metrics.perf import ModelMetrics, PerfStats
 from vllm.v1.metrics.stats import PrefixCacheStats, SchedulerStats
@@ -374,6 +379,7 @@ class Scheduler(SchedulerInterface):
         encoder_compute_budget = self.max_num_encoder_input_tokens
         # Spec decode-related.
         scheduled_spec_decode_tokens: dict[str, list[int]] = {}
+        ignored_reqs_by_client: dict[int, list[str]] = defaultdict(list)
 
         # For logging.
         scheduled_timestamp = time.monotonic()
@@ -739,9 +745,23 @@ class Scheduler(SchedulerInterface):
                         num_encoder_tokens=num_encoder_tokens,
                     )
                 ):
-                    if request.has_encoder_inputs:
-                        self.encoder_cache_manager.free(request)
-                    break
+                    if self.kv_cache_manager.can_ever_fit_full_sequence(
+                        request,
+                        num_new_computed_tokens=num_new_local_computed_tokens,
+                        new_computed_blocks=new_computed_blocks,
+                        num_external_computed_tokens=num_external_computed_tokens,
+                        num_encoder_tokens=num_encoder_tokens,
+                    ):
+                        if request.has_encoder_inputs:
+                            self.encoder_cache_manager.free(request)
+                        break
+
+                    finished_reqs = self.finish_requests(
+                        request.request_id, RequestStatus.FINISHED_IGNORED
+                    )
+                    for finished_req_id, client_index in finished_reqs:
+                        ignored_reqs_by_client[client_index].append(finished_req_id)
+                    continue
 
                 new_blocks = self.kv_cache_manager.allocate_slots(
                     request,
@@ -926,6 +946,9 @@ class Scheduler(SchedulerInterface):
             # the previous and the current steps.
             finished_req_ids=self.finished_req_ids,
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
+            ignored_reqs_by_client=(
+                dict(ignored_reqs_by_client) if ignored_reqs_by_client else None
+            ),
             new_block_ids_to_zero=new_block_ids_to_zero,
         )
 
@@ -1503,6 +1526,17 @@ class Scheduler(SchedulerInterface):
                         num_cached_tokens=request.num_cached_tokens,
                     )
                 )
+
+        if scheduler_output.ignored_reqs_by_client:
+            for client_index, req_ids in scheduler_output.ignored_reqs_by_client.items():
+                for req_id in req_ids:
+                    outputs[client_index].append(
+                        EngineCoreOutput(
+                            request_id=req_id,
+                            new_token_ids=[],
+                            finish_reason=FinishReason.LENGTH,
+                        )
+                    )
 
         # KV Connector: update state for finished KV Transfers.
         if kv_connector_output:

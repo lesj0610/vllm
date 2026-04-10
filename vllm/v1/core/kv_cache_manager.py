@@ -229,6 +229,50 @@ class KVCacheManager:
         This is used as an admission gate to prevent over-admitting requests
         when chunked prefill would otherwise only check the first chunk.
         """
+        num_blocks_to_allocate = self._get_num_blocks_to_allocate_for_full_sequence(
+            request,
+            num_new_computed_tokens=num_new_computed_tokens,
+            new_computed_blocks=new_computed_blocks,
+            num_external_computed_tokens=num_external_computed_tokens,
+            num_encoder_tokens=num_encoder_tokens,
+        )
+
+        return num_blocks_to_allocate <= self.block_pool.get_num_free_blocks()
+
+    def can_ever_fit_full_sequence(
+        self,
+        request: Request,
+        num_new_computed_tokens: int = 0,
+        new_computed_blocks: KVCacheBlocks | None = None,
+        num_external_computed_tokens: int = 0,
+        num_encoder_tokens: int = 0,
+    ) -> bool:
+        """Check whether a request can ever satisfy full-sequence admission.
+
+        Unlike can_fit_full_sequence(), this compares the required block count
+        against the engine's total usable KV capacity instead of the currently
+        free blocks. This lets the scheduler distinguish "doesn't fit yet" from
+        "can never fit".
+        """
+        num_blocks_to_allocate = self._get_num_blocks_to_allocate_for_full_sequence(
+            request,
+            num_new_computed_tokens=num_new_computed_tokens,
+            new_computed_blocks=new_computed_blocks,
+            num_external_computed_tokens=num_external_computed_tokens,
+            num_encoder_tokens=num_encoder_tokens,
+        )
+
+        total_usable_blocks = self.block_pool.num_gpu_blocks - 1
+        return num_blocks_to_allocate <= total_usable_blocks
+
+    def _get_num_blocks_to_allocate_for_full_sequence(
+        self,
+        request: Request,
+        num_new_computed_tokens: int = 0,
+        new_computed_blocks: KVCacheBlocks | None = None,
+        num_external_computed_tokens: int = 0,
+        num_encoder_tokens: int = 0,
+    ) -> int:
         if new_computed_blocks is not None:
             new_computed_block_list = new_computed_blocks.blocks
         else:
@@ -251,8 +295,7 @@ class KVCacheManager:
             total_computed_tokens=total_computed_tokens,
             num_tokens_main_model=full_num_tokens,
         )
-
-        return num_blocks_to_allocate <= self.block_pool.get_num_free_blocks()
+        return num_blocks_to_allocate
 
     def allocate_slots(
         self,
