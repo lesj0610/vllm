@@ -353,15 +353,26 @@ def _reshape_cache_int4_per_token_head(
 
     for group_idx in tl.static_range(NUM_SCALE_GROUPS):
         group_start = group_idx * INT4_GROUP_SIZE
+        packed_lanes = tl.arange(0, PACKED_GROUP_SIZE)
+        packed_group_offs = (group_start // 2) + packed_lanes
+        k_elem0 = group_start + packed_lanes * 2
+        k_elem1 = k_elem0 + 1
 
         # ---- Key group -> absmax -> scale ---------------------------------
-        group_dim_offs = group_start + tl.arange(0, INT4_GROUP_SIZE)
         k_group = tl.load(
-            key_ptr + tok * stride_key_tok + head * stride_key_head + group_dim_offs,
-            mask=group_dim_offs < head_size,
+            key_ptr + tok * stride_key_tok + head * stride_key_head + k_elem0,
+            mask=k_elem0 < head_size,
             other=0.0,
         ).to(tl.float32)
-        k_scale = tl.maximum(tl.max(tl.abs(k_group)) / 7.0, 1e-6)
+        k_group_hi = tl.load(
+            key_ptr + tok * stride_key_tok + head * stride_key_head + k_elem1,
+            mask=k_elem1 < head_size,
+            other=0.0,
+        ).to(tl.float32)
+        k_scale = tl.maximum(
+            tl.maximum(tl.max(tl.abs(k_group)), tl.max(tl.abs(k_group_hi))) / 7.0,
+            1e-6,
+        )
         tl.store(
             k_scale_cache_ptr
             + blk * stride_ks_blk
@@ -371,22 +382,8 @@ def _reshape_cache_int4_per_token_head(
             k_scale,
         )
 
-        packed_lanes = tl.arange(0, PACKED_GROUP_SIZE)
-        packed_group_offs = (group_start // 2) + packed_lanes
-        k_elem0 = group_start + packed_lanes * 2
-        k_elem1 = k_elem0 + 1
-        k_lo = tl.load(
-            key_ptr + tok * stride_key_tok + head * stride_key_head + k_elem0,
-            mask=k_elem0 < head_size,
-            other=0.0,
-        ).to(tl.float32)
-        k_hi = tl.load(
-            key_ptr + tok * stride_key_tok + head * stride_key_head + k_elem1,
-            mask=k_elem1 < head_size,
-            other=0.0,
-        ).to(tl.float32)
-        q_key_lo = _round_to_int32(k_lo / k_scale)
-        q_key_hi = _round_to_int32(k_hi / k_scale)
+        q_key_lo = _round_to_int32(k_group / k_scale)
+        q_key_hi = _round_to_int32(k_group_hi / k_scale)
         q_key_lo = tl.maximum(tl.minimum(q_key_lo, 7), -8)
         q_key_hi = tl.maximum(tl.minimum(q_key_hi, 7), -8)
         key_packed = ((q_key_lo & 0xF) | ((q_key_hi & 0xF) << 4)).to(tl.uint8)
@@ -405,11 +402,22 @@ def _reshape_cache_int4_per_token_head(
             value_ptr
             + tok * stride_val_tok
             + head * stride_val_head
-            + group_dim_offs,
-            mask=group_dim_offs < head_size_v,
+            + k_elem0,
+            mask=k_elem0 < head_size_v,
             other=0.0,
         ).to(tl.float32)
-        v_scale = tl.maximum(tl.max(tl.abs(v_group)) / 7.0, 1e-6)
+        v_group_hi = tl.load(
+            value_ptr
+            + tok * stride_val_tok
+            + head * stride_val_head
+            + k_elem1,
+            mask=k_elem1 < head_size_v,
+            other=0.0,
+        ).to(tl.float32)
+        v_scale = tl.maximum(
+            tl.maximum(tl.max(tl.abs(v_group)), tl.max(tl.abs(v_group_hi))) / 7.0,
+            1e-6,
+        )
         tl.store(
             v_scale_cache_ptr
             + blk * stride_vs_blk
@@ -419,18 +427,8 @@ def _reshape_cache_int4_per_token_head(
             v_scale,
         )
 
-        v_lo = tl.load(
-            value_ptr + tok * stride_val_tok + head * stride_val_head + k_elem0,
-            mask=k_elem0 < head_size_v,
-            other=0.0,
-        ).to(tl.float32)
-        v_hi = tl.load(
-            value_ptr + tok * stride_val_tok + head * stride_val_head + k_elem1,
-            mask=k_elem1 < head_size_v,
-            other=0.0,
-        ).to(tl.float32)
-        q_value_lo = _round_to_int32(v_lo / v_scale)
-        q_value_hi = _round_to_int32(v_hi / v_scale)
+        q_value_lo = _round_to_int32(v_group / v_scale)
+        q_value_hi = _round_to_int32(v_group_hi / v_scale)
         q_value_lo = tl.maximum(tl.minimum(q_value_lo, 7), -8)
         q_value_hi = tl.maximum(tl.minimum(q_value_hi, 7), -8)
         value_packed = ((q_value_lo & 0xF) | ((q_value_hi & 0xF) << 4)).to(tl.uint8)
