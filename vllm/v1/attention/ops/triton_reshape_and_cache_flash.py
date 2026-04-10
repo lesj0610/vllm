@@ -456,6 +456,11 @@ def triton_reshape_and_cache_flash_int4_per_token_head(
 ):
     num_tokens, num_kv_heads, head_size = key.shape
     head_size_v = value.shape[2]
+    if head_size_v != head_size:
+        raise ValueError(
+            "Grouped int4 KV cache currently requires head_size_v == head_size. "
+            f"Got head_size={head_size}, head_size_v={head_size_v}."
+        )
     head_size_padded = triton.next_power_of_2(max(head_size, head_size_v))
     packed_head_size = (head_size + 1) // 2
     packed_head_size_v = (head_size_v + 1) // 2

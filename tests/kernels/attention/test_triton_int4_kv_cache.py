@@ -345,6 +345,66 @@ def test_triton_reshape_and_cache_flash_int4():
 
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="requires CUDA")
 @torch.inference_mode()
+def test_triton_reshape_and_cache_flash_int4_rejects_mismatched_v_head_size():
+    device = "cuda"
+    set_random_seed(7)
+    torch.set_default_device(device)
+
+    num_tokens = 2
+    num_heads = 2
+    head_size = 128
+    head_size_v = 64
+    block_size = 16
+    num_blocks = 2
+    num_groups = get_int4_scale_group_count(head_size)
+
+    key = torch.randn(num_tokens, num_heads, head_size, dtype=torch.bfloat16)
+    value = torch.randn(num_tokens, num_heads, head_size_v, dtype=torch.bfloat16)
+    slot_mapping = torch.arange(num_tokens, device=device, dtype=torch.int64)
+
+    key_cache = torch.zeros(
+        num_blocks,
+        block_size,
+        num_heads,
+        get_int4_inline_head_size_bytes(head_size),
+        dtype=torch.uint8,
+        device=device,
+    )
+    value_cache = torch.zeros(
+        num_blocks,
+        block_size,
+        num_heads,
+        get_int4_inline_head_size_bytes(head_size_v),
+        dtype=torch.uint8,
+        device=device,
+    )
+    k_scale_cache = torch.ones(
+        num_blocks,
+        block_size,
+        num_heads,
+        num_groups,
+        dtype=torch.float32,
+        device=device,
+    )
+    v_scale_cache = torch.ones_like(k_scale_cache)
+
+    with pytest.raises(ValueError, match="head_size_v == head_size"):
+        triton_reshape_and_cache_flash(
+            key,
+            value,
+            key_cache,
+            value_cache,
+            slot_mapping,
+            "int4_per_token_head",
+            torch.tensor(1.0, device=device),
+            torch.tensor(1.0, device=device),
+            k_scale_cache,
+            v_scale_cache,
+        )
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="requires CUDA")
+@torch.inference_mode()
 def test_triton_unified_attention_int4():
     device = "cuda"
     set_random_seed(1)
