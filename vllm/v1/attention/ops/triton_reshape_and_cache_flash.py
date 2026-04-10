@@ -9,7 +9,11 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 )
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
-from vllm.utils.torch_utils import is_quantized_kv_cache
+from vllm.utils.torch_utils import (
+    is_quantized_kv_cache,
+    kv_cache_uses_fp8_storage,
+    kv_cache_uses_int4_packing,
+)
 
 FP8_MIN, FP8_MAX = get_fp8_min_max()
 
@@ -38,6 +42,7 @@ def reshape_and_cache_kernel_flash(
     USE_HEAD_MAJOR_LAYOUT: tl.constexpr,
     # FP8 flags
     FP8_KV_CACHE: tl.constexpr,
+    INT4_KV_CACHE: tl.constexpr,
     # tune parameters
     TILE_SIZE: tl.constexpr,
 ):
@@ -57,6 +62,8 @@ def reshape_and_cache_kernel_flash(
     src_value_idx = token_idx * value_stride
 
     if USE_HEAD_MAJOR_LAYOUT:
+        if INT4_KV_CACHE:
+            tl.device_assert(False, "int4 KV cache does not support head-major layout")
         # Decompose the tile index back into head and dim coordinates.
         cur_head = tile_pos // head_size
         cur_dim = tile_pos % head_size
@@ -76,8 +83,9 @@ def reshape_and_cache_kernel_flash(
             + (cur_dim % x)
         )
     else:
-        cur_head = tile_pos // head_size
-        cur_dim = tile_pos % head_size
+        head_size_physical = (head_size + 1) // 2 if INT4_KV_CACHE else head_size
+        cur_head = tile_pos // head_size_physical
+        cur_dim = tile_pos % head_size_physical
         tgt_idx_k = (
             block_idx * block_stride
             + block_offset * page_stride
@@ -87,39 +95,88 @@ def reshape_and_cache_kernel_flash(
         tgt_idx_v = tgt_idx_k
 
     # [TILE_SIZE]
-    key_load = tl.load(
-        key_ptr + src_key_idx + tile_pos, mask=tile_pos < (num_heads * head_size)
-    )
-    if FP8_KV_CACHE:
-        # tl.store will do the correct implicit cast to fp8,
-        # based on the key_cache_ptr.dtype.element_ty
-        key_tile = key_load if key_load.dtype.is_fp8() else key_load / tl.load(k_scale)
+    if INT4_KV_CACHE:
+        packed_src_pos = cur_head * head_size + cur_dim * 2
+        key_lo = tl.load(
+            key_ptr + src_key_idx + packed_src_pos,
+            mask=tile_pos < (num_heads * head_size_physical),
+            other=0.0,
+        )
+        key_hi = tl.load(
+            key_ptr + src_key_idx + packed_src_pos + 1,
+            mask=(tile_pos < (num_heads * head_size_physical))
+            & ((cur_dim * 2 + 1) < head_size),
+            other=0.0,
+        )
+        q_key_lo = tl.extra.cuda.libdevice.llrint(key_lo / tl.load(k_scale)).to(
+            tl.int32
+        )
+        q_key_hi = tl.extra.cuda.libdevice.llrint(key_hi / tl.load(k_scale)).to(
+            tl.int32
+        )
+        q_key_lo = tl.maximum(tl.minimum(q_key_lo, 7), -8)
+        q_key_hi = tl.maximum(tl.minimum(q_key_hi, 7), -8)
+        key_tile = ((q_key_lo & 0xF) | ((q_key_hi & 0xF) << 4)).to(tl.uint8)
     else:
-        key_tile = key_load
+        key_load = tl.load(
+            key_ptr + src_key_idx + tile_pos, mask=tile_pos < (num_heads * head_size)
+        )
+        if FP8_KV_CACHE:
+            # tl.store will do the correct implicit cast to fp8,
+            # based on the key_cache_ptr.dtype.element_ty
+            key_tile = (
+                key_load if key_load.dtype.is_fp8() else key_load / tl.load(k_scale)
+            )
+        else:
+            key_tile = key_load
 
     # [TILE_SIZE]
-    value_load = tl.load(
-        value_ptr + src_value_idx + tile_pos, mask=tile_pos < (num_heads * head_size)
-    )
-    if FP8_KV_CACHE:
-        if value_load.dtype.is_fp8():
-            value_tile = value_load
-        else:
-            # tl.store will do the correct implicit cast to fp8,
-            #  based on the value_cache_ptr.dtype.element_ty
-            value_tile = value_load / tl.load(v_scale)
+    if INT4_KV_CACHE:
+        packed_src_pos = cur_head * head_size + cur_dim * 2
+        value_lo = tl.load(
+            value_ptr + src_value_idx + packed_src_pos,
+            mask=tile_pos < (num_heads * head_size_physical),
+            other=0.0,
+        )
+        value_hi = tl.load(
+            value_ptr + src_value_idx + packed_src_pos + 1,
+            mask=(tile_pos < (num_heads * head_size_physical))
+            & ((cur_dim * 2 + 1) < head_size),
+            other=0.0,
+        )
+        q_value_lo = tl.extra.cuda.libdevice.llrint(value_lo / tl.load(v_scale)).to(
+            tl.int32
+        )
+        q_value_hi = tl.extra.cuda.libdevice.llrint(value_hi / tl.load(v_scale)).to(
+            tl.int32
+        )
+        q_value_lo = tl.maximum(tl.minimum(q_value_lo, 7), -8)
+        q_value_hi = tl.maximum(tl.minimum(q_value_hi, 7), -8)
+        value_tile = ((q_value_lo & 0xF) | ((q_value_hi & 0xF) << 4)).to(tl.uint8)
     else:
-        value_tile = value_load
+        value_load = tl.load(
+            value_ptr + src_value_idx + tile_pos,
+            mask=tile_pos < (num_heads * head_size),
+        )
+        if FP8_KV_CACHE:
+            if value_load.dtype.is_fp8():
+                value_tile = value_load
+            else:
+                # tl.store will do the correct implicit cast to fp8,
+                #  based on the value_cache_ptr.dtype.element_ty
+                value_tile = value_load / tl.load(v_scale)
+        else:
+            value_tile = value_load
 
     tl.store(
         key_cache_ptr + tgt_idx_k,
         key_tile,
-        mask=tile_pos < (num_heads * head_size),
+        mask=tile_pos < (num_heads * ((head_size + 1) // 2 if INT4_KV_CACHE else head_size)),
     )
     tl.store(
         value_cache_ptr + tgt_idx_v,
         value_tile,
-        mask=tile_pos < (num_heads * head_size),
+        mask=tile_pos < (num_heads * ((head_size + 1) // 2 if INT4_KV_CACHE else head_size)),
     )
     return
 
@@ -244,6 +301,200 @@ _PER_TOKEN_HEAD_QUANT_PARAMS: dict[torch.dtype, tuple[float, float]] = {
 }
 
 
+@triton.jit
+def _reshape_cache_int4_per_token_head(
+    key_ptr,  # [num_tokens, num_kv_heads, head_size]
+    value_ptr,  # [num_tokens, num_kv_heads, head_size_v]
+    key_cache_ptr,  # [num_blocks, block_size, num_kv_heads, packed_head_size+pad]
+    value_cache_ptr,  # [num_blocks, block_size, num_kv_heads, packed_head_size_v+pad]
+    k_scale_cache_ptr,  # [num_blocks, block_size, num_kv_heads] float32
+    v_scale_cache_ptr,  # [num_blocks, block_size, num_kv_heads] float32
+    slot_mapping_ptr,  # [num_tokens]
+    stride_key_tok: tl.int64,
+    stride_key_head: tl.int64,
+    stride_val_tok: tl.int64,
+    stride_val_head: tl.int64,
+    stride_kc_blk: tl.int64,
+    stride_kc_slot: tl.int64,
+    stride_kc_head: tl.int64,
+    stride_vc_blk: tl.int64,
+    stride_vc_slot: tl.int64,
+    stride_vc_head: tl.int64,
+    stride_ks_blk: tl.int64,
+    stride_ks_slot: tl.int64,
+    stride_ks_head: tl.int64,
+    stride_vs_blk: tl.int64,
+    stride_vs_slot: tl.int64,
+    stride_vs_head: tl.int64,
+    block_size: tl.constexpr,
+    head_size: tl.constexpr,
+    head_size_v: tl.constexpr,
+    HEAD_SIZE_PADDED: tl.constexpr,
+    PACKED_HEAD_SIZE: tl.constexpr,
+    PACKED_HEAD_SIZE_V: tl.constexpr,
+    PACKED_HEAD_SIZE_PADDED: tl.constexpr,
+    PACKED_HEAD_SIZE_V_PADDED: tl.constexpr,
+):
+    tok = tl.program_id(0)
+    head = tl.program_id(1)
+
+    slot = tl.load(slot_mapping_ptr + tok).to(tl.int64)
+    if slot < 0:
+        return
+
+    blk = slot // block_size
+    slot_in_blk = slot % block_size
+
+    dim_offs = tl.arange(0, HEAD_SIZE_PADDED)
+
+    # ---- Key head -> absmax -> scale --------------------------------------
+    k_mask = dim_offs < head_size
+    k_h = tl.load(
+        key_ptr + tok * stride_key_tok + head * stride_key_head + dim_offs,
+        mask=k_mask,
+        other=0.0,
+    ).to(tl.float32)
+    k_scale = tl.maximum(tl.max(tl.abs(k_h)) / 7.0, 1e-6)
+    tl.store(
+        k_scale_cache_ptr
+        + blk * stride_ks_blk
+        + slot_in_blk * stride_ks_slot
+        + head * stride_ks_head,
+        k_scale,
+    )
+
+    packed_offs = tl.arange(0, PACKED_HEAD_SIZE_PADDED)
+    k_elem0 = packed_offs * 2
+    k_elem1 = k_elem0 + 1
+    k_lo = tl.load(
+        key_ptr + tok * stride_key_tok + head * stride_key_head + k_elem0,
+        mask=k_elem0 < head_size,
+        other=0.0,
+    ).to(tl.float32)
+    k_hi = tl.load(
+        key_ptr + tok * stride_key_tok + head * stride_key_head + k_elem1,
+        mask=k_elem1 < head_size,
+        other=0.0,
+    ).to(tl.float32)
+    q_key_lo = tl.extra.cuda.libdevice.llrint(k_lo / k_scale).to(tl.int32)
+    q_key_hi = tl.extra.cuda.libdevice.llrint(k_hi / k_scale).to(tl.int32)
+    q_key_lo = tl.maximum(tl.minimum(q_key_lo, 7), -8)
+    q_key_hi = tl.maximum(tl.minimum(q_key_hi, 7), -8)
+    key_packed = ((q_key_lo & 0xF) | ((q_key_hi & 0xF) << 4)).to(tl.uint8)
+    tl.store(
+        key_cache_ptr
+        + blk * stride_kc_blk
+        + slot_in_blk * stride_kc_slot
+        + head * stride_kc_head
+        + packed_offs,
+        key_packed,
+        mask=packed_offs < PACKED_HEAD_SIZE,
+    )
+
+    # ---- Value head -> absmax -> scale ------------------------------------
+    v_mask = dim_offs < head_size_v
+    v_h = tl.load(
+        value_ptr + tok * stride_val_tok + head * stride_val_head + dim_offs,
+        mask=v_mask,
+        other=0.0,
+    ).to(tl.float32)
+    v_scale = tl.maximum(tl.max(tl.abs(v_h)) / 7.0, 1e-6)
+    tl.store(
+        v_scale_cache_ptr
+        + blk * stride_vs_blk
+        + slot_in_blk * stride_vs_slot
+        + head * stride_vs_head,
+        v_scale,
+    )
+
+    packed_offs_v = tl.arange(0, PACKED_HEAD_SIZE_V_PADDED)
+    v_elem0 = packed_offs_v * 2
+    v_elem1 = v_elem0 + 1
+    v_lo = tl.load(
+        value_ptr + tok * stride_val_tok + head * stride_val_head + v_elem0,
+        mask=v_elem0 < head_size_v,
+        other=0.0,
+    ).to(tl.float32)
+    v_hi = tl.load(
+        value_ptr + tok * stride_val_tok + head * stride_val_head + v_elem1,
+        mask=v_elem1 < head_size_v,
+        other=0.0,
+    ).to(tl.float32)
+    q_value_lo = tl.extra.cuda.libdevice.llrint(v_lo / v_scale).to(tl.int32)
+    q_value_hi = tl.extra.cuda.libdevice.llrint(v_hi / v_scale).to(tl.int32)
+    q_value_lo = tl.maximum(tl.minimum(q_value_lo, 7), -8)
+    q_value_hi = tl.maximum(tl.minimum(q_value_hi, 7), -8)
+    value_packed = ((q_value_lo & 0xF) | ((q_value_hi & 0xF) << 4)).to(tl.uint8)
+    tl.store(
+        value_cache_ptr
+        + blk * stride_vc_blk
+        + slot_in_blk * stride_vc_slot
+        + head * stride_vc_head
+        + packed_offs_v,
+        value_packed,
+        mask=packed_offs_v < PACKED_HEAD_SIZE_V,
+    )
+
+
+def triton_reshape_and_cache_flash_int4_per_token_head(
+    key: torch.Tensor,
+    value: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    k_scale_cache: torch.Tensor,
+    v_scale_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+):
+    num_tokens, num_kv_heads, head_size = key.shape
+    head_size_v = value.shape[2]
+    head_size_padded = triton.next_power_of_2(max(head_size, head_size_v))
+    packed_head_size = (head_size + 1) // 2
+    packed_head_size_v = (head_size_v + 1) // 2
+    packed_head_size_padded = triton.next_power_of_2(max(1, packed_head_size))
+    packed_head_size_v_padded = triton.next_power_of_2(max(1, packed_head_size_v))
+    block_size = key_cache.shape[1]
+
+    if current_platform.is_rocm() or current_platform.is_xpu():
+        num_warps = 4
+    else:
+        num_warps = min(8, max(1, head_size_padded // 32))
+
+    _reshape_cache_int4_per_token_head[(num_tokens, num_kv_heads)](
+        key_ptr=key,
+        value_ptr=value,
+        key_cache_ptr=key_cache,
+        value_cache_ptr=value_cache,
+        k_scale_cache_ptr=k_scale_cache,
+        v_scale_cache_ptr=v_scale_cache,
+        slot_mapping_ptr=slot_mapping,
+        stride_key_tok=key.stride(0),
+        stride_key_head=key.stride(1),
+        stride_val_tok=value.stride(0),
+        stride_val_head=value.stride(1),
+        stride_kc_blk=key_cache.stride(0),
+        stride_kc_slot=key_cache.stride(1),
+        stride_kc_head=key_cache.stride(2),
+        stride_vc_blk=value_cache.stride(0),
+        stride_vc_slot=value_cache.stride(1),
+        stride_vc_head=value_cache.stride(2),
+        stride_ks_blk=k_scale_cache.stride(0),
+        stride_ks_slot=k_scale_cache.stride(1),
+        stride_ks_head=k_scale_cache.stride(2),
+        stride_vs_blk=v_scale_cache.stride(0),
+        stride_vs_slot=v_scale_cache.stride(1),
+        stride_vs_head=v_scale_cache.stride(2),
+        block_size=block_size,
+        head_size=head_size,
+        head_size_v=head_size_v,
+        HEAD_SIZE_PADDED=head_size_padded,
+        PACKED_HEAD_SIZE=packed_head_size,
+        PACKED_HEAD_SIZE_V=packed_head_size_v,
+        PACKED_HEAD_SIZE_PADDED=packed_head_size_padded,
+        PACKED_HEAD_SIZE_V_PADDED=packed_head_size_v_padded,
+        num_warps=num_warps,
+    )
+
+
 def triton_reshape_and_cache_flash_per_token_head_quant(
     key: torch.Tensor,  # [num_tokens, num_kv_heads, head_size]
     value: torch.Tensor,  # [num_tokens, num_kv_heads, head_size_v]
@@ -324,9 +575,11 @@ def triton_reshape_and_cache_flash(
     # [num_blocks, block_size, num_heads, head_size]
     value_cache: torch.Tensor,
     slot_mapping: torch.Tensor,  # [num_tokens]
-    kv_cache_dtype: str,  # "auto", "fp8"
+    kv_cache_dtype: str,  # "auto", "fp8", "int4_per_token_head"
     k_scale: torch.Tensor,  # float32
     v_scale: torch.Tensor,  # float32
+    k_scale_cache: torch.Tensor | None = None,
+    v_scale_cache: torch.Tensor | None = None,
 ):
     num_heads = key.shape[1]
     head_size = key.shape[2]
@@ -353,15 +606,15 @@ def triton_reshape_and_cache_flash(
     assert kv_cache_dtype == "auto" or is_quantized_kv_cache(kv_cache_dtype), (
         f"unsupported kv_cache_dtype (str), got {kv_cache_dtype}."
     )
+    int4_kv_cache = kv_cache_uses_int4_packing(kv_cache_dtype)
+    fp8_kv_cache = kv_cache_uses_fp8_storage(kv_cache_dtype)
     kv_cache_torch_dtype = (
         current_platform.fp8_dtype()
-        if is_quantized_kv_cache(kv_cache_dtype)
-        else key_cache.dtype
+        if fp8_kv_cache
+        else torch.uint8 if int4_kv_cache else key_cache.dtype
     )
 
-    if key_cache.dtype != kv_cache_torch_dtype and is_quantized_kv_cache(
-        kv_cache_dtype
-    ):
+    if key_cache.dtype != kv_cache_torch_dtype and fp8_kv_cache:
         # to avoid erounous implicit cast in triton kernel (tl.store to uint8)
         # (e.g. explicit cast to fp8e4m3fnuz is not supported in triton 3.4)
         key_cache = key_cache.view(kv_cache_torch_dtype)
@@ -371,7 +624,7 @@ def triton_reshape_and_cache_flash(
         "uint8 is not supported by triton reshape_and_cache_flash"
     )
 
-    FP8_KV_CACHE = is_quantized_kv_cache(kv_cache_dtype)
+    FP8_KV_CACHE = fp8_kv_cache
     assert (not FP8_KV_CACHE) or kv_cache_torch_dtype in [
         torch.float8_e4m3fn,
         torch.float8_e5m2,
@@ -384,6 +637,22 @@ def triton_reshape_and_cache_flash(
     )
 
     # heuristics instead of autotuning
+    if int4_kv_cache:
+        assert (
+            not use_head_major_layout
+        ), "int4 KV cache only supports NHD layout for now"
+        if k_scale_cache is not None and v_scale_cache is not None:
+            triton_reshape_and_cache_flash_int4_per_token_head(
+                key,
+                value,
+                key_cache,
+                value_cache,
+                k_scale_cache,
+                v_scale_cache,
+                slot_mapping,
+            )
+            return
+        n = num_heads * ((head_size + 1) // 2)
     TILE_SIZE = min(2048, triton.next_power_of_2(n))
     if current_platform.is_rocm() or current_platform.is_xpu():
         num_stages = 4
@@ -423,6 +692,7 @@ def triton_reshape_and_cache_flash(
         x=x,
         USE_HEAD_MAJOR_LAYOUT=use_head_major_layout,
         FP8_KV_CACHE=FP8_KV_CACHE,
+        INT4_KV_CACHE=int4_kv_cache,
         # autotune parameters
         TILE_SIZE=TILE_SIZE,
         num_warps=num_warps,
@@ -519,6 +789,11 @@ def triton_reshape_and_cache_flash_diffkv(
     k_scale: torch.Tensor,  # float32
     v_scale: torch.Tensor,  # float32
 ):
+    if kv_cache_uses_int4_packing(kv_cache_dtype):
+        raise NotImplementedError(
+            "int4 KV cache is not supported for diffkv layout yet"
+        )
+
     num_heads = key.shape[1]
     head_size_k = key.shape[2]
     head_size_v = value.shape[2]

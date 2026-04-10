@@ -11,6 +11,7 @@ from vllm.logger import init_logger
 from vllm.utils.torch_utils import (
     is_quantized_kv_cache,
     kv_cache_uses_per_token_head_scales,
+    kv_cache_uses_runtime_scale_cache,
 )
 
 logger = init_logger(__name__)
@@ -19,6 +20,7 @@ CacheDType = Literal[
     "auto",
     "float16",
     "bfloat16",
+    "int4_per_token_head",
     "fp8",
     "fp8_e4m3",
     "fp8_e5m2",
@@ -242,11 +244,11 @@ class CacheConfig:
     @field_validator("cache_dtype", mode="after")
     @classmethod
     def _validate_cache_dtype(cls, cache_dtype: CacheDType) -> CacheDType:
-        if kv_cache_uses_per_token_head_scales(cache_dtype):
+        if kv_cache_uses_runtime_scale_cache(cache_dtype):
             logger.info(
                 "Using %s data type to store kv cache. It reduces the GPU "
                 "memory footprint and boosts the performance. "
-                "Dynamic per-token-head scales will be computed at runtime.",
+                "Runtime scales will be computed dynamically.",
                 str(cache_dtype),
             )
         elif is_quantized_kv_cache(cache_dtype):

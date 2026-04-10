@@ -112,7 +112,10 @@ class KVBlockZeroer:
         PAGE_SIZE_EL accounts for this ratio so that
         ``block_id * PAGE_SIZE_EL`` lands at the correct offset.
 
-        Only AttentionSpec layers are processed; Mamba layers are skipped.
+        Only decoder-style AttentionSpec layers are processed here.
+        Mamba layers are skipped, and encoder-only attention is skipped
+        because it does not participate in the decode-time KV block reuse
+        path handled by this zeroer.
         """
         seen_ptrs: set[int] = set()
         seg_addrs: list[int] = []
@@ -120,7 +123,9 @@ class KVBlockZeroer:
 
         for group in attn_groups_iter:
             spec = group.kv_cache_spec
-            if type(spec) is not FullAttentionSpec:
+            if not isinstance(spec, AttentionSpec) or isinstance(
+                spec, EncoderOnlyAttentionSpec
+            ):
                 continue
             if group.kv_cache_group_id >= len(kernel_block_sizes):
                 continue

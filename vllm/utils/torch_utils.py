@@ -33,6 +33,7 @@ STR_DTYPE_TO_TORCH_DTYPE = {
     "float16": torch.float16,
     "bfloat16": torch.bfloat16,
     "float": torch.float,
+    "int4_per_token_head": torch.uint8,
     "fp8": torch.uint8,
     "fp8_e4m3": torch.uint8,
     "fp8_e5m2": torch.uint8,
@@ -64,12 +65,31 @@ T = TypeVar("T")
 
 
 def is_quantized_kv_cache(kv_cache_dtype: str) -> bool:
-    return kv_cache_dtype.startswith("fp8") or kv_cache_dtype.endswith("per_token_head")
+    return (
+        kv_cache_dtype == "int4_per_token_head"
+        or kv_cache_dtype.startswith("fp8")
+        or kv_cache_dtype.endswith("per_token_head")
+    )
 
 
 def kv_cache_uses_per_token_head_scales(kv_cache_dtype: str) -> bool:
     """Return True if *kv_cache_dtype* needs per-token-head scales."""
     return kv_cache_dtype.endswith("per_token_head")
+
+
+def kv_cache_uses_runtime_scale_cache(kv_cache_dtype: str) -> bool:
+    return (
+        kv_cache_dtype == "int4_per_token_head"
+        or kv_cache_uses_per_token_head_scales(kv_cache_dtype)
+    )
+
+
+def kv_cache_uses_int4_packing(kv_cache_dtype: str) -> bool:
+    return kv_cache_dtype == "int4_per_token_head"
+
+
+def kv_cache_uses_fp8_storage(kv_cache_dtype: str) -> bool:
+    return kv_cache_dtype.startswith("fp8")
 
 
 def is_strictly_contiguous(t: torch.Tensor) -> bool:

@@ -38,15 +38,29 @@ class KVQuantMode(IntEnum):
     FP8_PER_TENSOR = 1  # per-tensor scales (current fp8 path)
     INT8_PER_TOKEN_HEAD = 2  # per-token-head dynamic scales for int8
     FP8_PER_TOKEN_HEAD = 3  # per-token-head dynamic scales for fp8
+    INT4_PER_TOKEN_HEAD = 4  # packed signed int4 with runtime token/head scales
 
     @property
     def is_per_token_head(self) -> bool:
         """True for any per-token-head quantization mode."""
-        return self >= 2
+        return self in (
+            KVQuantMode.INT8_PER_TOKEN_HEAD,
+            KVQuantMode.FP8_PER_TOKEN_HEAD,
+        )
+
+    @property
+    def is_int4_packed(self) -> bool:
+        return self == KVQuantMode.INT4_PER_TOKEN_HEAD
+
+    @property
+    def uses_runtime_scales(self) -> bool:
+        return self.is_per_token_head or self.is_int4_packed
 
 
 def get_kv_quant_mode(kv_cache_dtype: str) -> KVQuantMode:
     """Map a ``kv_cache_dtype`` string to a :class:`KVQuantMode`."""
+    if kv_cache_dtype == "int4_per_token_head":
+        return KVQuantMode.INT4_PER_TOKEN_HEAD
     if kv_cache_dtype == "int8_per_token_head":
         return KVQuantMode.INT8_PER_TOKEN_HEAD
     if kv_cache_dtype == "fp8_per_token_head":
@@ -63,6 +77,11 @@ def is_quantized_kv_cache(kv_cache_dtype: str) -> bool:
 def kv_cache_uses_per_token_head_scales(kv_cache_dtype: str) -> bool:
     """Return True if *kv_cache_dtype* needs per-token-head scales."""
     return get_kv_quant_mode(kv_cache_dtype).is_per_token_head
+
+
+def kv_cache_uses_runtime_scales(kv_cache_dtype: str) -> bool:
+    """Return True if *kv_cache_dtype* computes scales at cache-write time."""
+    return get_kv_quant_mode(kv_cache_dtype).uses_runtime_scales
 
 
 @dataclass(frozen=True)
@@ -135,11 +154,17 @@ class AttentionSpec(KVCacheSpec):
 
     @property
     def real_page_size_bytes(self) -> int:
+        head_size_physical = self.head_size
+        if self.kv_quant_mode.is_int4_packed:
+            packed_head_size = cdiv(self.head_size, 2)
+            packed_head_size_padded = cdiv(packed_head_size, 4) * 4
+            # int4 stores packed bytes plus one float32 runtime scale inline.
+            head_size_physical = packed_head_size_padded + get_dtype_size(torch.float32)
         return (
             2
             * self.block_size
             * self.num_kv_heads
-            * self.head_size
+            * head_size_physical
             * get_dtype_size(self.dtype)
         )
 
@@ -237,10 +262,21 @@ class FullAttentionSpec(AttentionSpec):
 
     @property
     def real_page_size_bytes(self) -> int:
+        head_size_k = self.head_size
+        head_size_v = self.head_size_v
+        if self.kv_quant_mode.is_int4_packed:
+            packed_head_size_k = cdiv(self.head_size, 2)
+            packed_head_size_v = cdiv(self.head_size_v, 2)
+            head_size_k = cdiv(packed_head_size_k, 4) * 4 + get_dtype_size(
+                torch.float32
+            )
+            head_size_v = cdiv(packed_head_size_v, 4) * 4 + get_dtype_size(
+                torch.float32
+            )
         return (
             self.block_size
             * self.num_kv_heads
-            * (self.head_size + self.head_size_v)
+            * (head_size_k + head_size_v)
             * get_dtype_size(self.dtype)
         )
 

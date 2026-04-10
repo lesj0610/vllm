@@ -18,6 +18,7 @@ from vllm.utils.hashing import sha256_cbor, xxhash_cbor
 from vllm.utils.math_utils import cdiv
 from vllm.utils.mem_utils import format_gib
 from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
     ChunkedLocalAttentionSpec,
     FullAttentionSpec,
     KVCacheConfig,
@@ -932,6 +933,40 @@ def unify_kv_cache_spec_page_size(
         return kv_cache_spec
 
     max_page_size = max(page_sizes)
+
+    # Runtime-scale quantized attention can add a small fixed per-head overhead
+    # that breaks exact divisibility between hybrid attention types even when
+    # the underlying KV topology is otherwise compatible. In that case we can
+    # preserve the existing block_size and pad the smaller attention pages up to
+    # the maximum page size instead of hard-failing during grouping.
+    if (
+        all(isinstance(spec, AttentionSpec) for spec in kv_cache_spec.values())
+        and any(
+            spec.kv_quant_mode.uses_runtime_scales
+            for spec in kv_cache_spec.values()
+        )
+    ):
+        block_sizes = {spec.block_size for spec in kv_cache_spec.values()}
+        has_non_divisible_page = any(
+            spec.page_size_bytes != max_page_size
+            and max_page_size % spec.page_size_bytes != 0
+            for spec in kv_cache_spec.values()
+        )
+        if len(block_sizes) == 1 and has_non_divisible_page:
+            logger.warning(
+                "Padding smaller hybrid KV pages up to %d bytes to keep page "
+                "sizes compatible across attention types.",
+                max_page_size,
+            )
+            return {
+                layer_name: (
+                    layer_spec
+                    if layer_spec.page_size_bytes == max_page_size
+                    else replace(layer_spec, page_size_padded=max_page_size)
+                )
+                for layer_name, layer_spec in kv_cache_spec.items()
+            }
+
     new_kv_cache_spec = {}
     for layer_name, layer_spec in kv_cache_spec.items():
         if layer_spec.page_size_bytes == max_page_size:
@@ -1294,27 +1329,10 @@ def _report_kv_cache_config(
         vllm_config: The global VllmConfig
         kv_cache_config: The resolved KV cache configuration
     """
-    min_block_size = min(
-        [group.kv_cache_spec.block_size for group in kv_cache_config.kv_cache_groups]
-    )
-
     # Log the KV cache size and maximum concurrency.
-    num_tokens = (
-        kv_cache_config.num_blocks
-        // len(kv_cache_config.kv_cache_groups)
-        * min_block_size
+    num_tokens = estimate_token_capacity_for_kv_cache_config(
+        vllm_config, kv_cache_config
     )
-    dcp_size = vllm_config.parallel_config.decode_context_parallel_size
-    pcp_size = vllm_config.parallel_config.prefill_context_parallel_size
-    if pcp_size * dcp_size > 1:
-        num_tokens *= pcp_size * dcp_size
-        logger.info(
-            "Multiplying the GPU KV cache size by the cp_world_size %d "
-            "(pcp_world_size %d * dcp_world_size %d).",
-            pcp_size * dcp_size,
-            pcp_size,
-            dcp_size,
-        )
     num_tokens_str = f"{num_tokens:,}"
     logger.info_once("GPU KV cache size: %s tokens", num_tokens_str, scope="local")
     max_model_len_str = f"{vllm_config.model_config.max_model_len:,}"
@@ -1326,6 +1344,29 @@ def _report_kv_cache_config(
         max_model_len_str,
         max_concurrency,
         scope="local",
+    )
+
+
+def estimate_token_capacity_for_kv_cache_config(
+    vllm_config: VllmConfig, kv_cache_config: KVCacheConfig
+) -> int:
+    """Estimate the maximum request length supported by the current KV config.
+
+    This reuses the same group-aware fit logic used during initialization,
+    instead of the older heuristic based on ``num_blocks`` and the minimum
+    block size. That heuristic can significantly under-report token capacity
+    for hybrid attention models, including int4 KV-cache cases where page-size
+    padding is used to keep groups compatible.
+    """
+    if not kv_cache_config.kv_cache_groups:
+        return 0
+
+    allocated_kv_memory = sum(tensor.size for tensor in kv_cache_config.kv_cache_tensors)
+    if allocated_kv_memory <= 0:
+        return 0
+
+    return _estimate_max_model_len_from_groups(
+        vllm_config, kv_cache_config.kv_cache_groups, allocated_kv_memory
     )
 
 

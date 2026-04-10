@@ -24,6 +24,7 @@ from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     FreeKVCacheBlockQueue,
     KVCacheBlock,
+    estimate_token_capacity_for_kv_cache_config,
     estimate_max_model_len,
     generate_block_hash_extra_keys,
     generate_scheduler_kv_cache_config,
@@ -43,6 +44,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheGroupSpec,
     KVCacheSpec,
     KVCacheTensor,
+    KVQuantMode,
     MambaSpec,
     MLAAttentionSpec,
     SlidingWindowSpec,
@@ -107,6 +109,7 @@ def new_kv_cache_spec(
     num_kv_heads=2,
     head_size=64,
     dtype=torch.float32,
+    kv_quant_mode=KVQuantMode.NONE,
     page_size_padded=None,
     sliding_window=None,
     attention_chunk_size=None,
@@ -116,6 +119,7 @@ def new_kv_cache_spec(
         num_kv_heads=num_kv_heads,
         head_size=head_size,
         dtype=dtype,
+        kv_quant_mode=kv_quant_mode,
         page_size_padded=page_size_padded,
         sliding_window=sliding_window,
         attention_chunk_size=attention_chunk_size,
@@ -127,6 +131,7 @@ def new_sliding_window_spec(
     num_kv_heads=2,
     head_size=64,
     dtype=torch.float32,
+    kv_quant_mode=KVQuantMode.NONE,
     page_size_padded=None,
     sliding_window=1,
 ):
@@ -135,6 +140,7 @@ def new_sliding_window_spec(
         num_kv_heads=num_kv_heads,
         head_size=head_size,
         dtype=dtype,
+        kv_quant_mode=kv_quant_mode,
         page_size_padded=page_size_padded,
         sliding_window=sliding_window,
     )
@@ -1418,6 +1424,76 @@ def test_get_max_concurrency_for_kv_cache_config():
     assert max_concurrency_hybrid_model == 3
 
 
+def test_estimate_token_capacity_for_kv_cache_config_uses_group_fit_logic():
+    model_id = "Qwen/Qwen1.5-7B"
+    max_model_len = 32768
+    model_config = ModelConfig(
+        model_id,
+        runner="generate",
+        dtype="float16",
+        max_model_len=max_model_len,
+    )
+    scheduler_config = SchedulerConfig(
+        max_num_batched_tokens=1024,
+        enable_chunked_prefill=True,
+        max_model_len=model_config.max_model_len,
+        is_encoder_decoder=model_config.is_encoder_decoder,
+    )
+    vllm_config = VllmConfig(
+        model_config=model_config,
+        scheduler_config=scheduler_config,
+    )
+
+    full_attention_spec = FullAttentionSpec(
+        block_size=16,
+        num_kv_heads=4,
+        head_size=128,
+        dtype=torch.uint8,
+        kv_quant_mode=KVQuantMode.INT4_PER_TOKEN_HEAD,
+    )
+    sliding_window_spec = SlidingWindowSpec(
+        block_size=16,
+        num_kv_heads=4,
+        head_size=128,
+        dtype=torch.uint8,
+        kv_quant_mode=KVQuantMode.INT4_PER_TOKEN_HEAD,
+        sliding_window=1024,
+    )
+
+    num_blocks = (1024 + 64) * 3
+    group_size = 32
+    page_size = full_attention_spec.page_size_bytes
+    kv_cache_config = KVCacheConfig(
+        num_blocks=num_blocks,
+        kv_cache_tensors=[
+            KVCacheTensor(size=page_size * num_blocks, shared_by=[])
+            for _ in range(group_size)
+        ],
+        kv_cache_groups=[
+            KVCacheGroupSpec([f"full_{i}" for i in range(group_size)], full_attention_spec),
+            KVCacheGroupSpec(
+                [f"sw_{i}" for i in range(group_size)],
+                sliding_window_spec,
+            ),
+        ],
+    )
+
+    allocated_kv_memory = sum(tensor.size for tensor in kv_cache_config.kv_cache_tensors)
+    expected_capacity = kv_cache_utils._estimate_max_model_len_from_groups(
+        vllm_config, kv_cache_config.kv_cache_groups, allocated_kv_memory
+    )
+
+    assert (
+        estimate_token_capacity_for_kv_cache_config(vllm_config, kv_cache_config)
+        == expected_capacity
+    )
+
+    old_heuristic_capacity = (
+        kv_cache_config.num_blocks // len(kv_cache_config.kv_cache_groups)
+    ) * min(group.kv_cache_spec.block_size for group in kv_cache_config.kv_cache_groups)
+    assert expected_capacity != old_heuristic_capacity
+
+
 def test_allocate_with_lookahead():
     """Verify that lookahead tokens correctly affect block allocation"""
     block_size = 4
@@ -1751,6 +1827,30 @@ def test_get_kv_cache_config_one_worker():
         get_kv_cache_configs(
             vllm_config, [kv_cache_specs_hybrid], [mem_per_block_per_layer * 2 * 32]
         )[0]
+
+    # The same non-divisible hybrid layout can be supported for runtime-scale
+    # quantized KV cache by padding the smaller page up to the larger one.
+    kv_cache_specs_hybrid_runtime_quant = {
+        "layer_1": new_kv_cache_spec(
+            head_size=64, dtype=torch.uint8, kv_quant_mode=KVQuantMode.INT4_PER_TOKEN_HEAD
+        ),
+        "layer_2": new_sliding_window_spec(
+            head_size=96, dtype=torch.uint8, kv_quant_mode=KVQuantMode.INT4_PER_TOKEN_HEAD
+        ),
+    }
+    kv_cache_config_hybrid_runtime_quant = get_kv_cache_configs(
+        vllm_config,
+        [kv_cache_specs_hybrid_runtime_quant],
+        [mem_per_block_per_layer * 2 * 32],
+    )[0]
+    assert len(kv_cache_config_hybrid_runtime_quant.kv_cache_groups) == 2
+    assert all(
+        group.kv_cache_spec.block_size == 16
+        for group in kv_cache_config_hybrid_runtime_quant.kv_cache_groups
+    )
+    assert len(
+        {group.kv_cache_spec.page_size_bytes for group in kv_cache_config_hybrid_runtime_quant.kv_cache_groups}
+    ) == 1
 
     # Test num_gpu_blocks_override
     vllm_config.cache_config.num_gpu_blocks_override = 16

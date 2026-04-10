@@ -10,7 +10,7 @@ from vllm.model_executor.layers.quantization.base_config import (
 )
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import is_quantized_kv_cache
-from vllm.v1.kv_cache_interface import kv_cache_uses_per_token_head_scales
+from vllm.v1.kv_cache_interface import kv_cache_uses_runtime_scales
 
 logger = init_logger(__name__)
 
@@ -54,14 +54,14 @@ class BaseKVCacheMethod(QuantizeMethodBase):
             assert not hasattr(layer, "prob_scale")
             return
 
-        # Per-token-head quantized KV cache: scales are computed dynamically
-        # per (token, head) in the kernel at cache-write time.  Checkpoint
-        # scales are never used regardless of calculate_kv_scales.
-        if kv_cache_uses_per_token_head_scales(layer.kv_cache_dtype):
+        # Runtime-scale quantized KV cache: scales are computed dynamically
+        # at cache-write time. Checkpoint scales are never used.
+        if kv_cache_uses_runtime_scales(layer.kv_cache_dtype):
             layer._k_scale.copy_(1.0)
             layer._v_scale.copy_(1.0)
             layer._k_scale_float = 1.0
             layer._v_scale_float = 1.0
+            layer.calculate_kv_scales = False
             del layer.k_scale
             del layer.v_scale
             del layer.q_scale

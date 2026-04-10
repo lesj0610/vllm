@@ -149,7 +149,39 @@ def _reshape_kv_cache(
 
             dtype = kv_cache_spec.dtype
             raw_tensor = raw_tensor.view(dtype)
-            raw_tensor = raw_tensor.view(kv_cache_shape)
+            padded_page_size_bytes = getattr(kv_cache_spec, "page_size_padded", None)
+            if (
+                padded_page_size_bytes is not None
+                and padded_page_size_bytes > kv_cache_spec.real_page_size_bytes
+            ):
+                block_dim = attn_backend.get_kv_cache_block_dim(
+                    kv_cache_spec.block_size,
+                    kv_cache_spec.num_kv_heads,
+                    kv_cache_spec.head_size,
+                    cache_dtype_str=cache_dtype,
+                )
+                physical_block_dim = kv_cache_stride_order.index(block_dim)
+                if physical_block_dim != 0:
+                    raise NotImplementedError(
+                        "Padded KV pages are only supported when the backend "
+                        "block dimension is leading."
+                    )
+                dtype_size = raw_tensor.element_size()
+                padded_elems_per_block = padded_page_size_bytes // dtype_size
+                strides = [0] * len(kv_cache_shape)
+                strides[-1] = 1
+                for i in range(len(kv_cache_shape) - 2, -1, -1):
+                    if i == physical_block_dim:
+                        strides[i] = padded_elems_per_block
+                    else:
+                        strides[i] = strides[i + 1] * kv_cache_shape[i + 1]
+                raw_tensor = torch.as_strided(
+                    raw_tensor,
+                    size=kv_cache_shape,
+                    stride=tuple(strides),
+                )
+            else:
+                raw_tensor = raw_tensor.view(kv_cache_shape)
             kv_caches[layer_name] = raw_tensor.permute(*inv_order)
     return kv_caches
 
