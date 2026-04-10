@@ -1180,10 +1180,8 @@ def unified_attention(
         is_prefill=False,
     )
     tile_size_2d = TILE_SIZE_PREFILL
-    if grouped_int4_uses_2d:
-        tile_size_2d = min(tile_size_2d, GROUPED_INT4_DECODE_TILE_SIZE)
-        if max_seqlen_q == 1:
-            tile_size_2d = min(TILE_SIZE_DECODE, GROUPED_INT4_DECODE_TILE_SIZE)
+    if grouped_int4_uses_2d and max_seqlen_q == 1:
+        tile_size_2d = min(TILE_SIZE_DECODE, GROUPED_INT4_DECODE_TILE_SIZE)
 
     # Launch the 2D kernel if
     # 1. No intermediate tiled softmax buffers for the 3D kernel have been allocated, or
