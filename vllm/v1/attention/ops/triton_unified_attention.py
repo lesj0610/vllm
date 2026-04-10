@@ -93,12 +93,20 @@ def _prepare_kv_tile(
         if DIM_IS_LAST:
             group_idx = dim_offsets[None, :] // INT4_GROUP_SIZE
             scale_idx = scale_base_idx[:, None] + group_idx * stride_s_group
-            scale_values = tl.load(scale_cache_ptr + scale_idx, mask=tile_mask[:, None], other=1.0)
+            scale_values = tl.load(
+                scale_cache_ptr + scale_idx,
+                mask=tile_mask[:, None],
+                other=1.0,
+            ).to(tl.float32)
             token_head_scales = scale_values
         else:
             group_idx = dim_offsets[:, None] // INT4_GROUP_SIZE
             scale_idx = scale_base_idx[None, :] + group_idx * stride_s_group
-            scale_values = tl.load(scale_cache_ptr + scale_idx, mask=tile_mask[None, :], other=1.0)
+            scale_values = tl.load(
+                scale_cache_ptr + scale_idx,
+                mask=tile_mask[None, :],
+                other=1.0,
+            ).to(tl.float32)
             token_head_scales = scale_values
         parity = (
             (dim_offsets[None, :] & 1) if DIM_IS_LAST else (dim_offsets[:, None] & 1)
@@ -1102,8 +1110,8 @@ def unified_attention(
     use_alibi_sqrt=False,
     # KV cache quantization mode and per-token-head scale caches.
     kv_quant_mode: KVQuantMode = KVQuantMode.NONE,
-    k_scale_cache=None,  # [num_blocks, block_size, num_kv_heads] float32
-    v_scale_cache=None,  # [num_blocks, block_size, num_kv_heads] float32
+    k_scale_cache=None,  # runtime K scale cache (per-head or grouped)
+    v_scale_cache=None,  # runtime V scale cache (per-head or grouped)
 ):
     assert causal, "Only causal attention is supported"
     assert q_descale is None, "Q scales not supported"

@@ -19,6 +19,7 @@ from vllm.v1.attention.ops.triton_unified_attention import unified_attention
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     INT4_SCALE_GROUP_SIZE,
+    INT4_SCALE_DTYPE,
     KVQuantMode,
     get_int4_inline_head_size_bytes,
     get_int4_packed_head_size,
@@ -102,29 +103,32 @@ def _get_int4_inline_scale_views(
     assert padded_hs == get_int4_inline_head_size_bytes(head_size)
     num_groups = get_int4_scale_group_count(head_size)
     data_hs_padded = get_int4_packed_head_size_padded(head_size)
-    assert data_hs_padded % 4 == 0
     assert num_groups >= 1
 
     raw = kv_cache.untyped_storage()
-    base_f32 = torch.tensor([], dtype=torch.float32, device=kv_cache.device).set_(raw)
+    scale_size = torch.tensor([], dtype=INT4_SCALE_DTYPE).element_size()
+    assert data_hs_padded % scale_size == 0
+    base_scale = torch.tensor(
+        [], dtype=INT4_SCALE_DTYPE, device=kv_cache.device
+    ).set_(raw)
 
     kv_half_bytes = block_size * num_heads * padded_hs
-    full_block_f32 = 2 * kv_half_bytes // 4
-    slot_f32 = num_heads * padded_hs // 4
-    head_f32 = padded_hs // 4
-    scale_off_f32 = data_hs_padded // 4
+    full_block_scale = 2 * kv_half_bytes // scale_size
+    slot_scale = num_heads * padded_hs // scale_size
+    head_scale = padded_hs // scale_size
+    scale_off = data_hs_padded // scale_size
 
     k_scale_cache = torch.as_strided(
-        base_f32,
+        base_scale,
         size=(kv_cache.shape[0], block_size, num_heads, num_groups),
-        stride=(full_block_f32, slot_f32, head_f32, 1),
-        storage_offset=scale_off_f32,
+        stride=(full_block_scale, slot_scale, head_scale, 1),
+        storage_offset=scale_off,
     )
     v_scale_cache = torch.as_strided(
-        base_f32,
+        base_scale,
         size=(kv_cache.shape[0], block_size, num_heads, num_groups),
-        stride=(full_block_f32, slot_f32, head_f32, 1),
-        storage_offset=(kv_half_bytes // 4) + scale_off_f32,
+        stride=(full_block_scale, slot_scale, head_scale, 1),
+        storage_offset=(kv_half_bytes // scale_size) + scale_off,
     )
     k_scale_cache.fill_(1.0)
     v_scale_cache.fill_(1.0)
@@ -179,7 +183,7 @@ def test_int4_kv_cache_shape_and_page_size():
         2,
         16,
         4,
-        80,
+        72,
     )
 
     spec = FullAttentionSpec(
@@ -189,7 +193,7 @@ def test_int4_kv_cache_shape_and_page_size():
         dtype=torch.uint8,
         kv_quant_mode=KVQuantMode.INT4_PER_TOKEN_HEAD,
     )
-    assert spec.page_size_bytes == 16 * 4 * (80 + 80)
+    assert spec.page_size_bytes == 16 * 4 * (72 + 72)
 
 
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="requires CUDA")
@@ -237,23 +241,26 @@ def test_int4_inline_scale_views_respect_padded_block_stride():
             impl._k_scale_cache[blk, :, :, group_idx].fill_(10.0 * (blk + 1) + group_idx)
             impl._v_scale_cache[blk, :, :, group_idx].fill_(20.0 * (blk + 1) + group_idx)
 
-    base_f32 = torch.tensor([], dtype=torch.float32, device=device).set_(kv_cache.untyped_storage())
-    block_f32 = padded_block_elems // 4
-    half_f32 = half_stride // 4
-    slot_f32 = slot_stride // 4
-    head_f32 = head_stride // 4
-    scale_off_f32 = get_int4_packed_head_size_padded(head_size) // 4
+    scale_size = torch.tensor([], dtype=INT4_SCALE_DTYPE).element_size()
+    base_scale = torch.tensor(
+        [], dtype=INT4_SCALE_DTYPE, device=device
+    ).set_(kv_cache.untyped_storage())
+    block_scale = padded_block_elems // scale_size
+    half_scale = half_stride // scale_size
+    slot_scale = slot_stride // scale_size
+    head_scale = head_stride // scale_size
+    scale_off = get_int4_packed_head_size_padded(head_size) // scale_size
 
     for blk in range(num_blocks):
         for slot in (0, block_size - 1):
             for head in (0, num_kv_heads - 1):
                 for group_idx in range(num_groups):
-                    k_idx = blk * block_f32 + slot * slot_f32 + head * head_f32 + scale_off_f32 + group_idx
-                    v_idx = blk * block_f32 + half_f32 + slot * slot_f32 + head * head_f32 + scale_off_f32 + group_idx
-                    assert base_f32[k_idx].item() == pytest.approx(
+                    k_idx = blk * block_scale + slot * slot_scale + head * head_scale + scale_off + group_idx
+                    v_idx = blk * block_scale + half_scale + slot * slot_scale + head * head_scale + scale_off + group_idx
+                    assert base_scale[k_idx].item() == pytest.approx(
                         10.0 * (blk + 1) + group_idx
                     )
-                    assert base_f32[v_idx].item() == pytest.approx(
+                    assert base_scale[v_idx].item() == pytest.approx(
                         20.0 * (blk + 1) + group_idx
                     )
 
@@ -316,16 +323,23 @@ def test_triton_reshape_and_cache_flash_int4():
     )
     expected_value = torch.zeros_like(expected_key)
     expected_k_scales = torch.ones(
-        num_blocks, block_size, num_heads, num_groups, device=device, dtype=torch.float32
+        num_blocks,
+        block_size,
+        num_heads,
+        num_groups,
+        device=device,
+        dtype=INT4_SCALE_DTYPE,
     )
     expected_v_scales = torch.ones_like(expected_k_scales)
     key_scales = _int4_grouped_scales(key)
     value_scales = _int4_grouped_scales(value)
+    key_dequant_scales = key_scales.to(INT4_SCALE_DTYPE)
+    value_dequant_scales = value_scales.to(INT4_SCALE_DTYPE)
     key_roundtrip = _dequantize_int4_values(
-        _quantize_int4(key, key_scales), key_scales
+        _quantize_int4(key, key_scales), key_dequant_scales
     )
     value_roundtrip = _dequantize_int4_values(
-        _quantize_int4(value, value_scales), value_scales
+        _quantize_int4(value, value_scales), value_dequant_scales
     )
 
     for token_idx, slot in enumerate(slot_mapping.cpu().tolist()):
@@ -333,14 +347,24 @@ def test_triton_reshape_and_cache_flash_int4():
         block_offset = slot % block_size
         expected_key[block_idx, block_offset] = key_roundtrip[token_idx]
         expected_value[block_idx, block_offset] = value_roundtrip[token_idx]
-        expected_k_scales[block_idx, block_offset] = key_scales[token_idx]
-        expected_v_scales[block_idx, block_offset] = value_scales[token_idx]
+        expected_k_scales[block_idx, block_offset] = key_dequant_scales[token_idx]
+        expected_v_scales[block_idx, block_offset] = value_dequant_scales[token_idx]
 
-    atol = max(float(key_scales.max().item()), float(value_scales.max().item())) + 1e-4
+    atol = (
+        max(
+            float(key_dequant_scales.float().max().item()),
+            float(value_dequant_scales.float().max().item()),
+        )
+        + 1e-4
+    )
     torch.testing.assert_close(got_key, expected_key, atol=atol, rtol=0.0)
     torch.testing.assert_close(got_value, expected_value, atol=atol, rtol=0.0)
-    torch.testing.assert_close(k_scale_cache, expected_k_scales, atol=1e-4, rtol=1e-4)
-    torch.testing.assert_close(v_scale_cache, expected_v_scales, atol=1e-4, rtol=1e-4)
+    torch.testing.assert_close(
+        k_scale_cache.float(), expected_k_scales.float(), atol=1e-4, rtol=1e-4
+    )
+    torch.testing.assert_close(
+        v_scale_cache.float(), expected_v_scales.float(), atol=1e-4, rtol=1e-4
+    )
 
 
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="requires CUDA")
@@ -383,7 +407,7 @@ def test_triton_reshape_and_cache_flash_int4_rejects_mismatched_v_head_size():
         block_size,
         num_heads,
         num_groups,
-        dtype=torch.float32,
+        dtype=INT4_SCALE_DTYPE,
         device=device,
     )
     v_scale_cache = torch.ones_like(k_scale_cache)
@@ -435,10 +459,12 @@ def test_triton_unified_attention_int4():
     )
     value_cache = torch.randn_like(key_cache)
 
-    k_scale = _int4_grouped_scales(key_cache)
-    v_scale = _int4_grouped_scales(value_cache)
-    key_cache_int4 = _pack_int4(key_cache, k_scale)
-    value_cache_int4 = _pack_int4(value_cache, v_scale)
+    k_quant_scale = _int4_grouped_scales(key_cache)
+    v_quant_scale = _int4_grouped_scales(value_cache)
+    k_scale = k_quant_scale.to(INT4_SCALE_DTYPE)
+    v_scale = v_quant_scale.to(INT4_SCALE_DTYPE)
+    key_cache_int4 = _pack_int4(key_cache, k_quant_scale)
+    value_cache_int4 = _pack_int4(value_cache, v_quant_scale)
 
     cu_query_lens = torch.tensor([0] + query_lens, dtype=torch.int32, device=device)
     cu_query_lens = cu_query_lens.cumsum(dim=0, dtype=torch.int32)
@@ -521,10 +547,12 @@ def test_triton_unified_attention_int4_decode_only_grouped_scale():
     )
     value_cache = torch.randn_like(key_cache)
 
-    k_scale = _int4_grouped_scales(key_cache)
-    v_scale = _int4_grouped_scales(value_cache)
-    key_cache_int4 = _pack_int4(key_cache, k_scale)
-    value_cache_int4 = _pack_int4(value_cache, v_scale)
+    k_quant_scale = _int4_grouped_scales(key_cache)
+    v_quant_scale = _int4_grouped_scales(value_cache)
+    k_scale = k_quant_scale.to(INT4_SCALE_DTYPE)
+    v_scale = v_quant_scale.to(INT4_SCALE_DTYPE)
+    key_cache_int4 = _pack_int4(key_cache, k_quant_scale)
+    value_cache_int4 = _pack_int4(value_cache, v_quant_scale)
 
     cu_query_lens = torch.tensor([0] + query_lens, dtype=torch.int32, device=device)
     cu_query_lens = cu_query_lens.cumsum(dim=0, dtype=torch.int32)
@@ -605,8 +633,9 @@ def test_int4_grouped_scale_reduces_outlier_mse():
     x[..., 1] = -5.5
 
     grouped_scale = _int4_grouped_scales(x)
+    grouped_dequant_scale = grouped_scale.to(INT4_SCALE_DTYPE)
     grouped_roundtrip = _dequantize_int4_values(
-        _quantize_int4(x, grouped_scale), grouped_scale
+        _quantize_int4(x, grouped_scale), grouped_dequant_scale
     )
 
     baseline_scale = _int4_scales_per_token_head(x)

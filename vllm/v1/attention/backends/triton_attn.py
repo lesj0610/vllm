@@ -45,6 +45,7 @@ from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     get_int4_inline_head_size_bytes,
     get_int4_packed_head_size_padded,
+    INT4_SCALE_DTYPE,
     get_int4_scale_group_count,
     get_kv_quant_mode,
     kv_cache_uses_per_token_head_scales,
@@ -408,10 +409,10 @@ class TritonAttentionImpl(AttentionImpl):
         """Extract per-head scale views from the padded head dimension.
 
         The KV cache shape is ``(num_blocks, 2, block_size, nkv, hs+pad)``
-        where the trailing bytes in each head region hold one float32 scale.
+        where the trailing bytes in each head region hold runtime scales.
         For int8/fp8 per-token-head cache, the scale sits after the dense data.
         For int4 cache, the scale sits after the packed-bytes region padded to a
-        4-byte boundary. We create strided float32 views over those bytes.
+        4-byte boundary. We create strided typed views over those bytes.
 
         Scale shape:
         - int8/fp8 per-token-head: ``(num_blocks, block_size, num_kv_heads)``
@@ -421,20 +422,23 @@ class TritonAttentionImpl(AttentionImpl):
             return
         num_blocks, _, block_size, nkv, padded_hs = kv_cache.shape
         dtype_sz = kv_cache.element_size()
-        scale_size = torch.tensor([], dtype=torch.float32).element_size()
         if kv_cache_uses_int4_packing(self.kv_cache_dtype):
+            scale_dtype = INT4_SCALE_DTYPE
             packed_hs = get_int4_packed_head_size_padded(self.head_size)
             num_scale_groups = get_int4_scale_group_count(self.head_size)
             hs = packed_hs
         else:
+            scale_dtype = torch.float32
+            scale_size = torch.tensor([], dtype=scale_dtype).element_size()
             scale_pad = scale_size // dtype_sz
             num_scale_groups = 1
             hs = padded_hs - scale_pad
+        scale_size = torch.tensor([], dtype=scale_dtype).element_size()
 
         raw = kv_cache.untyped_storage()
-        base_f32 = torch.tensor([], dtype=torch.float32, device=kv_cache.device).set_(
-            raw
-        )
+        base_scale = torch.tensor(
+            [], dtype=scale_dtype, device=kv_cache.device
+        ).set_(raw)
 
         # Use the actual tensor strides rather than re-deriving contiguous
         # ones from shape. Hybrid page padding can inflate the leading block
@@ -456,42 +460,42 @@ class TritonAttentionImpl(AttentionImpl):
             scale_off_bytes,
         ):
             assert value % scale_size == 0, (
-                "Scale cache view requires float32-aligned byte offsets/strides."
+                "Scale cache view requires scale-aligned byte offsets/strides."
             )
 
-        block_f32 = block_byte_stride // scale_size
-        kv_half_f32 = kv_half_byte_stride // scale_size
-        slot_f32 = slot_byte_stride // scale_size
-        head_f32 = head_byte_stride // scale_size
-        scale_off_f32 = (base_byte_offset + scale_off_bytes) // scale_size
+        block_scale = block_byte_stride // scale_size
+        kv_half_scale = kv_half_byte_stride // scale_size
+        slot_scale = slot_byte_stride // scale_size
+        head_scale = head_byte_stride // scale_size
+        scale_off = (base_byte_offset + scale_off_bytes) // scale_size
 
-        v_base_f32 = kv_half_f32
+        v_base_scale = kv_half_scale
         if kv_cache_uses_int4_packing(self.kv_cache_dtype):
             scale_stride = 1
             self._k_scale_cache = torch.as_strided(
-                base_f32,
+                base_scale,
                 size=(num_blocks, block_size, nkv, num_scale_groups),
-                stride=(block_f32, slot_f32, head_f32, scale_stride),
-                storage_offset=scale_off_f32,
+                stride=(block_scale, slot_scale, head_scale, scale_stride),
+                storage_offset=scale_off,
             )
             self._v_scale_cache = torch.as_strided(
-                base_f32,
+                base_scale,
                 size=(num_blocks, block_size, nkv, num_scale_groups),
-                stride=(block_f32, slot_f32, head_f32, scale_stride),
-                storage_offset=v_base_f32 + scale_off_f32,
+                stride=(block_scale, slot_scale, head_scale, scale_stride),
+                storage_offset=v_base_scale + scale_off,
             )
         else:
             self._k_scale_cache = torch.as_strided(
-                base_f32,
+                base_scale,
                 size=(num_blocks, block_size, nkv),
-                stride=(block_f32, slot_f32, head_f32),
-                storage_offset=scale_off_f32,
+                stride=(block_scale, slot_scale, head_scale),
+                storage_offset=scale_off,
             )
             self._v_scale_cache = torch.as_strided(
-                base_f32,
+                base_scale,
                 size=(num_blocks, block_size, nkv),
-                stride=(block_f32, slot_f32, head_f32),
-                storage_offset=v_base_f32 + scale_off_f32,
+                stride=(block_scale, slot_scale, head_scale),
+                storage_offset=v_base_scale + scale_off,
             )
 
         self._k_scale_cache.fill_(1.0)

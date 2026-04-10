@@ -308,8 +308,8 @@ def _reshape_cache_int4_per_token_head(
     value_ptr,  # [num_tokens, num_kv_heads, head_size_v]
     key_cache_ptr,  # [num_blocks, block_size, num_kv_heads, packed_head_size+pad]
     value_cache_ptr,  # [num_blocks, block_size, num_kv_heads, packed_head_size_v+pad]
-    k_scale_cache_ptr,  # [num_blocks, block_size, num_kv_heads] float32
-    v_scale_cache_ptr,  # [num_blocks, block_size, num_kv_heads] float32
+    k_scale_cache_ptr,  # [num_blocks, block_size, num_kv_heads, num_groups] float16
+    v_scale_cache_ptr,  # [num_blocks, block_size, num_kv_heads, num_groups] float16
     slot_mapping_ptr,  # [num_tokens]
     stride_key_tok: tl.int64,
     stride_key_head: tl.int64,
@@ -379,7 +379,7 @@ def _reshape_cache_int4_per_token_head(
             + slot_in_blk * stride_ks_slot
             + head * stride_ks_head
             + group_idx * stride_ks_group,
-            k_scale,
+            k_scale.to(tl.float16),
         )
 
         q_key_lo = _round_to_int32(k_group / k_scale)
@@ -424,7 +424,7 @@ def _reshape_cache_int4_per_token_head(
             + slot_in_blk * stride_vs_slot
             + head * stride_vs_head
             + group_idx * stride_vs_group,
-            v_scale,
+            v_scale.to(tl.float16),
         )
 
         q_value_lo = _round_to_int32(v_group / v_scale)

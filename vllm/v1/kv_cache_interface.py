@@ -22,6 +22,7 @@ from vllm.utils.torch_utils import get_dtype_size
 logger = init_logger(__name__)
 
 INT4_SCALE_GROUP_SIZE = 32
+INT4_SCALE_DTYPE = torch.float16
 
 
 # ---------------------------------------------------------------------------
@@ -100,7 +101,7 @@ def get_int4_scale_group_count(head_size: int) -> int:
 
 def get_int4_inline_head_size_bytes(head_size: int) -> int:
     return get_int4_packed_head_size_padded(head_size) + (
-        get_int4_scale_group_count(head_size) * get_dtype_size(torch.float32)
+        get_int4_scale_group_count(head_size) * get_dtype_size(INT4_SCALE_DTYPE)
     )
 
 
@@ -176,7 +177,7 @@ class AttentionSpec(KVCacheSpec):
     def real_page_size_bytes(self) -> int:
         head_size_physical = self.head_size
         if self.kv_quant_mode.is_int4_packed:
-            # int4 stores packed bytes plus one float32 runtime scale per
+            # int4 stores packed bytes plus one runtime scale per
             # 32-channel group inline with each head.
             head_size_physical = get_int4_inline_head_size_bytes(self.head_size)
         return (
