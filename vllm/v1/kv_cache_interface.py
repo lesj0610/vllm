@@ -21,6 +21,8 @@ from vllm.utils.torch_utils import get_dtype_size
 
 logger = init_logger(__name__)
 
+INT4_SCALE_GROUP_SIZE = 32
+
 
 # ---------------------------------------------------------------------------
 # KV cache quantization mode
@@ -82,6 +84,24 @@ def kv_cache_uses_per_token_head_scales(kv_cache_dtype: str) -> bool:
 def kv_cache_uses_runtime_scales(kv_cache_dtype: str) -> bool:
     """Return True if *kv_cache_dtype* computes scales at cache-write time."""
     return get_kv_quant_mode(kv_cache_dtype).uses_runtime_scales
+
+
+def get_int4_packed_head_size(head_size: int) -> int:
+    return cdiv(head_size, 2)
+
+
+def get_int4_packed_head_size_padded(head_size: int) -> int:
+    return cdiv(get_int4_packed_head_size(head_size), 4) * 4
+
+
+def get_int4_scale_group_count(head_size: int) -> int:
+    return cdiv(head_size, INT4_SCALE_GROUP_SIZE)
+
+
+def get_int4_inline_head_size_bytes(head_size: int) -> int:
+    return get_int4_packed_head_size_padded(head_size) + (
+        get_int4_scale_group_count(head_size) * get_dtype_size(torch.float32)
+    )
 
 
 @dataclass(frozen=True)
@@ -156,10 +176,9 @@ class AttentionSpec(KVCacheSpec):
     def real_page_size_bytes(self) -> int:
         head_size_physical = self.head_size
         if self.kv_quant_mode.is_int4_packed:
-            packed_head_size = cdiv(self.head_size, 2)
-            packed_head_size_padded = cdiv(packed_head_size, 4) * 4
-            # int4 stores packed bytes plus one float32 runtime scale inline.
-            head_size_physical = packed_head_size_padded + get_dtype_size(torch.float32)
+            # int4 stores packed bytes plus one float32 runtime scale per
+            # 32-channel group inline with each head.
+            head_size_physical = get_int4_inline_head_size_bytes(self.head_size)
         return (
             2
             * self.block_size
@@ -265,14 +284,8 @@ class FullAttentionSpec(AttentionSpec):
         head_size_k = self.head_size
         head_size_v = self.head_size_v
         if self.kv_quant_mode.is_int4_packed:
-            packed_head_size_k = cdiv(self.head_size, 2)
-            packed_head_size_v = cdiv(self.head_size_v, 2)
-            head_size_k = cdiv(packed_head_size_k, 4) * 4 + get_dtype_size(
-                torch.float32
-            )
-            head_size_v = cdiv(packed_head_size_v, 4) * 4 + get_dtype_size(
-                torch.float32
-            )
+            head_size_k = get_int4_inline_head_size_bytes(self.head_size)
+            head_size_v = get_int4_inline_head_size_bytes(self.head_size_v)
         return (
             self.block_size
             * self.num_kv_heads

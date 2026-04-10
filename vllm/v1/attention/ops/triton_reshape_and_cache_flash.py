@@ -14,6 +14,10 @@ from vllm.utils.torch_utils import (
     kv_cache_uses_fp8_storage,
     kv_cache_uses_int4_packing,
 )
+from vllm.v1.kv_cache_interface import (
+    INT4_SCALE_GROUP_SIZE,
+    get_int4_scale_group_count,
+)
 
 FP8_MIN, FP8_MAX = get_fp8_min_max()
 
@@ -320,9 +324,11 @@ def _reshape_cache_int4_per_token_head(
     stride_ks_blk: tl.int64,
     stride_ks_slot: tl.int64,
     stride_ks_head: tl.int64,
+    stride_ks_group: tl.int64,
     stride_vs_blk: tl.int64,
     stride_vs_slot: tl.int64,
     stride_vs_head: tl.int64,
+    stride_vs_group: tl.int64,
     block_size: tl.constexpr,
     head_size: tl.constexpr,
     head_size_v: tl.constexpr,
@@ -331,6 +337,9 @@ def _reshape_cache_int4_per_token_head(
     PACKED_HEAD_SIZE_V: tl.constexpr,
     PACKED_HEAD_SIZE_PADDED: tl.constexpr,
     PACKED_HEAD_SIZE_V_PADDED: tl.constexpr,
+    INT4_GROUP_SIZE: tl.constexpr,
+    PACKED_GROUP_SIZE: tl.constexpr,
+    NUM_SCALE_GROUPS: tl.constexpr,
 ):
     tok = tl.program_id(0)
     head = tl.program_id(1)
@@ -342,95 +351,98 @@ def _reshape_cache_int4_per_token_head(
     blk = slot // block_size
     slot_in_blk = slot % block_size
 
-    dim_offs = tl.arange(0, HEAD_SIZE_PADDED)
+    for group_idx in tl.static_range(NUM_SCALE_GROUPS):
+        group_start = group_idx * INT4_GROUP_SIZE
 
-    # ---- Key head -> absmax -> scale --------------------------------------
-    k_mask = dim_offs < head_size
-    k_h = tl.load(
-        key_ptr + tok * stride_key_tok + head * stride_key_head + dim_offs,
-        mask=k_mask,
-        other=0.0,
-    ).to(tl.float32)
-    k_scale = tl.maximum(tl.max(tl.abs(k_h)) / 7.0, 1e-6)
-    tl.store(
-        k_scale_cache_ptr
-        + blk * stride_ks_blk
-        + slot_in_blk * stride_ks_slot
-        + head * stride_ks_head,
-        k_scale,
-    )
+        # ---- Key group -> absmax -> scale ---------------------------------
+        group_dim_offs = group_start + tl.arange(0, INT4_GROUP_SIZE)
+        k_group = tl.load(
+            key_ptr + tok * stride_key_tok + head * stride_key_head + group_dim_offs,
+            mask=group_dim_offs < head_size,
+            other=0.0,
+        ).to(tl.float32)
+        k_scale = tl.maximum(tl.max(tl.abs(k_group)) / 7.0, 1e-6)
+        tl.store(
+            k_scale_cache_ptr
+            + blk * stride_ks_blk
+            + slot_in_blk * stride_ks_slot
+            + head * stride_ks_head
+            + group_idx * stride_ks_group,
+            k_scale,
+        )
 
-    packed_offs = tl.arange(0, PACKED_HEAD_SIZE_PADDED)
-    k_elem0 = packed_offs * 2
-    k_elem1 = k_elem0 + 1
-    k_lo = tl.load(
-        key_ptr + tok * stride_key_tok + head * stride_key_head + k_elem0,
-        mask=k_elem0 < head_size,
-        other=0.0,
-    ).to(tl.float32)
-    k_hi = tl.load(
-        key_ptr + tok * stride_key_tok + head * stride_key_head + k_elem1,
-        mask=k_elem1 < head_size,
-        other=0.0,
-    ).to(tl.float32)
-    q_key_lo = _round_to_int32(k_lo / k_scale)
-    q_key_hi = _round_to_int32(k_hi / k_scale)
-    q_key_lo = tl.maximum(tl.minimum(q_key_lo, 7), -8)
-    q_key_hi = tl.maximum(tl.minimum(q_key_hi, 7), -8)
-    key_packed = ((q_key_lo & 0xF) | ((q_key_hi & 0xF) << 4)).to(tl.uint8)
-    tl.store(
-        key_cache_ptr
-        + blk * stride_kc_blk
-        + slot_in_blk * stride_kc_slot
-        + head * stride_kc_head
-        + packed_offs,
-        key_packed,
-        mask=packed_offs < PACKED_HEAD_SIZE,
-    )
+        packed_lanes = tl.arange(0, PACKED_GROUP_SIZE)
+        packed_group_offs = (group_start // 2) + packed_lanes
+        k_elem0 = group_start + packed_lanes * 2
+        k_elem1 = k_elem0 + 1
+        k_lo = tl.load(
+            key_ptr + tok * stride_key_tok + head * stride_key_head + k_elem0,
+            mask=k_elem0 < head_size,
+            other=0.0,
+        ).to(tl.float32)
+        k_hi = tl.load(
+            key_ptr + tok * stride_key_tok + head * stride_key_head + k_elem1,
+            mask=k_elem1 < head_size,
+            other=0.0,
+        ).to(tl.float32)
+        q_key_lo = _round_to_int32(k_lo / k_scale)
+        q_key_hi = _round_to_int32(k_hi / k_scale)
+        q_key_lo = tl.maximum(tl.minimum(q_key_lo, 7), -8)
+        q_key_hi = tl.maximum(tl.minimum(q_key_hi, 7), -8)
+        key_packed = ((q_key_lo & 0xF) | ((q_key_hi & 0xF) << 4)).to(tl.uint8)
+        tl.store(
+            key_cache_ptr
+            + blk * stride_kc_blk
+            + slot_in_blk * stride_kc_slot
+            + head * stride_kc_head
+            + packed_group_offs,
+            key_packed,
+            mask=packed_group_offs < PACKED_HEAD_SIZE,
+        )
 
-    # ---- Value head -> absmax -> scale ------------------------------------
-    v_mask = dim_offs < head_size_v
-    v_h = tl.load(
-        value_ptr + tok * stride_val_tok + head * stride_val_head + dim_offs,
-        mask=v_mask,
-        other=0.0,
-    ).to(tl.float32)
-    v_scale = tl.maximum(tl.max(tl.abs(v_h)) / 7.0, 1e-6)
-    tl.store(
-        v_scale_cache_ptr
-        + blk * stride_vs_blk
-        + slot_in_blk * stride_vs_slot
-        + head * stride_vs_head,
-        v_scale,
-    )
+        # ---- Value group -> absmax -> scale -------------------------------
+        v_group = tl.load(
+            value_ptr
+            + tok * stride_val_tok
+            + head * stride_val_head
+            + group_dim_offs,
+            mask=group_dim_offs < head_size_v,
+            other=0.0,
+        ).to(tl.float32)
+        v_scale = tl.maximum(tl.max(tl.abs(v_group)) / 7.0, 1e-6)
+        tl.store(
+            v_scale_cache_ptr
+            + blk * stride_vs_blk
+            + slot_in_blk * stride_vs_slot
+            + head * stride_vs_head
+            + group_idx * stride_vs_group,
+            v_scale,
+        )
 
-    packed_offs_v = tl.arange(0, PACKED_HEAD_SIZE_V_PADDED)
-    v_elem0 = packed_offs_v * 2
-    v_elem1 = v_elem0 + 1
-    v_lo = tl.load(
-        value_ptr + tok * stride_val_tok + head * stride_val_head + v_elem0,
-        mask=v_elem0 < head_size_v,
-        other=0.0,
-    ).to(tl.float32)
-    v_hi = tl.load(
-        value_ptr + tok * stride_val_tok + head * stride_val_head + v_elem1,
-        mask=v_elem1 < head_size_v,
-        other=0.0,
-    ).to(tl.float32)
-    q_value_lo = _round_to_int32(v_lo / v_scale)
-    q_value_hi = _round_to_int32(v_hi / v_scale)
-    q_value_lo = tl.maximum(tl.minimum(q_value_lo, 7), -8)
-    q_value_hi = tl.maximum(tl.minimum(q_value_hi, 7), -8)
-    value_packed = ((q_value_lo & 0xF) | ((q_value_hi & 0xF) << 4)).to(tl.uint8)
-    tl.store(
-        value_cache_ptr
-        + blk * stride_vc_blk
-        + slot_in_blk * stride_vc_slot
-        + head * stride_vc_head
-        + packed_offs_v,
-        value_packed,
-        mask=packed_offs_v < PACKED_HEAD_SIZE_V,
-    )
+        v_lo = tl.load(
+            value_ptr + tok * stride_val_tok + head * stride_val_head + k_elem0,
+            mask=k_elem0 < head_size_v,
+            other=0.0,
+        ).to(tl.float32)
+        v_hi = tl.load(
+            value_ptr + tok * stride_val_tok + head * stride_val_head + k_elem1,
+            mask=k_elem1 < head_size_v,
+            other=0.0,
+        ).to(tl.float32)
+        q_value_lo = _round_to_int32(v_lo / v_scale)
+        q_value_hi = _round_to_int32(v_hi / v_scale)
+        q_value_lo = tl.maximum(tl.minimum(q_value_lo, 7), -8)
+        q_value_hi = tl.maximum(tl.minimum(q_value_hi, 7), -8)
+        value_packed = ((q_value_lo & 0xF) | ((q_value_hi & 0xF) << 4)).to(tl.uint8)
+        tl.store(
+            value_cache_ptr
+            + blk * stride_vc_blk
+            + slot_in_blk * stride_vc_slot
+            + head * stride_vc_head
+            + packed_group_offs,
+            value_packed,
+            mask=packed_group_offs < PACKED_HEAD_SIZE_V,
+        )
 
 
 def triton_reshape_and_cache_flash_int4_per_token_head(
@@ -449,6 +461,7 @@ def triton_reshape_and_cache_flash_int4_per_token_head(
     packed_head_size_v = (head_size_v + 1) // 2
     packed_head_size_padded = triton.next_power_of_2(max(1, packed_head_size))
     packed_head_size_v_padded = triton.next_power_of_2(max(1, packed_head_size_v))
+    num_scale_groups = get_int4_scale_group_count(head_size)
     block_size = key_cache.shape[1]
 
     if current_platform.is_rocm() or current_platform.is_xpu():
@@ -477,9 +490,11 @@ def triton_reshape_and_cache_flash_int4_per_token_head(
         stride_ks_blk=k_scale_cache.stride(0),
         stride_ks_slot=k_scale_cache.stride(1),
         stride_ks_head=k_scale_cache.stride(2),
+        stride_ks_group=k_scale_cache.stride(3),
         stride_vs_blk=v_scale_cache.stride(0),
         stride_vs_slot=v_scale_cache.stride(1),
         stride_vs_head=v_scale_cache.stride(2),
+        stride_vs_group=v_scale_cache.stride(3),
         block_size=block_size,
         head_size=head_size,
         head_size_v=head_size_v,
@@ -488,6 +503,9 @@ def triton_reshape_and_cache_flash_int4_per_token_head(
         PACKED_HEAD_SIZE_V=packed_head_size_v,
         PACKED_HEAD_SIZE_PADDED=packed_head_size_padded,
         PACKED_HEAD_SIZE_V_PADDED=packed_head_size_v_padded,
+        INT4_GROUP_SIZE=INT4_SCALE_GROUP_SIZE,
+        PACKED_GROUP_SIZE=INT4_SCALE_GROUP_SIZE // 2,
+        NUM_SCALE_GROUPS=num_scale_groups,
         num_warps=num_warps,
     )
 

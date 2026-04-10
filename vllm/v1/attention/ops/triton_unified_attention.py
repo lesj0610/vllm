@@ -13,11 +13,12 @@ import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
-from vllm.v1.kv_cache_interface import KVQuantMode
+from vllm.v1.kv_cache_interface import INT4_SCALE_GROUP_SIZE, KVQuantMode
 
 logger = init_logger(__name__)
 is_batch_invariant = envs.VLLM_BATCH_INVARIANT
 float8_info = torch.finfo(current_platform.fp8_dtype())
+GROUPED_INT4_DECODE_TILE_SIZE = 16
 
 
 @triton.jit
@@ -46,10 +47,12 @@ def _prepare_kv_tile(
     stride_s_blk,
     stride_s_slot,
     stride_s_head,
+    stride_s_group,
     tile_mask,
     BLOCK_SIZE: tl.constexpr,
     KV_QUANT_MODE: tl.constexpr,
     DIM_IS_LAST: tl.constexpr,
+    INT4_GROUP_SIZE: tl.constexpr,
 ):
     """Prepare a loaded KV tile for attention computation.
 
@@ -82,22 +85,28 @@ def _prepare_kv_tile(
             return data.to(Q.dtype), unused_scales
         return (data.to(tl.float32) * tl.load(tensor_scale)).to(Q.dtype), unused_scales
     if KV_QUANT_MODE == 4:  # int4
-        scale_idx = (
+        scale_base_idx = (
             physical_block_idx * stride_s_blk
             + (seq_offset % BLOCK_SIZE) * stride_s_slot
             + kv_head_idx * stride_s_head
         )
-        token_head_scales = tl.load(scale_cache_ptr + scale_idx, mask=tile_mask, other=1.0)
-        scale_values = (
-            token_head_scales[:, None] if DIM_IS_LAST else token_head_scales[None, :]
-        )
+        if DIM_IS_LAST:
+            group_idx = dim_offsets[None, :] // INT4_GROUP_SIZE
+            scale_idx = scale_base_idx[:, None] + group_idx * stride_s_group
+            scale_values = tl.load(scale_cache_ptr + scale_idx, mask=tile_mask[:, None], other=1.0)
+            token_head_scales = scale_values
+        else:
+            group_idx = dim_offsets[:, None] // INT4_GROUP_SIZE
+            scale_idx = scale_base_idx[None, :] + group_idx * stride_s_group
+            scale_values = tl.load(scale_cache_ptr + scale_idx, mask=tile_mask[None, :], other=1.0)
+            token_head_scales = scale_values
         parity = (
             (dim_offsets[None, :] & 1) if DIM_IS_LAST else (dim_offsets[:, None] & 1)
         )
         packed = data.to(tl.uint8).to(tl.int32)
         nibble = tl.where(parity == 0, packed & 0xF, packed >> 4)
         signed = tl.where(nibble >= 8, nibble - 16, nibble)
-        return (signed.to(tl.float32) * scale_values).to(Q.dtype), token_head_scales
+        return (signed.to(tl.float32) * scale_values).to(Q.dtype), unused_scales
     if KV_QUANT_MODE == 2 or KV_QUANT_MODE == 3:  # per-token-head (int8 or fp8)
         scale_idx = (
             physical_block_idx * stride_s_blk
@@ -190,6 +199,7 @@ def kernel_unified_attention_2d(
     KV_QUANT_MODE: tl.constexpr = 0,
     FP8_MIN: tl.constexpr = float8_info.min,
     FP8_MAX: tl.constexpr = float8_info.max,
+    INT4_GROUP_SIZE: tl.constexpr = 32,
     # Per-token-head scale caches (KV_QUANT_MODE == 2 or 3)
     # Shape: [num_blocks, block_size, num_kv_heads]
     k_scale_cache_ptr=None,
@@ -197,9 +207,11 @@ def kernel_unified_attention_2d(
     stride_ks_blk=0,
     stride_ks_slot=0,
     stride_ks_head=0,
+    stride_ks_group=0,
     stride_vs_blk=0,
     stride_vs_slot=0,
     stride_vs_head=0,
+    stride_vs_group=0,
 ):
     q_block_global_idx = tl.program_id(0)
     kv_head_idx = tl.program_id(1)
@@ -365,10 +377,12 @@ def kernel_unified_attention_2d(
             stride_ks_blk,
             stride_ks_slot,
             stride_ks_head,
+            stride_ks_group,
             tile_mask,
             BLOCK_SIZE,
             KV_QUANT_MODE,
             False,
+            INT4_GROUP_SIZE,
         )
 
         # V : (TILE_SIZE, HEAD_SIZE)
@@ -389,10 +403,12 @@ def kernel_unified_attention_2d(
             stride_vs_blk,
             stride_vs_slot,
             stride_vs_head,
+            stride_vs_group,
             tile_mask,
             BLOCK_SIZE,
             KV_QUANT_MODE,
             True,
+            INT4_GROUP_SIZE,
         )
 
         # Compute attention mask: causal by default (key <= query)
@@ -578,6 +594,7 @@ def kernel_unified_attention_3d(
     mm_prefix_range_ptr,  # [num_seqs] - prefix length for each sequence
     # KV cache quantization: 0=none, 1=fp8, 2=per-token-head
     KV_QUANT_MODE: tl.constexpr = 0,
+    INT4_GROUP_SIZE: tl.constexpr = 32,
     # Per-token-head scale caches (KV_QUANT_MODE == 2 or 3)
     # Shape: [num_blocks, block_size, num_kv_heads]
     k_scale_cache_ptr=None,
@@ -585,9 +602,11 @@ def kernel_unified_attention_3d(
     stride_ks_blk=0,
     stride_ks_slot=0,
     stride_ks_head=0,
+    stride_ks_group=0,
     stride_vs_blk=0,
     stride_vs_slot=0,
     stride_vs_head=0,
+    stride_vs_group=0,
 ):
     q_block_global_idx = tl.program_id(0)
     kv_head_idx = tl.program_id(1)
@@ -762,10 +781,12 @@ def kernel_unified_attention_3d(
             stride_ks_blk,
             stride_ks_slot,
             stride_ks_head,
+            stride_ks_group,
             tile_mask,
             BLOCK_SIZE,
             KV_QUANT_MODE,
             False,
+            INT4_GROUP_SIZE,
         )
 
         # V : (TILE_SIZE, HEAD_SIZE)
@@ -786,10 +807,12 @@ def kernel_unified_attention_3d(
             stride_vs_blk,
             stride_vs_slot,
             stride_vs_head,
+            stride_vs_group,
             tile_mask,
             BLOCK_SIZE,
             KV_QUANT_MODE,
             True,
+            INT4_GROUP_SIZE,
         )
 
         # Compute attention mask: causal by default (key <= query)
@@ -1113,6 +1136,21 @@ def unified_attention(
         16 if num_queries_per_kv <= 16 else triton.next_power_of_2(num_queries_per_kv)
     )
     BLOCK_Q = BLOCK_M // num_queries_per_kv
+    block_m_2d = BLOCK_M
+    block_q_2d = BLOCK_Q
+
+    # Grouped int4 scales increase the decode kernel working set enough that
+    # the 3D segmented kernel can exceed shared-memory limits on pre-Hopper
+    # parts. Keep the existing 3D optimization for all other paths, but route
+    # grouped int4 decode through the 2D kernel for correctness.
+    grouped_int4_uses_2d = (
+        kv_quant_mode == KVQuantMode.INT4_PER_TOKEN_HEAD
+        and k_scale_cache is not None
+        and k_scale_cache.ndim > 3
+    )
+    if grouped_int4_uses_2d and max_seqlen_q == 1:
+        block_m_2d = max(2, triton.next_power_of_2(num_queries_per_kv))
+        block_q_2d = max(1, block_m_2d // num_queries_per_kv)
 
     # Ideally we would launch with kernel with:
     # \sum_i[ceil(query_len[i] / BLOCK_Q)] blocks.
@@ -1124,6 +1162,7 @@ def unified_attention(
     #   <= floor(\sum_i(query_len[i]) / BLOCK_Q) + num_seqs
     #    = floor(q.shape[0] / BLOCK_Q) + num_seqs
     total_num_q_blocks = q.shape[0] // BLOCK_Q + num_seqs
+    total_num_q_blocks_2d = q.shape[0] // block_q_2d + num_seqs
 
     # Tile sizes for prefill and decode. Gemma3 models use optimized values.
     # Note: tile size must be at least 32 for fp8 (element_size == 1).
@@ -1140,6 +1179,11 @@ def unified_attention(
         q.element_size(),
         is_prefill=False,
     )
+    tile_size_2d = TILE_SIZE_PREFILL
+    if grouped_int4_uses_2d:
+        tile_size_2d = min(tile_size_2d, GROUPED_INT4_DECODE_TILE_SIZE)
+        if max_seqlen_q == 1:
+            tile_size_2d = min(TILE_SIZE_DECODE, GROUPED_INT4_DECODE_TILE_SIZE)
 
     # Launch the 2D kernel if
     # 1. No intermediate tiled softmax buffers for the 3D kernel have been allocated, or
@@ -1155,13 +1199,9 @@ def unified_attention(
         or max_seqlen_q > 1
         or num_seqs > seq_threshold_3D
         or is_batch_invariant
+        or grouped_int4_uses_2d
     ):
-        kernel_unified_attention_2d[
-            (
-                total_num_q_blocks,
-                num_kv_heads,
-            )
-        ](
+        kernel_2d_kwargs = dict(
             output_ptr=out,
             query_ptr=q,
             key_cache_ptr=k,
@@ -1185,7 +1225,7 @@ def unified_attention(
             output_stride_1=out.stride(1),
             qq_bias_stride_0=qq_bias.stride(0) if use_qq_bias else 0,
             BLOCK_SIZE=block_size,
-            TILE_SIZE=TILE_SIZE_PREFILL,
+            TILE_SIZE=tile_size_2d,
             HEAD_SIZE=head_size,
             HEAD_SIZE_PADDED=triton.next_power_of_2(head_size),
             USE_ALIBI_SLOPES=use_alibi_slopes,
@@ -1206,20 +1246,37 @@ def unified_attention(
             stride_v_cache_2=v.stride(2),
             stride_v_cache_3=v.stride(3),
             query_start_len_ptr=cu_seqlens_q,
-            BLOCK_Q=BLOCK_Q,
+            BLOCK_Q=block_q_2d,
             num_seqs=num_seqs,
-            BLOCK_M=BLOCK_M,
+            BLOCK_M=block_m_2d,
             USE_FP8=output_scale is not None,
             KV_QUANT_MODE=kv_quant_mode,
+            INT4_GROUP_SIZE=INT4_SCALE_GROUP_SIZE,
             k_scale_cache_ptr=k_scale_cache,
             v_scale_cache_ptr=v_scale_cache,
             stride_ks_blk=k_scale_cache.stride(0) if k_scale_cache is not None else 0,
             stride_ks_slot=k_scale_cache.stride(1) if k_scale_cache is not None else 0,
             stride_ks_head=k_scale_cache.stride(2) if k_scale_cache is not None else 0,
+            stride_ks_group=k_scale_cache.stride(3) if k_scale_cache is not None and k_scale_cache.ndim > 3 else 0,
             stride_vs_blk=v_scale_cache.stride(0) if v_scale_cache is not None else 0,
             stride_vs_slot=v_scale_cache.stride(1) if v_scale_cache is not None else 0,
             stride_vs_head=v_scale_cache.stride(2) if v_scale_cache is not None else 0,
+            stride_vs_group=v_scale_cache.stride(3) if v_scale_cache is not None and v_scale_cache.ndim > 3 else 0,
         )
+        if grouped_int4_uses_2d:
+            kernel_unified_attention_2d[
+                (
+                    total_num_q_blocks_2d,
+                    num_kv_heads,
+                )
+            ](**kernel_2d_kwargs, num_stages=1)
+        else:
+            kernel_unified_attention_2d[
+                (
+                    total_num_q_blocks_2d,
+                    num_kv_heads,
+                )
+            ](**kernel_2d_kwargs)
     else:
         kernel_unified_attention_3d[
             (total_num_q_blocks, num_kv_heads, num_par_softmax_segments)
@@ -1272,14 +1329,17 @@ def unified_attention(
             BLOCK_M=BLOCK_M,
             NUM_SEGMENTS_PER_SEQ=num_par_softmax_segments,
             KV_QUANT_MODE=kv_quant_mode,
+            INT4_GROUP_SIZE=INT4_SCALE_GROUP_SIZE,
             k_scale_cache_ptr=k_scale_cache,
             v_scale_cache_ptr=v_scale_cache,
             stride_ks_blk=k_scale_cache.stride(0) if k_scale_cache is not None else 0,
             stride_ks_slot=k_scale_cache.stride(1) if k_scale_cache is not None else 0,
             stride_ks_head=k_scale_cache.stride(2) if k_scale_cache is not None else 0,
+            stride_ks_group=k_scale_cache.stride(3) if k_scale_cache is not None and k_scale_cache.ndim > 3 else 0,
             stride_vs_blk=v_scale_cache.stride(0) if v_scale_cache is not None else 0,
             stride_vs_slot=v_scale_cache.stride(1) if v_scale_cache is not None else 0,
             stride_vs_head=v_scale_cache.stride(2) if v_scale_cache is not None else 0,
+            stride_vs_group=v_scale_cache.stride(3) if v_scale_cache is not None and v_scale_cache.ndim > 3 else 0,
         )
         reduce_segments[(q.shape[0], num_query_heads)](
             output_ptr=out,
