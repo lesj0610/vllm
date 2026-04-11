@@ -219,9 +219,13 @@ class RowvLLMParameter(BasevLLMParameter):
 
     def load_row_parallel_weight(self, loaded_weight: torch.Tensor):
         shard_size = self.data.shape[self.input_dim]
-        loaded_weight = loaded_weight.narrow(
-            self.input_dim, self.tp_rank * shard_size, shard_size
-        )
+        group_size = getattr(self, "row_group_size", None)
+        input_partition_size = getattr(self, "row_input_size_per_partition", None)
+        if group_size is not None and input_partition_size is not None:
+            start_idx = (self.tp_rank * input_partition_size) // group_size
+        else:
+            start_idx = self.tp_rank * shard_size
+        loaded_weight = loaded_weight.narrow(self.input_dim, start_idx, shard_size)
 
         if len(loaded_weight.shape) == 0:
             loaded_weight = loaded_weight.reshape(1)

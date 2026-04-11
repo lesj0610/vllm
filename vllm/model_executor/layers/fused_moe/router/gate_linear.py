@@ -5,6 +5,7 @@ from torch.nn.parameter import Parameter
 
 from vllm.model_executor.custom_op import PluggableLayer
 from vllm.model_executor.layers.linear import ReplicatedLinear
+from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.platforms import current_platform
 
 
@@ -33,6 +34,7 @@ class GateLinear(ReplicatedLinear):
         out_dtype: torch.dtype | None = None,
         params_dtype: torch.dtype | None = None,
         force_fp32_compute: bool = False,
+        quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ):
         is_hopper_or_blackwell = current_platform.is_device_capability(
@@ -52,10 +54,12 @@ class GateLinear(ReplicatedLinear):
             output_size,
             bias=bias,
             params_dtype=params_dtype,
-            quant_config=None,
+            quant_config=quant_config,
             prefix=prefix,
         )
         self.out_dtype = out_dtype
+        weight = getattr(self, "weight", None)
+        weight_dtype = None if weight is None else weight.dtype
 
         # DSV3 specialized kernel eligibility (SM90+, exact dims)
         self.allow_specialized_router_gemm = can_use_specialized_kernels
@@ -68,7 +72,7 @@ class GateLinear(ReplicatedLinear):
         # cuBLAS bf16→fp32 eligibility
         self.allow_cublas_router_gemm = (
             self.allow_specialized_router_gemm
-            and self.weight.dtype == torch.bfloat16
+            and weight_dtype == torch.bfloat16
             and self.out_dtype == torch.float32
         )
 
@@ -87,7 +91,10 @@ class GateLinear(ReplicatedLinear):
             and self.allow_specialized_router_gemm
             and out_dtype == torch.float32
         ):
-            self.allow_cublas_router_gemm = self.weight.dtype == torch.bfloat16
+            weight = getattr(self, "weight", None)
+            self.allow_cublas_router_gemm = (
+                weight is not None and weight.dtype == torch.bfloat16
+            )
 
     def forward(
         self, x: torch.Tensor
@@ -109,8 +116,9 @@ class GateLinear(ReplicatedLinear):
             return output, None
 
         # Tier 3: F.linear (ReplicatedLinear)
-        if self.out_dtype is not None and x.dtype != self.weight.dtype:
-            x = x.to(self.weight.dtype)
+        weight = getattr(self, "weight", None)
+        if self.out_dtype is not None and weight is not None and x.dtype != weight.dtype:
+            x = x.to(weight.dtype)
         output, output_bias = super().forward(x)
         if self.out_dtype is not None and output.dtype != self.out_dtype:
             output = output.to(self.out_dtype)

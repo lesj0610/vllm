@@ -161,6 +161,7 @@ class Gemma4Router(nn.Module):
             config.num_experts,
             bias=False,
             out_dtype=torch.float32,
+            quant_config=quant_config,
             prefix=f"{prefix}.proj",
         )
 

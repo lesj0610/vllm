@@ -464,6 +464,12 @@ class GPTQMarlinLinearMethod(LinearMethodBase):
                 packed_factor=self.quant_config.pack_factor,
                 **qzeros_args,
             )
+            row_group_attrs = {
+                "row_group_size": group_size,
+                "row_input_size_per_partition": input_size_per_partition,
+            }
+            set_weight_attrs(scales, row_group_attrs)
+            set_weight_attrs(qzeros, row_group_attrs)
 
         layer.register_parameter("qweight", qweight)
         layer.register_parameter("g_idx", g_idx)
