@@ -13,11 +13,30 @@ import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
-from vllm.v1.kv_cache_interface import KVQuantMode
+from vllm.v1.attention.ops.triton_reshape_and_cache_flash import INT4_CODEBOOK_LEVELS
+from vllm.v1.kv_cache_interface import INT4_CHANNELS_PER_SCALE, KVQuantMode
 
 logger = init_logger(__name__)
 is_batch_invariant = envs.VLLM_BATCH_INVARIANT
 float8_info = torch.finfo(current_platform.fp8_dtype())
+(
+    INT4_CODEBOOK_0,
+    INT4_CODEBOOK_1,
+    INT4_CODEBOOK_2,
+    INT4_CODEBOOK_3,
+    INT4_CODEBOOK_4,
+    INT4_CODEBOOK_5,
+    INT4_CODEBOOK_6,
+    INT4_CODEBOOK_7,
+    INT4_CODEBOOK_8,
+    INT4_CODEBOOK_9,
+    INT4_CODEBOOK_10,
+    INT4_CODEBOOK_11,
+    INT4_CODEBOOK_12,
+    INT4_CODEBOOK_13,
+    INT4_CODEBOOK_14,
+    INT4_CODEBOOK_15,
+) = INT4_CODEBOOK_LEVELS
 
 
 @triton.jit
@@ -34,6 +53,42 @@ def apply_softcap(S, x):
 
 
 @triton.jit
+def _int4_codebook_value(
+    idx,
+    C1: tl.constexpr,
+    C2: tl.constexpr,
+    C3: tl.constexpr,
+    C4: tl.constexpr,
+    C5: tl.constexpr,
+    C6: tl.constexpr,
+    C7: tl.constexpr,
+    C9: tl.constexpr,
+    C10: tl.constexpr,
+    C11: tl.constexpr,
+    C12: tl.constexpr,
+    C13: tl.constexpr,
+    C14: tl.constexpr,
+    C15: tl.constexpr,
+):
+    value = idx.to(tl.float32) * 0.0
+    value = tl.where(idx == 1, C1, value)
+    value = tl.where(idx == 2, C2, value)
+    value = tl.where(idx == 3, C3, value)
+    value = tl.where(idx == 4, C4, value)
+    value = tl.where(idx == 5, C5, value)
+    value = tl.where(idx == 6, C6, value)
+    value = tl.where(idx == 7, C7, value)
+    value = tl.where(idx == 9, C9, value)
+    value = tl.where(idx == 10, C10, value)
+    value = tl.where(idx == 11, C11, value)
+    value = tl.where(idx == 12, C12, value)
+    value = tl.where(idx == 13, C13, value)
+    value = tl.where(idx == 14, C14, value)
+    value = tl.where(idx == 15, C15, value)
+    return value
+
+
+@triton.jit
 def _prepare_kv_tile(
     data,
     Q,
@@ -45,9 +100,27 @@ def _prepare_kv_tile(
     stride_s_blk,
     stride_s_slot,
     stride_s_head,
+    stride_s_group,
+    offs_d,
     tile_mask,
+    IS_VALUE: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     KV_QUANT_MODE: tl.constexpr,
+    CHANNELS_PER_SCALE: tl.constexpr,
+    INT4_C1: tl.constexpr,
+    INT4_C2: tl.constexpr,
+    INT4_C3: tl.constexpr,
+    INT4_C4: tl.constexpr,
+    INT4_C5: tl.constexpr,
+    INT4_C6: tl.constexpr,
+    INT4_C7: tl.constexpr,
+    INT4_C9: tl.constexpr,
+    INT4_C10: tl.constexpr,
+    INT4_C11: tl.constexpr,
+    INT4_C12: tl.constexpr,
+    INT4_C13: tl.constexpr,
+    INT4_C14: tl.constexpr,
+    INT4_C15: tl.constexpr,
 ):
     """Prepare a loaded KV tile for attention computation.
 
@@ -57,7 +130,8 @@ def _prepare_kv_tile(
     - ``KV_QUANT_MODE == 0``: cast only (no-op for bf16/fp16).
     - ``KV_QUANT_MODE == 1`` (FP8 per-tensor): dequantize inline
       using the tensor-wide scale.
-    - ``KV_QUANT_MODE >= 2`` (per-token-head int8/fp8): cast to Q's
+    - ``KV_QUANT_MODE >= 2`` (per-token-head int8/fp8/int4): cast or
+      decode to Q's
       dtype and return per-head scales separately — the caller applies
       them after the dot product for better numerical efficiency.
 
@@ -66,7 +140,8 @@ def _prepare_kv_tile(
     the same constexpr so the compiler eliminates dead code.
     """
     # KV_QUANT_MODE values: 0=none, 1=fp8 per-tensor,
-    #                       2=int8 per-token-head, 3=fp8 per-token-head
+    #                       2=int8 per-token-head, 3=fp8 per-token-head,
+    #                       4=int4 per-token-head
 
     # Placeholder scales (float32) — never read when KV_QUANT_MODE < 2.
     unused_scales = tile_mask.to(tl.float32)
@@ -75,6 +150,49 @@ def _prepare_kv_tile(
         if Q.dtype.is_fp8():
             return data.to(Q.dtype), unused_scales
         return (data.to(tl.float32) * tl.load(tensor_scale)).to(Q.dtype), unused_scales
+    if KV_QUANT_MODE == 4:  # per-token-head int4
+        dim_groups = offs_d // CHANNELS_PER_SCALE
+        if IS_VALUE:
+            scale_idx = (
+                physical_block_idx[:, None] * stride_s_blk
+                + (seq_offset % BLOCK_SIZE)[:, None] * stride_s_slot
+                + kv_head_idx * stride_s_head
+                + dim_groups[None, :] * stride_s_group
+            )
+            scale_mask = tile_mask[:, None]
+        else:
+            scale_idx = (
+                physical_block_idx[None, :] * stride_s_blk
+                + (seq_offset % BLOCK_SIZE)[None, :] * stride_s_slot
+                + kv_head_idx * stride_s_head
+                + dim_groups[:, None] * stride_s_group
+            )
+            scale_mask = tile_mask[None, :]
+        token_dim_scales = tl.load(scale_cache_ptr + scale_idx, mask=scale_mask, other=1.0)
+        if IS_VALUE:
+            shift = ((offs_d % 2) * 4).to(tl.int32)[None, :]
+        else:
+            shift = ((offs_d % 2) * 4).to(tl.int32)[:, None]
+        idx = (data.to(tl.int32) >> shift) & 0xF
+        decoded = _int4_codebook_value(
+            idx,
+            INT4_C1,
+            INT4_C2,
+            INT4_C3,
+            INT4_C4,
+            INT4_C5,
+            INT4_C6,
+            INT4_C7,
+            INT4_C9,
+            INT4_C10,
+            INT4_C11,
+            INT4_C12,
+            INT4_C13,
+            INT4_C14,
+            INT4_C15,
+        )
+        scaled = decoded * token_dim_scales.to(tl.float32)
+        return scaled.to(Q.dtype), unused_scales
     if KV_QUANT_MODE >= 2:  # per-token-head (int8 or fp8)
         scale_idx = (
             physical_block_idx * stride_s_blk
@@ -84,7 +202,7 @@ def _prepare_kv_tile(
         token_head_scales = tl.load(
             scale_cache_ptr + scale_idx, mask=tile_mask, other=1.0
         )
-        return data.to(Q.dtype), token_head_scales
+        return data.to(Q.dtype), token_head_scales.to(tl.float32)
     # .to(Q.dtype) is a no-op when data is already Q's type (bf16/fp16),
     # but required so Triton sees consistent return types across branches.
     return data.to(Q.dtype), unused_scales
@@ -174,9 +292,26 @@ def kernel_unified_attention_2d(
     stride_ks_blk=0,
     stride_ks_slot=0,
     stride_ks_head=0,
+    stride_ks_group=0,
     stride_vs_blk=0,
     stride_vs_slot=0,
     stride_vs_head=0,
+    stride_vs_group=0,
+    CHANNELS_PER_SCALE: tl.constexpr = INT4_CHANNELS_PER_SCALE,
+    INT4_C1: tl.constexpr = 0.0,
+    INT4_C2: tl.constexpr = 0.0,
+    INT4_C3: tl.constexpr = 0.0,
+    INT4_C4: tl.constexpr = 0.0,
+    INT4_C5: tl.constexpr = 0.0,
+    INT4_C6: tl.constexpr = 0.0,
+    INT4_C7: tl.constexpr = 0.0,
+    INT4_C9: tl.constexpr = 0.0,
+    INT4_C10: tl.constexpr = 0.0,
+    INT4_C11: tl.constexpr = 0.0,
+    INT4_C12: tl.constexpr = 0.0,
+    INT4_C13: tl.constexpr = 0.0,
+    INT4_C14: tl.constexpr = 0.0,
+    INT4_C15: tl.constexpr = 0.0,
 ):
     q_block_global_idx = tl.program_id(0)
     kv_head_idx = tl.program_id(1)
@@ -308,17 +443,22 @@ def kernel_unified_attention_2d(
             block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE
         ).to(tl.int64)
 
+        if KV_QUANT_MODE == 4:
+            cache_offs_d = offs_d // 2
+        else:
+            cache_offs_d = offs_d
+
         v_offset = (
             physical_block_idx[:, None] * stride_v_cache_0
             + kv_head_idx * stride_v_cache_2
-            + offs_d[None, :] * stride_v_cache_3
+            + cache_offs_d[None, :] * stride_v_cache_3
             + (seq_offset % BLOCK_SIZE)[:, None] * stride_v_cache_1
         )
 
         k_offset = (
             physical_block_idx[None, :] * stride_k_cache_0
             + kv_head_idx * stride_k_cache_2
-            + offs_d[:, None] * stride_k_cache_3
+            + cache_offs_d[:, None] * stride_k_cache_3
             + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
         )
 
@@ -339,9 +479,27 @@ def kernel_unified_attention_2d(
             stride_ks_blk,
             stride_ks_slot,
             stride_ks_head,
+            stride_ks_group,
+            offs_d,
             tile_mask,
+            False,
             BLOCK_SIZE,
             KV_QUANT_MODE,
+            CHANNELS_PER_SCALE,
+            INT4_C1,
+            INT4_C2,
+            INT4_C3,
+            INT4_C4,
+            INT4_C5,
+            INT4_C6,
+            INT4_C7,
+            INT4_C9,
+            INT4_C10,
+            INT4_C11,
+            INT4_C12,
+            INT4_C13,
+            INT4_C14,
+            INT4_C15,
         )
 
         # V : (TILE_SIZE, HEAD_SIZE)
@@ -361,9 +519,27 @@ def kernel_unified_attention_2d(
             stride_vs_blk,
             stride_vs_slot,
             stride_vs_head,
+            stride_vs_group,
+            offs_d,
             tile_mask,
+            True,
             BLOCK_SIZE,
             KV_QUANT_MODE,
+            CHANNELS_PER_SCALE,
+            INT4_C1,
+            INT4_C2,
+            INT4_C3,
+            INT4_C4,
+            INT4_C5,
+            INT4_C6,
+            INT4_C7,
+            INT4_C9,
+            INT4_C10,
+            INT4_C11,
+            INT4_C12,
+            INT4_C13,
+            INT4_C14,
+            INT4_C15,
         )
 
         # Compute attention mask: causal by default (key <= query)
@@ -404,7 +580,9 @@ def kernel_unified_attention_2d(
 
         # Per-token-head quant: fuse softmax_scale with per-head k_scale
         # to avoid a separate BLOCK_M × TILE_SIZE multiply on S.
-        if KV_QUANT_MODE >= 2:
+        if KV_QUANT_MODE == 4:
+            S += scale * tl.dot(Q, K)
+        elif KV_QUANT_MODE >= 2:
             S += tl.dot(Q, K) * (scale * k_token_head_scales[None, :])
         else:
             S += scale * tl.dot(Q, K)
@@ -472,7 +650,9 @@ def kernel_unified_attention_2d(
 
         # acc : (BLOCK_M, HEAD_SIZE_PADDED)
         # Per-token-head quant: apply v_scale to P instead of V.
-        if KV_QUANT_MODE >= 2:
+        if KV_QUANT_MODE == 4:
+            acc += tl.dot(P.to(V.dtype), V)
+        elif KV_QUANT_MODE >= 2:
             P_v = (P * v_token_head_scales[None, :]).to(V.dtype)
             acc += tl.dot(P_v, V)
         else:
@@ -556,9 +736,26 @@ def kernel_unified_attention_3d(
     stride_ks_blk=0,
     stride_ks_slot=0,
     stride_ks_head=0,
+    stride_ks_group=0,
     stride_vs_blk=0,
     stride_vs_slot=0,
     stride_vs_head=0,
+    stride_vs_group=0,
+    CHANNELS_PER_SCALE: tl.constexpr = INT4_CHANNELS_PER_SCALE,
+    INT4_C1: tl.constexpr = 0.0,
+    INT4_C2: tl.constexpr = 0.0,
+    INT4_C3: tl.constexpr = 0.0,
+    INT4_C4: tl.constexpr = 0.0,
+    INT4_C5: tl.constexpr = 0.0,
+    INT4_C6: tl.constexpr = 0.0,
+    INT4_C7: tl.constexpr = 0.0,
+    INT4_C9: tl.constexpr = 0.0,
+    INT4_C10: tl.constexpr = 0.0,
+    INT4_C11: tl.constexpr = 0.0,
+    INT4_C12: tl.constexpr = 0.0,
+    INT4_C13: tl.constexpr = 0.0,
+    INT4_C14: tl.constexpr = 0.0,
+    INT4_C15: tl.constexpr = 0.0,
 ):
     q_block_global_idx = tl.program_id(0)
     kv_head_idx = tl.program_id(1)
@@ -699,17 +896,22 @@ def kernel_unified_attention_3d(
             block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE
         ).to(tl.int64)
 
+        if KV_QUANT_MODE == 4:
+            cache_offs_d = offs_d // 2
+        else:
+            cache_offs_d = offs_d
+
         v_offset = (
             physical_block_idx[:, None] * stride_v_cache_0
             + kv_head_idx * stride_v_cache_2
-            + offs_d[None, :] * stride_v_cache_3
+            + cache_offs_d[None, :] * stride_v_cache_3
             + (seq_offset % BLOCK_SIZE)[:, None] * stride_v_cache_1
         )
 
         k_offset = (
             physical_block_idx[None, :] * stride_k_cache_0
             + kv_head_idx * stride_k_cache_2
-            + offs_d[:, None] * stride_k_cache_3
+            + cache_offs_d[:, None] * stride_k_cache_3
             + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
         )
 
@@ -730,9 +932,27 @@ def kernel_unified_attention_3d(
             stride_ks_blk,
             stride_ks_slot,
             stride_ks_head,
+            stride_ks_group,
+            offs_d,
             tile_mask,
+            False,
             BLOCK_SIZE,
             KV_QUANT_MODE,
+            CHANNELS_PER_SCALE,
+            INT4_C1,
+            INT4_C2,
+            INT4_C3,
+            INT4_C4,
+            INT4_C5,
+            INT4_C6,
+            INT4_C7,
+            INT4_C9,
+            INT4_C10,
+            INT4_C11,
+            INT4_C12,
+            INT4_C13,
+            INT4_C14,
+            INT4_C15,
         )
 
         # V : (TILE_SIZE, HEAD_SIZE)
@@ -752,9 +972,27 @@ def kernel_unified_attention_3d(
             stride_vs_blk,
             stride_vs_slot,
             stride_vs_head,
+            stride_vs_group,
+            offs_d,
             tile_mask,
+            True,
             BLOCK_SIZE,
             KV_QUANT_MODE,
+            CHANNELS_PER_SCALE,
+            INT4_C1,
+            INT4_C2,
+            INT4_C3,
+            INT4_C4,
+            INT4_C5,
+            INT4_C6,
+            INT4_C7,
+            INT4_C9,
+            INT4_C10,
+            INT4_C11,
+            INT4_C12,
+            INT4_C13,
+            INT4_C14,
+            INT4_C15,
         )
 
         # Compute attention mask: causal by default (key <= query)
@@ -795,7 +1033,9 @@ def kernel_unified_attention_3d(
 
         # Per-token-head quant: fuse softmax_scale with per-head k_scale
         # to avoid a separate BLOCK_M × TILE_SIZE multiply on S.
-        if KV_QUANT_MODE >= 2:
+        if KV_QUANT_MODE == 4:
+            S += scale * tl.dot(Q, K)
+        elif KV_QUANT_MODE >= 2:
             S += tl.dot(Q, K) * (scale * k_token_head_scales[None, :])
         else:
             S += scale * tl.dot(Q, K)
@@ -863,7 +1103,9 @@ def kernel_unified_attention_3d(
 
         # acc : (BLOCK_M, HEAD_SIZE_PADDED)
         # Per-token-head quant: apply v_scale to P instead of V.
-        if KV_QUANT_MODE >= 2:
+        if KV_QUANT_MODE == 4:
+            acc += tl.dot(P.to(V.dtype), V)
+        elif KV_QUANT_MODE >= 2:
             P_v = (P * v_token_head_scales[None, :]).to(V.dtype)
             acc += tl.dot(P_v, V)
         else:
@@ -1044,8 +1286,8 @@ def unified_attention(
     use_alibi_sqrt=False,
     # KV cache quantization mode and per-token-head scale caches.
     kv_quant_mode: KVQuantMode = KVQuantMode.NONE,
-    k_scale_cache=None,  # [num_blocks, block_size, num_kv_heads] float32
-    v_scale_cache=None,  # [num_blocks, block_size, num_kv_heads] float32
+    k_scale_cache=None,  # int4: [num_blocks, block_size, num_kv_heads, num_groups]
+    v_scale_cache=None,  # int4: [num_blocks, block_size, num_kv_heads, num_groups]
 ):
     assert causal, "Only causal attention is supported"
     assert q_descale is None, "Q scales not supported"
@@ -1181,9 +1423,26 @@ def unified_attention(
             stride_ks_blk=k_scale_cache.stride(0) if k_scale_cache is not None else 0,
             stride_ks_slot=k_scale_cache.stride(1) if k_scale_cache is not None else 0,
             stride_ks_head=k_scale_cache.stride(2) if k_scale_cache is not None else 0,
+            stride_ks_group=k_scale_cache.stride(3) if k_scale_cache is not None and k_scale_cache.ndim == 4 else 0,
             stride_vs_blk=v_scale_cache.stride(0) if v_scale_cache is not None else 0,
             stride_vs_slot=v_scale_cache.stride(1) if v_scale_cache is not None else 0,
             stride_vs_head=v_scale_cache.stride(2) if v_scale_cache is not None else 0,
+            stride_vs_group=v_scale_cache.stride(3) if v_scale_cache is not None and v_scale_cache.ndim == 4 else 0,
+            CHANNELS_PER_SCALE=INT4_CHANNELS_PER_SCALE,
+            INT4_C1=INT4_CODEBOOK_1,
+            INT4_C2=INT4_CODEBOOK_2,
+            INT4_C3=INT4_CODEBOOK_3,
+            INT4_C4=INT4_CODEBOOK_4,
+            INT4_C5=INT4_CODEBOOK_5,
+            INT4_C6=INT4_CODEBOOK_6,
+            INT4_C7=INT4_CODEBOOK_7,
+            INT4_C9=INT4_CODEBOOK_9,
+            INT4_C10=INT4_CODEBOOK_10,
+            INT4_C11=INT4_CODEBOOK_11,
+            INT4_C12=INT4_CODEBOOK_12,
+            INT4_C13=INT4_CODEBOOK_13,
+            INT4_C14=INT4_CODEBOOK_14,
+            INT4_C15=INT4_CODEBOOK_15,
         )
     else:
         kernel_unified_attention_3d[
@@ -1242,9 +1501,26 @@ def unified_attention(
             stride_ks_blk=k_scale_cache.stride(0) if k_scale_cache is not None else 0,
             stride_ks_slot=k_scale_cache.stride(1) if k_scale_cache is not None else 0,
             stride_ks_head=k_scale_cache.stride(2) if k_scale_cache is not None else 0,
+            stride_ks_group=k_scale_cache.stride(3) if k_scale_cache is not None and k_scale_cache.ndim == 4 else 0,
             stride_vs_blk=v_scale_cache.stride(0) if v_scale_cache is not None else 0,
             stride_vs_slot=v_scale_cache.stride(1) if v_scale_cache is not None else 0,
             stride_vs_head=v_scale_cache.stride(2) if v_scale_cache is not None else 0,
+            stride_vs_group=v_scale_cache.stride(3) if v_scale_cache is not None and v_scale_cache.ndim == 4 else 0,
+            CHANNELS_PER_SCALE=INT4_CHANNELS_PER_SCALE,
+            INT4_C1=INT4_CODEBOOK_1,
+            INT4_C2=INT4_CODEBOOK_2,
+            INT4_C3=INT4_CODEBOOK_3,
+            INT4_C4=INT4_CODEBOOK_4,
+            INT4_C5=INT4_CODEBOOK_5,
+            INT4_C6=INT4_CODEBOOK_6,
+            INT4_C7=INT4_CODEBOOK_7,
+            INT4_C9=INT4_CODEBOOK_9,
+            INT4_C10=INT4_CODEBOOK_10,
+            INT4_C11=INT4_CODEBOOK_11,
+            INT4_C12=INT4_CODEBOOK_12,
+            INT4_C13=INT4_CODEBOOK_13,
+            INT4_C14=INT4_CODEBOOK_14,
+            INT4_C15=INT4_CODEBOOK_15,
         )
         reduce_segments[(q.shape[0], num_query_heads)](
             output_ptr=out,
