@@ -43,6 +43,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheGroupSpec,
     KVCacheSpec,
     KVCacheTensor,
+    KVQuantMode,
     MambaSpec,
     MLAAttentionSpec,
     SlidingWindowSpec,
@@ -2137,3 +2138,60 @@ def test_unify_hybrid_kv_cache_specs():
 
     with pytest.raises(ValueError):
         kv_cache_utils.unify_hybrid_kv_cache_specs(kv_cache_spec)
+
+
+def test_unify_kv_cache_spec_page_size_pads_non_divisible_attention_spec():
+    smaller_spec = FullAttentionSpec(
+        block_size=16,
+        num_kv_heads=8,
+        head_size=64,
+        dtype=torch.float16,
+        kv_quant_mode=KVQuantMode.INT4_PER_TOKEN_HEAD,
+    )
+    larger_spec = SlidingWindowSpec(
+        block_size=16,
+        num_kv_heads=8,
+        head_size=96,
+        dtype=torch.float16,
+        kv_quant_mode=KVQuantMode.INT4_PER_TOKEN_HEAD,
+        sliding_window=1024,
+    )
+    assert larger_spec.page_size_bytes > smaller_spec.page_size_bytes
+    assert larger_spec.page_size_bytes % smaller_spec.page_size_bytes != 0
+
+    kv_cache_spec = {
+        "full": smaller_spec,
+        "sliding": larger_spec,
+    }
+
+    unified = kv_cache_utils.unify_kv_cache_spec_page_size(kv_cache_spec)
+
+    assert unified["sliding"] == larger_spec
+    assert unified["full"].block_size == smaller_spec.block_size
+    assert unified["full"].page_size_padded == larger_spec.page_size_bytes
+    assert unified["full"].page_size_bytes == unified["sliding"].page_size_bytes
+    assert unified["full"].real_page_size_bytes == smaller_spec.real_page_size_bytes
+
+
+def test_unify_kv_cache_spec_page_size_rejects_non_attention_padding():
+    attention_spec = FullAttentionSpec(
+        block_size=16,
+        num_kv_heads=8,
+        head_size=96,
+        dtype=torch.float16,
+        kv_quant_mode=KVQuantMode.INT4_PER_TOKEN_HEAD,
+    )
+    mamba_spec = new_mamba_spec(
+        block_size=16,
+        shapes=((33,),),
+        dtypes=(torch.float16,),
+    )
+    assert attention_spec.page_size_bytes % mamba_spec.page_size_bytes != 0
+
+    with pytest.raises(NotImplementedError):
+        kv_cache_utils.unify_kv_cache_spec_page_size(
+            {
+                "attention": attention_spec,
+                "mamba": mamba_spec,
+            }
+        )
