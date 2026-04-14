@@ -60,6 +60,10 @@ from vllm.v1.attention.backends.utils import (
     infer_global_hyperparameters,
     split_decodes_and_prefills,
 )
+from vllm.v1.attention.kv_dequant import assert_backend_supports_kv_quant_mode
+from vllm.v1.attention.kv_dequant.flashinfer_tile import (
+    staged_dequantize_paged_kv_cache,
+)
 from vllm.v1.attention.ops.common import cp_lse_ag_out_rs
 from vllm.v1.attention.ops.dcp_alltoall import dcp_a2a_lse_reduce
 from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
@@ -67,6 +71,11 @@ from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     KVQuantMode,
     UniformTypeKVCacheSpecs,
+    get_kv_cache_head_size_bytes,
+    get_kv_quant_mode,
+    get_per_token_head_scale_count,
+    get_per_token_head_scale_dtype,
+    kv_cache_uses_per_token_head_scales,
 )
 from vllm.v1.utils import CpuGpuBuffer
 
@@ -327,6 +336,8 @@ class FlashInferBackend(AttentionBackend):
         "fp8",
         "fp8_e4m3",
         "fp8_e5m2",
+        "int8_per_token_head",
+        "int4_per_token_head",
     ]
 
     @staticmethod
@@ -355,6 +366,39 @@ class FlashInferBackend(AttentionBackend):
         head_size: int,
         cache_dtype_str: str = "auto",
     ) -> tuple[int, ...]:
+        kv_quant_mode = get_kv_quant_mode(cache_dtype_str)
+        if kv_quant_mode == KVQuantMode.INT4_PER_TOKEN_HEAD:
+            from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE, get_dtype_size
+
+            cache_dtype = STR_DTYPE_TO_TORCH_DTYPE[cache_dtype_str]
+            scale_dtype = get_per_token_head_scale_dtype(kv_quant_mode)
+            assert scale_dtype is not None
+            packed_head_size = get_kv_cache_head_size_bytes(
+                head_size, cache_dtype, kv_quant_mode
+            ) // get_dtype_size(cache_dtype)
+            scale_pad = (
+                get_per_token_head_scale_count(head_size, kv_quant_mode)
+                * get_dtype_size(scale_dtype)
+                // get_dtype_size(cache_dtype)
+            )
+            return (
+                num_blocks,
+                2,
+                block_size,
+                num_kv_heads,
+                packed_head_size + scale_pad,
+            )
+        if kv_cache_uses_per_token_head_scales(cache_dtype_str):
+            from vllm.utils.torch_utils import (
+                STR_DTYPE_TO_TORCH_DTYPE,
+                get_dtype_size,
+            )
+
+            cache_dtype = STR_DTYPE_TO_TORCH_DTYPE[cache_dtype_str]
+            scale_dtype = get_per_token_head_scale_dtype(kv_quant_mode)
+            assert scale_dtype is not None
+            scale_pad = get_dtype_size(scale_dtype) // get_dtype_size(cache_dtype)
+            return (num_blocks, 2, block_size, num_kv_heads, head_size + scale_pad)
         return (num_blocks, 2, block_size, num_kv_heads, head_size)
 
     @staticmethod
@@ -603,14 +647,25 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         self.num_kv_heads = self.kv_cache_spec.num_kv_heads
         self.head_dim = self.kv_cache_spec.head_size
         self.page_size = self.kv_cache_spec.block_size
+        self.kv_quant_mode = self.kv_cache_spec.kv_quant_mode
+        self.use_staged_quant_kv = self.kv_quant_mode in (
+            KVQuantMode.INT8_PER_TOKEN_HEAD,
+            KVQuantMode.INT4_PER_TOKEN_HEAD,
+        )
+        assert_backend_supports_kv_quant_mode(
+            FlashInferBackend.__name__, self.kv_quant_mode
+        )
 
-        if self.kv_cache_spec.kv_quant_mode != KVQuantMode.NONE:
+        if self.kv_quant_mode == KVQuantMode.FP8_PER_TENSOR:
             self.cache_dtype = self.cache_config.cache_dtype
             # Cannot use self.kv_cache_spec.dtype here because kv_cache_spec
             # storage dtype may not be the same as the op dtype (uint8 vs fp8_e4m3)
             self.kv_cache_dtype = FlashInferBackend.get_fp8_dtype_for_flashinfer(
                 self.cache_dtype
             )
+        elif self.use_staged_quant_kv:
+            self.cache_dtype = self.cache_config.cache_dtype
+            self.kv_cache_dtype = self.kv_cache_spec.dtype
         else:
             self.cache_dtype = "auto"
             assert self.kv_cache_spec.dtype == self.model_config.dtype
@@ -624,6 +679,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
 
         if (
             can_use_trtllm
+            and not self.use_staged_quant_kv
             and not vllm_config.attention_config.disable_flashinfer_q_quantization
         ):
             self.q_data_type = self.kv_cache_dtype
@@ -632,8 +688,12 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
 
         # Prefer TRTLLM attention for decoding in all cases.
         # This allows us to use AttentionCGSupport.UNIFORM_BATCH mode.
-        self.use_trtllm_decode_attention = can_use_trtllm
-        self._init_reorder_batch_threshold(1, supports_spec_as_decode=can_use_trtllm)
+        self.use_trtllm_decode_attention = (
+            can_use_trtllm and not self.use_staged_quant_kv
+        )
+        self._init_reorder_batch_threshold(
+            1, supports_spec_as_decode=self.use_trtllm_decode_attention
+        )
 
         self._cascade_wrapper = None  # Wrapper for cascade attention
 
@@ -707,6 +767,12 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 # FlashInfer only applies to attention, so we don't consider other types
                 # of KV spec (e.g. Mamba) here. This is mostly for type checking.
                 continue
+            if spec.kv_quant_mode in (
+                KVQuantMode.INT8_PER_TOKEN_HEAD,
+                KVQuantMode.INT4_PER_TOKEN_HEAD,
+            ):
+                has_trtllm_support = False
+                break
             if not can_use_trtllm_attention(
                 num_qo_heads=num_qo_heads,
                 num_kv_heads=spec.num_kv_heads,
@@ -875,21 +941,24 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         # - Cascade attention (distinct mode)
         # - Prefill (FI native or TRTLLM)
         # - Decode (FI native or TRTLLM)
-        use_cascade = common_prefix_len > 0
+        use_cascade = common_prefix_len > 0 and not self.use_staged_quant_kv
         uses_spec_reorder = self.reorder_batch_threshold > 1
-        prefill_use_trtllm = use_trtllm_attention(
-            self.num_qo_heads,
-            self.num_kv_heads,
-            num_prefill_tokens,
-            max_seq_len,
-            self.dcp_world_size,
-            self.cache_dtype,
-            self.q_data_type,
-            is_prefill=True,
-            force_use_trtllm=self.attention_config.use_trtllm_attention,
-            has_sinks=self.has_sinks,
-            has_spec=uses_spec_reorder,
-        )
+        if self.use_staged_quant_kv:
+            prefill_use_trtllm = False
+        else:
+            prefill_use_trtllm = use_trtllm_attention(
+                self.num_qo_heads,
+                self.num_kv_heads,
+                num_prefill_tokens,
+                max_seq_len,
+                self.dcp_world_size,
+                self.cache_dtype,
+                self.q_data_type,
+                is_prefill=True,
+                force_use_trtllm=self.attention_config.use_trtllm_attention,
+                has_sinks=self.has_sinks,
+                has_spec=uses_spec_reorder,
+            )
         decode_use_trtllm = (
             self.use_trtllm_decode_attention and self.dcp_world_size <= 1
         )
@@ -1213,6 +1282,12 @@ class FlashInferImpl(AttentionImpl):
         kv_sharing_target_layer_name: int | None = None,
         sinks: torch.Tensor | None = None,
     ) -> None:
+        self._kv_quant_mode = get_kv_quant_mode(kv_cache_dtype)
+        assert_backend_supports_kv_quant_mode(type(self).__name__, self._kv_quant_mode)
+        self._use_staged_quant_kv = self._kv_quant_mode in (
+            KVQuantMode.INT8_PER_TOKEN_HEAD,
+            KVQuantMode.INT4_PER_TOKEN_HEAD,
+        )
         self.num_heads = num_heads
         self.head_size = head_size
         self.scale = float(scale)
@@ -1321,12 +1396,18 @@ class FlashInferImpl(AttentionImpl):
 
         if self.bmm1_scale is None:
             self.bmm1_scale = self.scale
-            if is_quantized_kv_cache(self.kv_cache_dtype):
+            if (
+                is_quantized_kv_cache(self.kv_cache_dtype)
+                and not self._use_staged_quant_kv
+            ):
                 self.bmm1_scale *= layer._q_scale_float * layer._k_scale_float
 
         if self.bmm2_scale is None:
             self.bmm2_scale = 1.0
-            if is_quantized_kv_cache(self.kv_cache_dtype):
+            if (
+                is_quantized_kv_cache(self.kv_cache_dtype)
+                and not self._use_staged_quant_kv
+            ):
                 self.bmm2_scale *= layer._v_scale_float
 
         prefill_use_trtllm = isinstance(attn_metadata.prefill, TRTLLMPrefill)
@@ -1379,8 +1460,9 @@ class FlashInferImpl(AttentionImpl):
 
         # The FlashInfer api requires data to be in fp8_e4m3 or fp8_e5m2
         # to process the cache when the kv_cache_dtype is fp8
-        if self.kv_sharing_target_layer_name is None and is_quantized_kv_cache(
-            self.kv_cache_dtype
+        if (
+            self.kv_sharing_target_layer_name is None
+            and self._kv_quant_mode == KVQuantMode.FP8_PER_TENSOR
         ):
             torch_dtype = FlashInferBackend.get_fp8_dtype_for_flashinfer(
                 self.kv_cache_dtype
@@ -1407,6 +1489,16 @@ class FlashInferImpl(AttentionImpl):
 
         stride_order = FlashInferBackend.get_kv_cache_stride_order()
         kv_cache_permute = kv_cache.permute(*stride_order)
+        staged_kv_cache_permute = (
+            staged_dequantize_paged_kv_cache(
+                kv_cache_permute,
+                head_size=self.head_size,
+                kv_quant_mode=self._kv_quant_mode,
+                out_dtype=query.dtype,
+            )
+            if self.kv_sharing_target_layer_name is None and self._use_staged_quant_kv
+            else None
+        )
 
         use_dcp = self.dcp_world_size > 1
 
@@ -1438,7 +1530,11 @@ class FlashInferImpl(AttentionImpl):
                     prefill_wrapper.run(
                         layer,
                         prefill_query,
-                        kv_cache_permute,
+                        (
+                            staged_kv_cache_permute
+                            if staged_kv_cache_permute is not None
+                            else kv_cache_permute
+                        ),
                         key[num_decode_tokens:],
                         value[num_decode_tokens:],
                         out=output[num_decode_tokens:],
@@ -1455,9 +1551,21 @@ class FlashInferImpl(AttentionImpl):
                     assert prefill_wrapper._causal
                     prefill_wrapper.run(
                         prefill_query,
-                        kv_cache_permute,
-                        k_scale=layer._k_scale_float,
-                        v_scale=layer._v_scale_float,
+                        (
+                            staged_kv_cache_permute
+                            if staged_kv_cache_permute is not None
+                            else kv_cache_permute
+                        ),
+                        k_scale=(
+                            None
+                            if staged_kv_cache_permute is not None
+                            else layer._k_scale_float
+                        ),
+                        v_scale=(
+                            None
+                            if staged_kv_cache_permute is not None
+                            else layer._v_scale_float
+                        ),
                         out=output[num_decode_tokens:],
                     )
             else:
@@ -1565,9 +1673,21 @@ class FlashInferImpl(AttentionImpl):
                     )
                     decode_wrapper.run(
                         decode_query,
-                        kv_cache_permute,
-                        k_scale=layer._k_scale_float,
-                        v_scale=layer._v_scale_float,
+                        (
+                            staged_kv_cache_permute
+                            if staged_kv_cache_permute is not None
+                            else kv_cache_permute
+                        ),
+                        k_scale=(
+                            None
+                            if staged_kv_cache_permute is not None
+                            else layer._k_scale_float
+                        ),
+                        v_scale=(
+                            None
+                            if staged_kv_cache_permute is not None
+                            else layer._v_scale_float
+                        ),
                         out=output_tmp,
                         lse=lse,
                         return_lse=True,
@@ -1580,9 +1700,21 @@ class FlashInferImpl(AttentionImpl):
                 else:
                     decode_wrapper.run(
                         decode_query,
-                        kv_cache_permute,
-                        k_scale=layer._k_scale_float,
-                        v_scale=layer._v_scale_float,
+                        (
+                            staged_kv_cache_permute
+                            if staged_kv_cache_permute is not None
+                            else kv_cache_permute
+                        ),
+                        k_scale=(
+                            None
+                            if staged_kv_cache_permute is not None
+                            else layer._k_scale_float
+                        ),
+                        v_scale=(
+                            None
+                            if staged_kv_cache_permute is not None
+                            else layer._v_scale_float
+                        ),
                         out=output[:num_decode_tokens],
                     )
             else:
