@@ -4,7 +4,11 @@
 import pytest
 import torch
 
-from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheGroupSpec
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    KVCacheGroupSpec,
+    UniformTypeKVCacheSpecs,
+)
 from vllm.v1.worker.utils import add_kv_sharing_layers_to_kv_cache_groups
 
 pytestmark = pytest.mark.cpu_test
@@ -103,3 +107,35 @@ def test_initialize_kv_cache_for_kv_sharing_no_attn_groups():
     assert len(kv_cache_groups) == 2
     assert kv_cache_groups[0].layer_names == ["model.layers.0", "model.layers.2"]
     assert kv_cache_groups[1].layer_names == ["model.layers.1", "model.layers.3"]
+
+
+def test_kv_sharing_updates_uniform_type_specs():
+    shared_kv_cache_layers = {
+        "model.layers.2": "model.layers.0",
+    }
+
+    uniform_spec = UniformTypeKVCacheSpecs(
+        block_size=16,
+        kv_cache_specs={
+            "model.layers.0": new_kv_cache_spec(),
+            "model.layers.1": new_kv_cache_spec(),
+        },
+    )
+    kv_cache_groups = [
+        KVCacheGroupSpec(["model.layers.0", "model.layers.1"], uniform_spec),
+    ]
+
+    add_kv_sharing_layers_to_kv_cache_groups(
+        shared_kv_cache_layers=shared_kv_cache_layers,
+        kv_cache_groups=kv_cache_groups,
+    )
+
+    assert kv_cache_groups[0].layer_names == [
+        "model.layers.0",
+        "model.layers.1",
+        "model.layers.2",
+    ]
+    assert (
+        uniform_spec.kv_cache_specs["model.layers.2"]
+        is uniform_spec.kv_cache_specs["model.layers.0"]
+    )
