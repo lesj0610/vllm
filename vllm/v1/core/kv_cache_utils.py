@@ -1256,6 +1256,22 @@ def get_kv_cache_groups(
     if vllm_config.scheduler_config.disable_hybrid_kv_cache_manager:
         unify_hybrid_kv_cache_specs(kv_cache_spec)
 
+    if not vllm_config.scheduler_config.disable_hybrid_kv_cache_manager:
+        has_tq = any(
+            isinstance(spec, TQFullAttentionSpec) for spec in kv_cache_spec.values()
+        )
+        has_non_tq_sliding = any(
+            isinstance(spec, SlidingWindowSpec)
+            and not isinstance(spec, TQFullAttentionSpec)
+            for spec in kv_cache_spec.values()
+        )
+        if has_tq and has_non_tq_sliding:
+            logger.info(
+                "TurboQuant + sliding-window boundary layers detected; "
+                "disabling hybrid KV cache manager for this model."
+            )
+            unify_hybrid_kv_cache_specs(kv_cache_spec)
+
     if is_kv_cache_type_attention_free(kv_cache_spec):
         # This returns an empty list to allow for the KVCacheManager to handle
         # attention free models.
