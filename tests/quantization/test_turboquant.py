@@ -496,11 +496,29 @@ class TestWHTRotation:
             f"WHT rotation not orthonormal for dim={dim}"
         )
 
+    @pytest.mark.parametrize("dim", [64, 128, 256])
+    def test_wht_self_inverse(self, dim):
+        """PiT should be self-inverse via Pi @ PiT = I."""
+        signs = generate_wht_signs(dim, seed=42, device="cuda")
+        H = _build_hadamard(dim, "cuda")
+        PiT = (signs.unsqueeze(1) * H).contiguous()
+        Pi = PiT.T.contiguous()
+        result = Pi @ PiT
+        assert torch.allclose(result, torch.eye(dim, device="cuda"), atol=1e-5), (
+            f"WHT rotation not self-inverse for dim={dim}"
+        )
+
     def test_wht_signs_deterministic(self):
         """Same seed must produce identical signs."""
         s1 = generate_wht_signs(128, seed=42)
         s2 = generate_wht_signs(128, seed=42)
         assert torch.equal(s1, s2)
+
+    def test_wht_signs_different_seeds(self):
+        """Different seeds must produce different signs."""
+        s1 = generate_wht_signs(128, seed=42)
+        s2 = generate_wht_signs(128, seed=99)
+        assert not torch.equal(s1, s2)
 
     def test_wht_signs_are_pm1(self):
         """All sign values must be exactly +1 or -1."""

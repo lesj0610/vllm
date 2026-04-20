@@ -254,6 +254,11 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         self.num_kv_heads = num_kv_heads if num_kv_heads is not None else num_heads
         self.num_kv_groups = num_heads // self.num_kv_heads
         self.kv_cache_dtype = kv_cache_dtype
+        self.sliding_window = sliding_window
+        if sliding_window is None:
+            self._fa_window_size = (-1, -1)
+        else:
+            self._fa_window_size = (sliding_window - 1, 0)
 
         from vllm.model_executor.layers.quantization.turboquant.config import (
             TurboQuantConfig,
@@ -504,7 +509,8 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             self._can_use_flash_attn()
             and attn_metadata.max_query_len == attn_metadata.max_seq_len
         ):
-            return flash_attn_varlen_func(
+            output = torch.empty(N, Hq, D, device=query.device, dtype=query.dtype)
+            flash_attn_varlen_func(
                 q=query,
                 k=key,
                 v=value,
@@ -514,7 +520,10 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 max_seqlen_k=attn_metadata.max_query_len,
                 softmax_scale=self.scale,
                 causal=True,
+                window_size=self._fa_window_size,
+                out=output,
             )
+            return output
 
         # Continuation or no flash_attn: per-request attention.
         # For continuation chunks (seq_len > q_len), we must attend to
@@ -551,9 +560,10 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             if q_len == seq_len:
                 # First-chunk prefill: all K/V are in the current batch.
                 if self._can_use_flash_attn():
+                    out = torch.empty_like(q_seq)
                     _cu_2[1] = q_len
                     cu = _cu_2
-                    out = flash_attn_varlen_func(
+                    flash_attn_varlen_func(
                         q=q_seq,
                         k=k_seq,
                         v=v_seq,
@@ -563,19 +573,37 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                         max_seqlen_k=q_len,
                         softmax_scale=self.scale,
                         causal=True,
+                        window_size=self._fa_window_size,
+                        out=out,
                     )
                 else:
                     q_t = q_seq.transpose(0, 1).contiguous()
                     k_t = k_seq.transpose(0, 1).contiguous()
                     v_t = v_seq.transpose(0, 1).contiguous()
-                    out = F.scaled_dot_product_attention(
-                        q_t,
-                        k_t,
-                        v_t,
-                        is_causal=True,
-                        scale=self.scale,
-                        enable_gqa=use_gqa,
-                    ).transpose(0, 1)
+                    if self.sliding_window is not None:
+                        q_pos = torch.arange(q_len, device=query.device)
+                        k_pos = torch.arange(q_len, device=query.device)
+                        mask = (k_pos.unsqueeze(0) <= q_pos.unsqueeze(1)) & (
+                            q_pos.unsqueeze(1) - k_pos.unsqueeze(0)
+                            < self.sliding_window
+                        )
+                        out = F.scaled_dot_product_attention(
+                            q_t,
+                            k_t,
+                            v_t,
+                            attn_mask=mask,
+                            scale=self.scale,
+                            enable_gqa=use_gqa,
+                        ).transpose(0, 1)
+                    else:
+                        out = F.scaled_dot_product_attention(
+                            q_t,
+                            k_t,
+                            v_t,
+                            is_causal=True,
+                            scale=self.scale,
+                            enable_gqa=use_gqa,
+                        ).transpose(0, 1)
                 output[q_start:q_end] = out.to(query.dtype)
             else:
                 # Continuation chunk: tokens already stored to TQ cache
@@ -607,6 +635,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                         key_fp8=self.tq_config.key_fp8,
                         norm_correction=self.tq_config.norm_correction,
                         PiT=PiT,
+                        sliding_window=self.sliding_window,
                     )
                 else:
                     # Large continuation: dequant cached K/V and use
@@ -725,9 +754,10 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
 
         # Attention: q_len queries attending to seq_len K/V with causal mask
         if self._can_use_flash_attn():
+            output = torch.empty(q_len, Hq, D, device=device, dtype=query.dtype)
             cu_seqlens_q = torch.tensor([0, q_len], device=device, dtype=torch.int32)
             cu_seqlens_k = torch.tensor([0, seq_len], device=device, dtype=torch.int32)
-            return flash_attn_varlen_func(
+            flash_attn_varlen_func(
                 q=query,
                 k=k_full,
                 v=v_full,
@@ -737,7 +767,10 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 max_seqlen_k=seq_len,
                 softmax_scale=self.scale,
                 causal=True,
+                window_size=self._fa_window_size,
+                out=output,
             )
+            return output
         else:
             # SDPA fallback: expand KV for GQA, build causal mask
             q_t = query.transpose(0, 1).unsqueeze(0)  # (1, Hq, q_len, D)
@@ -748,6 +781,8 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             q_pos = torch.arange(q_len, device=device).unsqueeze(1) + cached_len
             k_pos = torch.arange(seq_len, device=device).unsqueeze(0)
             mask = k_pos <= q_pos  # (q_len, seq_len)
+            if self.sliding_window is not None:
+                mask = mask & (q_pos - k_pos < self.sliding_window)
             out = F.scaled_dot_product_attention(
                 q_t,
                 k_t,
@@ -797,5 +832,6 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             lse_buf=lse_buf,
             buf_holder=layer,
             max_num_kv_splits=self.max_num_kv_splits,
+            sliding_window=self.sliding_window,
         )
         return result
