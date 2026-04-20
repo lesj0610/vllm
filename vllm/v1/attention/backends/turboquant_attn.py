@@ -278,22 +278,20 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             vllm_config.attention_config.tq_max_kv_splits_for_cuda_graph
         )
 
+    def _can_use_flash_attn(self) -> bool:
+        # FlashAttention-2 only supports head_dim <= 256. TurboQuant
+        # prefill must fall back on larger-head layers such as Gemma4's
+        # global-attention blocks.
+        return _HAS_FLASH_ATTN and self.head_size <= 256
+
     def _ensure_on_device(self, layer, device):
-        """One-time derivation of TQ buffers (rotation matrix, midpoints).
-
-        The Hadamard rotation is shared across all layers: random sign
-        flips do not improve Lloyd-Max quantization quality because the
-        quantizer is symmetric around zero (sign-flipping a coordinate
-        maps it to the mirror centroid with identical distortion).
-        """
+        """One-time derivation of signed-WHT rotation matrices and midpoints."""
         if not hasattr(layer, "_tq_cached"):
-            D = self.head_size
-
-            # Pure Hadamard: orthonormal + symmetric (H = H^T), enabling
-            # in-kernel butterfly fusion and trivial inverse for continuation.
+            D = layer._tq_signs.shape[0]
+            signs = layer._tq_signs.to(device=device, dtype=torch.float32)
             H = _build_hadamard(D, str(device))
-            layer._tq_PiT = H
-            layer._tq_Pi = H
+            layer._tq_PiT = (signs.unsqueeze(1) * H).contiguous()
+            layer._tq_Pi = layer._tq_PiT.T.contiguous()
 
             c = layer._tq_centroids.to(device=device, dtype=torch.float32)
             c_sorted, _ = c.sort()
@@ -502,7 +500,10 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         # Fast path: use flash_attn for first-chunk prefills (all K/V in batch).
         # max_query_len == max_seq_len means no request has prior cached KV.
         # Both are Python ints — no GPU sync.
-        if _HAS_FLASH_ATTN and attn_metadata.max_query_len == attn_metadata.max_seq_len:
+        if (
+            self._can_use_flash_attn()
+            and attn_metadata.max_query_len == attn_metadata.max_seq_len
+        ):
             return flash_attn_varlen_func(
                 q=query,
                 k=key,
@@ -549,7 +550,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
 
             if q_len == seq_len:
                 # First-chunk prefill: all K/V are in the current batch.
-                if _HAS_FLASH_ATTN:
+                if self._can_use_flash_attn():
                     _cu_2[1] = q_len
                     cu = _cu_2
                     out = flash_attn_varlen_func(
@@ -723,7 +724,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         v_full = torch.cat([v_cached_trim.to(qdtype), val_chunk], dim=0)
 
         # Attention: q_len queries attending to seq_len K/V with causal mask
-        if _HAS_FLASH_ATTN:
+        if self._can_use_flash_attn():
             cu_seqlens_q = torch.tensor([0, q_len], device=device, dtype=torch.int32)
             cu_seqlens_k = torch.tensor([0, seq_len], device=device, dtype=torch.int32)
             return flash_attn_varlen_func(
