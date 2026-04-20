@@ -362,11 +362,12 @@ def cached_processor_from_config(
     )
     tokenizer = getattr(processor, "tokenizer", None)
     if tokenizer is not None:
-        _maybe_patch_gemma4_gguf_tokenizer(
+        tokenizer = _maybe_patch_gemma4_gguf_tokenizer(
             tokenizer,
             model_config.model,
             getattr(model_config.hf_config, "model_type", None),
         )
+        processor.tokenizer = tokenizer
     return processor
 
 
