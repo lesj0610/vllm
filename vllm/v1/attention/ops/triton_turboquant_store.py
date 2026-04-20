@@ -347,6 +347,14 @@ def _tq_fused_store_mse(
 # ═══════════════════════════════════════════════════════════════════════
 
 
+def _flat_storage_view(tensor: torch.Tensor) -> torch.Tensor:
+    """Return a copy-free 1D uint8 view over the tensor's backing storage."""
+    if tensor.dtype != torch.uint8:
+        raise TypeError(f"Expected uint8 kv cache tensor, got {tensor.dtype}.")
+    storage_elems = tensor.untyped_storage().nbytes() // tensor.element_size()
+    return torch.as_strided(tensor, (storage_elems,), (1,), 0)
+
+
 def triton_turboquant_store(
     key: torch.Tensor,  # [N, H, D] — raw keys (post-RoPE)
     value: torch.Tensor,  # [N, H, D] — raw values
@@ -379,8 +387,14 @@ def triton_turboquant_store(
     block_grp = triton.next_power_of_2(D // 8) if D >= 8 else 1
 
     # ── FP8 PATH: in-kernel FP8 cast + scatter via fp8 kernel ──
+    kv_cache_flat = _flat_storage_view(kv_cache)
     if key_fp8:
-        k_flat = key.reshape(NH, D).contiguous()
+        # Keep Triton's float8 input contract local to the TurboQuant
+        # launcher so the kernel itself stays dtype-agnostic.
+        if key.dtype == torch.bfloat16:
+            k_flat = key.float().reshape(NH, D).contiguous()
+        else:
+            k_flat = key.reshape(NH, D).contiguous()
         v_flat = value.reshape(NH, D).contiguous()
 
         fp8_e4b15 = _use_fp8_e4b15(key.device.index or 0)
@@ -389,7 +403,7 @@ def triton_turboquant_store(
         _tq_fused_store_fp8[grid](
             k_flat,
             v_flat,
-            kv_cache.view(-1),
+            kv_cache_flat,
             slot_mapping,
             stride_cache_block=stride_block,
             stride_cache_pos=stride_pos,
@@ -425,7 +439,7 @@ def triton_turboquant_store(
         norms.squeeze(1),
         v_flat,
         midpoints,
-        kv_cache.view(-1),
+        kv_cache_flat,
         slot_mapping,
         stride_cache_block=stride_block,
         stride_cache_pos=stride_pos,
