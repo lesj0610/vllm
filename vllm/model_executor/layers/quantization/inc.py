@@ -9,6 +9,7 @@ import torch
 import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 
+from vllm.distributed import get_tensor_model_parallel_rank
 from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import (
     LinearBase,
@@ -357,6 +358,10 @@ class INCConfig(QuantizationConfig):
             % group_size
             != 0
         ):
+            # Gemma4 AutoRound row-parallel linears can produce TP shards that
+            # straddle a GPTQ group boundary. Fall back to a correctness-first
+            # path in that case instead of using Marlin/GPTQ kernels that
+            # assume group-aligned input shards.
             return INCGPTQRowParallelTailLinearMethod(
                 weight_bits=weight_bits,
                 group_size=group_size,
@@ -720,22 +725,19 @@ class INCGPTQRowParallelTailLinearMethod(LinearMethodBase):
         shard_width = getattr(
             layer, "input_size_per_partition", input_size_per_partition
         )
-        shard_offset = qweight.tp_rank * shard_width
-        g_idx = torch.tensor(
-            [
-                (shard_offset + i) // self.group_size
-                for i in range(input_size_per_partition)
-            ],
-            dtype=torch.int32,
-        )
+        shard_offset = get_tensor_model_parallel_rank() * shard_width
+        g_idx = (
+            torch.arange(input_size_per_partition, dtype=torch.int32) + shard_offset
+        ) // self.group_size
         layer.register_parameter("g_idx", Parameter(g_idx, requires_grad=False))
-        layer.register_buffer("_inc_tail_dequant_weight", None, persistent=False)
+        layer._inc_tail_dequant_weight = None
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if self.sym:
-            # The tail-shard fallback dequantizes weights on demand, so keep
-            # only the effective symmetric zero point instead of the packed
-            # GPTQ qzeros tensor.
+            # The tail-shard fallback dequantizes weights on demand and handles
+            # the symmetric zero point via weight_type.bias in
+            # _get_dequantized_weight(), so the large packed qzeros tensor is
+            # replaced with a tiny placeholder after loading.
             layer.qzeros = Parameter(
                 torch.tensor([8], dtype=torch.int8, device=layer.qweight.device),
                 requires_grad=False,
