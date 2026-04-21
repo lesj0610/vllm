@@ -26,6 +26,8 @@ from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     KVCacheTensor,
     SlidingWindowSpec,
+    TQFullAttentionSpec,
+    TQSlidingWindowSpec,
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.request import Request
@@ -1198,22 +1200,32 @@ def unify_hybrid_kv_cache_specs(kv_cache_spec: dict[str, KVCacheSpec]):
     if has_full_attention and (has_sliding_window or has_chunked_local_attention):
         for layer_name, spec in kv_cache_spec.items():
             if isinstance(spec, SlidingWindowSpec):
-                kv_cache_spec[layer_name] = FullAttentionSpec(
-                    block_size=spec.block_size,
-                    num_kv_heads=spec.num_kv_heads,
-                    head_size=spec.head_size,
-                    dtype=spec.dtype,
-                    kv_quant_mode=spec.kv_quant_mode,
-                    sliding_window=spec.sliding_window,
-                    page_size_padded=spec.page_size_padded,
-                )
+                if isinstance(spec, TQSlidingWindowSpec):
+                    kv_cache_spec[layer_name] = TQFullAttentionSpec(
+                        block_size=spec.block_size,
+                        num_kv_heads=spec.num_kv_heads,
+                        head_size=spec.head_size,
+                        head_size_v=spec.head_size,
+                        dtype=spec.dtype,
+                        sliding_window=spec.sliding_window,
+                        page_size_padded=spec.page_size_padded,
+                        tq_slot_size=spec.tq_slot_size,
+                    )
+                else:
+                    kv_cache_spec[layer_name] = FullAttentionSpec(
+                        block_size=spec.block_size,
+                        num_kv_heads=spec.num_kv_heads,
+                        head_size=spec.head_size,
+                        dtype=spec.dtype,
+                        sliding_window=spec.sliding_window,
+                        page_size_padded=spec.page_size_padded,
+                    )
             elif isinstance(spec, ChunkedLocalAttentionSpec):
                 kv_cache_spec[layer_name] = FullAttentionSpec(
                     block_size=spec.block_size,
                     num_kv_heads=spec.num_kv_heads,
                     head_size=spec.head_size,
                     dtype=spec.dtype,
-                    kv_quant_mode=spec.kv_quant_mode,
                     attention_chunk_size=spec.attention_chunk_size,
                     page_size_padded=spec.page_size_padded,
                 )

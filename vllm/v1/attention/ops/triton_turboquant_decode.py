@@ -81,6 +81,7 @@ def _tq_decode_stage1(
     BLOCK_D: tl.constexpr,  # next_power_of_2(HEAD_DIM)
     BLOCK_KV: tl.constexpr,  # tokens per tile (16)
     KEY_FP8: tl.constexpr,  # 1 if K is stored as FP8
+    SLIDING_WINDOW: tl.constexpr = 0,  # 0 = disabled
     NORM_CORRECTION: tl.constexpr = 0,  # 1 = re-normalize centroids
     FP8_E4B15: tl.constexpr = 0,  # 1 = use e4b15 (Ampere/Ada), 0 = e4nv (Hopper+)
 ):
@@ -92,11 +93,17 @@ def _tq_decode_stage1(
 
     # Sequence length for this batch
     seq_len = tl.load(Seq_lens_ptr + bid)
+    if SLIDING_WINDOW > 0:
+        effective_seq_len = tl.minimum(seq_len, SLIDING_WINDOW)
+        window_start = seq_len - effective_seq_len
+    else:
+        effective_seq_len = seq_len
+        window_start = 0
 
     # KV split range
-    split_len = tl.cdiv(seq_len, NUM_KV_SPLITS)
+    split_len = tl.cdiv(effective_seq_len, NUM_KV_SPLITS)
     split_start = split_len * sid
-    split_end = tl.minimum(split_start + split_len, seq_len)
+    split_end = tl.minimum(split_start + split_len, effective_seq_len)
 
     if split_start >= split_end:
         return
@@ -136,9 +143,10 @@ def _tq_decode_stage1(
     for start_n in range(split_start, split_end, BLOCK_KV):
         kv_offs = start_n + kv_range
         kv_mask = kv_offs < split_end
+        global_kv_offs = kv_offs + window_start
 
-        page_idx = kv_offs // BLOCK_SIZE
-        page_off = kv_offs % BLOCK_SIZE
+        page_idx = global_kv_offs // BLOCK_SIZE
+        page_off = global_kv_offs % BLOCK_SIZE
         block_nums = tl.load(
             Block_table_ptr + bt_base + page_idx,
             mask=kv_mask,
@@ -503,6 +511,7 @@ def triton_turboquant_decode_attention(
     lse_buf: torch.Tensor | None = None,
     buf_holder: Any = None,
     max_num_kv_splits: int = 32,  # fixed split count (must be constant for cudagraph)
+    sliding_window: int | None = None,
 ) -> torch.Tensor:
     """Launch fused TQ decode attention (Triton stage1 + stage2).
 
@@ -581,6 +590,7 @@ def triton_turboquant_decode_attention(
         BLOCK_D=cfg["BLOCK_D"],
         BLOCK_KV=BLOCK_KV,
         KEY_FP8=1 if key_fp8 else 0,
+        SLIDING_WINDOW=sliding_window or 0,
         NORM_CORRECTION=1 if norm_correction else 0,
         FP8_E4B15=fp8_e4b15,
         num_warps=1,

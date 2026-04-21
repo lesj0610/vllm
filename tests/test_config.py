@@ -32,7 +32,9 @@ from vllm.config.vllm import (
     OPTIMIZATION_LEVEL_TO_CONFIG,
     OptimizationLevel,
 )
+from vllm.model_executor.models.config import Gemma4Config
 from vllm.platforms import current_platform
+from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 DEVICE_TYPE = current_platform.device_type
 
@@ -260,6 +262,27 @@ def test_get_pooling_config():
     assert model_config.pooler_config.use_activation
     assert model_config.pooler_config.seq_pooling_type == "MEAN"
     assert model_config.pooler_config.tok_pooling_type == "ALL"
+
+
+@pytest.mark.parametrize(
+    ("cache_dtype", "expected_backend"),
+    [
+        ("auto", AttentionBackendEnum.TRITON_ATTN),
+        ("turboquant_k8v4", None),
+    ],
+)
+def test_gemma4_backend_force_skips_turboquant(cache_dtype, expected_backend):
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_text_config=SimpleNamespace(head_dim=256, global_head_dim=512)
+        ),
+        cache_config=SimpleNamespace(cache_dtype=cache_dtype),
+        attention_config=SimpleNamespace(backend=None),
+    )
+
+    Gemma4Config.verify_and_update_config(vllm_config)
+
+    assert vllm_config.attention_config.backend == expected_backend
 
 
 @pytest.mark.skipif(
