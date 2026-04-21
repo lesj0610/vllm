@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import copy
 import importlib
 import inspect
 from functools import lru_cache
@@ -363,14 +362,11 @@ def cached_processor_from_config(
     )
     tokenizer = getattr(processor, "tokenizer", None)
     if tokenizer is not None:
-        tokenizer = _maybe_patch_gemma4_gguf_tokenizer(
+        _maybe_patch_gemma4_gguf_tokenizer(
             tokenizer,
             model_config.model,
             getattr(model_config.hf_config, "model_type", None),
         )
-        if tokenizer is not processor.tokenizer:
-            processor = copy.copy(processor)
-            processor.tokenizer = tokenizer
     return processor
 
 

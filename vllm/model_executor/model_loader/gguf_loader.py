@@ -592,9 +592,7 @@ class GGUFModelLoader(BaseModelLoader):
 
         gguf_files = self._get_all_gguf_files(model_name_or_path)
         if len(gguf_files) > 1:
-            iterator = gguf_quant_weights_iterator_multi(
-                gguf_files, gguf_to_hf_name_map
-            )
+            iterator = gguf_quant_weights_iterator_multi(gguf_files, gguf_to_hf_name_map)
         else:
             iterator = gguf_quant_weights_iterator(
                 model_name_or_path, gguf_to_hf_name_map

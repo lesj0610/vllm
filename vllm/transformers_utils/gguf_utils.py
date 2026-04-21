@@ -3,8 +3,8 @@
 """GGUF utility functions."""
 
 from functools import cache
+from os import PathLike
 from pathlib import Path
-
 import gguf
 import regex as re
 from gguf.constants import Keys, VisionProjectorType
@@ -27,7 +27,7 @@ _GGUF_TOKENIZER_SPECIAL_ID_FIELDS = {
 
 
 @cache
-def check_gguf_file(model: str | Path) -> bool:
+def check_gguf_file(model: str | PathLike) -> bool:
     """Check if the file is a GGUF model."""
     model = Path(model)
     if not model.is_file():
@@ -178,7 +178,7 @@ def detect_gguf_multimodal(model: str) -> Path | None:
 
 
 @cache
-def get_gguf_tokenizer_special_ids(model: str | Path) -> dict[str, int]:
+def get_gguf_tokenizer_special_ids(model: str | PathLike) -> dict[str, int]:
     """Read tokenizer special token ids embedded in a local GGUF file."""
     if not check_gguf_file(model):
         return {}
