@@ -27,6 +27,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheTensor,
     SlidingWindowSpec,
     TQFullAttentionSpec,
+    TQSlidingWindowSpec,
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.request import Request
@@ -1199,22 +1200,32 @@ def unify_hybrid_kv_cache_specs(kv_cache_spec: dict[str, KVCacheSpec]):
     if has_full_attention and (has_sliding_window or has_chunked_local_attention):
         for layer_name, spec in kv_cache_spec.items():
             if isinstance(spec, SlidingWindowSpec):
-                kv_cache_spec[layer_name] = FullAttentionSpec(
-                    block_size=spec.block_size,
-                    num_kv_heads=spec.num_kv_heads,
-                    head_size=spec.head_size,
-                    dtype=spec.dtype,
-                    kv_quant_mode=spec.kv_quant_mode,
-                    sliding_window=spec.sliding_window,
-                    page_size_padded=spec.page_size_padded,
-                )
+                if isinstance(spec, TQSlidingWindowSpec):
+                    kv_cache_spec[layer_name] = TQFullAttentionSpec(
+                        block_size=spec.block_size,
+                        num_kv_heads=spec.num_kv_heads,
+                        head_size=spec.head_size,
+                        head_size_v=spec.head_size,
+                        dtype=spec.dtype,
+                        sliding_window=spec.sliding_window,
+                        page_size_padded=spec.page_size_padded,
+                        tq_slot_size=spec.tq_slot_size,
+                    )
+                else:
+                    kv_cache_spec[layer_name] = FullAttentionSpec(
+                        block_size=spec.block_size,
+                        num_kv_heads=spec.num_kv_heads,
+                        head_size=spec.head_size,
+                        dtype=spec.dtype,
+                        sliding_window=spec.sliding_window,
+                        page_size_padded=spec.page_size_padded,
+                    )
             elif isinstance(spec, ChunkedLocalAttentionSpec):
                 kv_cache_spec[layer_name] = FullAttentionSpec(
                     block_size=spec.block_size,
                     num_kv_heads=spec.num_kv_heads,
                     head_size=spec.head_size,
                     dtype=spec.dtype,
-                    kv_quant_mode=spec.kv_quant_mode,
                     attention_chunk_size=spec.attention_chunk_size,
                     page_size_padded=spec.page_size_padded,
                 )
@@ -1244,22 +1255,6 @@ def get_kv_cache_groups(
     """
     if vllm_config.scheduler_config.disable_hybrid_kv_cache_manager:
         unify_hybrid_kv_cache_specs(kv_cache_spec)
-
-    if not vllm_config.scheduler_config.disable_hybrid_kv_cache_manager:
-        has_tq = any(
-            isinstance(spec, TQFullAttentionSpec) for spec in kv_cache_spec.values()
-        )
-        has_non_tq_sliding = any(
-            isinstance(spec, SlidingWindowSpec)
-            and not isinstance(spec, TQFullAttentionSpec)
-            for spec in kv_cache_spec.values()
-        )
-        if has_tq and has_non_tq_sliding:
-            logger.info(
-                "TurboQuant + sliding-window boundary layers detected; "
-                "disabling hybrid KV cache manager for this model."
-            )
-            unify_hybrid_kv_cache_specs(kv_cache_spec)
 
     if is_kv_cache_type_attention_free(kv_cache_spec):
         # This returns an empty list to allow for the KVCacheManager to handle

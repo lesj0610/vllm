@@ -1642,79 +1642,21 @@ class EngineArgs:
             kv_offloading_backend=self.kv_offloading_backend,
         )
 
+        # TurboQuant is opt-in. Respect user-specified skip layers, but avoid
+        # auto-injecting boundary fallbacks here because mixed KV specs can
+        # make the engine config invalid for some models/backend combos.
         if resolved_cache_dtype.startswith("turboquant_"):
-            from vllm.model_executor.layers.quantization.turboquant.config import (
-                TurboQuantConfig,
-            )
-
-            boundary = TurboQuantConfig.get_boundary_skip_layers(model_config)
-            existing = set(cache_config.kv_cache_dtype_skip_layers)
-            merged = sorted(existing | set(boundary), key=int)
-
-            hf_cfg = model_config.hf_text_config
-            layer_types = getattr(hf_cfg, "layer_types", None)
-            global_head_dim = getattr(hf_cfg, "global_head_dim", None)
-            if (
-                layer_types is not None
-                and global_head_dim is not None
-                and global_head_dim > 256
-            ):
-                merged_set = set(merged)
-                for idx, layer_type in enumerate(layer_types):
-                    if layer_type == "full_attention":
-                        merged_set.add(str(idx))
-                merged = sorted(merged_set, key=int)
-                logger.info(
-                    "TQ: also skipping full-attention layers with head_dim=%d > 256",
-                    global_head_dim,
+            if model_config.is_hybrid:
+                raise NotImplementedError(
+                    "TurboQuant KV cache is not supported for hybrid "
+                    "(attention + Mamba) models. Boundary layer protection "
+                    "requires uniform attention layers."
                 )
-
-            num_layers = getattr(hf_cfg, "num_hidden_layers", None)
-            num_kv_shared = getattr(hf_cfg, "num_kv_shared_layers", 0)
-            if num_layers is not None and num_kv_shared > 0 and layer_types is not None:
-                first_shared = num_layers - num_kv_shared
-                skip_set = set(merged)
-                target_set: set[str] = set()
-
-                for shared_idx in range(first_shared, num_layers):
-                    current_type = layer_types[shared_idx]
-                    for target_idx in range(first_shared - 1, -1, -1):
-                        if layer_types[target_idx] == current_type:
-                            target_set.add(str(target_idx))
-                            break
-
-                if target_set - skip_set:
-                    skip_set |= target_set
-                    logger.info(
-                        "TQ: skipping KV-sharing target layers %s",
-                        sorted(target_set, key=int),
-                    )
-
-                for shared_idx in range(first_shared, num_layers):
-                    current_type = layer_types[shared_idx]
-                    matched_target_idx: int | None = None
-                    for candidate_idx in range(first_shared - 1, -1, -1):
-                        if layer_types[candidate_idx] == current_type:
-                            matched_target_idx = candidate_idx
-                            break
-                    if matched_target_idx is None:
-                        continue
-                    if str(matched_target_idx) in skip_set:
-                        skip_set.add(str(shared_idx))
-                    else:
-                        skip_set.discard(str(shared_idx))
-
-                merged = sorted(skip_set, key=int)
+            if cache_config.kv_cache_dtype_skip_layers:
                 logger.info(
-                    "TQ: after KV-sharing alignment, skip list: %s",
-                    merged,
+                    "TQ: respecting user-specified skip layers %s",
+                    cache_config.kv_cache_dtype_skip_layers,
                 )
-
-            cache_config.kv_cache_dtype_skip_layers = merged
-            logger.info(
-                "TQ: skipping layers %s for boundary protection",
-                merged,
-            )
 
         ray_runtime_env = None
         if is_ray_initialized():
