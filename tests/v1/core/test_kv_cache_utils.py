@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import hashlib
 import importlib
+import math
 from collections.abc import Callable
 from typing import Any
 
@@ -12,6 +13,9 @@ import vllm.v1.core.kv_cache_utils as kv_cache_utils
 from vllm.config import ModelConfig, SchedulerConfig, VllmConfig
 from vllm.config.kv_events import KVEventsConfig
 from vllm.lora.request import LoRARequest
+from vllm.model_executor.layers.quantization.turboquant.config import (
+    TurboQuantConfig,
+)
 from vllm.multimodal.inputs import (
     MultiModalFeatureSpec,
     MultiModalKwargsItem,
@@ -44,9 +48,12 @@ from vllm.v1.kv_cache_interface import (
     KVCacheGroupSpec,
     KVCacheSpec,
     KVCacheTensor,
+    KVQuantMode,
     MambaSpec,
     MLAAttentionSpec,
     SlidingWindowSpec,
+    TQFullAttentionSpec,
+    TQSlidingWindowSpec,
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.metrics.stats import CachingMetrics, PrefixCacheStats
@@ -2138,6 +2145,98 @@ def test_unify_hybrid_kv_cache_specs():
 
     with pytest.raises(ValueError):
         kv_cache_utils.unify_hybrid_kv_cache_specs(kv_cache_spec)
+
+
+def test_tq_sliding_window_spec_uses_packed_slot_size():
+    tq_config = TurboQuantConfig.from_cache_dtype("turboquant_4bit_nc", head_dim=256)
+
+    tq_spec = TQSlidingWindowSpec(
+        block_size=16,
+        num_kv_heads=8,
+        head_size=256,
+        dtype=torch.uint8,
+        sliding_window=1024,
+        tq_slot_size=tq_config.slot_size_aligned,
+    )
+    raw_spec = SlidingWindowSpec(
+        block_size=16,
+        num_kv_heads=8,
+        head_size=256,
+        dtype=torch.uint8,
+        sliding_window=1024,
+    )
+
+    assert tq_spec.page_size_bytes == 16 * 8 * tq_config.slot_size_aligned
+    assert tq_spec.page_size_bytes < raw_spec.page_size_bytes
+
+
+def test_unify_hybrid_kv_cache_specs_preserves_tq_slot_size():
+    tq_config = TurboQuantConfig.from_cache_dtype("turboquant_4bit_nc", head_dim=256)
+    kv_cache_spec = {
+        "layer_1": TQFullAttentionSpec(
+            block_size=16,
+            num_kv_heads=8,
+            head_size=512,
+            head_size_v=512,
+            dtype=torch.uint8,
+            tq_slot_size=TurboQuantConfig.from_cache_dtype(
+                "turboquant_4bit_nc", head_dim=512
+            ).slot_size_aligned,
+        ),
+        "layer_2": TQSlidingWindowSpec(
+            block_size=16,
+            num_kv_heads=8,
+            head_size=256,
+            dtype=torch.uint8,
+            sliding_window=1024,
+            tq_slot_size=tq_config.slot_size_aligned,
+        ),
+    }
+
+    kv_cache_utils.unify_hybrid_kv_cache_specs(kv_cache_spec)
+
+    unified_spec = kv_cache_spec["layer_2"]
+    assert isinstance(unified_spec, TQFullAttentionSpec)
+    assert unified_spec.sliding_window == 1024
+    assert unified_spec.tq_slot_size == tq_config.slot_size_aligned
+
+
+def test_unify_kv_cache_spec_page_size_uses_common_multiple_for_int8_hybrid():
+    kv_cache_spec = {
+        "full": FullAttentionSpec(
+            block_size=16,
+            num_kv_heads=2,
+            head_size=512,
+            head_size_v=512,
+            dtype=torch.float16,
+            kv_quant_mode=KVQuantMode.INT8_PER_TOKEN_HEAD,
+        ),
+        "sliding": SlidingWindowSpec(
+            block_size=16,
+            num_kv_heads=8,
+            head_size=256,
+            dtype=torch.float16,
+            kv_quant_mode=KVQuantMode.INT8_PER_TOKEN_HEAD,
+            sliding_window=1024,
+        ),
+    }
+
+    original_page_sizes = {
+        name: spec.page_size_bytes for name, spec in kv_cache_spec.items()
+    }
+    unified = kv_cache_utils.unify_kv_cache_spec_page_size(kv_cache_spec)
+    expected_page_size = math.lcm(*original_page_sizes.values())
+
+    assert unified["full"].page_size_bytes == unified["sliding"].page_size_bytes
+    assert unified["full"].page_size_bytes == expected_page_size
+    assert unified["full"].block_size == (
+        16 * expected_page_size // original_page_sizes["full"]
+    )
+    assert unified["sliding"].block_size == (
+        16 * expected_page_size // original_page_sizes["sliding"]
+    )
+    assert isinstance(unified["sliding"], SlidingWindowSpec)
+    assert unified["sliding"].sliding_window == 1024
 
 
 def test_hma_not_disabled_when_kv_events_enabled():
