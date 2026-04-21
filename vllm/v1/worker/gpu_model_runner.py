@@ -6553,13 +6553,18 @@ class GPUModelRunner(
                         kv_cache_spec.block_size // kernel_block_size
                     )
                     kernel_num_blocks = num_blocks * num_blocks_per_kv_block
+                    layer_cache_dtype = (
+                        self.cache_config.cache_dtype
+                        if attn_backend.get_name() == "TURBOQUANT"
+                        else "auto"
+                    )
 
                     kv_cache_shape = attn_backend.get_kv_cache_shape(
                         kernel_num_blocks,
                         kernel_block_size,
                         kv_cache_spec.num_kv_heads,
                         kv_cache_spec.head_size,
-                        cache_dtype_str=self.cache_config.cache_dtype,
+                        cache_dtype_str=layer_cache_dtype,
                     )
                     dtype = kv_cache_spec.dtype
                     try:
@@ -6580,12 +6585,25 @@ class GPUModelRunner(
                         kv_cache_stride_order.index(i)
                         for i in range(len(kv_cache_stride_order))
                     ]
-                    kv_caches[layer_name] = (
-                        kv_cache_raw_tensors[layer_name]
-                        .view(dtype)
-                        .view(kv_cache_shape)
-                        .permute(*inv_order)
-                    )
+                    raw_view = kv_cache_raw_tensors[layer_name].view(dtype)
+                    if (
+                        getattr(kv_cache_spec, "page_size_padded", None) is not None
+                        and kv_cache_spec.page_size_padded
+                        > kv_cache_spec.real_page_size_bytes
+                    ):
+                        num_element_per_page = (
+                            kv_cache_spec.page_size_bytes // get_dtype_size(dtype)
+                        )
+                        stride = list(torch.empty(kv_cache_shape).stride())
+                        stride[0] = num_element_per_page
+                        kv_view = torch.as_strided(
+                            raw_view,
+                            size=kv_cache_shape,
+                            stride=tuple(stride),
+                        )
+                    else:
+                        kv_view = raw_view.view(kv_cache_shape)
+                    kv_caches[layer_name] = kv_view.permute(*inv_order)
                 elif isinstance(kv_cache_spec, MambaSpec):
                     has_mamba = True
                     raw_tensor = kv_cache_raw_tensors[layer_name]
@@ -6638,7 +6656,11 @@ class GPUModelRunner(
                 kernel_block_sizes[group.kv_cache_group_id],
                 kv_cache_spec.num_kv_heads,
                 kv_cache_spec.head_size,
-                cache_dtype_str=self.cache_config.cache_dtype,
+                cache_dtype_str=(
+                    self.cache_config.cache_dtype
+                    if group.backend.get_name() == "TURBOQUANT"
+                    else "auto"
+                ),
             )
             # block_dim: 0 means (num_blocks, 2, ...); 1 means (2, num_blocks, ...).
             if block_dim == 0:

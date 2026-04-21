@@ -18,7 +18,9 @@ from vllm.model_executor.layers.quantization.turboquant.config import (
     TQ_PRESETS,
     TurboQuantConfig,
 )
-from vllm.platforms import current_platform
+from vllm.model_executor.layers.quantization.turboquant.quantizer import (
+    generate_wht_signs,
+)
 from vllm.utils.math_utils import next_power_of_2
 
 # ============================================================================
@@ -172,7 +174,7 @@ class TestTurboQuantConfig:
             assert cfg.key_quant_bits in (3, 4)
 
     @pytest.mark.parametrize("preset", ALL_PRESETS)
-    @pytest.mark.parametrize("head_dim", [64, 96, 128, 256])
+    @pytest.mark.parametrize("head_dim", [64, 96, 128, 256, 512])
     def test_all_presets_all_head_dims(self, preset, head_dim):
         cfg = TurboQuantConfig.from_cache_dtype(preset, head_dim=head_dim)
         assert cfg.head_dim == head_dim
@@ -182,98 +184,20 @@ class TestTurboQuantConfig:
 
     # ---- Boundary skip layers ----
 
-    @staticmethod
-    def _dense_model_config(num_layers):
-        from types import SimpleNamespace
-
-        return SimpleNamespace(
-            is_hybrid=False,
-            hf_text_config=SimpleNamespace(num_hidden_layers=num_layers),
-        )
-
     def test_boundary_skip_layers_basic(self):
-        mc = self._dense_model_config(32)
-        layers = TurboQuantConfig.get_boundary_skip_layers(mc)
+        layers = TurboQuantConfig.get_boundary_skip_layers(32)
         assert layers == ["0", "1", "30", "31"]
 
     def test_boundary_skip_layers_zero(self):
-        mc = self._dense_model_config(32)
-        assert TurboQuantConfig.get_boundary_skip_layers(mc, 0) == []
+        assert TurboQuantConfig.get_boundary_skip_layers(32, 0) == []
 
     def test_boundary_skip_layers_small_model(self):
-        mc = self._dense_model_config(4)
-        layers = TurboQuantConfig.get_boundary_skip_layers(mc)
+        layers = TurboQuantConfig.get_boundary_skip_layers(4)
         assert layers == ["0", "1", "2", "3"]
 
     def test_boundary_skip_layers_cap_at_half(self):
-        mc = self._dense_model_config(8)
-        layers = TurboQuantConfig.get_boundary_skip_layers(mc, 10)
+        layers = TurboQuantConfig.get_boundary_skip_layers(8, 10)
         assert len(layers) == 8
-
-
-class TestHybridAttentionIndices:
-    """Regression tests for boundary protection on hybrid models.
-
-    Hybrid models (attention + Mamba / linear-attention) identify KV-carrying
-    layers via layer_types / layers_block_type / attn_type_list. The helper
-    must return the *global* layer indices of the full-attention layers so
-    that kv_cache_dtype_skip_layers matches what extract_layer_index(prefix)
-    reports on the Attention layers at runtime.
-    """
-
-    @staticmethod
-    def _fake_model_config(text_cfg=None, hf_cfg=None):
-        from types import SimpleNamespace
-
-        return SimpleNamespace(
-            hf_text_config=text_cfg if text_cfg is not None else SimpleNamespace(),
-            hf_config=hf_cfg if hf_cfg is not None else SimpleNamespace(),
-        )
-
-    def test_layer_types_full_attention(self):
-        from vllm.model_executor.layers.quantization.turboquant.config import (
-            _get_full_attention_layer_indices,
-        )
-
-        cfg = type("C", (), {})()
-        cfg.layer_types = [
-            "linear_attention",
-            "linear_attention",
-            "full_attention",
-            "linear_attention",
-            "full_attention",
-            "full_attention",
-        ]
-        mc = self._fake_model_config(text_cfg=cfg)
-        assert _get_full_attention_layer_indices(mc) == [2, 4, 5]
-
-    def test_layers_block_type_jamba(self):
-        from vllm.model_executor.layers.quantization.turboquant.config import (
-            _get_full_attention_layer_indices,
-        )
-
-        cfg = type("C", (), {})()
-        cfg.layers_block_type = ["mamba", "attention", "mamba", "attention"]
-        mc = self._fake_model_config(text_cfg=cfg)
-        assert _get_full_attention_layer_indices(mc) == [1, 3]
-
-    def test_attn_type_list_minimax(self):
-        from vllm.model_executor.layers.quantization.turboquant.config import (
-            _get_full_attention_layer_indices,
-        )
-
-        hf = type("C", (), {})()
-        hf.attn_type_list = [0, 1, 0, 1, 1]
-        mc = self._fake_model_config(hf_cfg=hf)
-        assert _get_full_attention_layer_indices(mc) == [1, 3, 4]
-
-    def test_no_hybrid_hints_returns_empty(self):
-        from vllm.model_executor.layers.quantization.turboquant.config import (
-            _get_full_attention_layer_indices,
-        )
-
-        mc = self._fake_model_config()
-        assert _get_full_attention_layer_indices(mc) == []
 
 
 # ============================================================================
@@ -421,8 +345,7 @@ class TestLloydMax:
 # Rotation matrix tests (GPU required)
 # ============================================================================
 
-GPGPU_AVAILABLE = torch.cuda.is_available() or torch.xpu.is_available()
-DEVICE_TYPE = current_platform.device_type
+CUDA_AVAILABLE = torch.cuda.is_available()
 
 
 def generate_rotation_matrix(d: int, seed: int, device: str = "cpu") -> torch.Tensor:
@@ -437,16 +360,16 @@ def generate_rotation_matrix(d: int, seed: int, device: str = "cpu") -> torch.Te
     return Q.to(device)
 
 
-@pytest.mark.skipif(not GPGPU_AVAILABLE, reason="GPGPU not available")
+@pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA not available")
 class TestRotationMatrix:
     """Tests for the QR-based rotation (standalone benchmarks only)."""
 
     @pytest.mark.parametrize("dim", [64, 96, 128, 256])
     def test_rotation_matrix_shape_and_orthogonal(self, dim):
-        Pi = generate_rotation_matrix(dim, seed=42, device=DEVICE_TYPE)
+        Pi = generate_rotation_matrix(dim, seed=42, device="cuda")
         assert Pi.shape == (dim, dim)
         eye = Pi @ Pi.T
-        assert torch.allclose(eye, torch.eye(dim, device=DEVICE_TYPE), atol=1e-5), (
+        assert torch.allclose(eye, torch.eye(dim, device="cuda"), atol=1e-5), (
             f"Pi not orthogonal for dim={dim}"
         )
 
@@ -462,13 +385,13 @@ class TestRotationMatrix:
 
     def test_rotation_matrix_det_is_pm1(self):
         """Orthogonal matrix determinant must be +1 or -1."""
-        Pi = generate_rotation_matrix(128, seed=42, device=DEVICE_TYPE)
+        Pi = generate_rotation_matrix(128, seed=42, device="cuda")
         det = torch.linalg.det(Pi)
         assert abs(abs(det.item()) - 1.0) < 1e-4
 
 
 # ============================================================================
-# Hadamard rotation tests (serving path: _build_hadamard)
+# WHT rotation tests (serving path: generate_wht_signs + _build_hadamard)
 # ============================================================================
 
 
@@ -480,26 +403,31 @@ def _build_hadamard(d: int, device: str = "cpu") -> torch.Tensor:
     return (H / math.sqrt(d)).to(torch.device(device))
 
 
-@pytest.mark.skipif(not GPGPU_AVAILABLE, reason="GPGPU not available")
-class TestHadamardRotation:
-    """Tests for the Hadamard rotation used in serving."""
+@pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA not available")
+class TestWHTRotation:
+    """Tests for the WHT rotation actually used in serving."""
 
     @pytest.mark.parametrize("dim", [64, 128, 256])
-    def test_hadamard_orthonormal(self, dim):
-        """H must be orthonormal: H @ H^T = I."""
-        H = _build_hadamard(dim, DEVICE_TYPE)
-        eye = H @ H.T
-        assert torch.allclose(eye, torch.eye(dim, device=DEVICE_TYPE), atol=1e-5), (
-            f"Hadamard not orthonormal for dim={dim}"
+    def test_wht_orthonormal(self, dim):
+        """signs * H must be orthonormal: (signs*H) @ (signs*H)^T = I."""
+        signs = generate_wht_signs(dim, seed=42, device="cuda")
+        H = _build_hadamard(dim, "cuda")
+        PiT = (signs.unsqueeze(1) * H).contiguous()
+        eye = PiT @ PiT.T
+        assert torch.allclose(eye, torch.eye(dim, device="cuda"), atol=1e-5), (
+            f"WHT rotation not orthonormal for dim={dim}"
         )
 
-    @pytest.mark.parametrize("dim", [64, 128, 256])
-    def test_hadamard_symmetric(self, dim):
-        """Sylvester Hadamard must be symmetric: H = H^T."""
-        H = _build_hadamard(dim, DEVICE_TYPE)
-        assert torch.allclose(H, H.T, atol=1e-6), (
-            f"Hadamard not symmetric for dim={dim}"
-        )
+    def test_wht_signs_deterministic(self):
+        """Same seed must produce identical signs."""
+        s1 = generate_wht_signs(128, seed=42)
+        s2 = generate_wht_signs(128, seed=42)
+        assert torch.equal(s1, s2)
+
+    def test_wht_signs_are_pm1(self):
+        """All sign values must be exactly +1 or -1."""
+        signs = generate_wht_signs(128, seed=42)
+        assert torch.all(signs.abs() == 1.0)
 
 
 # ============================================================================
@@ -507,15 +435,20 @@ class TestHadamardRotation:
 # ============================================================================
 
 
-@pytest.mark.skipif(not GPGPU_AVAILABLE, reason="GPGPU not available")
+@pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA not available")
 class TestStoreDecodeRoundTrip:
     """End-to-end: store KV into TQ cache, decode, compare vs fp16 ref."""
 
     @pytest.mark.parametrize(
-        "preset",
-        ["turboquant_k8v4", "turboquant_4bit_nc"],
+        ("preset", "input_dtype"),
+        [
+            ("turboquant_k8v4", torch.float16),
+            ("turboquant_k8v4", torch.bfloat16),
+            ("turboquant_4bit_nc", torch.float16),
+            ("turboquant_4bit_nc", torch.bfloat16),
+        ],
     )
-    def test_single_token_roundtrip(self, preset):
+    def test_single_token_roundtrip(self, preset, input_dtype):
         """Store 1 token, decode with query=key, check attention output.
 
         For a single token with query=key, attention output should equal
@@ -540,12 +473,13 @@ class TestStoreDecodeRoundTrip:
         block_size = 16
         num_blocks = 1
 
-        device = torch.device(DEVICE_TYPE)
+        device = torch.device("cuda")
 
-        # Pure Hadamard rotation (symmetric: H = H^T, so Pi = PiT = H)
-        H = _build_hadamard(D, DEVICE_TYPE)
-        PiT = H
-        Pi = H
+        # Generate rotation
+        signs = generate_wht_signs(D, seed=42, device=device)
+        H = _build_hadamard(D, "cuda")
+        PiT = (signs.unsqueeze(1) * H).contiguous().float()
+        Pi = PiT.T.contiguous()
 
         # Generate centroids
         centroids, _ = solve_lloyd_max(D, cfg.centroid_bits)
@@ -555,8 +489,8 @@ class TestStoreDecodeRoundTrip:
 
         # Random K, V
         torch.manual_seed(123)
-        key = torch.randn(B, Hk, D, device=device, dtype=torch.float16)
-        value = torch.randn(B, Hk, D, device=device, dtype=torch.float16)
+        key = torch.randn(B, Hk, D, device=device, dtype=input_dtype)
+        value = torch.randn(B, Hk, D, device=device, dtype=input_dtype)
 
         # Allocate KV cache
         padded_slot = cfg.slot_size_aligned
@@ -620,3 +554,192 @@ class TestStoreDecodeRoundTrip:
             assert cos_sim > threshold, (
                 f"Preset {preset} head {h}: cosine_sim={cos_sim:.4f} < {threshold}"
             )
+
+    def test_decode_respects_sliding_window(self):
+        from vllm.v1.attention.ops.triton_turboquant_decode import (
+            triton_turboquant_decode_attention,
+        )
+        from vllm.v1.attention.ops.triton_turboquant_store import (
+            triton_turboquant_store,
+        )
+
+        preset = "turboquant_k8v4"
+        cfg = TurboQuantConfig.from_cache_dtype(preset, head_dim=128)
+        D = 128
+        Hk = 2
+        Hq = 2
+        seq_len = 4
+        sliding_window = 2
+        block_size = 16
+        num_blocks = 1
+
+        device = torch.device("cuda")
+
+        signs = generate_wht_signs(D, seed=42, device=device)
+        H = _build_hadamard(D, "cuda")
+        PiT = (signs.unsqueeze(1) * H).contiguous().float()
+        Pi = PiT.T.contiguous()
+        centroids = get_centroids(D, cfg.centroid_bits).float().to(device)
+        c_sorted, _ = centroids.sort()
+        midpoints = ((c_sorted[:-1] + c_sorted[1:]) / 2).to(device)
+
+        key = torch.full((seq_len, Hk, D), 0.25, device=device, dtype=torch.float16)
+        value = torch.empty(seq_len, Hk, D, device=device, dtype=torch.float16)
+        value[:2].fill_(1.0)
+        value[2:].fill_(-1.0)
+
+        kv_cache = torch.zeros(
+            num_blocks,
+            block_size,
+            Hk,
+            cfg.slot_size_aligned,
+            device=device,
+            dtype=torch.uint8,
+        )
+        slot_mapping = torch.arange(seq_len, device=device, dtype=torch.int32)
+
+        triton_turboquant_store(
+            key,
+            value,
+            kv_cache,
+            slot_mapping,
+            PiT,
+            midpoints,
+            mse_bits=cfg.key_mse_bits,
+            key_packed_size=cfg.key_packed_size,
+            value_quant_bits=cfg.effective_value_quant_bits,
+            key_fp8=cfg.key_fp8,
+        )
+
+        query = torch.full((1, Hq, D), 0.25, device=device, dtype=torch.float16)
+        block_table = torch.tensor([[0]], device=device, dtype=torch.int32)
+        seq_lens = torch.tensor([seq_len], device=device, dtype=torch.int32)
+
+        output = triton_turboquant_decode_attention(
+            query=query,
+            kv_cache=kv_cache,
+            block_table=block_table,
+            seq_lens=seq_lens,
+            Pi=Pi,
+            centroids=centroids,
+            scale=1.0 / math.sqrt(D),
+            mse_bits=cfg.key_mse_bits,
+            key_packed_size=cfg.key_packed_size,
+            value_quant_bits=cfg.effective_value_quant_bits,
+            key_fp8=cfg.key_fp8,
+            norm_correction=cfg.norm_correction,
+            PiT=PiT,
+            max_num_kv_splits=4,
+            sliding_window=sliding_window,
+        )
+
+        ref = torch.nn.functional.scaled_dot_product_attention(
+            query.transpose(0, 1).unsqueeze(0),
+            value[-sliding_window:].new_full((1, Hk, sliding_window, D), 0.25),
+            value[-sliding_window:].transpose(0, 1).unsqueeze(0),
+            scale=1.0 / math.sqrt(D),
+        )[0].transpose(0, 1)
+
+        assert torch.allclose(output.float(), ref.float(), atol=0.25, rtol=0.1), (
+            "TurboQuant decode must only attend to the last sliding-window tokens."
+        )
+
+
+class TestTurboQuantWorkspaceReservation:
+    def test_attention_init_does_not_register_per_layer_decode_buffers(
+        self, default_vllm_config
+    ):
+        from vllm.config import set_current_vllm_config
+        from vllm.model_executor.layers.attention import Attention
+        from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+        vllm_config = default_vllm_config
+        vllm_config.cache_config.cache_dtype = "turboquant_4bit_nc"
+
+        prev_dtype = torch.get_default_dtype()
+        torch.set_default_dtype(torch.float16)
+        try:
+            with set_current_vllm_config(vllm_config):
+                attn = Attention(
+                    num_heads=8,
+                    head_size=512,
+                    scale=1.0,
+                    cache_config=vllm_config.cache_config,
+                    prefix="layers.0.self_attn",
+                    attn_backend=AttentionBackendEnum.TURBOQUANT.get_class(),
+                )
+        finally:
+            torch.set_default_dtype(prev_dtype)
+
+        buffer_names = {name for name, _ in attn.named_buffers()}
+        assert "_tq_signs" in buffer_names
+        assert "_tq_centroids" in buffer_names
+        assert "_tq_mid_o_buf" not in buffer_names
+        assert "_tq_output_buf" not in buffer_names
+        assert "_tq_lse_buf" not in buffer_names
+
+    @pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA not available")
+    def test_workspace_reservation_uses_shared_max_buffer(
+        self, default_vllm_config, workspace_init
+    ):
+        from vllm.config import set_current_vllm_config
+        from vllm.model_executor.layers.attention import Attention
+        from vllm.v1.attention.backends.registry import AttentionBackendEnum
+        from vllm.v1.worker.workspace import current_workspace_manager
+
+        del workspace_init
+
+        vllm_config = default_vllm_config
+        vllm_config.cache_config.cache_dtype = "turboquant_4bit_nc"
+        vllm_config.scheduler_config.max_num_seqs = 16
+
+        prev_dtype = torch.get_default_dtype()
+        torch.set_default_dtype(torch.float16)
+        try:
+            with set_current_vllm_config(vllm_config):
+                Attention(
+                    num_heads=8,
+                    head_size=256,
+                    scale=1.0,
+                    cache_config=vllm_config.cache_config,
+                    prefix="layers.0.self_attn",
+                    attn_backend=AttentionBackendEnum.TURBOQUANT.get_class(),
+                )
+                workspace = current_workspace_manager()._current_workspaces[0]
+                assert workspace is not None
+                workspace_bytes_256 = workspace.numel()
+
+                Attention(
+                    num_heads=8,
+                    head_size=512,
+                    scale=1.0,
+                    cache_config=vllm_config.cache_config,
+                    prefix="layers.1.self_attn",
+                    attn_backend=AttentionBackendEnum.TURBOQUANT.get_class(),
+                )
+                workspace = current_workspace_manager()._current_workspaces[0]
+                assert workspace is not None
+                workspace_bytes_512 = workspace.numel()
+        finally:
+            torch.set_default_dtype(prev_dtype)
+
+        batch_size = 128  # continuation decode threshold dominates max_num_seqs=16
+        heads = 8
+        splits = vllm_config.attention_config.tq_max_kv_splits_for_cuda_graph
+        raw_bytes_256 = (
+            batch_size * heads * splits * (256 + 1) * 4
+            + batch_size * heads * 256 * 4
+            + batch_size * heads * 4
+        )
+        raw_bytes_512 = (
+            batch_size * heads * splits * (512 + 1) * 4
+            + batch_size * heads * 512 * 4
+            + batch_size * heads * 4
+        )
+
+        assert workspace_bytes_256 >= raw_bytes_256
+        assert workspace_bytes_256 < raw_bytes_256 + 1024
+        assert workspace_bytes_512 >= raw_bytes_512
+        assert workspace_bytes_512 < raw_bytes_512 + 1024
+        assert workspace_bytes_512 > workspace_bytes_256
+        assert workspace_bytes_512 < raw_bytes_256 + raw_bytes_512
