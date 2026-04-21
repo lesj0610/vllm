@@ -406,7 +406,7 @@ class Attention(nn.Module, AttentionLayerBase):
     def _init_turboquant_buffers(
         self, cache_dtype: str, head_size: int, prefix: str
     ) -> None:
-        """Initialize TurboQuant rotation signs and centroids."""
+        """Initialize TurboQuant per-layer state and reserve shared scratch."""
         from vllm.model_executor.layers.quantization.turboquant.centroids import (
             get_centroids,
         )
@@ -416,20 +416,19 @@ class Attention(nn.Module, AttentionLayerBase):
         from vllm.model_executor.layers.quantization.turboquant.quantizer import (
             generate_wht_signs,
         )
+        from vllm.v1.attention.backends.turboquant_attn import (
+            reserve_turboquant_decode_workspace,
+        )
 
         tq_config = TurboQuantConfig.from_cache_dtype(cache_dtype, head_size)
 
-        # KV-sharing target/consumer layers must derive identical seeds so
-        # they use the same WHT rotation while sharing one cache tensor.
+        # Each layer needs a unique rotation matrix so quantization errors
+        # don't correlate across layers. Stride must exceed max head_dim to
+        # ensure non-overlapping RNG streams between adjacent layers.
         _TQ_LAYER_SEED_STRIDE = 1337
         from vllm.model_executor.models.utils import extract_layer_index
 
-        seed_prefix = (
-            self.kv_sharing_target_layer_name
-            if self.kv_sharing_target_layer_name is not None
-            else prefix
-        )
-        layer_idx = extract_layer_index(seed_prefix)
+        layer_idx = extract_layer_index(prefix)
         seed = tq_config.seed + layer_idx * _TQ_LAYER_SEED_STRIDE
 
         self.register_buffer(
@@ -442,29 +441,13 @@ class Attention(nn.Module, AttentionLayerBase):
         )
         self._tq_config = tq_config
 
-        # Pre-allocate decode intermediate buffers so model.to(device) moves
-        # them to GPU *before* the memory profiler runs.  Without this the
-        # profiler gives all free memory to KV cache blocks and the first
-        # decode OOMs when these buffers are lazily allocated.
-        _vllm_cfg = get_current_vllm_config()
-        B = _vllm_cfg.scheduler_config.max_num_seqs
-        Hq = self.num_heads
-        S = _vllm_cfg.attention_config.tq_max_kv_splits_for_cuda_graph
-        D = head_size
-        self.register_buffer(
-            "_tq_mid_o_buf",
-            torch.empty(B, Hq, S, D + 1, dtype=torch.float32),
-            persistent=False,
-        )
-        self.register_buffer(
-            "_tq_output_buf",
-            torch.empty(B, Hq, D, dtype=torch.float32),
-            persistent=False,
-        )
-        self.register_buffer(
-            "_tq_lse_buf",
-            torch.empty(B, Hq, dtype=torch.float32),
-            persistent=False,
+        # Reserve decode scratch in the shared workspace manager so the
+        # profiler accounts for it once per worker/ubatch, instead of paying
+        # the same scratch cost once per TurboQuant layer.
+        reserve_turboquant_decode_workspace(
+            vllm_config=get_current_vllm_config(),
+            num_heads=self.num_heads,
+            head_size=head_size,
         )
 
     def forward(
@@ -606,11 +589,27 @@ class Attention(nn.Module, AttentionLayerBase):
             from vllm.model_executor.layers.quantization.turboquant.config import (
                 TurboQuantConfig,
             )
-            from vllm.v1.kv_cache_interface import TQFullAttentionSpec
+            from vllm.v1.kv_cache_interface import (
+                TQFullAttentionSpec,
+                TQSlidingWindowSpec,
+            )
 
             tq_config = TurboQuantConfig.from_cache_dtype(
                 self.kv_cache_dtype, self.head_size
             )
+            if self.sliding_window is not None:
+                assert not vllm_config.model_config.use_mla, (
+                    "MLA is not supported for slidingwindow"
+                )
+                return TQSlidingWindowSpec(
+                    block_size=block_size,
+                    num_kv_heads=self.num_kv_heads,
+                    head_size=self.head_size,
+                    dtype=self.kv_cache_torch_dtype,
+                    kv_quant_mode=quant_mode,
+                    sliding_window=self.sliding_window,
+                    tq_slot_size=tq_config.slot_size_aligned,
+                )
             return TQFullAttentionSpec(
                 block_size=block_size,
                 num_kv_heads=self.num_kv_heads,
@@ -618,7 +617,6 @@ class Attention(nn.Module, AttentionLayerBase):
                 head_size_v=self.head_size,
                 dtype=self.kv_cache_torch_dtype,
                 tq_slot_size=tq_config.slot_size_aligned,
-                sliding_window=self.sliding_window,
             )
         elif self.sliding_window is not None:
             assert not vllm_config.model_config.use_mla, (
