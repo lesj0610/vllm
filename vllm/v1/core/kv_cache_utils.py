@@ -1207,6 +1207,7 @@ def unify_hybrid_kv_cache_specs(kv_cache_spec: dict[str, KVCacheSpec]):
                         head_size=spec.head_size,
                         head_size_v=spec.head_size,
                         dtype=spec.dtype,
+                        kv_quant_mode=spec.kv_quant_mode,
                         sliding_window=spec.sliding_window,
                         page_size_padded=spec.page_size_padded,
                         tq_slot_size=spec.tq_slot_size,
@@ -1217,6 +1218,7 @@ def unify_hybrid_kv_cache_specs(kv_cache_spec: dict[str, KVCacheSpec]):
                         num_kv_heads=spec.num_kv_heads,
                         head_size=spec.head_size,
                         dtype=spec.dtype,
+                        kv_quant_mode=spec.kv_quant_mode,
                         sliding_window=spec.sliding_window,
                         page_size_padded=spec.page_size_padded,
                     )
@@ -1226,6 +1228,7 @@ def unify_hybrid_kv_cache_specs(kv_cache_spec: dict[str, KVCacheSpec]):
                     num_kv_heads=spec.num_kv_heads,
                     head_size=spec.head_size,
                     dtype=spec.dtype,
+                    kv_quant_mode=spec.kv_quant_mode,
                     attention_chunk_size=spec.attention_chunk_size,
                     page_size_padded=spec.page_size_padded,
                 )
