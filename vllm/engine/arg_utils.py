@@ -1642,16 +1642,21 @@ class EngineArgs:
             kv_offloading_backend=self.kv_offloading_backend,
         )
 
+        # TurboQuant is opt-in. Respect user-specified skip layers, but avoid
+        # auto-injecting boundary fallbacks here because mixed KV specs can
+        # make the engine config invalid for some models/backend combos.
         if resolved_cache_dtype.startswith("turboquant_"):
-            from vllm.model_executor.layers.quantization.turboquant.config import (
-                TurboQuantConfig,
-            )
-
-            boundary = TurboQuantConfig.get_boundary_skip_layers(model_config)
-            existing = set(cache_config.kv_cache_dtype_skip_layers)
-            cache_config.kv_cache_dtype_skip_layers = sorted(
-                existing | set(boundary), key=int
-            )
+            if model_config.is_hybrid:
+                raise NotImplementedError(
+                    "TurboQuant KV cache is not supported for hybrid "
+                    "(attention + Mamba) models. Boundary layer protection "
+                    "requires uniform attention layers."
+                )
+            if cache_config.kv_cache_dtype_skip_layers:
+                logger.info(
+                    "TQ: respecting user-specified skip layers %s",
+                    cache_config.kv_cache_dtype_skip_layers,
+                )
 
         ray_runtime_env = None
         if is_ray_initialized():
