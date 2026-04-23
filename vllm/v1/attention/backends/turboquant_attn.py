@@ -885,6 +885,12 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         layer: torch.nn.Module | None = None,
     ) -> torch.Tensor:
         mid_o_buf, output_buf, lse_buf = self._get_decode_workspace(query.shape[0])
+        buf_holder = (
+            layer
+            if layer is not None
+            and (mid_o_buf is None or output_buf is None or lse_buf is None)
+            else None
+        )
 
         result = triton_turboquant_decode_attention(
             query=query,
@@ -903,6 +909,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             mid_o_buf=mid_o_buf,
             output_buf=output_buf,
             lse_buf=lse_buf,
+            buf_holder=buf_holder,
             max_num_kv_splits=self.max_num_kv_splits,
             sliding_window=self._local_window_size(),
         )

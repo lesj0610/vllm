@@ -6,6 +6,7 @@ Run: .venv/bin/python -m pytest tests/quantization/test_turboquant.py -v
 """
 
 import math
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -743,3 +744,55 @@ class TestTurboQuantWorkspaceReservation:
         assert workspace_bytes_512 < raw_bytes_512 + 1024
         assert workspace_bytes_512 > workspace_bytes_256
         assert workspace_bytes_512 < raw_bytes_256 + raw_bytes_512
+
+    def test_decode_uses_layer_fallback_when_workspace_unavailable(self, monkeypatch):
+        from vllm.v1.attention.backends.turboquant_attn import (
+            TurboQuantAttentionImpl,
+        )
+
+        impl = TurboQuantAttentionImpl.__new__(TurboQuantAttentionImpl)
+        impl.num_heads = 8
+        impl.head_size = 256
+        impl.scale = 1.0
+        impl.max_num_kv_splits = 4
+        impl.sliding_window = None
+        impl._local_window_size = lambda: None
+        impl.tq_config = SimpleNamespace(
+            key_mse_bits=4,
+            key_packed_size=66,
+            effective_value_quant_bits=4,
+            key_fp8=False,
+            norm_correction=True,
+        )
+
+        monkeypatch.setattr(
+            impl, "_get_decode_workspace", lambda batch_size: (None, None, None)
+        )
+
+        captured = {}
+
+        def fake_decode_attention(**kwargs):
+            captured["buf_holder"] = kwargs["buf_holder"]
+            return torch.empty_like(kwargs["query"])
+
+        monkeypatch.setattr(
+            "vllm.v1.attention.backends.turboquant_attn.triton_turboquant_decode_attention",
+            fake_decode_attention,
+        )
+
+        layer = torch.nn.Module()
+        query = torch.randn(1, 8, 256)
+        kv_cache = torch.empty(1, 1, 8, 134, dtype=torch.uint8)
+        attn_metadata = SimpleNamespace(
+            block_table=torch.zeros(1, 1, dtype=torch.int32),
+            seq_lens=torch.ones(1, dtype=torch.int32),
+        )
+        Pi = torch.eye(256, dtype=torch.float32)
+        centroids = torch.linspace(-1.0, 1.0, 16, dtype=torch.float32)
+
+        output = impl._decode_attention(
+            query, kv_cache, attn_metadata, Pi, centroids, PiT=Pi, layer=layer
+        )
+
+        assert captured["buf_holder"] is layer
+        assert output.shape == query.shape
