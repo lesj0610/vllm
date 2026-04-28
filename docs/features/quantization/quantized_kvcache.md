@@ -49,6 +49,29 @@ You can configure how the quantization scales are computed in vLLM using three d
 - `kv_cache_dtype="fp8_e4m3"`: Supported on CUDA 11.8+ and ROCm (AMD GPUs)
 - `kv_cache_dtype="fp8_e5m2"`: Supported on CUDA 11.8+
 
+#### TurboQuant Long-Prefill Backend
+
+TurboQuant KV-cache modes, such as `kv_cache_dtype="turboquant_4bit_nc"`,
+use the conservative long-prefill `stream` backend by default. You can opt in
+to the Triton native long-prefill backend with:
+
+```bash
+VLLM_TQ_LONG_PREFILL_BACKEND=native \
+vllm serve <model> --kv-cache-dtype turboquant_4bit_nc
+```
+
+Use the native backend when you need a FlashAttention-free TurboQuant prefill
+path, for example when validating configurations where the local FA comparison
+path is unavailable, or when you can trade some long-prefill latency for a
+native compressed-cache implementation. Otherwise, keep the default `stream`
+backend.
+
+In one local measurement on RTX 3090 (SM 8.6) with
+Qwen3.6-27B-int4-AutoRound at 65K context using `turboquant_4bit_nc`, the
+native backend took 128.38s versus 114.89s for the FA comparison path. Treat
+this as environment-specific guidance; A100/H100 results have not yet been
+measured.
+
 ---
 
 ## Examples

@@ -448,6 +448,24 @@ def test_prefix_cache_default():
     assert not engine_args.enable_prefix_caching
 
 
+def test_turboquant_nc_create_engine_config_keeps_pure_policy():
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+    args = parser.parse_args(
+        [
+            "--model",
+            "facebook/opt-125m",
+            "--kv-cache-dtype",
+            "turboquant_4bit_nc",
+        ]
+    )
+    engine_args = EngineArgs.from_cli_args(args)
+    vllm_config = engine_args.create_engine_config()
+
+    assert vllm_config.cache_config.cache_dtype == "turboquant_4bit_nc"
+    assert vllm_config.cache_config.kv_cache_dtype_skip_layers == []
+    assert vllm_config.attention_config.flash_attn_version is None
+
+
 @pytest.mark.parametrize(
     ("arg", "expected", "option"),
     [

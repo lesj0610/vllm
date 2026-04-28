@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import torch
+import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 
 from vllm.model_executor.custom_op import PluggableLayer
 from vllm.model_executor.layers.linear import ReplicatedLinear
+from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.platforms import current_platform
 
 
@@ -32,6 +34,7 @@ class GateLinear(ReplicatedLinear):
         bias: bool = False,
         out_dtype: torch.dtype | None = None,
         params_dtype: torch.dtype | None = None,
+        quant_config: QuantizationConfig | None = None,
         force_fp32_compute: bool = False,
         prefix: str = "",
     ):
@@ -52,10 +55,15 @@ class GateLinear(ReplicatedLinear):
             output_size,
             bias=bias,
             params_dtype=params_dtype,
-            quant_config=None,
+            quant_config=quant_config,
             prefix=prefix,
         )
+        # Quantized fallback dequantization helpers expect LinearBase-style
+        # partition metadata. ReplicatedLinear is effectively a single shard.
+        self.input_size_per_partition = input_size
         self.out_dtype = out_dtype
+        router_weight = getattr(self, "weight", None)
+        self.register_buffer("_dequant_router_weight", None, persistent=False)
 
         # DSV3 specialized kernel eligibility (SM90+, exact dims)
         self.allow_specialized_router_gemm = can_use_specialized_kernels
@@ -68,7 +76,8 @@ class GateLinear(ReplicatedLinear):
         # cuBLAS bf16→fp32 eligibility
         self.allow_cublas_router_gemm = (
             self.allow_specialized_router_gemm
-            and self.weight.dtype == torch.bfloat16
+            and router_weight is not None
+            and router_weight.dtype == torch.bfloat16
             and self.out_dtype == torch.float32
         )
 
@@ -87,12 +96,38 @@ class GateLinear(ReplicatedLinear):
             and self.allow_specialized_router_gemm
             and out_dtype == torch.float32
         ):
-            self.allow_cublas_router_gemm = self.weight.dtype == torch.bfloat16
+            router_weight = getattr(self, "weight", None)
+            self.allow_cublas_router_gemm = (
+                router_weight is not None
+                and router_weight.dtype == torch.bfloat16
+            )
 
     def forward(
         self, x: torch.Tensor
     ) -> torch.Tensor | tuple[torch.Tensor, Parameter | None]:
         import vllm._custom_ops as ops
+
+        if (
+            self.out_dtype == torch.float32
+            and getattr(self, "weight", None) is None
+            and self.quant_method is not None
+        ):
+            dequant_router_weight = self._dequant_router_weight
+            if dequant_router_weight is None:
+                eye_dtype = x.dtype if x.dtype in (torch.float16, torch.bfloat16) else torch.float16
+                eye = torch.eye(
+                    self.input_size_per_partition,
+                    dtype=eye_dtype,
+                    device=x.device,
+                )
+                dequant_router_weight = (
+                    self.quant_method.apply(self, eye, bias=None)
+                    .to(torch.float32)
+                    .T
+                )
+                self._dequant_router_weight = dequant_router_weight
+            output = F.linear(x.to(torch.float32), dequant_router_weight)
+            return output, None
 
         # Tier 1: DSV3 specialized kernel
         if self.allow_dsv3_router_gemm and x.shape[0] <= 16:
@@ -109,8 +144,13 @@ class GateLinear(ReplicatedLinear):
             return output, None
 
         # Tier 3: F.linear (ReplicatedLinear)
-        if self.out_dtype is not None and x.dtype != self.weight.dtype:
-            x = x.to(self.weight.dtype)
+        router_weight = getattr(self, "weight", None)
+        if (
+            self.out_dtype is not None
+            and router_weight is not None
+            and x.dtype != router_weight.dtype
+        ):
+            x = x.to(router_weight.dtype)
         output, output_bias = super().forward(x)
         if self.out_dtype is not None and output.dtype != self.out_dtype:
             output = output.to(self.out_dtype)

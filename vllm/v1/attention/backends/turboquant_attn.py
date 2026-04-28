@@ -1,11 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""TurboQuant attention backend for vLLM.
+"""Paper-faithful TurboQuant attention backend for vLLM.
 
-Prefill: Standard scaled dot-product attention on uncompressed K/V,
-         then quantize K and store K+V into combined cache slot.
-Decode:  Compute TQ attention scores from compressed cache,
-         unpack FP16 values, softmax + weighted sum.
+Prefill / continuation / decode all read compressed KV through the
+TurboQuant Triton path. Keys use TurboQuant_prod:
+  * TurboQuant_mse indices on a randomly rotated normalized key
+  * QJL sign sketch on the residual
+  * stored key norm and residual norm scalars
+
+Values remain uniformly quantized per slot.
 
 Cache layout (no leading 2 dimension):
   (num_blocks, block_size, num_kv_heads, slot_size)
@@ -16,17 +19,18 @@ Per-head per-position slot layout:
   For turboquant_k3v4_nc head_dim=256: [100 bytes key | 512 bytes value] = 612
 """
 
-import functools
 import math
 from dataclasses import dataclass
 from typing import Any, ClassVar
 
 import torch
-import torch.nn.functional as F
 
+from vllm import envs
 from vllm.config import get_current_vllm_config
 from vllm.config.cache import CacheDType
-from vllm.triton_utils import triton
+from vllm.config.compilation import CUDAGraphMode
+from vllm.forward_context import get_forward_context, is_forward_context_available
+from vllm.logger import init_logger
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -39,19 +43,23 @@ from vllm.v1.attention.backend import (
     MultipleOf,
 )
 from vllm.v1.attention.backends.fa_utils import (
+    flash_attn_varlen_func,
+    get_flash_attn_version,
     is_flash_attn_varlen_func_available,
 )
 from vllm.v1.attention.backends.utils import split_decodes_and_prefills
 from vllm.v1.attention.ops.triton_turboquant_decode import (
-    _tq_full_dequant_kv,
-    _use_fp8_e4b15,
+    dequant_turboquant_cache_pages,
     triton_turboquant_decode_attention,
 )
+from vllm.v1.attention.ops.triton_turboquant_prefill import (
+    triton_turboquant_prefill_attention,
+)
 from vllm.v1.attention.ops.triton_turboquant_store import triton_turboquant_store
-
-_HAS_FLASH_ATTN = is_flash_attn_varlen_func_available()
-if _HAS_FLASH_ATTN:
-    from vllm.v1.attention.backends.fa_utils import flash_attn_varlen_func
+from vllm.v1.worker.workspace import (
+    current_workspace_manager,
+    is_workspace_manager_initialized,
+)
 
 # Continuation prefill: for small continuation chunks (q_len ≤ threshold),
 # use the TQ decode kernel directly instead of full-dequant + flash_attn.
@@ -59,24 +67,60 @@ if _HAS_FLASH_ATTN:
 # kernel can read them efficiently. This avoids O(cached_len) dequant work
 # per continuation, eliminating the O(N²/chunk_size) collapse at long context.
 _CONTINUATION_DECODE_THRESHOLD = 128
+# Long prefill chunks larger than the continuation threshold amortize decode
+# kernel launch overhead without requiring prohibitively large scratch buffers.
+# Keep this module-level so local experiments can retune it easily.
+_LONG_PREFILL_DECODE_CHUNK_SIZE = 1024
+_LONG_PREFILL_FA_MIN_SEQ_LEN = 8192
+_LONG_PREFILL_FA_MIN_FREE_HEADROOM_BYTES = 1 << 30
+_LONG_PREFILL_FA_PAGE_CHUNK_SIZE = 4
+
+logger = init_logger(__name__)
 
 
-def _build_hadamard(d: int, device_str: str) -> torch.Tensor:
-    """Orthonormal Hadamard matrix (Sylvester construction), cached per (d, device).
+def _get_turboquant_decode_workspace_shapes(
+    batch_size: int,
+    num_heads: int,
+    head_size: int,
+    max_num_kv_splits: int,
+) -> tuple[tuple[tuple[int, ...], torch.dtype], ...]:
+    return (
+        ((batch_size, num_heads, max_num_kv_splits, head_size + 1), torch.float32),
+        ((batch_size, num_heads, head_size), torch.float32),
+        ((batch_size, num_heads), torch.float32),
+    )
 
-    Precomputed D×D matrix enables matmul-based WHT — single cuBLAS GEMM
-    instead of log2(D) butterfly kernel launches. 64KB for D=128.
-    """
-    # Normalize device string so "cuda" and "cuda:0" hit the same cache entry.
-    return _build_hadamard_cached(d, str(torch.device(device_str)))
+
+def reserve_turboquant_decode_workspace(
+    *,
+    vllm_config,
+    num_heads: int,
+    head_size: int,
+) -> None:
+    if not is_workspace_manager_initialized():
+        return
+
+    batch_size = max(
+        vllm_config.scheduler_config.max_num_seqs,
+        _CONTINUATION_DECODE_THRESHOLD,
+    )
+    max_num_kv_splits = vllm_config.attention_config.tq_max_kv_splits_for_cuda_graph
+    current_workspace_manager().get_simultaneous(
+        *_get_turboquant_decode_workspace_shapes(
+            batch_size=batch_size,
+            num_heads=num_heads,
+            head_size=head_size,
+            max_num_kv_splits=max_num_kv_splits,
+        )
+    )
 
 
-@functools.cache
-def _build_hadamard_cached(d: int, device_str: str) -> torch.Tensor:
-    H = torch.tensor([[1.0]])
-    while H.shape[0] < d:
-        H = torch.cat([torch.cat([H, H], 1), torch.cat([H, -H], 1)], 0)
-    return (H / math.sqrt(d)).to(torch.device(device_str))
+def _build_key_norm_lut(
+    log_min: torch.Tensor, log_max: torch.Tensor, device: torch.device
+) -> torch.Tensor:
+    lut_idx = torch.arange(256, device=device, dtype=torch.float32)
+    step = (log_max - log_min) / 255.0
+    return torch.exp2(log_min + lut_idx * step).contiguous()
 
 
 class TurboQuantAttentionBackend(AttentionBackend):
@@ -90,7 +134,6 @@ class TurboQuantAttentionBackend(AttentionBackend):
         torch.bfloat16,
     ]
     supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
-        "turboquant_k8v4",
         "turboquant_4bit_nc",
         "turboquant_k3v4_nc",
         "turboquant_3bit_nc",
@@ -156,7 +199,7 @@ class TurboQuantAttentionBackend(AttentionBackend):
     def supports_kv_cache_dtype(cls, kv_cache_dtype: CacheDType | None) -> bool:
         if kv_cache_dtype is None:
             return False
-        return kv_cache_dtype.startswith("turboquant_")
+        return kv_cache_dtype in cls.supported_kv_cache_dtypes
 
     @classmethod
     def supports_head_size(cls, head_size: int) -> bool:
@@ -254,6 +297,9 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         self.num_kv_heads = num_kv_heads if num_kv_heads is not None else num_heads
         self.num_kv_groups = num_heads // self.num_kv_heads
         self.kv_cache_dtype = kv_cache_dtype
+        self.sliding_window = (
+            (sliding_window - 1, 0) if sliding_window is not None else None
+        )
 
         from vllm.model_executor.layers.quantization.turboquant.config import (
             TurboQuantConfig,
@@ -263,13 +309,10 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
 
         # Pre-compute kernel constants from config (avoid repeated arithmetic)
         cfg = self.tq_config
-        self._mse_bytes = (
-            math.ceil(head_size * cfg.key_mse_bits / 8)
-            if not cfg.key_fp8
-            else head_size
-        )
+        self._mse_bytes = math.ceil(head_size * cfg.key_mse_bits / 8)
+        self._qjl_bytes = math.ceil(head_size / 8)
         self._val_data_bytes = math.ceil(head_size * cfg.effective_value_quant_bits / 8)
-        self._n_centroids = cfg.n_centroids if not cfg.key_fp8 else 1
+        self._n_centroids = cfg.n_centroids
 
         # Fixed NUM_KV_SPLITS (grid dims must be constant for cudagraph,
         # and benchmarks show no regression vs dynamic in eager mode).
@@ -278,31 +321,75 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             vllm_config.attention_config.tq_max_kv_splits_for_cuda_graph
         )
 
+    def _local_window_size(self) -> int | None:
+        if self.sliding_window is None:
+            return None
+        return self.sliding_window[0] + 1
+
     def _ensure_on_device(self, layer, device):
-        """One-time derivation of TQ buffers (rotation matrices, midpoints).
+        """Move paper-faithful TurboQuant state to the active device once."""
+        cached_device = getattr(layer, "_tq_cached_device", None)
+        if cached_device == device:
+            return
 
-        Registered buffers (_tq_signs, _tq_centroids) are already on the
-        correct device via register_buffer + model.to(device).
-        """
-        if not hasattr(layer, "_tq_cached"):
-            D = layer._tq_signs.shape[0]
-            signs = layer._tq_signs.to(device=device, dtype=torch.float32)
+        layer._tq_Pi = layer._tq_Pi.to(device=device, dtype=torch.float32)
+        layer._tq_PiT = layer._tq_PiT.to(device=device, dtype=torch.float32)
+        layer._tq_S = layer._tq_S.to(device=device, dtype=torch.float32)
+        layer._tq_ST = layer._tq_ST.to(device=device, dtype=torch.float32)
+        layer._tq_centroids = layer._tq_centroids.to(device=device, dtype=torch.float32)
+        layer._tq_midpoints = layer._tq_midpoints.to(device=device, dtype=torch.float32)
+        layer._tq_key_norm_log_min = layer._tq_key_norm_log_min.to(
+            device=device, dtype=torch.float32
+        )
+        layer._tq_key_norm_log_max = layer._tq_key_norm_log_max.to(
+            device=device, dtype=torch.float32
+        )
+        layer._tq_key_norm_lut = _build_key_norm_lut(
+            layer._tq_key_norm_log_min,
+            layer._tq_key_norm_log_max,
+            device,
+        )
+        layer._tq_cached_device = device
 
-            # WHT rotation: orthonormal + self-inverse, enabling future
-            # in-kernel butterfly fusion and trivial inverse for continuation.
-            H = _build_hadamard(D, str(device))
-            layer._tq_PiT = (signs.unsqueeze(1) * H).contiguous()
-            layer._tq_Pi = layer._tq_PiT.T.contiguous()
+    def _get_decode_workspace(
+        self, batch_size: int
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
+        if not is_workspace_manager_initialized():
+            return None, None, None
 
-            c = layer._tq_centroids.to(device=device, dtype=torch.float32)
-            # Precompute midpoints for threshold-based quantization
-            c_sorted, _ = c.sort()
-            layer._tq_midpoints = (c_sorted[:-1] + c_sorted[1:]) / 2
-            # Decode buffers (_tq_mid_o_buf, _tq_output_buf, _tq_lse_buf)
-            # are pre-allocated via register_buffer in Attention.__init__
-            # and moved to GPU by model.to(device) — no allocation needed
-            # here.  The memory profiler sees them before KV cache sizing.
-            layer._tq_cached = True
+        return tuple(
+            current_workspace_manager().get_simultaneous(
+                *_get_turboquant_decode_workspace_shapes(
+                    batch_size=batch_size,
+                    num_heads=self.num_heads,
+                    head_size=self.head_size,
+                    max_num_kv_splits=self.max_num_kv_splits,
+                )
+            )
+        )
+
+    def _select_num_kv_splits(self, max_seq_len: int) -> int:
+        # Keep the fixed upper bound while using CUDA graphs. In eager mode,
+        # very long decode/prefill chunks benefit from fewer splits because the
+        # reduction overhead of many small partitions dominates.
+        if is_forward_context_available():
+            runtime_mode = get_forward_context().cudagraph_runtime_mode
+            if runtime_mode != CUDAGraphMode.NONE:
+                return self.max_num_kv_splits
+
+        if max_seq_len >= 32768:
+            return min(self.max_num_kv_splits, 8)
+        if max_seq_len >= 16384:
+            return min(self.max_num_kv_splits, 16)
+        return self.max_num_kv_splits
+
+    def _select_long_prefill_chunk_size(self, seq_len: int) -> int:
+        del seq_len  # reserved for future heuristics
+        if is_forward_context_available():
+            runtime_mode = get_forward_context().cudagraph_runtime_mode
+            if runtime_mode != CUDAGraphMode.NONE:
+                return _CONTINUATION_DECODE_THRESHOLD
+        return _LONG_PREFILL_DECODE_CHUNK_SIZE
 
     def do_kv_cache_update(
         self,
@@ -368,6 +455,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         self._ensure_on_device(tq_layer, device)
         Pi = tq_layer._tq_Pi
         PiT = tq_layer._tq_PiT
+        ST = tq_layer._tq_ST
         centroids = tq_layer._tq_centroids
 
         # Compute attention (KV cache was already updated by do_kv_cache_update)
@@ -379,7 +467,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         if not attn_metadata.is_prefill:
             # Pure decode batch — fast path
             attn_out = self._decode_attention(
-                q, kv_cache, attn_metadata, Pi, centroids, PiT, layer
+                q, kv_cache, attn_metadata, Pi, ST, centroids, PiT, layer
             )
         elif num_decodes == 0:
             # Pure prefill batch
@@ -392,6 +480,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 kv_cache,
                 attn_metadata,
                 Pi,
+                ST,
                 centroids,
                 PiT,
                 layer=layer,
@@ -415,7 +504,14 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 is_prefill=False,
             )
             attn_out[:num_decode_tokens] = self._decode_attention(
-                q[:num_decode_tokens], kv_cache, decode_meta, Pi, centroids, PiT, layer
+                q[:num_decode_tokens],
+                kv_cache,
+                decode_meta,
+                Pi,
+                ST,
+                centroids,
+                PiT,
+                layer,
             )
 
             # --- Prefill portion (remaining requests) ---
@@ -448,6 +544,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 kv_cache,
                 prefill_meta,
                 Pi,
+                ST,
                 centroids,
                 PiT,
                 layer=layer,
@@ -478,16 +575,20 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             value,
             kv_cache,
             slot_mapping,
+            layer._tq_Pi,
             layer._tq_PiT,
+            layer._tq_ST,
+            layer._tq_centroids,
             layer._tq_midpoints,
+            layer._tq_key_norm_log_min,
+            layer._tq_key_norm_log_max,
             mse_bits=self.tq_config.key_mse_bits,
             key_packed_size=self.tq_config.key_packed_size,
             value_quant_bits=self.tq_config.effective_value_quant_bits,
-            key_fp8=self.tq_config.key_fp8,
         )
 
     # ------------------------------------------------------------------ #
-    #  Prefill: SDPA on raw Q/K/V with causal mask                        #
+    #  Prefill / continuation: compressed-KV Triton path                  #
     # ------------------------------------------------------------------ #
     def _prefill_attention(
         self,
@@ -497,50 +598,44 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         kv_cache: torch.Tensor,  # (num_blocks, block_size, Hk, slot_size)
         attn_metadata: TurboQuantMetadata,
         Pi: torch.Tensor,
+        ST: torch.Tensor,
         centroids: torch.Tensor,
         PiT: torch.Tensor | None = None,
         layer: Any = None,
     ) -> torch.Tensor:
-        N, Hq, D = query.shape
+        # key/value are consumed by do_kv_cache_update before this call.
+        # Attention itself reads only compressed KV from the cache.
+        del key, value
+        return self._tq_prefill_attention(
+            query=query,
+            kv_cache=kv_cache,
+            attn_metadata=attn_metadata,
+            Pi=Pi,
+            ST=ST,
+            centroids=centroids,
+            PiT=PiT,
+            layer=layer,
+        )
 
-        # Fast path: use flash_attn for first-chunk prefills (all K/V in batch).
-        # max_query_len == max_seq_len means no request has prior cached KV.
-        # Both are Python ints — no GPU sync.
-        if _HAS_FLASH_ATTN and attn_metadata.max_query_len == attn_metadata.max_seq_len:
-            output = torch.empty(N, Hq, D, device=query.device, dtype=query.dtype)
-            flash_attn_varlen_func(
-                q=query,
-                k=key,
-                v=value,
-                cu_seqlens_q=attn_metadata.query_start_loc,
-                cu_seqlens_k=attn_metadata.query_start_loc,
-                max_seqlen_q=attn_metadata.max_query_len,
-                max_seqlen_k=attn_metadata.max_query_len,
-                softmax_scale=self.scale,
-                causal=True,
-                out=output,
-            )
-            return output
-
-        # Continuation or no flash_attn: per-request attention.
-        # For continuation chunks (seq_len > q_len), we must attend to
-        # previously cached K/V from the TQ cache, not just the current
-        # chunk's raw K/V.
-        Hk = key.shape[1]
-        use_gqa = Hk < Hq
+    def _tq_prefill_attention(
+        self,
+        query: torch.Tensor,  # (N, Hq, D)
+        kv_cache: torch.Tensor,  # (num_blocks, block_size, Hk, slot_size)
+        attn_metadata: TurboQuantMetadata,
+        Pi: torch.Tensor,
+        ST: torch.Tensor,
+        centroids: torch.Tensor,
+        PiT: torch.Tensor | None = None,
+        layer: Any = None,
+    ) -> torch.Tensor:
+        n, hq, d = query.shape
         query_start_loc = attn_metadata.query_start_loc
         num_reqs = query_start_loc.shape[0] - 1
 
-        output = torch.zeros(N, Hq, D, device=query.device, dtype=query.dtype)
+        output = torch.zeros(n, hq, d, device=query.device, dtype=query.dtype)
 
-        # Convert to Python lists once (single CPU-GPU sync) instead of
-        # per-request .item() calls that each force a sync.
         qsl = query_start_loc.tolist()
         seq_lens_list = attn_metadata.seq_lens.tolist()
-
-        # Pre-allocate cu_seqlens for single-request flash_attn calls
-        # to avoid per-request host→device tensor creation.
-        _cu_2 = torch.zeros(2, device=query.device, dtype=torch.int32)
 
         for i in range(num_reqs):
             q_start = qsl[i]
@@ -550,224 +645,375 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 continue
 
             seq_len = seq_lens_list[i]
-            q_seq = query[q_start:q_end]  # (q_len, Hq, D)
-            k_seq = key[q_start:q_end]  # (q_len, Hk, D)
-            v_seq = value[q_start:q_end]  # (q_len, Hk, D)
+            cached_len = seq_len - q_len
+            q_seq = query[q_start:q_end]
+            synth_seq_lens = torch.arange(
+                cached_len + 1,
+                seq_len + 1,
+                device=query.device,
+                dtype=attn_metadata.seq_lens.dtype,
+            )
+            block_table = attn_metadata.block_table[i : i + 1]
 
-            if q_len == seq_len:
-                # First-chunk prefill: all K/V are in the current batch.
-                if _HAS_FLASH_ATTN:
-                    out = torch.empty_like(q_seq)
-                    _cu_2[1] = q_len
-                    cu = _cu_2
-                    flash_attn_varlen_func(
-                        q=q_seq,
-                        k=k_seq,
-                        v=v_seq,
-                        cu_seqlens_q=cu,
-                        cu_seqlens_k=cu,
-                        max_seqlen_q=q_len,
-                        max_seqlen_k=q_len,
-                        softmax_scale=self.scale,
-                        causal=True,
-                        out=out,
-                    )
-                else:
-                    q_t = q_seq.transpose(0, 1).contiguous()
-                    k_t = k_seq.transpose(0, 1).contiguous()
-                    v_t = v_seq.transpose(0, 1).contiguous()
-                    out = F.scaled_dot_product_attention(
-                        q_t,
-                        k_t,
-                        v_t,
-                        is_causal=True,
-                        scale=self.scale,
-                        enable_gqa=use_gqa,
-                    ).transpose(0, 1)
-                output[q_start:q_end] = out.to(query.dtype)
+            if q_len <= _CONTINUATION_DECODE_THRESHOLD:
+                synth_bt = block_table.expand(q_len, -1)
+                out = self._decode_prefill_chunk_from_cache(
+                    query=q_seq,
+                    kv_cache=kv_cache,
+                    block_table=synth_bt,
+                    seq_lens=synth_seq_lens,
+                    max_seq_len=seq_len,
+                    Pi=Pi,
+                    ST=ST,
+                    centroids=centroids,
+                    PiT=PiT,
+                    layer=layer,
+                )
             else:
-                # Continuation chunk: tokens already stored to TQ cache
-                # by do_kv_cache_update. Use decode kernel directly to
-                # avoid O(cached_len) full-dequant per continuation.
-                # For large continuations, fall back to _continuation_prefill.
-                cached_len = seq_len - q_len
-                if q_len <= _CONTINUATION_DECODE_THRESHOLD:
-                    # Fast path: treat each query as a decode request
-                    # with incremental seq_lens for causal masking.
-                    synth_seq_lens = torch.arange(
-                        cached_len + 1,
-                        seq_len + 1,
-                        device=query.device,
-                        dtype=attn_metadata.seq_lens.dtype,
-                    )
-                    synth_bt = attn_metadata.block_table[i : i + 1].expand(q_len, -1)
-                    out = triton_turboquant_decode_attention(
+                out = None
+                backend = envs.VLLM_TQ_LONG_PREFILL_BACKEND
+                if backend == "native":
+                    out = self._try_long_prefill_native_from_cache(
                         query=q_seq,
                         kv_cache=kv_cache,
-                        block_table=synth_bt,
-                        seq_lens=synth_seq_lens,
-                        Pi=Pi,
+                        block_table=block_table,
+                        cached_len=cached_len,
+                        PiT=PiT if PiT is not None else Pi.T.contiguous(),
+                        ST=ST,
                         centroids=centroids,
-                        scale=self.scale,
-                        mse_bits=self.tq_config.key_mse_bits,
-                        key_packed_size=self.tq_config.key_packed_size,
-                        value_quant_bits=(self.tq_config.effective_value_quant_bits),
-                        key_fp8=self.tq_config.key_fp8,
-                        norm_correction=self.tq_config.norm_correction,
+                        layer=layer,
+                    )
+                elif backend == "fa":
+                    out = self._try_long_prefill_flash_from_cache(
+                        query=q_seq,
+                        kv_cache=kv_cache,
+                        block_table=block_table,
+                        cached_len=cached_len,
+                        Pi=Pi,
+                        ST=ST,
+                        centroids=centroids,
+                        layer=layer,
+                    )
+                if out is None:
+                    out = self._stream_long_prefill_from_cache(
+                        query=q_seq,
+                        kv_cache=kv_cache,
+                        block_table=block_table,
+                        seq_lens_dtype=attn_metadata.seq_lens.dtype,
+                        cached_len=cached_len,
+                        Pi=Pi,
+                        ST=ST,
+                        centroids=centroids,
                         PiT=PiT,
+                        layer=layer,
                     )
-                else:
-                    # Large continuation: dequant cached K/V and use
-                    # flash_attn for better throughput.
-                    out = self._continuation_prefill(
-                        layer,
-                        q_seq,
-                        k_seq,
-                        v_seq,
-                        kv_cache,
-                        attn_metadata.block_table[i : i + 1],
-                        cached_len,
-                        seq_len,
-                        Pi,
-                        centroids,
-                    )
-                output[q_start:q_end] = out.to(query.dtype)
+            output[q_start:q_end] = out.to(query.dtype)
 
         return output
 
-    def _continuation_prefill(
+    def _try_long_prefill_native_from_cache(
         self,
-        layer: Any,
-        query: torch.Tensor,  # (q_len, Hq, D)
-        key_chunk: torch.Tensor,  # (q_len, Hk, D)
-        val_chunk: torch.Tensor,  # (q_len, Hk, D)
-        kv_cache: torch.Tensor,  # (num_blocks, block_size, Hk, slot_size)
-        block_table: torch.Tensor,  # (1, max_num_blocks)
+        query: torch.Tensor,
+        kv_cache: torch.Tensor,
+        block_table: torch.Tensor,
         cached_len: int,
-        seq_len: int,
-        Pi: torch.Tensor,
+        PiT: torch.Tensor,
+        ST: torch.Tensor,
         centroids: torch.Tensor,
-    ) -> torch.Tensor:
-        """Handle continuation chunk by dequanting cached K/V from TQ cache.
+        layer: torch.nn.Module | None = None,
+    ) -> torch.Tensor | None:
+        if layer is None:
+            return None
+        if is_forward_context_available():
+            runtime_mode = get_forward_context().cudagraph_runtime_mode
+            if runtime_mode != CUDAGraphMode.NONE:
+                return None
 
-        Dequants previously cached K/V, concatenates with the current
-        chunk's raw K/V, then runs flash_attn with causal masking.
-        """
-        q_len, Hq, D = query.shape
-        Hk = key_chunk.shape[1]
-        device = query.device
+        q_len = query.shape[0]
+        target_seq_len = cached_len + q_len
+        try:
+            return triton_turboquant_prefill_attention(
+                query=query,
+                kv_cache=kv_cache,
+                block_table=block_table,
+                seq_len=target_seq_len,
+                cached_len=cached_len,
+                PiT=PiT,
+                ST=ST,
+                key_norm_lut=layer._tq_key_norm_lut,
+                key_norm_log_min=layer._tq_key_norm_log_min,
+                key_norm_log_max=layer._tq_key_norm_log_max,
+                centroids=centroids,
+                scale=self.scale,
+                mse_bits=self.tq_config.key_mse_bits,
+                key_packed_size=self.tq_config.key_packed_size,
+                value_quant_bits=self.tq_config.effective_value_quant_bits,
+                sliding_window=self._local_window_size(),
+            )
+        except torch.cuda.OutOfMemoryError:
+            logger.warning_once(
+                "TurboQuant native prefill ran out of memory; falling back to "
+                "stream prefill."
+            )
+            return None
+
+    def _can_use_long_prefill_flash(
+        self,
+        query: torch.Tensor,
+        kv_cache: torch.Tensor,
+        block_table: torch.Tensor,
+        seq_len: int,
+    ) -> bool:
+        if seq_len < _LONG_PREFILL_FA_MIN_SEQ_LEN:
+            return False
+        if not is_flash_attn_varlen_func_available():
+            return False
+        if not query.is_cuda or not kv_cache.is_cuda:
+            return False
+        if is_forward_context_available():
+            runtime_mode = get_forward_context().cudagraph_runtime_mode
+            if runtime_mode != CUDAGraphMode.NONE:
+                return False
+
         block_size = kv_cache.shape[1]
-        BLOCK_D = triton.next_power_of_2(D)
+        num_pages = math.ceil(seq_len / block_size)
+        if num_pages <= 0 or block_table.shape[1] < num_pages:
+            return False
 
-        mse_bytes = self._mse_bytes
-        val_data_bytes = self._val_data_bytes
-
-        # Dequant cached K/V from TQ cache
-        # Allocate slightly over to align to block_size for the grid.
-        # Reuse cached buffers to avoid per-call allocation (~16MB at 8K).
-        alloc_len = math.ceil(cached_len / block_size) * block_size
-        buf_shape = (1, Hk, alloc_len, D)
-        k_buf = getattr(layer, "_tq_k_dequant_buf", None)
-        if k_buf is None or k_buf.shape[2] < alloc_len:
-            k_buf = torch.empty(buf_shape, dtype=torch.float16, device=device)
-            v_buf = torch.empty(buf_shape, dtype=torch.float16, device=device)
-            layer._tq_k_dequant_buf = k_buf
-            layer._tq_v_dequant_buf = v_buf
-        else:
-            v_buf = layer._tq_v_dequant_buf
-        k_cached = k_buf[:, :, :alloc_len, :].zero_()
-        v_cached = v_buf[:, :, :alloc_len, :].zero_()
-
-        grid = (alloc_len, 1 * Hk)
-        _tq_full_dequant_kv[grid](
-            kv_cache,
-            block_table,
-            centroids,
-            k_cached,
-            v_cached,
-            k_cached.stride(0),
-            k_cached.stride(1),
-            k_cached.stride(2),
-            v_cached.stride(0),
-            v_cached.stride(1),
-            v_cached.stride(2),
-            kv_cache.stride(0),
-            kv_cache.stride(1),
-            kv_cache.stride(2),
-            block_table.stride(0),
-            HEAD_DIM=D,
-            BLOCK_SIZE=block_size,
-            NUM_KV_HEADS=Hk,
-            MSE_BYTES=mse_bytes,
-            KPS=self.tq_config.key_packed_size,
-            VQB=self.tq_config.effective_value_quant_bits,
-            VAL_DATA_BYTES=val_data_bytes,
-            MSE_BITS=self.tq_config.key_mse_bits,
-            KEY_FP8=1 if self.tq_config.key_fp8 else 0,
-            BLOCK_D=BLOCK_D,
-            NORM_CORRECTION=1 if self.tq_config.norm_correction else 0,
-            FP8_E4B15=_use_fp8_e4b15(device.index or 0),
-            num_warps=4,
+        element_size = torch.empty((), dtype=query.dtype, device="meta").element_size()
+        transient_bytes = (
+            num_pages
+            * block_size
+            * self.num_kv_heads
+            * self.head_size
+            * element_size
+            * 2
         )
+        try:
+            free_bytes, _total_bytes = torch.cuda.mem_get_info(query.device)
+        except RuntimeError:
+            return True
+        return transient_bytes + _LONG_PREFILL_FA_MIN_FREE_HEADROOM_BYTES < free_bytes
 
-        # Inverse-rotate MSE keys back to original space
-        if not self.tq_config.key_fp8:
-            k_flat = k_cached[0, :, :cached_len, :].reshape(-1, D).float()
-            k_flat = k_flat @ Pi
-            k_cached_trim = (
-                k_flat.to(torch.float16).reshape(Hk, cached_len, D).transpose(0, 1)
-            )  # (cached_len, Hk, D)
-        else:
-            k_cached_trim = (
-                k_cached[0, :, :cached_len, :].transpose(0, 1).contiguous()
-            )  # (cached_len, Hk, D)
+    def _try_long_prefill_flash_from_cache(
+        self,
+        query: torch.Tensor,
+        kv_cache: torch.Tensor,
+        block_table: torch.Tensor,
+        cached_len: int,
+        Pi: torch.Tensor,
+        ST: torch.Tensor,
+        centroids: torch.Tensor,
+        layer: torch.nn.Module | None = None,
+    ) -> torch.Tensor | None:
+        if layer is None:
+            return None
 
-        v_cached_trim = (
-            v_cached[0, :, :cached_len, :].transpose(0, 1).contiguous()
-        )  # (cached_len, Hk, D)
+        q_len = query.shape[0]
+        target_seq_len = cached_len + q_len
+        if not self._can_use_long_prefill_flash(
+            query=query,
+            kv_cache=kv_cache,
+            block_table=block_table,
+            seq_len=target_seq_len,
+        ):
+            return None
 
-        # Concatenate cached + current chunk K/V (match query dtype)
-        qdtype = query.dtype
-        k_full = torch.cat([k_cached_trim.to(qdtype), key_chunk], dim=0)
-        v_full = torch.cat([v_cached_trim.to(qdtype), val_chunk], dim=0)
-
-        # Attention: q_len queries attending to seq_len K/V with causal mask
-        if _HAS_FLASH_ATTN:
-            output = torch.empty(q_len, Hq, D, device=device, dtype=query.dtype)
-            cu_seqlens_q = torch.tensor([0, q_len], device=device, dtype=torch.int32)
-            cu_seqlens_k = torch.tensor([0, seq_len], device=device, dtype=torch.int32)
+        try:
+            k_cache, v_cache, compact_block_table = dequant_turboquant_cache_pages(
+                kv_cache=kv_cache,
+                block_table=block_table,
+                seq_len=target_seq_len,
+                Pi=Pi,
+                S=layer._tq_S,
+                ST=ST,
+                centroids=centroids,
+                mse_bits=self.tq_config.key_mse_bits,
+                key_packed_size=self.tq_config.key_packed_size,
+                value_quant_bits=self.tq_config.effective_value_quant_bits,
+                key_norm_log_min=layer._tq_key_norm_log_min,
+                key_norm_log_max=layer._tq_key_norm_log_max,
+                page_chunk_size=_LONG_PREFILL_FA_PAGE_CHUNK_SIZE,
+                output_dtype=query.dtype,
+            )
+            output = torch.empty_like(query)
+            cu_seqlens_q = torch.tensor(
+                [0, q_len], device=query.device, dtype=torch.int32
+            )
+            seqused_k = torch.tensor(
+                [target_seq_len], device=query.device, dtype=torch.int32
+            )
+            sliding_window = (
+                list(self.sliding_window) if self.sliding_window is not None else None
+            )
+            fa_version = get_flash_attn_version(head_size=self.head_size)
+            num_splits = (
+                self._select_num_kv_splits(target_seq_len)
+                if fa_version not in (None, 2)
+                else 1
+            )
             flash_attn_varlen_func(
-                q=query,
-                k=k_full,
-                v=v_full,
+                q=query.contiguous(),
+                k=k_cache,
+                v=v_cache,
+                out=output,
                 cu_seqlens_q=cu_seqlens_q,
-                cu_seqlens_k=cu_seqlens_k,
                 max_seqlen_q=q_len,
-                max_seqlen_k=seq_len,
+                seqused_k=seqused_k,
+                max_seqlen_k=target_seq_len,
                 softmax_scale=self.scale,
                 causal=True,
-                out=output,
+                window_size=sliding_window,
+                block_table=compact_block_table,
+                fa_version=fa_version,
+                num_splits=num_splits,
             )
             return output
-        else:
-            # SDPA fallback: expand KV for GQA, build causal mask
-            q_t = query.transpose(0, 1).unsqueeze(0)  # (1, Hq, q_len, D)
-            k_t = k_full.transpose(0, 1).unsqueeze(0)  # (1, Hk, seq_len, D)
-            v_t = v_full.transpose(0, 1).unsqueeze(0)  # (1, Hk, seq_len, D)
-            # Build causal mask: query position p can attend to K position j
-            # where j <= cached_len + p (p is 0-indexed within chunk)
-            q_pos = torch.arange(q_len, device=device).unsqueeze(1) + cached_len
-            k_pos = torch.arange(seq_len, device=device).unsqueeze(0)
-            mask = k_pos <= q_pos  # (q_len, seq_len)
-            out = F.scaled_dot_product_attention(
-                q_t,
-                k_t,
-                v_t,
-                attn_mask=mask,
-                scale=self.scale,
-                enable_gqa=(Hk < Hq),
-            )  # (1, Hq, q_len, D)
-            return out[0].transpose(0, 1)  # (q_len, Hq, D)
+        except torch.cuda.OutOfMemoryError:
+            return None
+
+    def _decode_prefill_chunk_from_cache(
+        self,
+        query: torch.Tensor,
+        kv_cache: torch.Tensor,
+        block_table: torch.Tensor,
+        seq_lens: torch.Tensor,
+        max_seq_len: int,
+        Pi: torch.Tensor,
+        ST: torch.Tensor,
+        centroids: torch.Tensor,
+        PiT: torch.Tensor | None = None,
+        query_rot: torch.Tensor | None = None,
+        query_qjl: torch.Tensor | None = None,
+        layer: torch.nn.Module | None = None,
+        mid_o_buf: torch.Tensor | None = None,
+        output_buf: torch.Tensor | None = None,
+        lse_buf: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if (
+            mid_o_buf is None
+            and output_buf is None
+            and lse_buf is None
+            and query.shape[0] <= _CONTINUATION_DECODE_THRESHOLD
+        ):
+            mid_o_buf, output_buf, lse_buf = self._get_decode_workspace(query.shape[0])
+        buf_holder = (
+            layer
+            if layer is not None
+            and (mid_o_buf is None or output_buf is None or lse_buf is None)
+            else None
+        )
+        num_kv_splits = self._select_num_kv_splits(max_seq_len)
+
+        return triton_turboquant_decode_attention(
+            query=query,
+            query_rot=query_rot,
+            query_qjl=query_qjl,
+            kv_cache=kv_cache,
+            block_table=block_table,
+            seq_lens=seq_lens,
+            Pi=Pi,
+            ST=ST,
+            key_norm_lut=layer._tq_key_norm_lut if layer is not None else None,
+            key_norm_log_min=(
+                layer._tq_key_norm_log_min if layer is not None else None
+            ),
+            key_norm_log_max=(
+                layer._tq_key_norm_log_max if layer is not None else None
+            ),
+            centroids=centroids,
+            scale=self.scale,
+            mse_bits=self.tq_config.key_mse_bits,
+            key_packed_size=self.tq_config.key_packed_size,
+            value_quant_bits=self.tq_config.effective_value_quant_bits,
+            PiT=PiT,
+            mid_o_buf=mid_o_buf,
+            output_buf=output_buf,
+            lse_buf=lse_buf,
+            buf_holder=buf_holder,
+            max_num_kv_splits=num_kv_splits,
+            sliding_window=self._local_window_size(),
+        )
+
+    def _stream_long_prefill_from_cache(
+        self,
+        query: torch.Tensor,
+        kv_cache: torch.Tensor,
+        block_table: torch.Tensor,
+        seq_lens_dtype: torch.dtype,
+        cached_len: int,
+        Pi: torch.Tensor,
+        ST: torch.Tensor,
+        centroids: torch.Tensor,
+        PiT: torch.Tensor | None = None,
+        layer: torch.nn.Module | None = None,
+    ) -> torch.Tensor:
+        q_len = query.shape[0]
+        output = torch.empty_like(query)
+        target_seq_len = cached_len + q_len
+        chunk_size = self._select_long_prefill_chunk_size(target_seq_len)
+        seq_lens_full = torch.arange(
+            cached_len + 1,
+            target_seq_len + 1,
+            device=query.device,
+            dtype=seq_lens_dtype,
+        )
+        if PiT is None:
+            PiT = Pi.T.contiguous()
+
+        temp_mid_o = temp_output = temp_lse = None
+        if chunk_size > _CONTINUATION_DECODE_THRESHOLD:
+            num_kv_splits = self._select_num_kv_splits(target_seq_len)
+            temp_mid_o = torch.empty(
+                chunk_size,
+                self.num_heads,
+                num_kv_splits,
+                self.head_size + 1,
+                dtype=torch.float32,
+                device=query.device,
+            )
+            temp_output = torch.empty(
+                chunk_size,
+                self.num_heads,
+                self.head_size,
+                dtype=torch.float32,
+                device=query.device,
+            )
+            temp_lse = torch.empty(
+                chunk_size,
+                self.num_heads,
+                dtype=torch.float32,
+                device=query.device,
+            )
+
+        for chunk_start in range(0, q_len, chunk_size):
+            chunk_end = min(chunk_start + chunk_size, q_len)
+            chunk_len = chunk_end - chunk_start
+            synth_seq_lens = seq_lens_full[chunk_start:chunk_end]
+            synth_bt = block_table.expand(chunk_len, -1)
+            q_chunk = query[chunk_start:chunk_end]
+            q_chunk_float = q_chunk.float()
+            output[chunk_start:chunk_end] = self._decode_prefill_chunk_from_cache(
+                query=q_chunk,
+                kv_cache=kv_cache,
+                block_table=synth_bt,
+                seq_lens=synth_seq_lens,
+                max_seq_len=target_seq_len,
+                Pi=Pi,
+                ST=ST,
+                centroids=centroids,
+                PiT=PiT,
+                query_rot=(q_chunk_float @ PiT).contiguous(),
+                query_qjl=(q_chunk_float @ ST).contiguous(),
+                layer=layer,
+                mid_o_buf=(temp_mid_o[:chunk_len] if temp_mid_o is not None else None),
+                output_buf=(
+                    temp_output[:chunk_len] if temp_output is not None else None
+                ),
+                lse_buf=(temp_lse[:chunk_len] if temp_lse is not None else None),
+            )
+
+        return output
 
     # ------------------------------------------------------------------ #
     #  Decode: Triton TQ decode attention                                 #
@@ -778,35 +1024,44 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         kv_cache: torch.Tensor,  # (num_blocks, block_size, Hk, slot_size)
         attn_metadata: TurboQuantMetadata,
         Pi: torch.Tensor,
+        ST: torch.Tensor,
         centroids: torch.Tensor,
         PiT: torch.Tensor | None = None,
         layer: torch.nn.Module | None = None,
     ) -> torch.Tensor:
-        # Grab cached decode buffers from the layer (lazily allocated).
-        mid_o_buf = output_buf = lse_buf = None
-        if layer is not None:
-            mid_o_buf = getattr(layer, "_tq_mid_o_buf", None)
-            output_buf = getattr(layer, "_tq_output_buf", None)
-            lse_buf = getattr(layer, "_tq_lse_buf", None)
+        mid_o_buf, output_buf, lse_buf = self._get_decode_workspace(query.shape[0])
+        buf_holder = (
+            layer
+            if layer is not None
+            and (mid_o_buf is None or output_buf is None or lse_buf is None)
+            else None
+        )
+        num_kv_splits = self._select_num_kv_splits(attn_metadata.max_seq_len)
 
-        result = triton_turboquant_decode_attention(
+        return triton_turboquant_decode_attention(
             query=query,
             kv_cache=kv_cache,
             block_table=attn_metadata.block_table,
             seq_lens=attn_metadata.seq_lens,
             Pi=Pi,
+            ST=ST,
+            key_norm_lut=layer._tq_key_norm_lut if layer is not None else None,
+            key_norm_log_min=(
+                layer._tq_key_norm_log_min if layer is not None else None
+            ),
+            key_norm_log_max=(
+                layer._tq_key_norm_log_max if layer is not None else None
+            ),
             centroids=centroids,
             scale=self.scale,
             mse_bits=self.tq_config.key_mse_bits,
             key_packed_size=self.tq_config.key_packed_size,
             value_quant_bits=self.tq_config.effective_value_quant_bits,
-            key_fp8=self.tq_config.key_fp8,
-            norm_correction=self.tq_config.norm_correction,
             PiT=PiT,
             mid_o_buf=mid_o_buf,
             output_buf=output_buf,
             lse_buf=lse_buf,
-            buf_holder=layer,
-            max_num_kv_splits=self.max_num_kv_splits,
+            buf_holder=buf_holder,
+            max_num_kv_splits=num_kv_splits,
+            sliding_window=self._local_window_size(),
         )
-        return result

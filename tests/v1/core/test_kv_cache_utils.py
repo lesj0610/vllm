@@ -12,6 +12,9 @@ import vllm.v1.core.kv_cache_utils as kv_cache_utils
 from vllm.config import ModelConfig, SchedulerConfig, VllmConfig
 from vllm.config.kv_events import KVEventsConfig
 from vllm.lora.request import LoRARequest
+from vllm.model_executor.layers.quantization.turboquant.config import (
+    TurboQuantConfig,
+)
 from vllm.multimodal.inputs import (
     MultiModalFeatureSpec,
     MultiModalKwargsItem,
@@ -47,6 +50,8 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
     MLAAttentionSpec,
     SlidingWindowSpec,
+    TQFullAttentionSpec,
+    TQSlidingWindowSpec,
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.metrics.stats import CachingMetrics, PrefixCacheStats
@@ -2138,6 +2143,98 @@ def test_unify_hybrid_kv_cache_specs():
 
     with pytest.raises(ValueError):
         kv_cache_utils.unify_hybrid_kv_cache_specs(kv_cache_spec)
+
+
+def test_tq_sliding_window_spec_uses_packed_slot_size():
+    tq_config = TurboQuantConfig.from_cache_dtype("turboquant_4bit_nc", head_dim=256)
+
+    tq_spec = TQSlidingWindowSpec(
+        block_size=16,
+        num_kv_heads=8,
+        head_size=256,
+        dtype=torch.uint8,
+        sliding_window=1024,
+        tq_slot_size=tq_config.slot_size_aligned,
+    )
+    raw_spec = SlidingWindowSpec(
+        block_size=16,
+        num_kv_heads=8,
+        head_size=256,
+        dtype=torch.uint8,
+        sliding_window=1024,
+    )
+
+    assert tq_spec.page_size_bytes == 16 * 8 * tq_config.slot_size_aligned
+    assert tq_spec.page_size_bytes < raw_spec.page_size_bytes
+
+
+def test_tq_phase3b_dual_norm_uint8_reduces_even_aligned_slot_size():
+    raw_4bit = TurboQuantConfig.from_cache_dtype("turboquant_4bit_nc", head_dim=128)
+    raw_k3v4 = TurboQuantConfig.from_cache_dtype("turboquant_k3v4_nc", head_dim=128)
+    raw_3bit = TurboQuantConfig.from_cache_dtype("turboquant_3bit_nc", head_dim=128)
+
+    assert raw_4bit.slot_size == 134
+    assert raw_4bit.slot_size_aligned == 134
+    assert raw_k3v4.slot_size == 118
+    assert raw_k3v4.slot_size_aligned == 118
+    assert raw_3bit.slot_size == 102
+    assert raw_3bit.slot_size_aligned == 102
+
+
+def test_unify_hybrid_kv_cache_specs_preserves_tq_slot_size():
+    tq_config = TurboQuantConfig.from_cache_dtype("turboquant_4bit_nc", head_dim=256)
+    kv_cache_spec = {
+        "layer_1": TQFullAttentionSpec(
+            block_size=16,
+            num_kv_heads=8,
+            head_size=512,
+            head_size_v=512,
+            dtype=torch.uint8,
+            tq_slot_size=TurboQuantConfig.from_cache_dtype(
+                "turboquant_4bit_nc", head_dim=512
+            ).slot_size_aligned,
+        ),
+        "layer_2": TQSlidingWindowSpec(
+            block_size=16,
+            num_kv_heads=8,
+            head_size=256,
+            dtype=torch.uint8,
+            sliding_window=1024,
+            tq_slot_size=tq_config.slot_size_aligned,
+        ),
+    }
+
+    kv_cache_utils.unify_hybrid_kv_cache_specs(kv_cache_spec)
+
+    unified_spec = kv_cache_spec["layer_2"]
+    assert isinstance(unified_spec, TQFullAttentionSpec)
+    assert unified_spec.sliding_window == 1024
+    assert unified_spec.tq_slot_size == tq_config.slot_size_aligned
+
+
+def test_unify_kv_cache_spec_page_size_falls_back_to_padding():
+    kv_cache_spec = {
+        "layer_1": new_kv_cache_spec(
+            block_size=16,
+            num_kv_heads=3,
+            head_size=64,
+            dtype=torch.float16,
+        ),
+        "layer_2": new_kv_cache_spec(
+            block_size=16,
+            num_kv_heads=5,
+            head_size=64,
+            dtype=torch.float16,
+        ),
+    }
+
+    unified = kv_cache_utils.unify_kv_cache_spec_page_size(kv_cache_spec)
+
+    max_page_size = max(spec.page_size_bytes for spec in kv_cache_spec.values())
+    assert unified["layer_2"].page_size_bytes == max_page_size
+    assert unified["layer_1"].page_size_bytes == max_page_size
+    assert unified["layer_1"].block_size == kv_cache_spec["layer_1"].block_size
+    assert unified["layer_1"].page_size_padded == max_page_size
 
 
 def test_hma_not_disabled_when_kv_events_enabled():

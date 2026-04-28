@@ -201,10 +201,6 @@ MMQ_QUANT_TYPES = STANDARD_QUANT_TYPES | KQUANT_TYPES
 def _fused_mul_mat_gguf(
     x: torch.Tensor, qweight: torch.Tensor, qweight_type: int
 ) -> torch.Tensor:
-    if qweight_type in IMATRIX_QUANT_TYPES:
-        mmvq_safe = 8 if qweight.shape[0] > 5120 else 16
-    else:
-        mmvq_safe = 2 if qweight.shape[0] > 5120 else 6
     # HACK: when doing chunked prefill we don't generate output tokens
     # so input to logits generator is empty which causes invalid parameter
     if x.shape[0] == 0:
@@ -212,8 +208,11 @@ def _fused_mul_mat_gguf(
     # there is no need to call any kernel for fp16/bf16
     if qweight_type in UNQUANTIZED_TYPES:
         return x @ qweight.T
-    # enable MMVQ in contiguous batching with batch_size=1
-    if x.shape[0] <= mmvq_safe and qweight_type in MMVQ_QUANT_TYPES:
+    # Correctness-first path: prefer the per-row vec kernel for all quant
+    # types that support it, regardless of batch size. This avoids the
+    # batched MMQ path until its mixed-quant/padded-linear correctness is
+    # fully validated.
+    if qweight_type in MMVQ_QUANT_TYPES:
         y = ops.ggml_mul_mat_vec_a8(qweight, x, qweight_type, qweight.shape[0])
     # Use MMQ Kernel if it's available (standard + k-quants)
     elif qweight_type in MMQ_QUANT_TYPES:
@@ -263,12 +262,11 @@ def _fused_moe_gguf(
     qweight_type2: int,
     activation: str,
 ) -> torch.Tensor:
-    activation_enum = MoEActivation.from_str(activation)
-
     def act(x: torch.Tensor):
         d = x.shape[-1] // 2
         output_shape = x.shape[:-1] + (d,)
         out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
+        activation_enum = MoEActivation.from_str(activation)
         apply_moe_activation(activation_enum, out, x)
         return out
 
@@ -276,7 +274,7 @@ def _fused_moe_gguf(
     from vllm.model_executor.layers.fused_moe.fused_moe import moe_align_block_size
 
     out_hidden_states = torch.empty_like(x)
-    # unless we decent expert reuse we are better off running moe_vec kernel
+
     if (
         qweight_type2 in MMQ_QUANT_TYPES
         and qweight_type in MMQ_QUANT_TYPES

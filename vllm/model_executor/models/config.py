@@ -77,8 +77,14 @@ class Gemma4Config(VerifyAndUpdateConfig):
         with different head dimensions for prefill-decode disaggregation.
         """
         hf_text_config = vllm_config.model_config.hf_text_config
+        cache_dtype = vllm_config.cache_config.cache_dtype
         head_dim = getattr(hf_text_config, "head_dim", None)
         global_head_dim = getattr(hf_text_config, "global_head_dim", None)
+
+        # TurboQuant has its own backend-selection path keyed off KV cache dtype.
+        # Preserve auto selection so CUDA can route to TURBOQUANT directly.
+        if cache_dtype.startswith("turboquant_"):
+            return
 
         # Only force Triton when head dimensions actually differ AND the
         # larger one exceeds FlashAttention's kernel limit (head_size <= 256).

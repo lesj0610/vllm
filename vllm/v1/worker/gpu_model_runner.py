@@ -159,6 +159,7 @@ from vllm.v1.outputs import (
     SamplerOutput,
     make_empty_encoder_model_runner_output,
 )
+from vllm.v1.worker.gpu.attn_utils import adjust_kv_cache_shape_for_padding
 from vllm.v1.pool.metadata import PoolingMetadata, PoolingStates
 from vllm.v1.sample.logits_processor import LogitsProcessors, build_logitsprocs
 from vllm.v1.sample.logits_processor.interface import LogitsProcessor
@@ -6561,14 +6562,17 @@ class GPUModelRunner(
                     kv_cache_shape = tuple(
                         kv_cache_shape[i] for i in kv_cache_stride_order
                     )
+                    typed_raw_tensor = kv_cache_raw_tensors[layer_name].view(dtype)
+                    kv_cache_shape = adjust_kv_cache_shape_for_padding(
+                        typed_raw_tensor.numel(), kv_cache_shape
+                    )
                     # Maintain original KV shape view.
                     inv_order = [
                         kv_cache_stride_order.index(i)
                         for i in range(len(kv_cache_stride_order))
                     ]
                     kv_caches[layer_name] = (
-                        kv_cache_raw_tensors[layer_name]
-                        .view(dtype)
+                        typed_raw_tensor
                         .view(kv_cache_shape)
                         .permute(*inv_order)
                     )

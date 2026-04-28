@@ -24,6 +24,7 @@ from vllm.v1.outputs import (
     KVConnectorOutput,
     ModelRunnerOutput,
 )
+from vllm.v1.worker.gpu.attn_utils import adjust_kv_cache_shape_for_padding
 from vllm.v1.worker.utils import AttentionGroup
 
 if TYPE_CHECKING:
@@ -262,6 +263,8 @@ class KVConnectorModelRunnerMixin:
         logger.info("Allocating a cross layer KV cache of shape %s", kv_cache_shape)
 
         # allocate one contiguous buffer for all layers
+        typed_numel = total_size // torch.tensor([], dtype=kv_cache_spec.dtype).element_size()
+        kv_cache_shape = adjust_kv_cache_shape_for_padding(typed_numel, kv_cache_shape)
         cross_layers_kv_cache = (
             torch.zeros(total_size, dtype=torch.int8, device=device)
             .view(kv_cache_spec.dtype)

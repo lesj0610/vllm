@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Sequence
 from dataclasses import dataclass
+from math import prod
 from typing import Any, cast
 
 import numpy as np
@@ -27,6 +28,21 @@ from vllm.v1.worker.utils import AttentionGroup, bind_kv_cache
 class AttentionCGSupportInfo:
     min_cg_support: AttentionCGSupport = AttentionCGSupport.ALWAYS
     min_cg_attn_backend: str | None = None
+
+
+def adjust_kv_cache_shape_for_padding(
+    num_elements: int, kv_cache_shape: tuple[int, ...]
+) -> tuple[int, ...]:
+    """Expand the trailing dimension when allocation includes page padding."""
+    expected_numel = prod(kv_cache_shape)
+    if expected_numel == num_elements:
+        return kv_cache_shape
+
+    prefix_numel = prod(kv_cache_shape[:-1])
+    if prefix_numel == 0 or num_elements % prefix_numel != 0:
+        return kv_cache_shape
+
+    return (*kv_cache_shape[:-1], num_elements // prefix_numel)
 
 
 def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
@@ -183,6 +199,9 @@ def _reshape_kv_cache(
 
             dtype = kv_cache_spec.dtype
             raw_tensor = raw_tensor.view(dtype)
+            kv_cache_shape = adjust_kv_cache_shape_for_padding(
+                raw_tensor.numel(), kv_cache_shape
+            )
             raw_tensor = raw_tensor.view(kv_cache_shape)
             kv_caches[layer_name] = raw_tensor.permute(*inv_order)
     return kv_caches

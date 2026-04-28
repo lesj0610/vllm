@@ -152,6 +152,7 @@ class NemotronHMoE(nn.Module):
             config.hidden_size,
             config.n_routed_experts,
             out_dtype=torch.float32,
+            quant_config=quant_config,
             force_fp32_compute=True,
             prefix=f"{prefix}.gate",
         )

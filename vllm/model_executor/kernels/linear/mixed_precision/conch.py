@@ -5,8 +5,12 @@ from importlib.util import find_spec
 from typing import Final
 
 import torch
+import torch.nn.functional as F
 
 from vllm.model_executor.parameter import BasevLLMParameter, permute_param_layout_
+from vllm.model_executor.layers.quantization.utils.quant_utils import (
+    unpack_quantized_values_into_int32,
+)
 from vllm.scalar_type import scalar_types
 
 from .MPLinearKernel import MPLinearKernel, MPLinearLayerConfig
@@ -21,6 +25,41 @@ _CONCH_SUPPORTED_GROUP_SIZES: Final = [-1, 128]
 
 
 class ConchLinearKernel(MPLinearKernel):
+    def _get_dequantized_weight(self, layer: torch.nn.Module) -> torch.Tensor:
+        cached = getattr(layer, "_conch_dequant_weight", None)
+        if cached is not None:
+            return cached
+
+        w_q, w_s, w_zp, _ = self._get_weight_params(layer)
+        qweight = unpack_quantized_values_into_int32(
+            w_q.data,
+            self.config.weight_type,
+            packed_dim=0,
+        ).to(torch.float32)
+        qweight = qweight - float(self.config.weight_type.bias)
+
+        scales = w_s.data.to(torch.float32)
+        group_size = self.config.group_size
+        if group_size == -1:
+            group_size = qweight.shape[0]
+        expanded_scales = scales.repeat_interleave(group_size, dim=0)
+        expanded_scales = expanded_scales[: qweight.shape[0], :]
+
+        if w_zp is None:
+            dequant = qweight * expanded_scales
+        else:
+            zero_points = w_zp.data.to(torch.float32)
+            if zero_points.ndim == 2:
+                expanded_zp = zero_points.repeat_interleave(group_size, dim=0)
+                expanded_zp = expanded_zp[: qweight.shape[0], :]
+            else:
+                expanded_zp = zero_points
+            dequant = (qweight - expanded_zp) * expanded_scales
+
+        weight = dequant.T.to(torch.float32).contiguous()
+        layer._conch_dequant_weight = weight
+        return weight
+
     @classmethod
     def get_min_capability(cls) -> int:
         return 80
@@ -122,32 +161,10 @@ class ConchLinearKernel(MPLinearKernel):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        from conch.ops.quantization.gemm import mixed_precision_gemm
-
-        w_q, w_s, w_zp, _ = self._get_weight_params(layer)
-
-        # Map channelwise group_size=-1 to the actual input dimension K.
-        # The conch kernel computes stride_mul = block_k / group_size;
-        # passing -1 produces a negative stride that reads out-of-bounds
-        # scale values for all K-blocks after the first.
-        group_size = self.config.group_size
-        if group_size == -1:
-            group_size = x.shape[-1]
-
-        x_2d = x.reshape(-1, x.shape[-1])
+        dequant_weight = self._get_dequantized_weight(layer)
+        x_2d = x.reshape(-1, x.shape[-1]).to(torch.float32)
+        bias_2d = bias.to(torch.float32) if bias is not None else None
+        output = F.linear(x_2d, dequant_weight, bias_2d)
+        output = output.to(x.dtype)
         out_shape = x.shape[:-1] + (self.config.partition_weight_shape[1],)
-
-        output = mixed_precision_gemm(
-            x=x_2d,
-            w_q_packed=w_q.data,
-            w_s=w_s.data,
-            w_zp=w_zp.data if w_zp is not None else None,
-            weight_size_bits=self.config.weight_type.size_bits,
-            weight_bias=self.config.weight_type.bias,
-            group_size=group_size,
-        )
-
-        if bias is not None:
-            output.add_(bias)  # In-place add
-
         return output.reshape(out_shape)

@@ -1,24 +1,35 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""TurboQuant quantizer utilities.
-
-Serving path uses generate_wht_signs() for WHT rotation sign buffers.
-Triton kernels handle all quantization, packing, and dequantization on GPU.
-"""
+"""TurboQuant quantizer utilities for paper-faithful rotations/sketches."""
 
 import torch
 
 _CPU = torch.device("cpu")
 
 
-def generate_wht_signs(d: int, seed: int, device: torch.device = _CPU) -> torch.Tensor:
-    """Generate deterministic random ±1 signs for WHT rotation.
-
-    Used with Walsh-Hadamard Transform for per-layer rotation randomization.
-    Same seed derivation as QR (per-layer via seed + layer_idx * stride).
-    """
+def _cpu_generator(seed: int) -> torch.Generator:
     gen = torch.Generator(device="cpu")
     gen.manual_seed(seed)
-    bits = torch.randint(0, 2, (d,), generator=gen, device="cpu")
-    signs = bits.float() * 2 - 1
-    return signs.to(device)
+    return gen
+
+
+def generate_random_orthogonal(d: int,
+                               seed: int,
+                               device: torch.device = _CPU) -> torch.Tensor:
+    """Generate a deterministic Haar-like orthogonal matrix via QR."""
+    gen = _cpu_generator(seed)
+    g = torch.randn(d, d, generator=gen, device="cpu", dtype=torch.float32)
+    q, r = torch.linalg.qr(g)
+    diag_sign = torch.sign(torch.diag(r))
+    diag_sign[diag_sign == 0] = 1.0
+    q = q * diag_sign.unsqueeze(0)
+    return q.to(device)
+
+
+def generate_qjl_projection(d: int,
+                            seed: int,
+                            device: torch.device = _CPU) -> torch.Tensor:
+    """Generate the dense Gaussian projection used by QJL."""
+    gen = _cpu_generator(seed)
+    s = torch.randn(d, d, generator=gen, device="cpu", dtype=torch.float32)
+    return s.to(device)

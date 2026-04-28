@@ -4,9 +4,13 @@
 from typing import Any
 
 import torch
+import torch.nn.functional as F
 
 from vllm.distributed import get_tensor_model_parallel_rank, get_tp_group
-from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+from vllm.model_executor.layers.fused_moe.activation import (
+    MoEActivation,
+    apply_moe_activation,
+)
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEQuantConfig,
     int4_w4a16_moe_quant_config,
@@ -108,7 +112,11 @@ class MoeWNA16Config(QuantizationConfig):
         group_size = cls.get_from_keys(config, ["group_size"])
         lm_head_quantized = cls.get_from_keys_or(config, ["lm_head"], default=False)
         if linear_quant_method == "gptq":
-            has_zp = not cls.get_from_keys(config, ["sym"])
+            # GPTQ checkpoints keep qzeros tensors even for symmetric
+            # quantization and the MoE loader/kernel path expects them.
+            # Match the dense GPTQ contract instead of dropping qzeros
+            # whenever `sym=true`.
+            has_zp = True
             modules_to_not_convert = []
         elif linear_quant_method in ("awq", "awq_marlin"):
             has_zp = cls.get_from_keys(config, ["zero_point"])
@@ -209,6 +217,34 @@ class MoeWNA16Config(QuantizationConfig):
 
 def is_layer_skipped_quant(prefix: str, modules_to_not_convert: list[str]):
     return any(module_name in prefix for module_name in modules_to_not_convert)
+
+
+def _unpack_uint4(packed: torch.Tensor, dim: int) -> torch.Tensor:
+    dim = dim if dim >= 0 else packed.dim() + dim
+    low = packed & 0x0F
+    high = packed >> 4
+    return torch.stack((low, high), dim=dim + 1).flatten(dim, dim + 1)
+
+
+def _dequantize_moe_wna16_int4_weight(
+    qweight: torch.Tensor,
+    scales: torch.Tensor,
+    qzeros: torch.Tensor | None,
+    group_size: int,
+    out_dtype: torch.dtype,
+) -> torch.Tensor:
+    q = _unpack_uint4(qweight, dim=-1).to(torch.float32)
+    scales = scales.to(torch.float32).repeat_interleave(group_size, dim=-1)
+    scales = scales[..., : q.size(-1)]
+
+    if qzeros is None:
+        zeros = 0.0
+    else:
+        zeros = _unpack_uint4(qzeros, dim=0).to(torch.float32)
+        zeros = zeros.repeat_interleave(group_size, dim=-1)
+        zeros = zeros[..., : q.size(-1)]
+
+    return ((q - zeros) * scales).to(out_dtype)
 
 
 class MoeWNA16Method(FusedMoEMethodBase):
@@ -362,6 +398,72 @@ class MoeWNA16Method(FusedMoEMethodBase):
             block_shape=[0, layer.group_size],
         )
 
+    def _apply_torch_fallback(
+        self,
+        layer: FusedMoE,
+        x: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        activation = MoEActivation.from_str(layer.activation.value)
+        local_topk_ids = topk_ids
+        if layer.expert_map is not None:
+            local_topk_ids = layer.expert_map[topk_ids.to(torch.long)]
+
+        output = torch.zeros_like(x)
+        group_size = layer.group_size
+        local_num_experts = layer.local_num_experts
+        has_zp = self.quant_config.has_zp
+
+        for local_expert_id in range(local_num_experts):
+            matching_tokens = local_topk_ids == local_expert_id
+            if not torch.any(matching_tokens):
+                continue
+
+            token_idx, topk_idx = torch.where(matching_tokens)
+            expert_input = x.index_select(0, token_idx).to(torch.float32)
+            if layer.apply_router_weight_on_input:
+                expert_input.mul_(
+                    topk_weights[token_idx, topk_idx]
+                    .to(expert_input.dtype)
+                    .unsqueeze(-1)
+                )
+
+            w13 = _dequantize_moe_wna16_int4_weight(
+                layer.w13_qweight[local_expert_id],
+                layer.w13_scales[local_expert_id],
+                layer.w13_qzeros[local_expert_id] if has_zp else None,
+                group_size=group_size,
+                out_dtype=torch.float32,
+            )
+            gate_up = F.linear(expert_input, w13)
+            activated = torch.empty(
+                gate_up.size(0),
+                gate_up.size(1) // 2 if activation.is_gated else gate_up.size(1),
+                device=gate_up.device,
+                dtype=gate_up.dtype,
+            )
+            apply_moe_activation(activation, activated, gate_up)
+
+            w2 = _dequantize_moe_wna16_int4_weight(
+                layer.w2_qweight[local_expert_id],
+                layer.w2_scales[local_expert_id],
+                layer.w2_qzeros[local_expert_id] if has_zp else None,
+                group_size=group_size,
+                out_dtype=torch.float32,
+            )
+            expert_output = F.linear(activated, w2).to(output.dtype)
+            if not layer.apply_router_weight_on_input:
+                expert_output.mul_(
+                    topk_weights[token_idx, topk_idx]
+                    .to(expert_output.dtype)
+                    .unsqueeze(-1)
+                )
+
+            output.index_add_(0, token_idx, expert_output)
+
+        return output
+
     def apply(
         self,
         layer: FusedMoE,
@@ -372,9 +474,17 @@ class MoeWNA16Method(FusedMoEMethodBase):
     ) -> torch.Tensor:
         from vllm.model_executor.layers.fused_moe import fused_experts
 
-        assert layer.activation == MoEActivation.SILU, (
-            f"Only SiLU activation is supported, not {layer.activation}."
-        )
+        # Correctness-first fallback for GPTQ-family GELU-tanh MoE experts.
+        # Gemma4-A4B currently reaches this path under AutoRound(auto_gptq),
+        # and the fused int4 expert path can produce NaNs during generation.
+        # Route through an explicit torch implementation until the shared
+        # quantized expert contract is corrected end-to-end.
+        if (
+            self.quant_config.linear_quant_method == "gptq"
+            and self.quant_config.weight_bits == 4
+            and layer.activation == MoEActivation.GELU_TANH
+        ):
+            return self._apply_torch_fallback(layer, x, topk_weights, topk_ids)
 
         return fused_experts(
             x,
@@ -383,6 +493,7 @@ class MoeWNA16Method(FusedMoEMethodBase):
             topk_weights=topk_weights,
             topk_ids=topk_ids,
             inplace=not self.moe.disable_inplace,
+            activation=layer.activation,
             apply_router_weight_on_input=layer.apply_router_weight_on_input,
             global_num_experts=layer.global_num_experts,
             expert_map=layer.expert_map,
@@ -493,15 +604,19 @@ class MoeWNA16Method(FusedMoEMethodBase):
                 tensor = loaded_weight.view(layer.tp_size, -1, loaded_weight.size(1))[
                     tp_rank
                 ]
+                target_width = param.data[expert_id].size(1)
+                tensor = tensor[:, :target_width]
                 if shard_id == "w1":
                     param.data[expert_id, : shard_size // 2] = tensor
                 else:
                     param.data[expert_id, shard_size // 2 :] = tensor
                 return True if return_success else None
             elif "w2_qzeros" in weight_name:
-                param.data[expert_id] = loaded_weight.view(
+                tensor = loaded_weight.view(
                     loaded_weight.size(0), layer.tp_size, -1
                 )[:, tp_rank]
+                target_width = param.data[expert_id].size(1)
+                param.data[expert_id] = tensor[:, :target_width]
                 return True if return_success else None
             else:
                 # Delegate to the original loader, passing return_success

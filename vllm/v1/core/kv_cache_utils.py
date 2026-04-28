@@ -25,6 +25,8 @@ from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     KVCacheTensor,
     SlidingWindowSpec,
+    TQFullAttentionSpec,
+    TQSlidingWindowSpec,
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.request import Request
@@ -939,9 +941,18 @@ def unify_kv_cache_spec_page_size(
         else:
             layer_page_size = layer_spec.page_size_bytes
             if max_page_size % layer_page_size != 0:
+                # Some hybrid / mixed-quant models have layer page sizes that
+                # cannot be unified by scaling block_size alone. In that case,
+                # fall back to padding smaller pages up to the common physical
+                # page size so KVCacheManager can still allocate one page size.
+                if hasattr(layer_spec, "page_size_padded"):
+                    new_spec = replace(layer_spec, page_size_padded=max_page_size)
+                    assert new_spec.page_size_bytes == max_page_size
+                    new_kv_cache_spec[layer_name] = new_spec
+                    continue
                 raise NotImplementedError(
                     "The page size of the layer is not divisible by the "
-                    "maximum page size. Cannot unify by adjusting block_size."
+                    "maximum page size and cannot be padded to unify it."
                 )
             ratio = max_page_size // layer_page_size
             new_block_size = layer_spec.block_size * ratio
@@ -1191,14 +1202,26 @@ def unify_hybrid_kv_cache_specs(kv_cache_spec: dict[str, KVCacheSpec]):
     if has_full_attention and (has_sliding_window or has_chunked_local_attention):
         for layer_name, spec in kv_cache_spec.items():
             if isinstance(spec, SlidingWindowSpec):
-                kv_cache_spec[layer_name] = FullAttentionSpec(
-                    block_size=spec.block_size,
-                    num_kv_heads=spec.num_kv_heads,
-                    head_size=spec.head_size,
-                    dtype=spec.dtype,
-                    sliding_window=spec.sliding_window,
-                    page_size_padded=spec.page_size_padded,
-                )
+                if isinstance(spec, TQSlidingWindowSpec):
+                    kv_cache_spec[layer_name] = TQFullAttentionSpec(
+                        block_size=spec.block_size,
+                        num_kv_heads=spec.num_kv_heads,
+                        head_size=spec.head_size,
+                        head_size_v=spec.head_size,
+                        dtype=spec.dtype,
+                        sliding_window=spec.sliding_window,
+                        page_size_padded=spec.page_size_padded,
+                        tq_slot_size=spec.tq_slot_size,
+                    )
+                else:
+                    kv_cache_spec[layer_name] = FullAttentionSpec(
+                        block_size=spec.block_size,
+                        num_kv_heads=spec.num_kv_heads,
+                        head_size=spec.head_size,
+                        dtype=spec.dtype,
+                        sliding_window=spec.sliding_window,
+                        page_size_padded=spec.page_size_padded,
+                    )
             elif isinstance(spec, ChunkedLocalAttentionSpec):
                 kv_cache_spec[layer_name] = FullAttentionSpec(
                     block_size=spec.block_size,

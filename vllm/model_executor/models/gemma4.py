@@ -22,9 +22,11 @@ from collections.abc import Iterable
 from dataclasses import replace
 from itertools import islice
 
+import gguf
 import regex as re
 import torch
 from torch import nn
+from torch.nn.parameter import UninitializedParameter
 
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
@@ -89,6 +91,30 @@ def _get_text_config(config):
     if hasattr(config, "text_config"):
         return config.text_config
     return config
+
+
+def _split_gemma4_gate_up_qweight(
+    weight: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Split fused Gemma4 GGUF gate/up qweight into gate and up halves.
+
+    GGUF packed MoE gate_up qweight is stored with fused gate+up on dim=1.
+    The downstream FusedMoE loader expects separate source tensors for w1
+    (gate) and w3 (up), and only narrows the destination half.
+    """
+    if weight.dim() != 3:
+        raise ValueError(
+            "Gemma4 gate_up qweight must be a 3D tensor, "
+            f"but got shape {tuple(weight.shape)}"
+        )
+    fused_dim = weight.shape[1]
+    if fused_dim % 2 != 0:
+        raise ValueError(
+            "Gemma4 gate_up qweight fused dimension must be even, "
+            f"but got shape {tuple(weight.shape)}"
+        )
+    split = fused_dim // 2
+    return weight[:, :split, :], weight[:, split:, :]
 
 
 class Gemma4MLP(nn.Module):
@@ -168,6 +194,7 @@ class Gemma4Router(nn.Module):
             config.num_experts,
             bias=False,
             out_dtype=torch.float32,
+            quant_config=quant_config,
             prefix=f"{prefix}.proj",
         )
 
@@ -248,7 +275,11 @@ class Gemma4MoE(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.experts",
             custom_routing_function=routing_function,
-            activation="gelu",
+            activation=(
+                "gelu_tanh"
+                if config.hidden_activation == "gelu_pytorch_tanh"
+                else "gelu"
+            ),
         )
 
     def forward(self, x: torch.Tensor, router_logits: torch.Tensor) -> torch.Tensor:
@@ -1319,6 +1350,88 @@ class Gemma4Model(nn.Module, EagleModelMixin):
                     loaded_params.add(remapped_name)
                     continue
 
+            if name.endswith("moe.gate_up_proj.qweight_type"):
+                moe_name = name.replace(
+                    "moe.gate_up_proj.qweight_type",
+                    "moe.experts.w13_qweight_type",
+                )
+                if moe_name in params_dict and not is_pp_missing_parameter(
+                    moe_name, self
+                ):
+                    param = params_dict[moe_name]
+                    param.weight_type = loaded_weight.item()
+                    param.data.copy_(loaded_weight)
+                    loaded_params.add(moe_name)
+                    loaded_params.add(name)
+                    continue
+
+            if name.endswith("moe.down_proj.qweight_type"):
+                moe_name = name.replace(
+                    "moe.down_proj.qweight_type",
+                    "moe.experts.w2_qweight_type",
+                )
+                if moe_name in params_dict and not is_pp_missing_parameter(
+                    moe_name, self
+                ):
+                    param = params_dict[moe_name]
+                    param.weight_type = loaded_weight.item()
+                    param.data.copy_(loaded_weight)
+                    loaded_params.add(moe_name)
+                    loaded_params.add(name)
+                    continue
+
+            if name.endswith("moe.gate_up_proj.qweight"):
+                moe_name = name.replace(
+                    "moe.gate_up_proj.qweight",
+                    "moe.experts.w13_qweight",
+                )
+                if moe_name in params_dict and not is_pp_missing_parameter(
+                    moe_name, self
+                ):
+                    param = params_dict[moe_name]
+                    weight_loader = param.weight_loader
+                    gate_weight, up_weight = _split_gemma4_gate_up_qweight(
+                        loaded_weight
+                    )
+                    weight_loader(
+                        param,
+                        gate_weight,
+                        moe_name,
+                        shard_id="w1",
+                        expert_id=0,
+                    )
+                    weight_loader(
+                        param,
+                        up_weight,
+                        moe_name,
+                        shard_id="w3",
+                        expert_id=0,
+                    )
+                    loaded_params.add(moe_name)
+                    loaded_params.add(name)
+                    continue
+
+            if name.endswith("moe.down_proj.qweight"):
+                moe_name = name.replace(
+                    "moe.down_proj.qweight",
+                    "moe.experts.w2_qweight",
+                )
+                if moe_name in params_dict and not is_pp_missing_parameter(
+                    moe_name, self
+                ):
+                    param = params_dict[moe_name]
+                    weight_loader = param.weight_loader
+                    weight_loader(
+                        param,
+                        loaded_weight,
+                        moe_name,
+                        shard_id="w2",
+                        expert_id=0,
+                    )
+                    loaded_params.add(moe_name)
+                    loaded_params.add(name)
+                    continue
+
             for param_name, shard_name, shard_id in stacked_params_mapping:
                 if shard_name not in name:
                     continue
@@ -1555,7 +1668,7 @@ class Gemma4ForCausalLM(
                 # tensors.  Explode into per-expert 2D weights for
                 # FusedMoE weight_loader.
                 #
-                # Checkpoint format:
+                # Loader-normalized GGUF / checkpoint format:
                 #   moe.gate_up_proj: [E, 2*I, H]  (fused gate + up)
                 #   moe.down_proj:    [E, H, I]
                 #
@@ -1566,7 +1679,11 @@ class Gemma4ForCausalLM(
                 #
                 # No transpose needed: checkpoint orientation already
                 # matches FusedMoE's expected layout.
-                if "moe.gate_up_proj" in name and weight.dim() == 3:
+                if (
+                    "moe.gate_up_proj" in name
+                    and weight.dim() == 3
+                    and ".qweight" not in name
+                ):
                     num_experts = weight.size(0)
                     intermediate_size = weight.size(1) // 2
                     for expert_id in range(num_experts):
@@ -1577,7 +1694,11 @@ class Gemma4ForCausalLM(
                         yield base.replace("gate_up_proj", "up_proj"), up_weight
                     continue
 
-                if "moe.down_proj" in name and weight.dim() == 3:
+                if (
+                    "moe.down_proj" in name
+                    and weight.dim() == 3
+                    and ".qweight" not in name
+                ):
                     num_experts = weight.size(0)
                     for expert_id in range(num_experts):
                         expert_name = name.replace("moe.", f"moe.experts.{expert_id}.")
