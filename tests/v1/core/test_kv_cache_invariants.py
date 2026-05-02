@@ -18,6 +18,8 @@ from vllm.v1.kv_cache_interface import (
     MLAAttentionSpec,
     SinkFullAttentionSpec,
     SlidingWindowSpec,
+    TQFullAttentionSpec,
+    TQSlidingWindowSpec,
     UniformTypeKVCacheSpecs,
 )
 
@@ -59,6 +61,27 @@ def _sliding_window_spec() -> SlidingWindowSpec:
         head_size=64,
         dtype=torch.float16,
         sliding_window=128,
+    )
+
+
+def _tq_full_attention_spec() -> TQFullAttentionSpec:
+    return TQFullAttentionSpec(
+        block_size=16,
+        num_kv_heads=2,
+        head_size=64,
+        dtype=torch.float16,
+        tq_slot_size=80,
+    )
+
+
+def _tq_sliding_window_spec() -> TQSlidingWindowSpec:
+    return TQSlidingWindowSpec(
+        block_size=16,
+        num_kv_heads=2,
+        head_size=64,
+        dtype=torch.float16,
+        sliding_window=128,
+        tq_slot_size=80,
     )
 
 
@@ -113,6 +136,8 @@ TOKEN_PROPORTIONAL_SPEC_FACTORIES: list[tuple[str, Callable[[], KVCacheSpec]]] =
     ("MLAAttentionSpec", _mla_attention_spec),
     ("ChunkedLocalAttentionSpec", _chunked_local_attention_spec),
     ("SlidingWindowSpec", _sliding_window_spec),
+    ("TQFullAttentionSpec", _tq_full_attention_spec),
+    ("TQSlidingWindowSpec", _tq_sliding_window_spec),
     ("EncoderOnlyAttentionSpec", _encoder_only_attention_spec),
     ("CrossAttentionSpec", _cross_attention_spec),
     ("SinkFullAttentionSpec", _sink_full_attention_spec),

@@ -24,6 +24,7 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
     SlidingWindowSpec,
     TQFullAttentionSpec,
+    TQSlidingWindowSpec,
 )
 
 pytestmark = pytest.mark.cpu_test
@@ -83,6 +84,18 @@ def get_chunked_local_attention_manager(
                 head_size=1,
                 dtype=torch.float32,
                 sliding_window=4,
+            ),
+            SlidingWindowManager,
+            False,
+        ),
+        (
+            TQSlidingWindowSpec(
+                block_size=2,
+                num_kv_heads=1,
+                head_size=1,
+                dtype=torch.float32,
+                sliding_window=4,
+                tq_slot_size=1,
             ),
             SlidingWindowManager,
             False,
