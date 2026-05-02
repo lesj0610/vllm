@@ -2089,8 +2089,12 @@ def test_token_proportional_capacity_ignores_request_constant_pool():
     assert get_max_concurrency_for_kv_cache_config(vllm_config, config) == 4
 
 
-def test_request_constant_mamba_full_cudagraph_fails_closed():
-    vllm_config = make_request_constant_vllm_config(max_num_seqs=4)
+def _make_request_constant_mamba_cudagraph_config(
+    max_num_seqs: int = 4,
+    mamba_cache_mode: str = "none",
+    num_speculative_blocks: int = 2,
+) -> KVCacheConfig:
+    vllm_config = make_request_constant_vllm_config(max_num_seqs=max_num_seqs)
     attention_spec = new_kv_cache_spec(
         block_size=4,
         num_kv_heads=1,
@@ -2101,27 +2105,94 @@ def test_request_constant_mamba_full_cudagraph_fails_closed():
         block_size=4,
         shapes=((4,),),
         dtypes=(torch.float32,),
-        mamba_cache_mode="none",
+        mamba_cache_mode=mamba_cache_mode,
+        num_speculative_blocks=num_speculative_blocks,
         page_size_padded=attention_spec.page_size_bytes,
     )
-    mamba_num_blocks = 4 * mamba_spec.blocks_per_request + 1
+    mamba_num_blocks = max_num_seqs * mamba_spec.blocks_per_request + 1
     mamba_reserved_bytes = mamba_num_blocks * mamba_spec.physical_page_size_bytes
-    kv_cache_config = get_kv_cache_configs(
+    return get_kv_cache_configs(
         vllm_config,
         [{"attn": attention_spec, "mamba": mamba_spec}],
         [mamba_reserved_bytes + attention_spec.page_size_bytes * 16],
     )[0]
+
+
+def test_request_constant_mamba_full_cudagraph_uses_pool_capacity():
+    kv_cache_config = _make_request_constant_mamba_cudagraph_config()
+    compilation_config = CompilationConfig(cudagraph_mode=CUDAGraphMode.FULL)
+
+    cudagraph_mode = compilation_config.resolve_cudagraph_mode_and_sizes(
+        min_cg_support=AttentionCGSupport.ALWAYS,
+        min_cg_attn_backend="test",
+        kv_cache_config=kv_cache_config,
+        max_num_reqs=4,
+    )
+
+    assert cudagraph_mode == CUDAGraphMode.FULL
+
+
+def test_request_constant_mamba_full_cudagraph_rejects_small_pool():
+    kv_cache_config = _make_request_constant_mamba_cudagraph_config()
     compilation_config = CompilationConfig(cudagraph_mode=CUDAGraphMode.FULL)
 
     with pytest.raises(
         ValueError,
-        match="Full CUDA graph capture with REQUEST_CONSTANT KV cache",
+        match="REQUEST_CONSTANT KV cache blocks",
     ):
         compilation_config.resolve_cudagraph_mode_and_sizes(
             min_cg_support=AttentionCGSupport.ALWAYS,
             min_cg_attn_backend="test",
             kv_cache_config=kv_cache_config,
-            max_num_reqs=4,
+            max_num_reqs=5,
+        )
+
+
+def test_request_constant_mamba_full_cudagraph_align_uses_blocks_per_request():
+    kv_cache_config = _make_request_constant_mamba_cudagraph_config(
+        mamba_cache_mode="align",
+        num_speculative_blocks=1,
+    )
+    compilation_config = CompilationConfig(cudagraph_mode=CUDAGraphMode.FULL)
+
+    cudagraph_mode = compilation_config.resolve_cudagraph_mode_and_sizes(
+        min_cg_support=AttentionCGSupport.ALWAYS,
+        min_cg_attn_backend="test",
+        kv_cache_config=kv_cache_config,
+        max_num_reqs=4,
+    )
+
+    assert cudagraph_mode == CUDAGraphMode.FULL
+
+
+def test_request_constant_mamba_full_cudagraph_skips_profiling_capacity():
+    kv_cache_config = _make_request_constant_mamba_cudagraph_config()
+    compilation_config = CompilationConfig(cudagraph_mode=CUDAGraphMode.FULL)
+
+    cudagraph_mode = compilation_config.resolve_cudagraph_mode_and_sizes(
+        min_cg_support=AttentionCGSupport.ALWAYS,
+        min_cg_attn_backend="test",
+        kv_cache_config=kv_cache_config,
+        max_num_reqs=5,
+        is_profiling=True,
+    )
+
+    assert cudagraph_mode == CUDAGraphMode.FULL
+
+
+def test_request_constant_mamba_full_cudagraph_requires_max_num_reqs():
+    kv_cache_config = _make_request_constant_mamba_cudagraph_config()
+    compilation_config = CompilationConfig(cudagraph_mode=CUDAGraphMode.FULL)
+
+    with pytest.raises(
+        ValueError,
+        match="requires max_num_seqs for capacity validation",
+    ):
+        compilation_config.resolve_cudagraph_mode_and_sizes(
+            min_cg_support=AttentionCGSupport.ALWAYS,
+            min_cg_attn_backend="test",
+            kv_cache_config=kv_cache_config,
+            max_num_reqs=None,
         )
 
 
