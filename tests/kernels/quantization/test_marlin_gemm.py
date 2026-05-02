@@ -636,17 +636,7 @@ def test_marlin_gemm_with_bias(size_m):
 )
 @pytest.mark.parametrize("orig_n", [32, 48, 96])
 def test_marlin_gemm_sub_tile_n_pad(orig_n):
-    """Verify the pad-on-load strategy implemented in
-    `MarlinLinearKernel` for shapes where `size_n` is not a multiple of
-    `GPTQ_MARLIN_MIN_THREAD_N`.
-
-    The kernel pads qweight/scales/qzeros along the output dim to the
-    next tile multiple at `process_weights_after_loading` time and
-    slices the extra columns off the output in `apply_weights`. This
-    test replays that sequence directly against `ops.marlin_gemm` and
-    checks the sliced output against a reference matmul on the
-    un-padded weight.
-    """
+    """Check padded Marlin GEMM matches the unpadded reference output."""
     quant_type = scalar_types.uint4b8
     group_size = 128
     size_m, size_k = 32, 1024
@@ -658,11 +648,6 @@ def test_marlin_gemm_sub_tile_n_pad(orig_n):
     a_input = rand_data((size_m, size_k))
     b_weight = rand_data((size_k, orig_n))
 
-    # Zero-pad the weight along the output dim up to padded_n. The
-    # kernel pad lives at the pre-repack layer — padding the raw
-    # qweight with zeros and then running repack at the padded n
-    # produces a valid Marlin layout whose padded output columns
-    # decode to zero.
     b_weight_padded = torch.nn.functional.pad(b_weight, (0, padded_n - orig_n), value=0)
 
     w_ref_padded, marlin_q_w, marlin_s, g_idx, sort_indices, _ = marlin_quantize(
@@ -694,8 +679,6 @@ def test_marlin_gemm_sub_tile_n_pad(orig_n):
         is_zp_float=False,
     )
 
-    # Slice back to the un-padded output — the columns Marlin wrote
-    # for the zero-weight padding are discarded.
     output = output_padded[..., :orig_n].contiguous()
     output_ref = torch.matmul(a_input, w_ref_padded[:, :orig_n])
 
@@ -710,13 +693,7 @@ def _noop_weight_loader(*args, **kwargs):
 
 
 def test_marlin_output_padding_uses_parameter_layout(monkeypatch):
-    """Marlin output padding must use each parameter's output_dim metadata.
-
-    GPTQ-style params are output_dim=1, while compressed-tensors WNA16
-    params are output_dim=0 before Marlin normalizes layout. qzeros can
-    also pack the output dimension, where an unpacked output pad must be
-    converted to packed columns.
-    """
+    """Check output padding follows vLLM parameter layout metadata."""
     output_dim_pad = 32
     monkeypatch.setattr(parameter_module, "get_tensor_model_parallel_rank", lambda: 0)
     monkeypatch.setattr(

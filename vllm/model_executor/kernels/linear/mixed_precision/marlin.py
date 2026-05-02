@@ -4,6 +4,7 @@
 
 import dataclasses
 from fractions import Fraction
+from typing import cast
 
 import torch
 
@@ -83,11 +84,6 @@ def _pad_parameter_output_dim(
 
 
 class MarlinLinearKernel(MPLinearKernel):
-    config: MPLinearLayerConfig
-    w_q_name: str
-    w_s_name: str
-    w_zp_name: str | None
-    w_gidx_name: str | None
     orig_output_size_per_partition: int
 
     @classmethod
@@ -116,10 +112,7 @@ class MarlinLinearKernel(MPLinearKernel):
                 f"{MARLIN_SUPPORTED_GROUP_SIZES}",
             )
 
-        # Allow shapes where out_features is not divisible by the Marlin
-        # tile (GPTQ_MARLIN_MIN_THREAD_N). We pad the weight/scales/zeros
-        # at load time inside `process_weights_after_loading` and mask the
-        # extra columns by slicing the output in `apply_weights`.
+        # Pad sub-tile output dims at load time; see _maybe_pad_n().
         padded_n = round_up(c.partition_weight_shape[1], GPTQ_MARLIN_MIN_THREAD_N)
         return check_marlin_supports_shape(
             padded_n,  # out_features (possibly padded up to tile multiple)
@@ -129,17 +122,7 @@ class MarlinLinearKernel(MPLinearKernel):
         )
 
     def _maybe_pad_n(self, layer: torch.nn.Module) -> None:
-        """Pad weight / scales / zeros / bias along the output dim to the
-        next multiple of GPTQ_MARLIN_MIN_THREAD_N so Marlin can run on
-        shards whose per-rank out-dim is not tile-aligned (e.g. the
-        n=32 shard produced by Intel AutoRound Int4 on TP=2).
-
-        Stores the original out-dim for later output slicing and replaces
-        `self.config` with a new config whose
-        partition_weight_shape reports the padded out-dim so that
-        downstream transforms (repack, permute_scales, marlin_zero_points)
-        see the padded size.
-        """
+        """Pad output dim to a Marlin tile multiple when needed."""
         c = self.config
         orig_n = c.partition_weight_shape[1]
         padded_n = round_up(orig_n, GPTQ_MARLIN_MIN_THREAD_N)
@@ -149,32 +132,21 @@ class MarlinLinearKernel(MPLinearKernel):
 
         pad = padded_n - orig_n
 
-        # Pad qweight along its real output dimension. This is usually
-        # dim 1 for GPTQMarlin, but some Marlin callers register
-        # output_dim=0 before `permute_param_layout_` normalizes the layout.
-        q = getattr(layer, self.w_q_name)
-        assert isinstance(q, BasevLLMParameter)
+        q = cast(BasevLLMParameter, getattr(layer, self.w_q_name))
         _pad_parameter_output_dim(q, pad)
 
-        # Pad scales along their output dimension. Padded values are only
-        # used with padded zero-weight columns.
-        s = getattr(layer, self.w_s_name)
-        assert isinstance(s, BasevLLMParameter)
+        s = cast(BasevLLMParameter, getattr(layer, self.w_s_name))
         _pad_parameter_output_dim(s, pad)
 
-        # qzeros may pack the output dimension. `_pad_parameter_output_dim`
-        # uses packed_dim/packed_factor metadata to pad the packed shape.
         if c.zero_points and self.w_zp_name is not None:
             zp = getattr(layer, self.w_zp_name, None)
             if zp is not None:
-                assert isinstance(zp, BasevLLMParameter)
-                _pad_parameter_output_dim(zp, pad)
+                _pad_parameter_output_dim(cast(BasevLLMParameter, zp), pad)
 
         # bias: [n] -> [padded_n]
         if hasattr(layer, "bias") and layer.bias is not None:
             layer.bias.data = _pad_tensor_dim(layer.bias.data, -1, pad)
 
-        # Swap config so that all downstream transforms use padded n.
         self.config = dataclasses.replace(
             c,
             partition_weight_shape=(c.partition_weight_shape[0], padded_n),
@@ -190,8 +162,6 @@ class MarlinLinearKernel(MPLinearKernel):
     #  `weight_packed` is: {input_dim = 0, output_dim = 1, packed_dim = 0}
     #  `weight_scale` is: {input_dim = 0, output_dim = 1}
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        # Pad out-dim up to the Marlin tile multiple before any repack /
-        # permute / zero-point processing touches the tensors.
         self._maybe_pad_n(layer)
 
         device = getattr(layer, self.w_q_name).device
@@ -314,11 +284,6 @@ class MarlinLinearKernel(MPLinearKernel):
         padded_n = c.partition_weight_shape[1]
         orig_n = getattr(self, "orig_output_size_per_partition", padded_n)
 
-        # If caller supplied a bias sized for the unpadded output, pad it
-        # here so the fused bias-add inside marlin_gemm sees padded_n.
-        if bias is not None and bias.shape[-1] != padded_n:
-            bias = _pad_tensor_dim(bias, -1, padded_n - bias.shape[-1])
-
         out = apply_gptq_marlin_linear(
             input=x,
             weight=w_q,
@@ -336,7 +301,6 @@ class MarlinLinearKernel(MPLinearKernel):
             input_dtype=c.act_type,
         )
 
-        # Discard the extra columns produced by the padded matmul.
         if orig_n != padded_n:
             out = out[..., :orig_n].contiguous()
         return out
