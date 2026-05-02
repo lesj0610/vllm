@@ -143,6 +143,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheGroupSpec,
     KVCacheSpec,
     MambaSpec,
+    MemoryModel,
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
 )
@@ -159,7 +160,6 @@ from vllm.v1.outputs import (
     SamplerOutput,
     make_empty_encoder_model_runner_output,
 )
-from vllm.v1.worker.gpu.attn_utils import adjust_kv_cache_shape_for_padding
 from vllm.v1.pool.metadata import PoolingMetadata, PoolingStates
 from vllm.v1.sample.logits_processor import LogitsProcessors, build_logitsprocs
 from vllm.v1.sample.logits_processor.interface import LogitsProcessor
@@ -189,6 +189,10 @@ from vllm.v1.worker.cp_utils import (
 )
 from vllm.v1.worker.dp_utils import coordinate_batch_across_dp
 from vllm.v1.worker.ec_connector_model_runner_mixin import ECConnectorModelRunnerMixin
+from vllm.v1.worker.gpu.attn_utils import (
+    adjust_kv_cache_shape_for_padding,
+    get_block_layout_page_size_bytes,
+)
 from vllm.v1.worker.gpu.pool.late_interaction_runner import LateInteractionRunner
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.gpu_ubatch_wrapper import UBatchWrapper
@@ -6532,9 +6536,15 @@ class GPUModelRunner(
                 if layer_name in self.runner_only_attn_layers:
                     continue
                 raw_tensor = kv_cache_raw_tensors[layer_name]
-                assert raw_tensor.numel() % kv_cache_spec.page_size_bytes == 0
-                num_blocks = raw_tensor.numel() // kv_cache_spec.page_size_bytes
+                page_size_bytes = get_block_layout_page_size_bytes(kv_cache_spec)
                 if isinstance(kv_cache_spec, AttentionSpec):
+                    if kv_cache_spec.memory_model == MemoryModel.REQUEST_CONSTANT:
+                        raise NotImplementedError(
+                            "REQUEST_CONSTANT AttentionSpec is not supported. "
+                            "Attention is inherently token-proportional."
+                        )
+                    assert raw_tensor.numel() % page_size_bytes == 0
+                    num_blocks = raw_tensor.numel() // page_size_bytes
                     has_attn = True
                     num_blocks_per_kv_block = (
                         kv_cache_spec.block_size // kernel_block_size
@@ -6571,21 +6581,19 @@ class GPUModelRunner(
                         kv_cache_stride_order.index(i)
                         for i in range(len(kv_cache_stride_order))
                     ]
-                    kv_caches[layer_name] = (
-                        typed_raw_tensor
-                        .view(kv_cache_shape)
-                        .permute(*inv_order)
-                    )
+                    kv_caches[layer_name] = typed_raw_tensor.view(
+                        kv_cache_shape
+                    ).permute(*inv_order)
                 elif isinstance(kv_cache_spec, MambaSpec):
+                    assert raw_tensor.numel() % page_size_bytes == 0
+                    num_blocks = raw_tensor.numel() // page_size_bytes
                     has_mamba = True
                     raw_tensor = kv_cache_raw_tensors[layer_name]
                     state_tensors = []
                     storage_offset_bytes = 0
                     for shape, dtype in zip(kv_cache_spec.shapes, kv_cache_spec.dtypes):
                         dtype_size = get_dtype_size(dtype)
-                        num_element_per_page = (
-                            kv_cache_spec.page_size_bytes // dtype_size
-                        )
+                        num_element_per_page = page_size_bytes // dtype_size
                         target_shape = (num_blocks, *shape)
                         stride = torch.empty(target_shape).stride()
                         target_stride = (num_element_per_page, *stride[1:])

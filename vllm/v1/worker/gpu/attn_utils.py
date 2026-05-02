@@ -19,6 +19,7 @@ from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     KVCacheConfig,
     KVCacheSpec,
+    MemoryModel,
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.worker.utils import AttentionGroup, bind_kv_cache
@@ -43,6 +44,21 @@ def adjust_kv_cache_shape_for_padding(
         return kv_cache_shape
 
     return (*kv_cache_shape[:-1], num_elements // prefix_numel)
+
+
+def get_block_layout_page_size_bytes(spec: KVCacheSpec) -> int:
+    """Page size used for block-count and stride math during reshape.
+
+    Returns physical_page_size_bytes for REQUEST_CONSTANT specs (whose
+    underlying tensors were sized in Phase 6A using physical size).
+    Returns page_size_bytes otherwise (preserves padded accounting layout).
+
+    This is the *only* helper for choosing between accounting and physical
+    page sizes during reshape. Add a callsite, never a new branch.
+    """
+    if spec.memory_model == MemoryModel.REQUEST_CONSTANT:
+        return spec.physical_page_size_bytes
+    return spec.page_size_bytes
 
 
 def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
@@ -172,8 +188,14 @@ def _reshape_kv_cache(
             assert isinstance(kv_cache_spec, AttentionSpec)
 
             raw_tensor = kv_cache_raw_tensors[layer_name]
-            assert raw_tensor.numel() % kv_cache_spec.page_size_bytes == 0
-            num_blocks = raw_tensor.numel() // kv_cache_spec.page_size_bytes
+            if kv_cache_spec.memory_model == MemoryModel.REQUEST_CONSTANT:
+                raise NotImplementedError(
+                    "REQUEST_CONSTANT AttentionSpec is not supported. "
+                    "Attention is inherently token-proportional."
+                )
+            page_size_bytes = get_block_layout_page_size_bytes(kv_cache_spec)
+            assert raw_tensor.numel() % page_size_bytes == 0
+            num_blocks = raw_tensor.numel() // page_size_bytes
 
             attn_backend = attn_backends[layer_name]
             kv_cache_shape = attn_backend.get_kv_cache_shape(
