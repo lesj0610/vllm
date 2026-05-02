@@ -50,6 +50,8 @@ class BlockPoolProtocol(Protocol):
 
     def get_usage(self) -> float: ...
 
+    def take_events(self) -> list[KVCacheEvent]: ...
+
 
 class CacheableBlockPoolProtocol(BlockPoolProtocol, Protocol):
     """Block-pool contract for pools that also support prefix caching."""
@@ -73,8 +75,6 @@ class CacheableBlockPoolProtocol(BlockPoolProtocol, Protocol):
     def evict_blocks(self, block_ids: set[int]) -> None: ...
 
     def reset_prefix_cache(self) -> bool: ...
-
-    def take_events(self) -> list[KVCacheEvent]: ...
 
 
 class CompactBlockPool:
@@ -138,6 +138,10 @@ class CompactBlockPool:
         if self._num_allocatable == 0:
             return 0
         return 1.0 - (self.get_num_free_blocks() / self._num_allocatable)
+
+    def take_events(self) -> list[KVCacheEvent]:
+        """Compact pools do not emit prefix-cache events."""
+        return []
 
 
 class BlockHashToBlockMap:
