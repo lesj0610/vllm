@@ -20,9 +20,6 @@ from vllm.model_executor.layers.quantization import (
     QuantizationConfig,
     QuantizationMethods,
 )
-from vllm.model_executor.layers.quantization.utils.marlin_utils import (
-    check_marlin_supports_layer,
-)
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     unpack_quantized_values_into_int32,
 )
@@ -377,10 +374,6 @@ class INCConfig(QuantizationConfig):
             )
             if isinstance(layer, FusedMoE):
                 use_marlin = use_marlin and check_moe_marlin_supports_layer(
-                    layer, group_size
-                )
-            elif isinstance(layer, LinearBase):
-                use_marlin = use_marlin and check_marlin_supports_layer(
                     layer, group_size
                 )
         else:
