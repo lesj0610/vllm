@@ -2494,6 +2494,42 @@ def test_request_constant_reservation_fails_closed_when_memory_exhausted():
         )
 
 
+def test_request_constant_num_blocks_override_allows_minimal_config():
+    vllm_config = make_request_constant_vllm_config(max_num_seqs=4)
+    vllm_config.cache_config.num_gpu_blocks_override = 1
+    attention_spec = new_kv_cache_spec(
+        block_size=4,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.float32,
+    )
+    request_constant_spec = new_request_constant_spec(
+        num_speculative_blocks=1,
+        page_size_padded=16,
+    )
+    request_constant_num_blocks = 4 * request_constant_spec.blocks_per_request + 1
+    reserved_bytes = (
+        request_constant_num_blocks * request_constant_spec.physical_page_size_bytes
+    )
+
+    config = kv_cache_utils.get_kv_cache_config_from_groups(
+        vllm_config,
+        [
+            KVCacheGroupSpec(["attn"], attention_spec),
+            KVCacheGroupSpec(["state"], request_constant_spec),
+        ],
+        available_memory=0,
+    )
+
+    assert config.num_blocks == 1
+    assert config.pool_configs[0].num_blocks == 1
+    assert config.pool_configs[1].num_blocks == request_constant_num_blocks
+    assert config.kv_cache_tensors == [
+        KVCacheTensor(size=attention_spec.page_size_bytes, shared_by=["attn"]),
+        KVCacheTensor(size=reserved_bytes, shared_by=["state"]),
+    ]
+
+
 def test_generate_uniform_type_kv_cache_specs():
     # All layers are full attention, can be merged
     kv_cache_specs = {
