@@ -19,6 +19,7 @@ from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     KVCacheConfig,
     KVCacheSpec,
+    MemoryModel,
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.worker.utils import AttentionGroup, bind_kv_cache
@@ -28,6 +29,13 @@ from vllm.v1.worker.utils import AttentionGroup, bind_kv_cache
 class AttentionCGSupportInfo:
     min_cg_support: AttentionCGSupport = AttentionCGSupport.ALWAYS
     min_cg_attn_backend: str | None = None
+
+
+def get_block_layout_page_size_bytes(spec: KVCacheSpec) -> int:
+    """Page size used for block-count and stride math during reshape."""
+    if spec.memory_model == MemoryModel.REQUEST_CONSTANT:
+        return spec.physical_page_size_bytes
+    return spec.page_size_bytes
 
 
 def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
@@ -155,10 +163,16 @@ def _reshape_kv_cache(
             if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs):
                 kv_cache_spec = kv_cache_spec.kv_cache_specs[layer_name]
             assert isinstance(kv_cache_spec, AttentionSpec)
+            if kv_cache_spec.memory_model == MemoryModel.REQUEST_CONSTANT:
+                raise NotImplementedError(
+                    "REQUEST_CONSTANT AttentionSpec is not supported. "
+                    "Attention KV cache is token-proportional."
+                )
 
             raw_tensor = kv_cache_raw_tensors[layer_name]
-            assert raw_tensor.numel() % kv_cache_spec.page_size_bytes == 0
-            num_blocks = raw_tensor.numel() // kv_cache_spec.page_size_bytes
+            block_layout_page_size = get_block_layout_page_size_bytes(kv_cache_spec)
+            assert raw_tensor.numel() % block_layout_page_size == 0
+            num_blocks = raw_tensor.numel() // block_layout_page_size
 
             attn_backend = attn_backends[layer_name]
             kv_cache_shape = attn_backend.get_kv_cache_shape(
@@ -194,7 +208,7 @@ def _reshape_kv_cache(
                 # standard attention backends whose shape starts with
                 # a K/V dimension of size 2.
                 dtype_size = get_dtype_size(dtype)
-                page_stride = kv_cache_spec.page_size_bytes // dtype_size
+                page_stride = block_layout_page_size // dtype_size
                 strides = list(torch.empty(kv_cache_shape).stride())
                 strides[inv_order[0]] = page_stride
                 kv_cache = torch.as_strided(
