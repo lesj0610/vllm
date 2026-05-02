@@ -1996,6 +1996,42 @@ def test_kv_cache_events(blocks_to_cache: int):
     assert len(manager.block_pool.cached_block_hash_to_block) == 0
 
 
+def test_request_constant_only_kv_cache_events_noop():
+    block_size = 4
+    mamba_spec = MambaSpec(
+        block_size=block_size,
+        shapes=((1,),),
+        dtypes=(torch.float32,),
+        mamba_cache_mode="none",
+    )
+    kv_cache_config = KVCacheConfig(
+        num_blocks=3,
+        kv_cache_tensors=[],
+        kv_cache_groups=[KVCacheGroupSpec(["mamba"], mamba_spec)],
+        pool_configs=(
+            KVCachePoolConfig(
+                pool_id=0,
+                memory_model=MemoryModel.REQUEST_CONSTANT,
+                group_ids=(0,),
+                num_blocks=3,
+                accounting_page_size_bytes=mamba_spec.accounting_page_size_bytes,
+                physical_page_size_bytes=mamba_spec.physical_page_size_bytes,
+            ),
+        ),
+        group_to_pool_id=(0,),
+    )
+
+    manager = KVCacheManager(
+        kv_cache_config,
+        max_model_len=8192,
+        enable_caching=False,
+        enable_kv_cache_events=True,
+        hash_block_size=block_size,
+    )
+
+    assert manager.take_events() == []
+
+
 def test_null_parent_block_hash():
     block_size = 1
     num_cached_blocks = 2

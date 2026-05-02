@@ -2530,6 +2530,43 @@ def test_request_constant_num_blocks_override_allows_minimal_config():
     ]
 
 
+def test_request_constant_only_num_blocks_override_allows_minimal_config():
+    vllm_config = make_request_constant_vllm_config(max_num_seqs=4)
+    vllm_config.cache_config.num_gpu_blocks_override = 1
+    request_constant_spec = new_request_constant_spec(
+        num_speculative_blocks=1,
+        page_size_padded=16,
+    )
+    request_constant_num_blocks = 4 * request_constant_spec.blocks_per_request + 1
+    reserved_bytes = (
+        request_constant_num_blocks * request_constant_spec.physical_page_size_bytes
+    )
+
+    config = kv_cache_utils.get_kv_cache_config_from_groups(
+        vllm_config,
+        [KVCacheGroupSpec(["state"], request_constant_spec)],
+        available_memory=0,
+    )
+
+    assert config.num_blocks == request_constant_num_blocks
+    assert config.group_to_pool_id == (0,)
+    assert config.pool_configs == (
+        KVCachePoolConfig(
+            pool_id=0,
+            memory_model=MemoryModel.REQUEST_CONSTANT,
+            group_ids=(0,),
+            num_blocks=request_constant_num_blocks,
+            accounting_page_size_bytes=(
+                request_constant_spec.accounting_page_size_bytes
+            ),
+            physical_page_size_bytes=request_constant_spec.physical_page_size_bytes,
+        ),
+    )
+    assert config.kv_cache_tensors == [
+        KVCacheTensor(size=reserved_bytes, shared_by=["state"]),
+    ]
+
+
 def test_generate_uniform_type_kv_cache_specs():
     # All layers are full attention, can be merged
     kv_cache_specs = {
