@@ -10,9 +10,13 @@ import itertools
 import pytest
 import torch
 
+import vllm.model_executor.parameter as parameter_module
 from tests.kernels.utils import opcheck
 from tests.quantization.utils import is_quant_method_supported
 from vllm import _custom_ops as ops
+from vllm.model_executor.kernels.linear.mixed_precision.marlin import (
+    _pad_parameter_output_dim,
+)
 from vllm.model_executor.layers.quantization.utils.int8_utils import (
     per_token_quant_int8,
 )
@@ -42,6 +46,11 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     gptq_quantize_weights,
     quantize_weights,
     sort_weights,
+)
+from vllm.model_executor.parameter import (
+    GroupQuantScaleParameter,
+    PackedColumnParameter,
+    PackedvLLMParameter,
 )
 from vllm.platforms import current_platform
 from vllm.scalar_type import scalar_types
@@ -694,3 +703,67 @@ def test_marlin_gemm_sub_tile_n_pad(orig_n):
 
     max_diff = compute_max_diff(output, output_ref)
     assert max_diff < 0.04
+
+
+def _noop_weight_loader(*args, **kwargs):
+    pass
+
+
+def test_marlin_output_padding_uses_parameter_layout(monkeypatch):
+    """Marlin output padding must use each parameter's output_dim metadata.
+
+    GPTQ-style params are output_dim=1, while compressed-tensors WNA16
+    params are output_dim=0 before Marlin normalizes layout. qzeros can
+    also pack the output dimension, where an unpacked output pad must be
+    converted to packed columns.
+    """
+    output_dim_pad = 32
+    monkeypatch.setattr(parameter_module, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(
+        parameter_module, "get_tensor_model_parallel_world_size", lambda: 1
+    )
+
+    gptq_qweight = PackedvLLMParameter(
+        data=torch.ones(2, 32, dtype=torch.int32),
+        input_dim=0,
+        output_dim=1,
+        packed_dim=0,
+        packed_factor=8,
+        weight_loader=_noop_weight_loader,
+    )
+    _pad_parameter_output_dim(gptq_qweight, output_dim_pad)
+    assert gptq_qweight.shape == (2, 64)
+    assert torch.count_nonzero(gptq_qweight[:, 32:]) == 0
+
+    compressed_tensors_qweight = PackedvLLMParameter(
+        data=torch.ones(32, 2, dtype=torch.int32),
+        input_dim=1,
+        output_dim=0,
+        packed_dim=1,
+        packed_factor=8,
+        weight_loader=_noop_weight_loader,
+    )
+    _pad_parameter_output_dim(compressed_tensors_qweight, output_dim_pad)
+    assert compressed_tensors_qweight.shape == (64, 2)
+    assert torch.count_nonzero(compressed_tensors_qweight[32:, :]) == 0
+
+    compressed_tensors_scales = GroupQuantScaleParameter(
+        data=torch.ones(32, 4, dtype=torch.float16),
+        input_dim=1,
+        output_dim=0,
+        weight_loader=_noop_weight_loader,
+    )
+    _pad_parameter_output_dim(compressed_tensors_scales, output_dim_pad)
+    assert compressed_tensors_scales.shape == (64, 4)
+    assert torch.count_nonzero(compressed_tensors_scales[32:, :]) == 0
+
+    packed_qzeros = PackedColumnParameter(
+        data=torch.ones(4, 4, dtype=torch.int32),
+        output_dim=1,
+        packed_dim=1,
+        packed_factor=8,
+        weight_loader=_noop_weight_loader,
+    )
+    _pad_parameter_output_dim(packed_qzeros, output_dim_pad)
+    assert packed_qzeros.shape == (4, 8)
+    assert torch.count_nonzero(packed_qzeros[:, 4:]) == 0

@@ -3,9 +3,9 @@
 
 
 import dataclasses
+from fractions import Fraction
 
 import torch
-import torch.nn.functional as F
 
 from vllm import _custom_ops as ops
 from vllm.logger import init_logger
@@ -35,7 +35,61 @@ from .MPLinearKernel import MPLinearKernel, MPLinearLayerConfig
 logger = init_logger(__name__)
 
 
+def _pad_tensor_dim(x: torch.Tensor, dim: int, pad: int) -> torch.Tensor:
+    if pad == 0:
+        return x
+
+    dim = dim if dim >= 0 else x.dim() + dim
+    pad_shape = list(x.shape)
+    pad_shape[dim] = pad
+    return torch.cat([x, x.new_zeros(pad_shape)], dim=dim)
+
+
+def _get_param_output_dim_padding(
+    param: BasevLLMParameter,
+    output_dim_pad: int,
+) -> tuple[int, int]:
+    output_dim = getattr(param, "output_dim", None)
+    if output_dim is None:
+        raise ValueError(
+            "Marlin output-dim padding requires vLLM parameter output_dim metadata."
+        )
+
+    pad = output_dim_pad
+    if getattr(param, "packed_dim", None) == output_dim:
+        packed_factor = getattr(param, "packed_factor", None)
+        if packed_factor is None:
+            raise ValueError(
+                "Marlin packed output-dim padding requires packed_factor metadata."
+            )
+
+        packed_pad = Fraction(output_dim_pad, 1) / Fraction(packed_factor)
+        if packed_pad.denominator != 1:
+            raise ValueError(
+                "Marlin output padding is not divisible by packed_factor: "
+                f"pad={output_dim_pad}, packed_factor={packed_factor}."
+            )
+        pad = packed_pad.numerator
+
+    return output_dim, pad
+
+
+def _pad_parameter_output_dim(
+    param: BasevLLMParameter,
+    output_dim_pad: int,
+) -> None:
+    output_dim, pad = _get_param_output_dim_padding(param, output_dim_pad)
+    param.data = _pad_tensor_dim(param.data, output_dim, pad)
+
+
 class MarlinLinearKernel(MPLinearKernel):
+    config: MPLinearLayerConfig
+    w_q_name: str
+    w_s_name: str
+    w_zp_name: str | None
+    w_gidx_name: str | None
+    orig_output_size_per_partition: int
+
     @classmethod
     def get_min_capability(cls) -> int:
         return 75
@@ -80,8 +134,8 @@ class MarlinLinearKernel(MPLinearKernel):
         shards whose per-rank out-dim is not tile-aligned (e.g. the
         n=32 shard produced by Intel AutoRound Int4 on TP=2).
 
-        Stores `layer._marlin_orig_n` for later output slicing and
-        replaces `self.config` with a new config whose
+        Stores the original out-dim for later output slicing and replaces
+        `self.config` with a new config whose
         partition_weight_shape reports the padded out-dim so that
         downstream transforms (repack, permute_scales, marlin_zero_points)
         see the padded size.
@@ -89,38 +143,36 @@ class MarlinLinearKernel(MPLinearKernel):
         c = self.config
         orig_n = c.partition_weight_shape[1]
         padded_n = round_up(orig_n, GPTQ_MARLIN_MIN_THREAD_N)
-        layer._marlin_orig_n = orig_n
+        self.orig_output_size_per_partition = orig_n
         if padded_n == orig_n:
             return
 
         pad = padded_n - orig_n
-        pack_factor = 32 // c.weight_type.size_bits
 
-        # qweight: [k/pack, n] int32, output_dim=1, unpacked along dim 1.
-        # Pad with zeros; those output columns decode to weight 0.
+        # Pad qweight along its real output dimension. This is usually
+        # dim 1 for GPTQMarlin, but some Marlin callers register
+        # output_dim=0 before `permute_param_layout_` normalizes the layout.
         q = getattr(layer, self.w_q_name)
-        q_padded = F.pad(q.data, (0, pad), value=0)
-        q.data = q_padded
+        assert isinstance(q, BasevLLMParameter)
+        _pad_parameter_output_dim(q, pad)
 
-        # scales: [num_groups, n], output_dim=1. Pad with zeros
-        # (values don't matter; the padded weight columns are zero).
+        # Pad scales along their output dimension. Padded values are only
+        # used with padded zero-weight columns.
         s = getattr(layer, self.w_s_name)
-        s_padded = F.pad(s.data, (0, pad), value=0)
-        s.data = s_padded
+        assert isinstance(s, BasevLLMParameter)
+        _pad_parameter_output_dim(s, pad)
 
-        # qzeros: [num_groups, n/pack] int32, packed_dim=1. Pad by
-        # pad/pack extra packed columns. Pad value 0 is safe (used only
-        # for padded weight columns, which are already zero).
+        # qzeros may pack the output dimension. `_pad_parameter_output_dim`
+        # uses packed_dim/packed_factor metadata to pad the packed shape.
         if c.zero_points and self.w_zp_name is not None:
             zp = getattr(layer, self.w_zp_name, None)
             if zp is not None:
-                zp_pad_cols = pad // pack_factor
-                if zp_pad_cols > 0:
-                    zp.data = F.pad(zp.data, (0, zp_pad_cols), value=0)
+                assert isinstance(zp, BasevLLMParameter)
+                _pad_parameter_output_dim(zp, pad)
 
         # bias: [n] -> [padded_n]
         if hasattr(layer, "bias") and layer.bias is not None:
-            layer.bias.data = F.pad(layer.bias.data, (0, pad), value=0)
+            layer.bias.data = _pad_tensor_dim(layer.bias.data, -1, pad)
 
         # Swap config so that all downstream transforms use padded n.
         self.config = dataclasses.replace(
@@ -260,12 +312,12 @@ class MarlinLinearKernel(MPLinearKernel):
         #  None for marlin
 
         padded_n = c.partition_weight_shape[1]
-        orig_n = getattr(layer, "_marlin_orig_n", padded_n)
+        orig_n = getattr(self, "orig_output_size_per_partition", padded_n)
 
         # If caller supplied a bias sized for the unpadded output, pad it
         # here so the fused bias-add inside marlin_gemm sees padded_n.
         if bias is not None and bias.shape[-1] != padded_n:
-            bias = F.pad(bias, (0, padded_n - bias.shape[-1]), value=0)
+            bias = _pad_tensor_dim(bias, -1, padded_n - bias.shape[-1])
 
         out = apply_gptq_marlin_linear(
             input=x,
