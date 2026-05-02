@@ -1377,6 +1377,21 @@ def _get_kv_cache_config_mixed_memory_model(
 
     request_constant_pool_specs: list[tuple[int, KVCachePoolConfig]] = []
     reserved_bytes = _get_request_constant_reserved_bytes(vllm_config, kv_cache_groups)
+
+    # CUDA graph memory profiling temporarily sets num_gpu_blocks_override and
+    # asks for a minimal KV cache with available_memory=0.  The single-pool
+    # TOKEN_PROPORTIONAL path already honors that override after deriving an
+    # initial block count from available_memory.  Mirror that behavior here so
+    # mixed-memory configs do not fail before the token pool gets a chance to
+    # apply the override.  REQUEST_CONSTANT pool sizes remain deterministic.
+    override = vllm_config.cache_config.num_gpu_blocks_override
+    if override is not None and token_group_ids:
+        token_groups = [kv_cache_groups[group_id] for group_id in token_group_ids]
+        available_memory = max(
+            available_memory,
+            reserved_bytes + override * _pool_bytes_per_block(token_groups),
+        )
+
     next_pool_id = 1 if token_group_ids else 0
     for group_id in request_constant_group_ids:
         group = kv_cache_groups[group_id]
