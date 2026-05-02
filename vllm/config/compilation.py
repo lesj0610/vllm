@@ -1443,6 +1443,26 @@ class CompilationConfig:
                 tensor_parallel_size,
             )
 
+        if (
+            kv_cache_config is not None
+            and cudagraph_mode.has_full_cudagraphs()
+            and not is_profiling
+            and kv_cache_config.has_mamba_layers
+        ):
+            from vllm.v1.kv_cache_interface import MemoryModel
+
+            if any(
+                pool.memory_model == MemoryModel.REQUEST_CONSTANT
+                for pool in kv_cache_config.pool_configs
+            ):
+                raise ValueError(
+                    "Full CUDA graph capture with REQUEST_CONSTANT KV cache "
+                    "(Mamba in 'none' or 'align' mode) is not yet supported. "
+                    "Either disable cudagraph capture (e.g., enforce_eager=True) "
+                    "or set mamba_cache_mode='all' to use the legacy "
+                    "shared-pool path."
+                )
+
         # For Mamba models with FULL decode cudagraphs, each decode
         # sequence needs one Mamba cache block. The decode cudagraph
         # dispatcher already caps batch sizes at max_num_seqs, so we just
