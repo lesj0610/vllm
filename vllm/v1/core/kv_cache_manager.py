@@ -539,7 +539,7 @@ class KVCacheManager:
         Returns:
             A list of KV cache events.
         """
-        return self._cacheable_block_pool().take_events()
+        return self.block_pool.take_events()
 
     def get_blocks(self, request_id: str) -> KVCacheBlocks:
         """Get the blocks of a request."""
