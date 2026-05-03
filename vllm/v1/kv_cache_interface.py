@@ -984,8 +984,8 @@ class KVCacheConfig:
             return
 
         if not self.pool_configs and not self.group_to_pool_id:
-            pool_config, group_to_pool_id = self._make_legacy_pool_metadata()
-            self.pool_configs = (pool_config,)
+            pool_configs, group_to_pool_id = self._make_legacy_pool_metadata()
+            self.pool_configs = pool_configs
             self.group_to_pool_id = group_to_pool_id
             return
 
@@ -997,27 +997,31 @@ class KVCacheConfig:
     def _make_legacy_pool_metadata(
         self,
         num_blocks: int | None = None,
-    ) -> tuple[KVCachePoolConfig, tuple[int, ...]]:
+    ) -> tuple[tuple[KVCachePoolConfig, ...], tuple[int, ...]]:
+        """Derive pool metadata for legacy direct ``KVCacheConfig`` callers.
+
+        Production multi-pool configs should pass explicit pool metadata. This
+        fallback keeps the old single shared block-pool behavior. It cannot
+        compute request-constant compact capacity because it has no scheduler
+        context.
+        """
         specs = [group.kv_cache_spec for group in self.kv_cache_groups]
-        memory_models = {spec.memory_model for spec in specs}
-        assert len(memory_models) == 1
-        accounting_page_sizes = {spec.accounting_page_size_bytes for spec in specs}
-        assert len(accounting_page_sizes) == 1
+        accounting_page_size = max(spec.accounting_page_size_bytes for spec in specs)
         physical_page_sizes = {spec.physical_page_size_bytes for spec in specs}
         if len(physical_page_sizes) == 1:
             pool_physical_page_size_bytes = physical_page_sizes.pop()
         else:
-            pool_physical_page_size_bytes = next(iter(accounting_page_sizes))
+            pool_physical_page_size_bytes = accounting_page_size
 
         pool_config = KVCachePoolConfig(
             pool_id=0,
-            memory_model=memory_models.pop(),
+            memory_model=MemoryModel.TOKEN_PROPORTIONAL,
             group_ids=tuple(range(len(self.kv_cache_groups))),
             num_blocks=self.num_blocks if num_blocks is None else num_blocks,
-            accounting_page_size_bytes=accounting_page_sizes.pop(),
+            accounting_page_size_bytes=accounting_page_size,
             physical_page_size_bytes=pool_physical_page_size_bytes,
         )
-        return pool_config, tuple(0 for _ in self.kv_cache_groups)
+        return (pool_config,), tuple(0 for _ in self.kv_cache_groups)
 
     def _legacy_num_blocks_pool_id(self) -> int | None:
         """Return the pool represented by the legacy ``num_blocks`` field."""
@@ -1086,8 +1090,8 @@ class KVCacheConfig:
         ):
             self._refresh_multi_pool_metadata()
             return
-        pool_config, group_to_pool_id = self._make_legacy_pool_metadata()
-        self.pool_configs = (pool_config,)
+        pool_configs, group_to_pool_id = self._make_legacy_pool_metadata()
+        self.pool_configs = pool_configs
         self.group_to_pool_id = group_to_pool_id
 
     @property
