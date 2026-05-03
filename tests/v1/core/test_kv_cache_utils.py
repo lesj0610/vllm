@@ -249,6 +249,90 @@ def assert_legacy_single_pool_metadata(config: KVCacheConfig) -> None:
         assert pool_config.physical_page_size_bytes == accounting_page_size
 
 
+def test_legacy_pool_metadata_keeps_mixed_memory_models_shared():
+    attention_spec = new_kv_cache_spec(
+        block_size=4,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.float32,
+    )
+    mamba_spec = new_mamba_spec(
+        block_size=4,
+        shapes=((4,),),
+        dtypes=(torch.float32,),
+        mamba_cache_mode="none",
+    )
+
+    config = KVCacheConfig(
+        num_blocks=7,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(["attn"], attention_spec),
+            KVCacheGroupSpec(["mamba"], mamba_spec),
+        ],
+    )
+
+    assert config.group_to_pool_id == (0, 0)
+    assert config.pool_configs == (
+        KVCachePoolConfig(
+            pool_id=0,
+            memory_model=MemoryModel.TOKEN_PROPORTIONAL,
+            group_ids=(0, 1),
+            num_blocks=7,
+            accounting_page_size_bytes=max(
+                attention_spec.accounting_page_size_bytes,
+                mamba_spec.accounting_page_size_bytes,
+            ),
+            physical_page_size_bytes=max(
+                attention_spec.accounting_page_size_bytes,
+                mamba_spec.accounting_page_size_bytes,
+            ),
+        ),
+    )
+
+
+def test_legacy_pool_metadata_keeps_different_page_sizes_shared():
+    small_spec = FullAttentionSpec(
+        block_size=12,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.float32,
+    )
+    large_spec = FullAttentionSpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.float32,
+    )
+
+    config = KVCacheConfig(
+        num_blocks=11,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(["small"], small_spec),
+            KVCacheGroupSpec(["large"], large_spec),
+        ],
+    )
+
+    assert config.group_to_pool_id == (0, 0)
+    assert config.pool_configs == (
+        KVCachePoolConfig(
+            pool_id=0,
+            memory_model=MemoryModel.TOKEN_PROPORTIONAL,
+            group_ids=(0, 1),
+            num_blocks=11,
+            accounting_page_size_bytes=max(
+                small_spec.accounting_page_size_bytes,
+                large_spec.accounting_page_size_bytes,
+            ),
+            physical_page_size_bytes=max(
+                small_spec.accounting_page_size_bytes,
+                large_spec.accounting_page_size_bytes,
+            ),
+        ),
+    )
+
+
 @pytest.mark.parametrize("hash_fn", [sha256, sha256_cbor])
 def test_none_hash(monkeypatch, hash_fn):
     import vllm.v1.core.kv_cache_utils
