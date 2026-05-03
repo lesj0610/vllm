@@ -309,7 +309,9 @@ class MarlinLinearKernel(MPLinearKernel):
             if bias.shape[-1] == orig_n:
                 bias = _pad_tensor_dim(bias, -1, padded_n - orig_n)
                 bias = marlin_permute_bias(bias)
-            elif bias.shape[-1] != padded_n:
+            elif bias.shape[-1] == padded_n:
+                bias = marlin_permute_bias(bias)
+            else:
                 raise ValueError(
                     "Marlin bias shape does not match original or padded output dim: "
                     f"bias={bias.shape[-1]}, orig_n={orig_n}, padded_n={padded_n}."

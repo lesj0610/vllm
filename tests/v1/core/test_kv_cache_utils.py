@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import hashlib
 import importlib
+import math
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -49,6 +50,7 @@ from vllm.v1.kv_cache_interface import (
     KVCachePoolConfig,
     KVCacheSpec,
     KVCacheTensor,
+    KVQuantMode,
     MambaSpec,
     MemoryModel,
     MLAAttentionSpec,
@@ -264,6 +266,90 @@ def assert_legacy_single_pool_metadata(config: KVCacheConfig) -> None:
         assert pool_config.physical_page_size_bytes == physical_page_sizes.pop()
     else:
         assert pool_config.physical_page_size_bytes == accounting_page_size
+
+
+def test_legacy_pool_metadata_keeps_mixed_memory_models_shared():
+    attention_spec = new_kv_cache_spec(
+        block_size=4,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.float32,
+    )
+    mamba_spec = new_mamba_spec(
+        block_size=4,
+        shapes=((4,),),
+        dtypes=(torch.float32,),
+        mamba_cache_mode="none",
+    )
+
+    config = KVCacheConfig(
+        num_blocks=7,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(["attn"], attention_spec),
+            KVCacheGroupSpec(["mamba"], mamba_spec),
+        ],
+    )
+
+    assert config.group_to_pool_id == (0, 0)
+    assert config.pool_configs == (
+        KVCachePoolConfig(
+            pool_id=0,
+            memory_model=MemoryModel.TOKEN_PROPORTIONAL,
+            group_ids=(0, 1),
+            num_blocks=7,
+            accounting_page_size_bytes=max(
+                attention_spec.accounting_page_size_bytes,
+                mamba_spec.accounting_page_size_bytes,
+            ),
+            physical_page_size_bytes=max(
+                attention_spec.accounting_page_size_bytes,
+                mamba_spec.accounting_page_size_bytes,
+            ),
+        ),
+    )
+
+
+def test_legacy_pool_metadata_keeps_different_page_sizes_shared():
+    small_spec = FullAttentionSpec(
+        block_size=12,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.float32,
+    )
+    large_spec = FullAttentionSpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.float32,
+    )
+
+    config = KVCacheConfig(
+        num_blocks=11,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(["small"], small_spec),
+            KVCacheGroupSpec(["large"], large_spec),
+        ],
+    )
+
+    assert config.group_to_pool_id == (0, 0)
+    assert config.pool_configs == (
+        KVCachePoolConfig(
+            pool_id=0,
+            memory_model=MemoryModel.TOKEN_PROPORTIONAL,
+            group_ids=(0, 1),
+            num_blocks=11,
+            accounting_page_size_bytes=max(
+                small_spec.accounting_page_size_bytes,
+                large_spec.accounting_page_size_bytes,
+            ),
+            physical_page_size_bytes=max(
+                small_spec.accounting_page_size_bytes,
+                large_spec.accounting_page_size_bytes,
+            ),
+        ),
+    )
 
 
 @pytest.mark.parametrize("hash_fn", [sha256, sha256_cbor])
@@ -1831,16 +1917,32 @@ def test_get_kv_cache_config_one_worker():
         ],
     )
 
-    # different hidden size that cannot be aligned by using different block size
+    # Different hidden size and non-divisible page sizes, align by the least
+    # common multiple of the page sizes.
     kv_cache_specs_hybrid = {
         "layer_1": new_kv_cache_spec(head_size=64),
         "layer_2": new_sliding_window_spec(head_size=96),
     }
-
-    with pytest.raises(NotImplementedError):
-        get_kv_cache_configs(
-            vllm_config, [kv_cache_specs_hybrid], [mem_per_block_per_layer * 2 * 32]
-        )[0]
+    kv_cache_config_hybrid = get_kv_cache_configs(
+        vllm_config, [kv_cache_specs_hybrid], [mem_per_block_per_layer * 2 * 32]
+    )[0]
+    assert kv_cache_config_hybrid == KVCacheConfig(
+        num_blocks=21,
+        kv_cache_tensors=[
+            KVCacheTensor(
+                size=mem_per_block_per_layer * 3 * 21,
+                shared_by=["layer_1", "layer_2"],
+            ),
+        ],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["layer_1"], new_kv_cache_spec(head_size=64, block_size=48)
+            ),
+            KVCacheGroupSpec(
+                ["layer_2"], new_sliding_window_spec(head_size=96, block_size=32)
+            ),
+        ],
+    )
 
     # Test num_gpu_blocks_override
     vllm_config.cache_config.num_gpu_blocks_override = 16
@@ -2924,6 +3026,44 @@ def test_unify_hybrid_kv_cache_specs_preserves_tq_page_size():
         * before_spec_2.num_kv_heads
         * before_spec_2.tq_slot_size
     )
+
+
+def test_unify_kv_cache_spec_page_size_uses_common_multiple_for_int8_hybrid():
+    kv_cache_spec = {
+        "full": FullAttentionSpec(
+            block_size=16,
+            num_kv_heads=2,
+            head_size=512,
+            head_size_v=512,
+            dtype=torch.float16,
+            kv_quant_mode=KVQuantMode.INT8_PER_TOKEN_HEAD,
+        ),
+        "sliding": SlidingWindowSpec(
+            block_size=16,
+            num_kv_heads=8,
+            head_size=256,
+            dtype=torch.float16,
+            kv_quant_mode=KVQuantMode.INT8_PER_TOKEN_HEAD,
+            sliding_window=1024,
+        ),
+    }
+
+    original_page_sizes = {
+        name: spec.page_size_bytes for name, spec in kv_cache_spec.items()
+    }
+    unified = kv_cache_utils.unify_kv_cache_spec_page_size(kv_cache_spec)
+    expected_page_size = math.lcm(*original_page_sizes.values())
+
+    assert unified["full"].page_size_bytes == unified["sliding"].page_size_bytes
+    assert unified["full"].page_size_bytes == expected_page_size
+    assert unified["full"].block_size == (
+        16 * expected_page_size // original_page_sizes["full"]
+    )
+    assert unified["sliding"].block_size == (
+        16 * expected_page_size // original_page_sizes["sliding"]
+    )
+    assert isinstance(unified["sliding"], SlidingWindowSpec)
+    assert unified["sliding"].sliding_window == 1024
 
 
 def test_hma_not_disabled_when_kv_events_enabled():
