@@ -89,6 +89,23 @@ class MarlinLinearKernel(MPLinearKernel):
     w_gidx_name: str | None
     orig_output_size_per_partition: int
 
+    def __init__(
+        self,
+        c: MPLinearLayerConfig,
+        w_q_param_name: str,
+        w_s_param_name: str,
+        w_zp_param_name: str | None = None,
+        w_gidx_param_name: str | None = None,
+    ) -> None:
+        super().__init__(
+            c,
+            w_q_param_name,
+            w_s_param_name,
+            w_zp_param_name,
+            w_gidx_param_name,
+        )
+        self.orig_output_size_per_partition = self.config.partition_weight_shape[1]
+
     @classmethod
     def get_min_capability(cls) -> int:
         return 75
@@ -145,10 +162,6 @@ class MarlinLinearKernel(MPLinearKernel):
             zp = getattr(layer, self.w_zp_name, None)
             if zp is not None:
                 _pad_parameter_output_dim(cast(BasevLLMParameter, zp), pad)
-
-        # bias: [n] -> [padded_n]
-        if hasattr(layer, "bias") and layer.bias is not None:
-            layer.bias.data = _pad_tensor_dim(layer.bias.data, -1, pad)
 
         self.config = dataclasses.replace(
             c,
@@ -269,7 +282,12 @@ class MarlinLinearKernel(MPLinearKernel):
         self._transform_param(layer, self.w_q_name, transform_w_q)
         self._transform_param(layer, self.w_s_name, transform_w_s)
 
-        if hasattr(layer, "bias") and layer.bias is not None:
+        if (
+            hasattr(layer, "bias")
+            and layer.bias is not None
+            and self.orig_output_size_per_partition
+            == self.config.partition_weight_shape[1]
+        ):
             layer.bias.data = marlin_permute_bias(layer.bias)
 
     def apply_weights(
@@ -286,6 +304,16 @@ class MarlinLinearKernel(MPLinearKernel):
 
         padded_n = c.partition_weight_shape[1]
         orig_n = self.orig_output_size_per_partition
+
+        if bias is not None and orig_n != padded_n:
+            if bias.shape[-1] == orig_n:
+                bias = _pad_tensor_dim(bias, -1, padded_n - orig_n)
+                bias = marlin_permute_bias(bias)
+            elif bias.shape[-1] != padded_n:
+                raise ValueError(
+                    "Marlin bias shape does not match original or padded output dim: "
+                    f"bias={bias.shape[-1]}, orig_n={orig_n}, padded_n={padded_n}."
+                )
 
         out = apply_gptq_marlin_linear(
             input=x,
