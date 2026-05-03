@@ -84,6 +84,9 @@ def _pad_parameter_output_dim(
 
 
 class MarlinLinearKernel(MPLinearKernel):
+    config: MPLinearLayerConfig
+    w_zp_name: str | None
+    w_gidx_name: str | None
     orig_output_size_per_partition: int
 
     @classmethod
@@ -282,7 +285,7 @@ class MarlinLinearKernel(MPLinearKernel):
         #  None for marlin
 
         padded_n = c.partition_weight_shape[1]
-        orig_n = getattr(self, "orig_output_size_per_partition", padded_n)
+        orig_n = self.orig_output_size_per_partition
 
         out = apply_gptq_marlin_linear(
             input=x,
