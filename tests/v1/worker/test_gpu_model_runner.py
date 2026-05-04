@@ -167,18 +167,8 @@ def _reshape_kv_cache_tensor_for_test(
         cache_config=SimpleNamespace(cache_dtype="auto"),
         _kv_cache_spec_attn_group_iterator=lambda: iter([group]),
     )
-    kv_cache_config = KVCacheConfig(
-        num_blocks=1,
-        kv_cache_tensors=[
-            KVCacheTensor(size=raw_tensor.numel(), shared_by=[layer_name]),
-        ],
-        kv_cache_groups=[
-            KVCacheGroupSpec(layer_names=[layer_name], kv_cache_spec=kv_cache_spec)
-        ],
-    )
     return GPUModelRunner._reshape_kv_cache_tensors(
         runner_stub,
-        kv_cache_config,
         {layer_name: raw_tensor},
         [kv_cache_spec.block_size],
     )
@@ -1232,11 +1222,20 @@ def test_reshape_token_proportional_attention_unchanged():
     kv_caches = _reshape_kv_cache_tensor_for_test(spec, raw_tensor, "attn")
     kv_cache = kv_caches["attn"]
 
-    assert kv_cache.shape[1] == num_blocks
-    assert (
-        kv_cache.numel()
-        == raw_tensor.numel() // torch.empty((), dtype=spec.dtype).element_size()
+    expected_shape = (
+        2,
+        num_blocks,
+        spec.block_size,
+        spec.num_kv_heads,
+        spec.head_size,
     )
+    expected_numel = 1
+    for dim in expected_shape:
+        expected_numel *= dim
+
+    assert kv_cache.shape == expected_shape
+    assert kv_cache.shape[1] == num_blocks
+    assert kv_cache.numel() == expected_numel
 
 
 def test_reshape_attention_request_constant_rejected():

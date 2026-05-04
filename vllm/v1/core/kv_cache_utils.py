@@ -1381,6 +1381,24 @@ def _get_kv_cache_config_mixed_memory_model(
 
     request_constant_pool_specs: list[tuple[int, KVCachePoolConfig]] = []
     reserved_bytes = _get_request_constant_reserved_bytes(vllm_config, kv_cache_groups)
+
+    # CUDA graph memory profiling temporarily sets num_gpu_blocks_override and
+    # asks for a minimal KV cache with available_memory=0.  The single-pool
+    # TOKEN_PROPORTIONAL path already honors that override after deriving an
+    # initial block count from available_memory.  Mirror that behavior here so
+    # mixed-memory configs do not fail before the token pool gets a chance to
+    # apply the override.  REQUEST_CONSTANT pool sizes remain deterministic.
+    override = vllm_config.cache_config.num_gpu_blocks_override
+    if override is not None:
+        if token_group_ids:
+            token_groups = [kv_cache_groups[group_id] for group_id in token_group_ids]
+            available_memory = max(
+                available_memory,
+                reserved_bytes + override * _pool_bytes_per_block(token_groups),
+            )
+        else:
+            available_memory = max(available_memory, reserved_bytes)
+
     next_pool_id = 1 if token_group_ids else 0
     for group_id in request_constant_group_ids:
         group = kv_cache_groups[group_id]
@@ -1397,7 +1415,12 @@ def _get_kv_cache_config_mixed_memory_model(
         request_constant_pool_specs.append((group_id, pool_config))
         next_pool_id += 1
 
-    if reserved_bytes >= available_memory:
+    reservation_exhausts_memory = (
+        reserved_bytes >= available_memory
+        if token_group_ids
+        else reserved_bytes > available_memory
+    )
+    if reservation_exhausts_memory:
         raise ValueError(
             "REQUEST_CONSTANT KV cache reservation "
             f"({format_gib(reserved_bytes)} GiB) is not smaller than the "
@@ -2318,6 +2341,9 @@ def _normalize_kv_cache_config_num_blocks(
             pool_id = _get_tensor_pool_id(kv_cache_config, tensor)
             old_num_blocks = old_pool_num_blocks[pool_id]
             new_num_blocks = normalized_pool_num_blocks[pool_id]
+            assert old_num_blocks > 0, (
+                "KV cache pool num_blocks includes the null block and must be positive."
+            )
             if old_num_blocks == new_num_blocks:
                 continue
             assert tensor.size % old_num_blocks == 0

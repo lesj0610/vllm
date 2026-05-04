@@ -450,7 +450,11 @@ def test_eager_store_and_load_roundtrip() -> None:
         block_hasher=req._block_hasher,
     )
     hit_tokens, is_async = sched.get_num_new_matched_tokens(req2, num_computed_tokens=0)
-    assert hit_tokens == num_blocks * BLOCK_SIZE
+    # The scheduler must recompute at least the final token, so a prompt that
+    # spans ``num_blocks`` full blocks can only load ``num_blocks - 1`` blocks
+    # from the external cache.
+    expected_hit_tokens = (num_blocks - 1) * BLOCK_SIZE
+    assert hit_tokens == expected_hit_tokens
     assert is_async is True
 
     gpu_blocks2 = fix.gpu_block_pool.get_new_blocks(num_blocks)
@@ -533,8 +537,11 @@ def test_lazy_store_and_load_roundtrip() -> None:
     hit_tokens, is_async = sched.get_num_new_matched_tokens(
         req_old2, num_computed_tokens=0
     )
-    assert hit_tokens == num_blocks * BLOCK_SIZE, (
-        f"Expected {num_blocks * BLOCK_SIZE} hit tokens, got {hit_tokens}"
+    # The scheduler must recompute at least the final token, so only complete
+    # blocks before the final token are externally loadable.
+    expected_hit_tokens = (num_blocks - 1) * BLOCK_SIZE
+    assert hit_tokens == expected_hit_tokens, (
+        f"Expected {expected_hit_tokens} hit tokens, got {hit_tokens}"
     )
     assert is_async is True
 
@@ -1156,12 +1163,10 @@ def test_partial_gpu_prefix_plus_cpu_load() -> None:
     hit_tokens, is_async = sched.get_num_new_matched_tokens(
         req2, num_computed_tokens=gpu_local_computed
     )
-    # CPU should hit blocks 2,3 (not 4,5 — those are beyond the CPU range).
-    num_cpu_hit_blocks = 2
-    # Actually CPU has all 6 stored; it returns hits starting from position 2.
-    # The number of CPU hit blocks = min(remaining request blocks, CPU cached).
-    # Here remaining = 6 - 2 = 4 blocks are in CPU, so hit = 4 * BLOCK_SIZE.
-    num_cpu_hit_blocks = 4
+    # CPU has all 6 stored, but the scheduler must recompute at least the final
+    # token. Starting after the 2 GPU-local blocks, that leaves only 3 complete
+    # externally loadable CPU blocks.
+    num_cpu_hit_blocks = 3
     assert hit_tokens == num_cpu_hit_blocks * BLOCK_SIZE, (
         f"Expected {num_cpu_hit_blocks * BLOCK_SIZE} CPU hit tokens, got {hit_tokens}"
     )
