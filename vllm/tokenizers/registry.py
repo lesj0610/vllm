@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import contextlib
+import copy
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
@@ -105,6 +106,7 @@ def _maybe_patch_gemma4_gguf_tokenizer(
     if not special_ids:
         return tokenizer
 
+    patched_tokenizer = copy.copy(tokenizer)
     token_attrs = {
         "padding_token_id": "pad_token",
         "bos_token_id": "bos_token",
@@ -115,12 +117,13 @@ def _maybe_patch_gemma4_gguf_tokenizer(
         token_id = special_ids.get(id_attr)
         if token_id is None:
             continue
-        token = tokenizer.convert_ids_to_tokens(token_id)
-        if token is None:
+        tokens = patched_tokenizer.convert_ids_to_tokens([token_id])
+        if not tokens:
             continue
-        setattr(tokenizer, token_attr, token)
+        token = tokens[0]
+        setattr(patched_tokenizer, token_attr, token)
 
-    return tokenizer
+    return patched_tokenizer
 
 
 def resolve_tokenizer_args(
