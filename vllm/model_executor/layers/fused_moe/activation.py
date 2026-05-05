@@ -55,8 +55,7 @@ class MoEActivation(Enum):
     @classmethod
     def from_str(cls, s: str) -> "MoEActivation":
         """Parse from string for backward compatibility."""
-        if s == "gelu_pytorch_tanh":
-            s = cls.GELU_TANH.value
+        s = _STR_ALIASES.get(s, s)
         for member in cls:
             if member.value == s:
                 return member
@@ -65,6 +64,10 @@ class MoEActivation(Enum):
 
 
 # Module-level lookup tables used by MoEActivation functions.
+_STR_ALIASES: dict[str, str] = {
+    "gelu_pytorch_tanh": "gelu_tanh",
+}
+
 _CUSTOM_OP_NAMES: dict[MoEActivation, str] = {
     MoEActivation.SILU: "silu_and_mul",
     MoEActivation.GELU: "gelu_and_mul",
@@ -123,11 +126,7 @@ def apply_moe_activation(
     elif activation == MoEActivation.GELU:
         torch.ops._C.gelu_and_mul(output, input)
     elif activation == MoEActivation.GELU_TANH:
-        if hasattr(torch.ops._C, "gelu_tanh_and_mul"):
-            torch.ops._C.gelu_tanh_and_mul(output, input)
-        else:
-            gate, up = input.chunk(2, dim=-1)
-            output.copy_(F.gelu(gate, approximate="tanh") * up)
+        torch.ops._C.gelu_tanh_and_mul(output, input)
     elif activation == MoEActivation.SWIGLUOAI:
         torch.ops._C.swigluoai_and_mul(output, input)
     elif activation == MoEActivation.SWIGLUSTEP:

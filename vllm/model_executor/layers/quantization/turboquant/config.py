@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """TurboQuant configuration."""
 
+from __future__ import annotations
+
 import logging
 import math
 from dataclasses import dataclass
@@ -179,21 +181,21 @@ class TurboQuantConfig:
 
     @staticmethod
     def get_boundary_skip_layers(
-        model_config_or_num_layers: "ModelConfig | int",
+        model_config: ModelConfig,
         n: int = 2,
     ) -> list[str]:
-        """Get layer indices to skip TQ compression (boundary protection).
+        """Layer indices to skip TQ compression (boundary protection).
 
-        Dense models skip first/last N layers. Mixed attention-layout models
-        disable automatic boundary skips because skipped layers would create
-        incompatible KV page sizes across attention/stateful layer groups.
+        For hybrid or mixed attention-layout models, boundary protection is
+        disabled because skipped attention layers would create incompatible KV
+        page sizes across attention/stateful layer groups.
+
+        For dense models, skips first N and last N attention layers.
+        Empirically required for aggressive presets (k3v4_nc, 3bit_nc)
+        — without it GSM8K drops ~30 points on Qwen3-4B.
         """
-        if isinstance(model_config_or_num_layers, int):
-            return _get_boundary_skip_layers_by_count(model_config_or_num_layers, n)
-
-        model_config = model_config_or_num_layers
-        attn_indices = _get_full_attention_layer_indices(model_config)
         text_cfg = model_config.hf_text_config
+        attn_indices = _get_full_attention_layer_indices(model_config)
         num_layers = getattr(text_cfg, "num_hidden_layers", None)
         has_mixed_attention_layout = (
             num_layers is not None and 0 < len(attn_indices) < num_layers
@@ -212,24 +214,7 @@ class TurboQuantConfig:
         return _get_boundary_skip_layers_by_count(text_cfg.num_hidden_layers, n)
 
     @staticmethod
-    def get_boundary_skip_layers_from_layer_types(
-        layer_types: list[str] | None, n: int = 2
-    ) -> list[str]:
-        """Get boundary skip layers for hybrid models using absolute indices."""
-        if n <= 0 or not layer_types:
-            return []
-        attention_indices = [
-            idx
-            for idx, layer_type in enumerate(layer_types)
-            if "attention" in layer_type and not layer_type.startswith("linear_")
-        ]
-        if not attention_indices:
-            return []
-        boundary = attention_indices[:n] + attention_indices[-n:]
-        return [str(i) for i in sorted(set(boundary))]
-
-    @staticmethod
-    def from_cache_dtype(cache_dtype: str, head_dim: int) -> "TurboQuantConfig":
+    def from_cache_dtype(cache_dtype: str, head_dim: int) -> TurboQuantConfig:
         """Create config from a named preset.
 
         Valid presets: turboquant_k8v4, turboquant_4bit_nc, etc.
@@ -260,10 +245,14 @@ def _get_boundary_skip_layers_by_count(num_layers: int, n: int = 2) -> list[str]
     return [str(i) for i in indices]
 
 
-def _get_full_attention_layer_indices(model_config: "ModelConfig") -> list[int]:
-    """Global indices of full-attention layers in a hybrid model."""
+def _get_full_attention_layer_indices(model_config: ModelConfig) -> list[int]:
+    """Global indices of full-attention layers in a hybrid model.
+
+    Covers the conventions used across vLLM: ``layer_types`` (Qwen3.5/Next),
+    ``layers_block_type`` (Jamba/Zamba2), ``attn_type_list`` (Minimax).
+    """
     text_cfg = model_config.hf_text_config
-    hf_cfg = model_config.hf_config
+    hf_cfg = getattr(model_config, "hf_config", None)
 
     layer_types = getattr(text_cfg, "layer_types", None)
     if layer_types is not None:
