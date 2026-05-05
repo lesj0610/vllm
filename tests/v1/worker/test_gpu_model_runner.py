@@ -51,6 +51,29 @@ NUM_BLOCKS = 10
 DEVICE_TYPE = current_platform.device_type
 
 
+def test_profile_warmups_call_only_opt_in_layers():
+    calls: list[str] = []
+
+    class _HookLayer:
+        def warmup_for_profile_run(self):
+            calls.append("hook")
+
+    runner_stub = SimpleNamespace(
+        vllm_config=SimpleNamespace(
+            compilation_config=SimpleNamespace(
+                static_forward_context={
+                    "hook": _HookLayer(),
+                    "plain": object(),
+                },
+            ),
+        ),
+    )
+
+    GPUModelRunner._run_profile_warmups(runner_stub)
+
+    assert calls == ["hook"]
+
+
 def initialize_kv_cache(runner: GPUModelRunner):
     """
     Only perform necessary steps in GPUModelRunner.initialize_kv_cache()
