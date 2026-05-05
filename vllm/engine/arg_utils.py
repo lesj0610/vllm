@@ -1702,12 +1702,32 @@ class EngineArgs:
         if resolved_cache_dtype.startswith("turboquant_"):
             from vllm.model_executor.layers.quantization.turboquant.config import (
                 TurboQuantConfig,
+                align_kv_sharing_skip_layers,
             )
 
             boundary = TurboQuantConfig.get_boundary_skip_layers(model_config)
             existing = set(cache_config.kv_cache_dtype_skip_layers)
-            cache_config.kv_cache_dtype_skip_layers = sorted(
-                existing | set(boundary), key=int
+            merged = sorted(existing | set(boundary), key=int)
+
+            hf_cfg = model_config.hf_text_config
+            layer_types = getattr(hf_cfg, "layer_types", None)
+            num_layers = getattr(hf_cfg, "num_hidden_layers", None)
+            num_kv_shared = getattr(hf_cfg, "num_kv_shared_layers", 0)
+            if num_layers is not None and num_kv_shared > 0 and layer_types is not None:
+                merged = align_kv_sharing_skip_layers(
+                    layer_types=layer_types,
+                    skip_layers=merged,
+                    num_kv_shared_layers=num_kv_shared,
+                )
+                logger.info(
+                    "TQ: after KV-sharing alignment, skip list: %s",
+                    merged,
+                )
+
+            cache_config.kv_cache_dtype_skip_layers = merged
+            logger.info(
+                "TQ: skipping layers %s for boundary protection",
+                merged,
             )
 
         ray_runtime_env = None

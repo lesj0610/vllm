@@ -6,6 +6,7 @@ Run: .venv/bin/python -m pytest tests/quantization/test_turboquant.py -v
 """
 
 import math
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -17,9 +18,12 @@ from vllm.model_executor.layers.quantization.turboquant.centroids import (
 from vllm.model_executor.layers.quantization.turboquant.config import (
     TQ_PRESETS,
     TurboQuantConfig,
+    align_kv_sharing_skip_layers,
 )
+from vllm.model_executor.models.config import Gemma4Config
 from vllm.platforms import current_platform
 from vllm.utils.math_utils import next_power_of_2
+from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 # ============================================================================
 # Helpers
@@ -209,6 +213,569 @@ class TestTurboQuantConfig:
         mc = self._dense_model_config(8)
         layers = TurboQuantConfig.get_boundary_skip_layers(mc, 10)
         assert len(layers) == 8
+
+    def test_boundary_skip_layers_mixed_attention_layout_returns_empty(self):
+        model_config = SimpleNamespace(
+            is_hybrid=False,
+            hf_text_config=SimpleNamespace(
+                num_hidden_layers=5,
+                layer_types=[
+                    "full_attention",
+                    "sliding_attention",
+                    "sliding_attention",
+                    "full_attention",
+                    "sliding_attention",
+                ],
+            ),
+            hf_config=SimpleNamespace(),
+        )
+
+        assert TurboQuantConfig.get_boundary_skip_layers(model_config) == []
+
+    def test_boundary_skip_layers_hybrid_without_attention_layers_rejected(self):
+        model_config = SimpleNamespace(
+            is_hybrid=True,
+            hf_text_config=SimpleNamespace(
+                num_hidden_layers=4,
+                layer_types=["linear_attention"] * 4,
+            ),
+            hf_config=SimpleNamespace(),
+        )
+
+        with pytest.raises(NotImplementedError, match="identifiable"):
+            TurboQuantConfig.get_boundary_skip_layers(model_config)
+
+    def test_kv_sharing_alignment_follows_target(self):
+        layer_types = [
+            "sliding_attention",
+            "full_attention",
+            "sliding_attention",
+            "full_attention",
+            "sliding_attention",
+            "full_attention",
+        ]
+
+        assert align_kv_sharing_skip_layers(
+            layer_types=layer_types,
+            skip_layers=["3"],
+            num_kv_shared_layers=2,
+        ) == ["3", "5"]
+
+    def test_heterogeneous_gemma_uses_turboquant_backend_for_tq_cache(self):
+        vllm_config = SimpleNamespace(
+            model_config=SimpleNamespace(
+                hf_text_config=SimpleNamespace(head_dim=256, global_head_dim=512)
+            ),
+            cache_config=SimpleNamespace(cache_dtype="turboquant_4bit_nc"),
+            attention_config=SimpleNamespace(backend=None),
+        )
+
+        Gemma4Config.verify_and_update_config(vllm_config)
+
+        assert vllm_config.attention_config.backend == AttentionBackendEnum.TURBOQUANT
+
+    def test_heterogeneous_gemma_uses_triton_backend_for_regular_cache(self):
+        vllm_config = SimpleNamespace(
+            model_config=SimpleNamespace(
+                hf_text_config=SimpleNamespace(head_dim=256, global_head_dim=512)
+            ),
+            cache_config=SimpleNamespace(cache_dtype="auto"),
+            attention_config=SimpleNamespace(backend=None),
+        )
+
+        Gemma4Config.verify_and_update_config(vllm_config)
+
+        assert vllm_config.attention_config.backend == AttentionBackendEnum.TRITON_ATTN
+
+
+class TestTurboQuantMasking:
+    def _make_impl(self, sliding_window: int | None = None):
+        from vllm.v1.attention.backends.turboquant_attn import (
+            TurboQuantAttentionImpl,
+        )
+
+        impl = TurboQuantAttentionImpl.__new__(TurboQuantAttentionImpl)
+        impl.num_heads = 2
+        impl.head_size = 4
+        impl.scale = 1.0
+        impl.sliding_window = sliding_window
+        impl._can_use_flash_attn = False
+        impl.max_num_kv_splits = 4
+        impl.tq_config = SimpleNamespace(
+            key_mse_bits=4,
+            key_packed_size=66,
+            effective_value_quant_bits=4,
+            key_fp8=False,
+            norm_correction=True,
+        )
+        impl._get_decode_workspace = lambda batch_size, output_dtype: (None, None, None)
+        return impl
+
+    def test_backend_declares_mm_prefix_support(self):
+        from vllm.v1.attention.backends.turboquant_attn import (
+            TurboQuantAttentionBackend,
+        )
+
+        assert TurboQuantAttentionBackend.supports_mm_prefix() is True
+
+    def test_slice_mm_prefix_range_remaps_rows(self):
+        from vllm.v1.attention.backends.turboquant_attn import (
+            TurboQuantAttentionImpl,
+        )
+
+        assert TurboQuantAttentionImpl._slice_mm_prefix_range(
+            {2: [(4, 6)], 3: [(8, 9)]},
+            start=2,
+            length=1,
+        ) == {0: [(4, 6)]}
+
+    def test_explicit_mask_applies_sliding_window(self):
+        impl = self._make_impl(sliding_window=3)
+
+        mask = impl._build_explicit_attention_mask(
+            q_len=5,
+            kv_len=5,
+            query_start_pos=0,
+            key_start_pos=0,
+            device=torch.device("cpu"),
+            mm_prefix_ranges=[],
+        )
+
+        assert mask[4].tolist() == [False, False, True, True, True]
+
+    def test_explicit_mask_mm_prefix_overrides_causal_and_sliding_window(self):
+        impl = self._make_impl(sliding_window=2)
+
+        mask = impl._build_explicit_attention_mask(
+            q_len=3,
+            kv_len=3,
+            query_start_pos=0,
+            key_start_pos=0,
+            device=torch.device("cpu"),
+            mm_prefix_ranges=[(0, 2)],
+        )
+
+        assert mask[0, 2].item() is True
+        assert mask[2, 0].item() is True
+
+    def test_metadata_computes_mm_prefix_range_tensor(self):
+        from vllm.v1.attention.backends.turboquant_attn import TurboQuantMetadata
+
+        tensor = TurboQuantMetadata.compute_mm_prefix_range_tensor(
+            {0: [(1, 3), (4, 5)], 2: [(7, 8)]},
+            num_seqs=3,
+            device=torch.device("cpu"),
+        )
+
+        assert tensor is not None
+        assert tensor.shape == (3, 2, 2)
+        assert tensor[0].tolist() == [[1, 3], [4, 5]]
+        assert tensor[1].tolist() == [[0, 0], [0, 0]]
+        assert tensor[2].tolist() == [[7, 8], [0, 0]]
+
+    def test_decode_passes_sliding_window_to_kernel(self, monkeypatch):
+        impl = self._make_impl(sliding_window=2)
+
+        captured = {}
+
+        def fail_masked_decode_attention(*args, **kwargs):
+            raise AssertionError("masked decode fallback should not be used")
+
+        def fake_decode_attention(**kwargs):
+            captured["sliding_window"] = kwargs["sliding_window"]
+            captured["mm_prefix_range"] = kwargs["mm_prefix_range"]
+            return torch.empty_like(query)
+
+        monkeypatch.setattr(
+            impl,
+            "_masked_decode_attention",
+            fail_masked_decode_attention,
+        )
+        monkeypatch.setattr(
+            "vllm.v1.attention.backends.turboquant_attn."
+            "triton_turboquant_decode_attention",
+            fake_decode_attention,
+        )
+
+        query = torch.randn(1, 2, 4)
+        kv_cache = torch.empty(1, 1, 1, 1, dtype=torch.uint8)
+        attn_metadata = SimpleNamespace(
+            block_table=torch.zeros(1, 1, dtype=torch.int32),
+            seq_lens=torch.tensor([3], dtype=torch.int32),
+            mm_prefix_range=None,
+        )
+
+        output = impl._decode_attention(
+            query,
+            kv_cache,
+            attn_metadata,
+            Pi=torch.eye(4),
+            centroids=torch.empty(0),
+            PiT=torch.eye(4),
+            layer=torch.nn.Module(),
+        )
+
+        assert captured == {"sliding_window": 2, "mm_prefix_range": None}
+        assert output.shape == query.shape
+
+    def test_decode_passes_mm_prefix_tensor_to_kernel(self, monkeypatch):
+        impl = self._make_impl()
+
+        mm_tensor = torch.tensor([[[0, 1]]], dtype=torch.int32)
+        captured = {}
+
+        def fail_masked_decode_attention(*args, **kwargs):
+            raise AssertionError("masked decode fallback should not be used")
+
+        def fake_decode_attention(**kwargs):
+            captured["mm_prefix_range"] = kwargs["mm_prefix_range"]
+            captured["sliding_window"] = kwargs["sliding_window"]
+            return torch.empty_like(kwargs["query"])
+
+        monkeypatch.setattr(
+            impl,
+            "_masked_decode_attention",
+            fail_masked_decode_attention,
+        )
+        monkeypatch.setattr(
+            "vllm.v1.attention.backends.turboquant_attn."
+            "triton_turboquant_decode_attention",
+            fake_decode_attention,
+        )
+
+        query = torch.randn(1, 2, 4)
+        kv_cache = torch.empty(1, 1, 1, 1, dtype=torch.uint8)
+        attn_metadata = SimpleNamespace(
+            block_table=torch.zeros(1, 1, dtype=torch.int32),
+            seq_lens=torch.tensor([3], dtype=torch.int32),
+            mm_prefix_range={0: [(0, 1)]},
+            mm_prefix_range_tensor=mm_tensor,
+        )
+
+        output = impl._decode_attention(
+            query,
+            kv_cache,
+            attn_metadata,
+            Pi=torch.eye(4),
+            centroids=torch.empty(0),
+            PiT=torch.eye(4),
+            layer=torch.nn.Module(),
+        )
+
+        assert captured["mm_prefix_range"] is mm_tensor
+        assert captured["sliding_window"] is None
+        assert output.shape == query.shape
+
+    def test_decode_falls_back_for_mm_prefix_without_tensor(self, monkeypatch):
+        impl = self._make_impl()
+
+        captured = {}
+
+        def fake_masked_decode_attention(
+            query, kv_cache, attn_metadata, centroids, layer
+        ):
+            captured["called"] = True
+            return torch.empty_like(query)
+
+        def fail_decode_attention(**kwargs):
+            raise AssertionError("TQ decode kernel should not be used")
+
+        monkeypatch.setattr(
+            impl,
+            "_masked_decode_attention",
+            fake_masked_decode_attention,
+        )
+        monkeypatch.setattr(
+            "vllm.v1.attention.backends.turboquant_attn."
+            "triton_turboquant_decode_attention",
+            fail_decode_attention,
+        )
+
+        query = torch.randn(1, 2, 4)
+        kv_cache = torch.empty(1, 1, 1, 1, dtype=torch.uint8)
+        attn_metadata = SimpleNamespace(
+            block_table=torch.zeros(1, 1, dtype=torch.int32),
+            seq_lens=torch.tensor([3], dtype=torch.int32),
+            mm_prefix_range={0: [(0, 1)]},
+            mm_prefix_range_tensor=None,
+        )
+
+        output = impl._decode_attention(
+            query,
+            kv_cache,
+            attn_metadata,
+            Pi=torch.eye(4),
+            centroids=torch.empty(0),
+            PiT=torch.eye(4),
+            layer=torch.nn.Module(),
+        )
+
+        assert captured == {"called": True}
+        assert output.shape == query.shape
+
+    def test_prefill_uses_sdpa_when_flash_attn_is_disabled(self, monkeypatch):
+        impl = self._make_impl()
+
+        def fail_flash_attn(*args, **kwargs):
+            raise AssertionError("flash-attn should not be used")
+
+        monkeypatch.setattr(impl, "_flash_attn_varlen", fail_flash_attn)
+
+        query = torch.randn(2, 2, 4)
+        key = torch.randn(2, 2, 4)
+        value = torch.randn(2, 2, 4)
+        attn_metadata = SimpleNamespace(
+            query_start_loc=torch.tensor([0, 2], dtype=torch.int32),
+            seq_lens=torch.tensor([2], dtype=torch.int32),
+            max_query_len=2,
+            max_seq_len=2,
+            block_table=torch.zeros(1, 1, dtype=torch.int32),
+            mm_prefix_range=None,
+        )
+
+        output = impl._prefill_attention(
+            query,
+            key,
+            value,
+            kv_cache=torch.empty(0),
+            attn_metadata=attn_metadata,
+            Pi=torch.eye(4),
+            centroids=torch.empty(0),
+        )
+
+        assert output.shape == query.shape
+
+
+class TestTurboQuantWorkspaceReservation:
+    def test_decode_uses_layer_fallback_when_workspace_unavailable(self, monkeypatch):
+        from vllm.v1.attention.backends.turboquant_attn import (
+            TurboQuantAttentionImpl,
+        )
+
+        impl = TurboQuantAttentionImpl.__new__(TurboQuantAttentionImpl)
+        impl.num_heads = 8
+        impl.head_size = 256
+        impl.scale = 1.0
+        impl.max_num_kv_splits = 4
+        impl.tq_config = SimpleNamespace(
+            key_mse_bits=4,
+            key_packed_size=66,
+            effective_value_quant_bits=4,
+            key_fp8=False,
+            norm_correction=True,
+        )
+
+        monkeypatch.setattr(
+            impl,
+            "_get_decode_workspace",
+            lambda batch_size, output_dtype: (None, None, None),
+        )
+
+        captured = {}
+
+        def fake_decode_attention(**kwargs):
+            captured["buf_holder"] = kwargs["buf_holder"]
+            return torch.empty_like(kwargs["query"])
+
+        monkeypatch.setattr(
+            "vllm.v1.attention.backends.turboquant_attn."
+            "triton_turboquant_decode_attention",
+            fake_decode_attention,
+        )
+
+        layer = torch.nn.Module()
+        query = torch.randn(1, 8, 256)
+        kv_cache = torch.empty(1, 1, 8, 134, dtype=torch.uint8)
+        attn_metadata = SimpleNamespace(
+            block_table=torch.zeros(1, 1, dtype=torch.int32),
+            seq_lens=torch.ones(1, dtype=torch.int32),
+        )
+        Pi = torch.eye(256, dtype=torch.float32)
+        centroids = torch.linspace(-1.0, 1.0, 16, dtype=torch.float32)
+
+        output = impl._decode_attention(
+            query, kv_cache, attn_metadata, Pi, centroids, PiT=Pi, layer=layer
+        )
+
+        assert captured["buf_holder"] is layer
+        assert output.shape == query.shape
+
+    def test_decode_uses_workspace_without_layer_fallback(self, monkeypatch):
+        from vllm.v1.attention.backends.turboquant_attn import (
+            TurboQuantAttentionImpl,
+        )
+
+        impl = TurboQuantAttentionImpl.__new__(TurboQuantAttentionImpl)
+        impl.num_heads = 8
+        impl.head_size = 256
+        impl.scale = 1.0
+        impl.max_num_kv_splits = 4
+        impl.tq_config = SimpleNamespace(
+            key_mse_bits=4,
+            key_packed_size=66,
+            effective_value_quant_bits=4,
+            key_fp8=False,
+            norm_correction=True,
+        )
+
+        query = torch.randn(2, 8, 256, dtype=torch.float16)
+        workspace = (
+            torch.empty(2, 8, 4, 257, dtype=torch.float32),
+            torch.empty(2, 8, 256, dtype=torch.float16),
+            torch.empty(2, 8, dtype=torch.float32),
+        )
+        monkeypatch.setattr(
+            impl,
+            "_get_decode_workspace",
+            lambda batch_size, output_dtype: workspace,
+        )
+
+        captured = {}
+
+        def fake_decode_attention(**kwargs):
+            captured["buf_holder"] = kwargs["buf_holder"]
+            captured["mid_o_buf"] = kwargs["mid_o_buf"]
+            captured["output_buf"] = kwargs["output_buf"]
+            captured["lse_buf"] = kwargs["lse_buf"]
+            return torch.empty_like(kwargs["query"])
+
+        monkeypatch.setattr(
+            "vllm.v1.attention.backends.turboquant_attn."
+            "triton_turboquant_decode_attention",
+            fake_decode_attention,
+        )
+
+        layer = torch.nn.Module()
+        kv_cache = torch.empty(1, 1, 8, 134, dtype=torch.uint8)
+        attn_metadata = SimpleNamespace(
+            block_table=torch.zeros(2, 1, dtype=torch.int32),
+            seq_lens=torch.ones(2, dtype=torch.int32),
+        )
+        Pi = torch.eye(256, dtype=torch.float32)
+        centroids = torch.linspace(-1.0, 1.0, 16, dtype=torch.float32)
+
+        output = impl._decode_attention(
+            query, kv_cache, attn_metadata, Pi, centroids, PiT=Pi, layer=layer
+        )
+
+        assert captured["buf_holder"] is None
+        assert captured["mid_o_buf"] is workspace[0]
+        assert captured["output_buf"] is workspace[1]
+        assert captured["lse_buf"] is workspace[2]
+        assert output.shape == query.shape
+
+    def test_reservation_noops_without_workspace_manager(self, default_vllm_config):
+        from vllm.v1.attention.backends.turboquant_attn import (
+            reserve_turboquant_decode_workspace,
+        )
+
+        assert (
+            reserve_turboquant_decode_workspace(
+                vllm_config=default_vllm_config,
+                num_heads=8,
+                head_size=256,
+            )
+            is False
+        )
+
+    def test_workspace_reservation_uses_max_not_sum_for_heterogeneous_heads(
+        self, default_vllm_config, workspace_init
+    ):
+        from vllm.v1.attention.backends.turboquant_attn import (
+            _get_turboquant_decode_workspace_shapes,
+            reserve_turboquant_decode_workspace,
+        )
+        from vllm.v1.worker.workspace import current_workspace_manager
+
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA required for workspace manager tests")
+
+        default_vllm_config.scheduler_config.max_num_seqs = 8
+        default_vllm_config.attention_config.tq_max_kv_splits_for_cuda_graph = 4
+
+        batch_size = 128
+        num_heads = 8
+        splits = default_vllm_config.attention_config.tq_max_kv_splits_for_cuda_graph
+
+        reserve_turboquant_decode_workspace(
+            vllm_config=default_vllm_config,
+            num_heads=num_heads,
+            head_size=256,
+        )
+        workspace_bytes_256 = current_workspace_manager()._current_workspaces[0].numel()
+        raw_bytes_256 = sum(
+            math.prod(shape) * dtype.itemsize
+            for shape, dtype in _get_turboquant_decode_workspace_shapes(
+                batch_size=batch_size,
+                num_heads=num_heads,
+                head_size=256,
+                max_num_kv_splits=splits,
+            )
+        )
+
+        reserve_turboquant_decode_workspace(
+            vllm_config=default_vllm_config,
+            num_heads=num_heads,
+            head_size=512,
+        )
+        workspace_bytes_512 = current_workspace_manager()._current_workspaces[0].numel()
+        raw_bytes_512 = sum(
+            math.prod(shape) * dtype.itemsize
+            for shape, dtype in _get_turboquant_decode_workspace_shapes(
+                batch_size=batch_size,
+                num_heads=num_heads,
+                head_size=512,
+                max_num_kv_splits=splits,
+            )
+        )
+
+        assert workspace_bytes_256 >= raw_bytes_256
+        assert workspace_bytes_512 >= raw_bytes_512
+        assert workspace_bytes_512 < raw_bytes_256 + raw_bytes_512
+
+    def test_workspace_acquire_after_lock_no_growth(
+        self, default_vllm_config, workspace_init
+    ):
+        from vllm.v1.attention.backends.turboquant_attn import (
+            _get_turboquant_decode_workspace_shapes,
+            reserve_turboquant_decode_workspace,
+        )
+        from vllm.v1.worker.workspace import (
+            current_workspace_manager,
+            lock_workspace,
+        )
+
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA required for workspace manager tests")
+
+        default_vllm_config.scheduler_config.max_num_seqs = 8
+        default_vllm_config.attention_config.tq_max_kv_splits_for_cuda_graph = 4
+
+        reserve_turboquant_decode_workspace(
+            vllm_config=default_vllm_config,
+            num_heads=8,
+            head_size=256,
+        )
+        ws_before = current_workspace_manager()._current_workspaces[0].numel()
+
+        lock_workspace()
+
+        shapes = _get_turboquant_decode_workspace_shapes(
+            batch_size=1,
+            num_heads=8,
+            head_size=256,
+            max_num_kv_splits=(
+                default_vllm_config.attention_config.tq_max_kv_splits_for_cuda_graph
+            ),
+            output_dtype=torch.float16,
+        )
+        mid_o, output, lse = current_workspace_manager().get_simultaneous(*shapes)
+        ws_after = current_workspace_manager()._current_workspaces[0].numel()
+
+        assert ws_before == ws_after, "workspace grew after lock"
+        assert mid_o.shape == (1, 8, 4, 257)
+        assert output.shape == (1, 8, 256)
+        assert lse.shape == (1, 8)
 
 
 class TestHybridAttentionIndices:
@@ -514,6 +1081,57 @@ class TestHadamardRotation:
 class TestStoreDecodeRoundTrip:
     """End-to-end: store KV into TQ cache, decode, compare vs fp16 ref."""
 
+    def _make_two_token_cache(self, preset: str):
+        from vllm.model_executor.layers.quantization.turboquant.centroids import (
+            solve_lloyd_max,
+        )
+        from vllm.v1.attention.ops.triton_turboquant_store import (
+            triton_turboquant_store,
+        )
+
+        cfg = TurboQuantConfig.from_cache_dtype(preset, head_dim=128)
+        D = 128
+        Hk = 4
+        Hq = 4
+        block_size = 16
+        device = torch.device(DEVICE_TYPE)
+
+        PiT = _build_hadamard(D, DEVICE_TYPE)
+        Pi = PiT
+
+        centroids, _ = solve_lloyd_max(D, cfg.centroid_bits)
+        centroids = centroids.float().to(device)
+        c_sorted, _ = centroids.sort()
+        midpoints = ((c_sorted[:-1] + c_sorted[1:]) / 2).to(device)
+
+        torch.manual_seed(123)
+        key = torch.randn(2, Hk, D, device=device, dtype=torch.float16)
+        value = torch.randn(2, Hk, D, device=device, dtype=torch.float16)
+
+        kv_cache = torch.zeros(
+            1,
+            block_size,
+            Hk,
+            cfg.slot_size_aligned,
+            device=device,
+            dtype=torch.uint8,
+        )
+        slot_mapping = torch.arange(2, device=device, dtype=torch.int32)
+
+        triton_turboquant_store(
+            key,
+            value,
+            kv_cache,
+            slot_mapping,
+            PiT,
+            midpoints,
+            mse_bits=cfg.key_mse_bits,
+            key_packed_size=cfg.key_packed_size,
+            value_quant_bits=cfg.effective_value_quant_bits,
+            key_fp8=cfg.key_fp8,
+        )
+        return cfg, D, Hq, Pi, PiT, centroids, kv_cache, key, value
+
     @pytest.mark.parametrize(
         "preset",
         ["turboquant_k8v4", "turboquant_4bit_nc"],
@@ -623,3 +1241,80 @@ class TestStoreDecodeRoundTrip:
             assert cos_sim > threshold, (
                 f"Preset {preset} head {h}: cosine_sim={cos_sim:.4f} < {threshold}"
             )
+
+    def test_decode_sliding_window_masks_old_tokens(self):
+        from vllm.v1.attention.ops.triton_turboquant_decode import (
+            triton_turboquant_decode_attention,
+        )
+
+        cfg, D, Hq, Pi, PiT, centroids, kv_cache, key, value = (
+            self._make_two_token_cache("turboquant_k8v4")
+        )
+        device = torch.device(DEVICE_TYPE)
+
+        query = key[1:2].expand(1, Hq, D).contiguous().to(torch.float16)
+        block_table = torch.tensor([[0]], device=device, dtype=torch.int32)
+        seq_lens = torch.tensor([2], device=device, dtype=torch.int32)
+
+        output = triton_turboquant_decode_attention(
+            query=query,
+            kv_cache=kv_cache,
+            block_table=block_table,
+            seq_lens=seq_lens,
+            Pi=Pi,
+            centroids=centroids,
+            scale=1.0 / math.sqrt(D),
+            mse_bits=cfg.key_mse_bits,
+            key_packed_size=cfg.key_packed_size,
+            value_quant_bits=cfg.effective_value_quant_bits,
+            key_fp8=cfg.key_fp8,
+            norm_correction=cfg.norm_correction,
+            PiT=PiT,
+            max_num_kv_splits=4,
+            sliding_window=1,
+        )
+
+        expected = value[1:2].expand(1, Hq, D).float()
+        for h in range(Hq):
+            cos_sim = torch.nn.functional.cosine_similarity(
+                output.float()[0, h].unsqueeze(0),
+                expected[0, h].unsqueeze(0),
+            ).item()
+            assert cos_sim > 0.90, f"head {h}: cosine_sim={cos_sim:.4f}"
+
+    def test_decode_mm_prefix_mask_branch_compiles(self):
+        from vllm.v1.attention.ops.triton_turboquant_decode import (
+            triton_turboquant_decode_attention,
+        )
+
+        cfg, D, Hq, Pi, PiT, centroids, kv_cache, key, _ = self._make_two_token_cache(
+            "turboquant_k8v4"
+        )
+        device = torch.device(DEVICE_TYPE)
+
+        query = key[1:2].expand(1, Hq, D).contiguous().to(torch.float16)
+        block_table = torch.tensor([[0]], device=device, dtype=torch.int32)
+        seq_lens = torch.tensor([2], device=device, dtype=torch.int32)
+        mm_prefix_range = torch.tensor([[[0, 1]]], device=device, dtype=torch.int32)
+
+        output = triton_turboquant_decode_attention(
+            query=query,
+            kv_cache=kv_cache,
+            block_table=block_table,
+            seq_lens=seq_lens,
+            Pi=Pi,
+            centroids=centroids,
+            scale=1.0 / math.sqrt(D),
+            mse_bits=cfg.key_mse_bits,
+            key_packed_size=cfg.key_packed_size,
+            value_quant_bits=cfg.effective_value_quant_bits,
+            mm_prefix_range=mm_prefix_range,
+            key_fp8=cfg.key_fp8,
+            norm_correction=cfg.norm_correction,
+            PiT=PiT,
+            max_num_kv_splits=4,
+            sliding_window=1,
+        )
+
+        assert output.shape == query.shape
+        assert torch.isfinite(output).all()
