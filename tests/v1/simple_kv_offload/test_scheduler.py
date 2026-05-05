@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import pytest
 import torch
 
 from vllm import SamplingParams
@@ -34,7 +35,10 @@ from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
+    KVCachePoolConfig,
     KVCacheTensor,
+    MambaSpec,
+    MemoryModel,
 )
 from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import Request
@@ -91,6 +95,59 @@ def _make_kv_cache_config(
         num_blocks=num_blocks,
         kv_cache_tensors=tensors,
         kv_cache_groups=groups,
+    )
+
+
+def _make_request_constant_kv_cache_config(num_blocks: int = 8) -> KVCacheConfig:
+    attention_spec = FullAttentionSpec(
+        block_size=BLOCK_SIZE,
+        num_kv_heads=NUM_KV_HEADS,
+        head_size=HEAD_SIZE,
+        dtype=DTYPE,
+    )
+    mamba_spec = MambaSpec(
+        block_size=BLOCK_SIZE,
+        shapes=((1,),),
+        dtypes=(DTYPE,),
+        mamba_cache_mode="none",
+        page_size_padded=attention_spec.page_size_bytes,
+    )
+    mamba_num_blocks = 3
+    return KVCacheConfig(
+        num_blocks=num_blocks,
+        kv_cache_tensors=[
+            KVCacheTensor(
+                size=attention_spec.page_size_bytes * num_blocks,
+                shared_by=["attn"],
+            ),
+            KVCacheTensor(
+                size=mamba_spec.physical_page_size_bytes * mamba_num_blocks,
+                shared_by=["mamba"],
+            ),
+        ],
+        kv_cache_groups=[
+            KVCacheGroupSpec(["attn"], attention_spec),
+            KVCacheGroupSpec(["mamba"], mamba_spec),
+        ],
+        pool_configs=(
+            KVCachePoolConfig(
+                pool_id=0,
+                memory_model=MemoryModel.TOKEN_PROPORTIONAL,
+                group_ids=(0,),
+                num_blocks=num_blocks,
+                accounting_page_size_bytes=attention_spec.accounting_page_size_bytes,
+                physical_page_size_bytes=attention_spec.physical_page_size_bytes,
+            ),
+            KVCachePoolConfig(
+                pool_id=1,
+                memory_model=MemoryModel.REQUEST_CONSTANT,
+                group_ids=(1,),
+                num_blocks=mamba_num_blocks,
+                accounting_page_size_bytes=mamba_spec.accounting_page_size_bytes,
+                physical_page_size_bytes=mamba_spec.physical_page_size_bytes,
+            ),
+        ),
+        group_to_pool_id=(0, 1),
     )
 
 
@@ -171,6 +228,19 @@ def make_scheduler(
         kv_cache_config=kv_cache_config,
         num_groups=num_groups,
     )
+
+
+def test_cpu_offload_rejects_request_constant_kv_cache():
+    kv_cache_config = _make_request_constant_kv_cache_config()
+
+    with pytest.raises(
+        NotImplementedError,
+        match="CPU KV cache offload with REQUEST_CONSTANT specs",
+    ):
+        SimpleCPUOffloadScheduler._derive_cpu_config(
+            kv_cache_config,
+            cpu_capacity_bytes=_BYTES_PER_BLOCK,
+        )
 
 
 _req_counter = 0
@@ -380,7 +450,11 @@ def test_eager_store_and_load_roundtrip() -> None:
         block_hasher=req._block_hasher,
     )
     hit_tokens, is_async = sched.get_num_new_matched_tokens(req2, num_computed_tokens=0)
-    assert hit_tokens == num_blocks * BLOCK_SIZE
+    # The scheduler must recompute at least the final token, so a prompt that
+    # spans ``num_blocks`` full blocks can only load ``num_blocks - 1`` blocks
+    # from the external cache.
+    expected_hit_tokens = (num_blocks - 1) * BLOCK_SIZE
+    assert hit_tokens == expected_hit_tokens
     assert is_async is True
 
     gpu_blocks2 = fix.gpu_block_pool.get_new_blocks(num_blocks)
@@ -463,8 +537,11 @@ def test_lazy_store_and_load_roundtrip() -> None:
     hit_tokens, is_async = sched.get_num_new_matched_tokens(
         req_old2, num_computed_tokens=0
     )
-    assert hit_tokens == num_blocks * BLOCK_SIZE, (
-        f"Expected {num_blocks * BLOCK_SIZE} hit tokens, got {hit_tokens}"
+    # The scheduler must recompute at least the final token, so only complete
+    # blocks before the final token are externally loadable.
+    expected_hit_tokens = (num_blocks - 1) * BLOCK_SIZE
+    assert hit_tokens == expected_hit_tokens, (
+        f"Expected {expected_hit_tokens} hit tokens, got {hit_tokens}"
     )
     assert is_async is True
 
@@ -1086,12 +1163,10 @@ def test_partial_gpu_prefix_plus_cpu_load() -> None:
     hit_tokens, is_async = sched.get_num_new_matched_tokens(
         req2, num_computed_tokens=gpu_local_computed
     )
-    # CPU should hit blocks 2,3 (not 4,5 — those are beyond the CPU range).
-    num_cpu_hit_blocks = 2
-    # Actually CPU has all 6 stored; it returns hits starting from position 2.
-    # The number of CPU hit blocks = min(remaining request blocks, CPU cached).
-    # Here remaining = 6 - 2 = 4 blocks are in CPU, so hit = 4 * BLOCK_SIZE.
-    num_cpu_hit_blocks = 4
+    # CPU has all 6 stored, but the scheduler must recompute at least the final
+    # token. Starting after the 2 GPU-local blocks, that leaves only 3 complete
+    # externally loadable CPU blocks.
+    num_cpu_hit_blocks = 3
     assert hit_tokens == num_cpu_hit_blocks * BLOCK_SIZE, (
         f"Expected {num_cpu_hit_blocks * BLOCK_SIZE} CPU hit tokens, got {hit_tokens}"
     )
