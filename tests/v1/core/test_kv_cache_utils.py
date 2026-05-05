@@ -3030,6 +3030,45 @@ def test_unify_kv_cache_spec_page_size_uses_common_multiple_for_int8_hybrid():
     assert unified["sliding"].sliding_window == 1024
 
 
+def test_unify_kv_cache_spec_page_size_pads_tq_hybrid_without_lcm_blowup():
+    kv_cache_spec = {
+        "full": TQFullAttentionSpec(
+            block_size=16,
+            num_kv_heads=1,
+            head_size=512,
+            head_size_v=512,
+            dtype=torch.bfloat16,
+            tq_slot_size=518,
+        ),
+        "sliding": TQSlidingWindowSpec(
+            block_size=16,
+            num_kv_heads=4,
+            head_size=256,
+            dtype=torch.bfloat16,
+            sliding_window=1024,
+            tq_slot_size=262,
+        ),
+    }
+
+    original_page_sizes = {
+        name: spec.page_size_bytes for name, spec in kv_cache_spec.items()
+    }
+    max_page_size = max(original_page_sizes.values())
+    lcm_page_size = math.lcm(*original_page_sizes.values())
+    assert lcm_page_size > max_page_size
+
+    unified = kv_cache_utils.unify_kv_cache_spec_page_size(kv_cache_spec)
+
+    assert unified["full"].page_size_bytes == max_page_size
+    assert unified["sliding"].page_size_bytes == max_page_size
+    assert unified["full"].block_size == 16
+    assert unified["sliding"].block_size == 16
+    assert unified["full"].page_size_padded == max_page_size
+    assert unified["sliding"].page_size_padded is None
+    assert isinstance(unified["sliding"], TQSlidingWindowSpec)
+    assert unified["sliding"].sliding_window == 1024
+
+
 def test_unify_hybrid_kv_cache_specs_preserves_tq_page_size():
     before_spec_1 = new_kv_cache_spec()
     before_spec_2 = new_tq_sliding_window_spec(

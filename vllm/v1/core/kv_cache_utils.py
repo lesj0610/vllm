@@ -1104,7 +1104,15 @@ def unify_kv_cache_spec_page_size(
         return kv_cache_spec
 
     unified_page_size = max(page_sizes)
-    if any(unified_page_size % page_size != 0 for page_size in page_sizes):
+    tq_spec_types = (TQFullAttentionSpec, TQSlidingWindowSpec)
+    can_pad_to_max_page_size = all(
+        layer.page_size_bytes == unified_page_size
+        or isinstance(layer, tq_spec_types)
+        for layer in kv_cache_spec.values()
+    )
+    if not can_pad_to_max_page_size and any(
+        unified_page_size % page_size != 0 for page_size in page_sizes
+    ):
         unified_page_size = math.lcm(*page_sizes)
 
     new_kv_cache_spec = {}
@@ -1112,6 +1120,12 @@ def unify_kv_cache_spec_page_size(
         if layer_spec.page_size_bytes == unified_page_size:
             new_kv_cache_spec[layer_name] = layer_spec
         else:
+            if isinstance(layer_spec, tq_spec_types):
+                new_spec = replace(layer_spec, page_size_padded=unified_page_size)
+                if new_spec.page_size_bytes == unified_page_size:
+                    new_kv_cache_spec[layer_name] = new_spec
+                    continue
+
             layer_page_size = layer_spec.page_size_bytes
             if unified_page_size % layer_page_size != 0:
                 raise NotImplementedError(

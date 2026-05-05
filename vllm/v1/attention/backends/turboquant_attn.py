@@ -168,6 +168,10 @@ class TurboQuantAttentionBackend(AttentionBackend):
     def supports_per_head_quant_scales(cls) -> bool:
         return False
 
+    @classmethod
+    def supports_mm_prefix(cls) -> bool:
+        return True
+
     @staticmethod
     def get_impl_cls() -> type["TurboQuantAttentionImpl"]:
         return TurboQuantAttentionImpl
@@ -235,6 +239,34 @@ class TurboQuantMetadata(AttentionMetadata):
     is_prefill: bool = False
     num_decodes: int = 0  # number of decode requests (first in batch)
     num_decode_tokens: int = 0  # tokens from decode requests
+    mm_prefix_range: dict[int, list[tuple[int, int]]] | None = None
+    mm_prefix_range_tensor: torch.Tensor | None = None
+
+    @staticmethod
+    def compute_mm_prefix_range_tensor(
+        mm_prefix_range: dict[int, list[tuple[int, int]]] | None,
+        num_seqs: int,
+        device: torch.device,
+    ) -> torch.Tensor | None:
+        """Convert mm-prefix ranges to a padded device tensor.
+
+        Shape is (num_seqs, max_ranges, 2). Empty rows use (0, 0),
+        which kernels treat as invalid because start == end.
+        """
+        if mm_prefix_range is None:
+            return None
+
+        range_lists = [
+            mm_prefix_range.get(i, [(0, 0)]) or [(0, 0)] for i in range(num_seqs)
+        ]
+        if all(r == [(0, 0)] for r in range_lists):
+            return None
+
+        max_ranges = max(len(r) for r in range_lists)
+        padded = [list(r) + [(0, 0)] * (max_ranges - len(r)) for r in range_lists]
+        return torch.tensor(padded, dtype=torch.int32, device=device).view(
+            num_seqs, max_ranges, 2
+        )
 
 
 class TurboQuantMetadataBuilder(AttentionMetadataBuilder[TurboQuantMetadata]):
@@ -278,6 +310,8 @@ class TurboQuantMetadataBuilder(AttentionMetadataBuilder[TurboQuantMetadata]):
             is_prefill=(cam.max_query_len > 1),
             num_decodes=num_decodes,
             num_decode_tokens=num_decode_tokens,
+            mm_prefix_range=getattr(cam, "mm_prefix_range", None),
+            mm_prefix_range_tensor=getattr(cam, "mm_prefix_range_tensor", None),
         )
 
 
@@ -310,6 +344,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         self.num_kv_heads = num_kv_heads if num_kv_heads is not None else num_heads
         self.num_kv_groups = num_heads // self.num_kv_heads
         self.kv_cache_dtype = kv_cache_dtype
+        self.sliding_window = sliding_window
 
         from vllm.model_executor.layers.quantization.turboquant.config import (
             TurboQuantConfig,
@@ -329,6 +364,10 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
 
         # Detect flash-attn version (FA2/3/4) for prefill paths.
         self.fa_version = get_flash_attn_version(head_size=head_size)
+        # vllm_flash_attn FA2 rejects head dimensions above 256 at runtime.
+        # Gemma4 global-attention layers use global_head_dim=512, so TQ must
+        # fall back to SDPA for those prefill/continuation paths.
+        self._can_use_flash_attn = _HAS_FLASH_ATTN and head_size <= 256
 
         # Fixed NUM_KV_SPLITS (grid dims must be constant for cudagraph,
         # and benchmarks show no regression vs dynamic in eager mode).
@@ -426,6 +465,253 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 )
             )
         )
+
+    @staticmethod
+    def _slice_mm_prefix_range(
+        mm_prefix_range: dict[int, list[tuple[int, int]]] | None,
+        start: int,
+        length: int,
+    ) -> dict[int, list[tuple[int, int]]] | None:
+        """Slice metadata rows and remap them to a zero-based sub-batch."""
+        if not mm_prefix_range or length <= 0:
+            return None
+        sliced = {}
+        for new_idx in range(length):
+            ranges = mm_prefix_range.get(start + new_idx)
+            if ranges:
+                sliced[new_idx] = ranges
+        return sliced or None
+
+    @staticmethod
+    def _slice_mm_prefix_range_tensor(
+        mm_prefix_range_tensor: torch.Tensor | None,
+        start: int,
+        length: int,
+    ) -> torch.Tensor | None:
+        if mm_prefix_range_tensor is None or length <= 0:
+            return None
+        return mm_prefix_range_tensor[start : start + length]
+
+    @staticmethod
+    def _get_mm_prefix_ranges(
+        attn_metadata: TurboQuantMetadata,
+        req_idx: int,
+    ) -> list[tuple[int, int]]:
+        mm_prefix_range = getattr(attn_metadata, "mm_prefix_range", None)
+        if not mm_prefix_range:
+            return []
+        return mm_prefix_range.get(req_idx, []) or []
+
+    @staticmethod
+    def _mm_prefix_active_for_queries(
+        ranges: list[tuple[int, int]],
+        query_start_pos: int,
+        q_len: int,
+    ) -> bool:
+        if not ranges or q_len <= 0:
+            return False
+        query_end_pos = query_start_pos + q_len - 1
+        return any(
+            start < end and query_start_pos <= end and query_end_pos >= start
+            for start, end in ranges
+        )
+
+    def _request_needs_explicit_mask(
+        self,
+        *,
+        query_start_pos: int,
+        q_len: int,
+        seq_len: int,
+        mm_prefix_ranges: list[tuple[int, int]],
+    ) -> bool:
+        sliding_window = getattr(self, "sliding_window", None)
+        if sliding_window is not None and seq_len > sliding_window:
+            return True
+        return self._mm_prefix_active_for_queries(
+            mm_prefix_ranges,
+            query_start_pos,
+            q_len,
+        )
+
+    def _metadata_needs_explicit_prefill_mask(
+        self,
+        attn_metadata: TurboQuantMetadata,
+    ) -> bool:
+        sliding_window = getattr(self, "sliding_window", None)
+        if sliding_window is not None and attn_metadata.max_seq_len > sliding_window:
+            return True
+        mm_prefix_range = getattr(attn_metadata, "mm_prefix_range", None)
+        return bool(mm_prefix_range and any(mm_prefix_range.values()))
+
+    def _metadata_needs_explicit_decode_mask(
+        self,
+        attn_metadata: TurboQuantMetadata,
+    ) -> bool:
+        """Return True only when Python fallback is still required.
+
+        Sliding-window decode and mm-prefix decode are handled by the TQ Triton
+        kernel when mm_prefix_range_tensor is available. Avoid seq_lens.tolist()
+        here: decode can run during CUDA graph capture.
+        """
+        mm_prefix_range = getattr(attn_metadata, "mm_prefix_range", None)
+        if not (mm_prefix_range and any(mm_prefix_range.values())):
+            return False
+        return getattr(attn_metadata, "mm_prefix_range_tensor", None) is None
+
+    def _build_explicit_attention_mask(
+        self,
+        *,
+        q_len: int,
+        kv_len: int,
+        query_start_pos: int,
+        key_start_pos: int,
+        device: torch.device,
+        mm_prefix_ranges: list[tuple[int, int]],
+    ) -> torch.Tensor:
+        q_pos = torch.arange(q_len, device=device).unsqueeze(1) + query_start_pos
+        k_pos = torch.arange(kv_len, device=device).unsqueeze(0) + key_start_pos
+        mask = k_pos <= q_pos
+
+        sliding_window = getattr(self, "sliding_window", None)
+        if sliding_window is not None:
+            mask &= (q_pos - k_pos) < sliding_window
+
+        for start, end in mm_prefix_ranges:
+            if start >= end:
+                continue
+            q_in_range = (q_pos >= start) & (q_pos <= end)
+            k_in_range = (k_pos >= start) & (k_pos <= end)
+            mask |= q_in_range & k_in_range
+
+        return mask
+
+    def _masked_sdpa(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        *,
+        query_start_pos: int,
+        key_start_pos: int = 0,
+        mm_prefix_ranges: list[tuple[int, int]] | None = None,
+    ) -> torch.Tensor:
+        q_len = query.shape[0]
+        kv_len = key.shape[0]
+        mask = self._build_explicit_attention_mask(
+            q_len=q_len,
+            kv_len=kv_len,
+            query_start_pos=query_start_pos,
+            key_start_pos=key_start_pos,
+            device=query.device,
+            mm_prefix_ranges=mm_prefix_ranges or [],
+        )
+        q_t = query.transpose(0, 1).unsqueeze(0)
+        k_t = key.transpose(0, 1).unsqueeze(0)
+        v_t = value.transpose(0, 1).unsqueeze(0)
+        out = F.scaled_dot_product_attention(
+            q_t,
+            k_t,
+            v_t,
+            attn_mask=mask,
+            scale=self.scale,
+            enable_gqa=(key.shape[1] < query.shape[1]),
+        )
+        return out[0].transpose(0, 1)
+
+    def _get_dequant_kv_buffers(
+        self,
+        *,
+        batch_size: int,
+        num_kv_heads: int,
+        alloc_len: int,
+        head_size: int,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        buf_shape = (batch_size, num_kv_heads, alloc_len, head_size)
+        if is_workspace_manager_initialized():
+            return current_workspace_manager().get_simultaneous(
+                (buf_shape, torch.float16),
+                (buf_shape, torch.float16),
+            )
+        return (
+            torch.empty(buf_shape, device=device, dtype=torch.float16),
+            torch.empty(buf_shape, device=device, dtype=torch.float16),
+        )
+
+    def _dequant_kv_cache_prefix(
+        self,
+        layer: Any,
+        kv_cache: torch.Tensor,
+        block_table: torch.Tensor,
+        seq_len: int,
+        centroids: torch.Tensor,
+        output_dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Dequantize a single request's cached prefix from TQ KV cache."""
+        Hk = kv_cache.shape[2]
+        D = self.head_size
+        device = kv_cache.device
+        if seq_len <= 0:
+            empty = torch.empty(0, Hk, D, dtype=output_dtype, device=device)
+            return empty, empty
+
+        block_size = kv_cache.shape[1]
+        alloc_len = math.ceil(seq_len / block_size) * block_size
+        BLOCK_D = triton.next_power_of_2(D)
+
+        k_buf, v_buf = self._get_dequant_kv_buffers(
+            batch_size=1,
+            num_kv_heads=Hk,
+            alloc_len=alloc_len,
+            head_size=D,
+            device=device,
+        )
+        k_cached = k_buf[:, :, :alloc_len, :]
+        v_cached = v_buf[:, :, :alloc_len, :]
+
+        grid = (alloc_len, Hk)
+        _tq_full_dequant_kv[grid](
+            kv_cache,
+            block_table,
+            centroids,
+            k_cached,
+            v_cached,
+            k_cached.stride(0),
+            k_cached.stride(1),
+            k_cached.stride(2),
+            v_cached.stride(0),
+            v_cached.stride(1),
+            v_cached.stride(2),
+            kv_cache.stride(0),
+            kv_cache.stride(1),
+            kv_cache.stride(2),
+            block_table.stride(0),
+            HEAD_DIM=D,
+            BLOCK_SIZE=block_size,
+            NUM_KV_HEADS=Hk,
+            MSE_BYTES=self._mse_bytes,
+            KPS=self.tq_config.key_packed_size,
+            VQB=self.tq_config.effective_value_quant_bits,
+            VAL_DATA_BYTES=self._val_data_bytes,
+            MSE_BITS=self.tq_config.key_mse_bits,
+            KEY_FP8=1 if self.tq_config.key_fp8 else 0,
+            BLOCK_D=BLOCK_D,
+            NORM_CORRECTION=1 if self.tq_config.norm_correction else 0,
+            FP8_E4B15=_use_fp8_e4b15(device.index or 0),
+            num_warps=4,
+        )
+
+        if not self.tq_config.key_fp8:
+            assert layer is not None, "TurboQuant MSE dequant requires layer buffers"
+            Pi_half = layer._tq_Pi_half
+            k_flat = k_cached[0, :, :seq_len, :].reshape(-1, D)
+            k_flat = k_flat @ Pi_half
+            k_cached_trim = k_flat.reshape(Hk, seq_len, D).transpose(0, 1)
+        else:
+            k_cached_trim = k_cached[0, :, :seq_len, :].transpose(0, 1)
+
+        v_cached_trim = v_cached[0, :, :seq_len, :].transpose(0, 1)
+        return k_cached_trim.to(output_dtype), v_cached_trim.to(output_dtype)
 
     def do_kv_cache_update(
         self,
@@ -527,6 +813,10 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
 
             # --- Decode portion (first num_decodes requests) ---
             # Use full-batch max_seq_len as safe upper bound (no GPU sync).
+            mm_prefix_range = getattr(attn_metadata, "mm_prefix_range", None)
+            mm_prefix_range_tensor = getattr(
+                attn_metadata, "mm_prefix_range_tensor", None
+            )
             decode_meta = TurboQuantMetadata(
                 seq_lens=attn_metadata.seq_lens[:num_decodes],
                 slot_mapping=attn_metadata.slot_mapping[:num_decode_tokens],
@@ -536,6 +826,12 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 max_query_len=1,
                 max_seq_len=attn_metadata.max_seq_len,
                 is_prefill=False,
+                mm_prefix_range=self._slice_mm_prefix_range(
+                    mm_prefix_range, 0, num_decodes
+                ),
+                mm_prefix_range_tensor=self._slice_mm_prefix_range_tensor(
+                    mm_prefix_range_tensor, 0, num_decodes
+                ),
             )
             attn_out[:num_decode_tokens] = self._decode_attention(
                 q[:num_decode_tokens], kv_cache, decode_meta, Pi, centroids, PiT, layer
@@ -561,6 +857,16 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 max_query_len=attn_metadata.max_query_len,
                 max_seq_len=prefill_max_seq,
                 is_prefill=True,
+                mm_prefix_range=self._slice_mm_prefix_range(
+                    mm_prefix_range,
+                    num_decodes,
+                    prefill_seq_lens.shape[0],
+                ),
+                mm_prefix_range_tensor=self._slice_mm_prefix_range_tensor(
+                    mm_prefix_range_tensor,
+                    num_decodes,
+                    prefill_seq_lens.shape[0],
+                ),
             )
             k = key[:N].view(N, self.num_kv_heads, self.head_size)
             v = value[:N].view(N, self.num_kv_heads, self.head_size)
@@ -629,16 +935,24 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         # Fast path: use flash_attn for first-chunk prefills (all K/V in batch).
         # max_query_len == max_seq_len means no request has prior cached KV.
         # Both are Python ints — no GPU sync.
-        if _HAS_FLASH_ATTN and attn_metadata.max_query_len == attn_metadata.max_seq_len:
-            return self._flash_attn_varlen(
-                q=query,
-                k=key,
-                v=value,
-                cu_seqlens_q=attn_metadata.query_start_loc,
-                cu_seqlens_k=attn_metadata.query_start_loc,
-                max_seqlen_q=attn_metadata.max_query_len,
-                max_seqlen_k=attn_metadata.max_query_len,
-            )
+        if (
+            self._can_use_flash_attn
+            and attn_metadata.max_query_len == attn_metadata.max_seq_len
+        ):
+            if self._metadata_needs_explicit_prefill_mask(attn_metadata):
+                # flash_attn_varlen cannot represent Gemma4's
+                # (causal AND sliding_window) OR mm_prefix mask.
+                pass
+            else:
+                return self._flash_attn_varlen(
+                    q=query,
+                    k=key,
+                    v=value,
+                    cu_seqlens_q=attn_metadata.query_start_loc,
+                    cu_seqlens_k=attn_metadata.query_start_loc,
+                    max_seqlen_q=attn_metadata.max_query_len,
+                    max_seqlen_k=attn_metadata.max_query_len,
+                )
 
         # Continuation or no flash_attn: per-request attention.
         # For continuation chunks (seq_len > q_len), we must attend to
@@ -681,10 +995,24 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             q_seq = query[q_start:q_end]  # (q_len, Hq, D)
             k_seq = key[q_start:q_end]  # (q_len, Hk, D)
             v_seq = value[q_start:q_end]  # (q_len, Hk, D)
+            mm_prefix_ranges = self._get_mm_prefix_ranges(attn_metadata, i)
 
             if q_len == seq_len:
                 # First-chunk prefill: all K/V are in the current batch.
-                if _HAS_FLASH_ATTN:
+                if self._request_needs_explicit_mask(
+                    query_start_pos=0,
+                    q_len=q_len,
+                    seq_len=seq_len,
+                    mm_prefix_ranges=mm_prefix_ranges,
+                ):
+                    out = self._masked_sdpa(
+                        q_seq,
+                        k_seq,
+                        v_seq,
+                        query_start_pos=0,
+                        mm_prefix_ranges=mm_prefix_ranges,
+                    )
+                elif self._can_use_flash_attn:
                     self._cu_2[1] = q_len
                     cu = self._cu_2
                     out = self._flash_attn_varlen(
@@ -711,11 +1039,17 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 output[q_start:q_end] = out.to(query.dtype)
             else:
                 # Continuation chunk: tokens already stored to TQ cache
-                # by do_kv_cache_update. Use decode kernel directly to
-                # avoid O(cached_len) full-dequant per continuation.
-                # For large continuations, fall back to _continuation_prefill.
+                # by do_kv_cache_update. Use decode kernel directly when the
+                # standard causal mask is sufficient. Explicit mm-prefix or
+                # sliding-window masks require dequant + masked SDPA.
                 cached_len = seq_len - q_len
-                if q_len <= _CONTINUATION_DECODE_THRESHOLD:
+                needs_explicit_mask = self._request_needs_explicit_mask(
+                    query_start_pos=cached_len,
+                    q_len=q_len,
+                    seq_len=seq_len,
+                    mm_prefix_ranges=mm_prefix_ranges,
+                )
+                if q_len <= _CONTINUATION_DECODE_THRESHOLD and not needs_explicit_mask:
                     # Fast path: treat each query as a decode request
                     # with incremental seq_lens for causal masking.
                     # Slice from pre-built arange (no kernel launch)
@@ -737,8 +1071,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                         PiT=PiT,
                     )
                 else:
-                    # Large continuation: dequant cached K/V and use
-                    # flash_attn for better throughput.
+                    # Large continuation, or explicit mask required.
                     out = self._continuation_prefill(
                         layer,
                         q_seq,
@@ -750,6 +1083,8 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                         seq_len,
                         Pi,
                         centroids,
+                        mm_prefix_ranges=mm_prefix_ranges,
+                        force_explicit_mask=needs_explicit_mask,
                     )
                 output[q_start:q_end] = out.to(query.dtype)
 
@@ -767,6 +1102,8 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         seq_len: int,
         Pi: torch.Tensor,
         centroids: torch.Tensor,
+        mm_prefix_ranges: list[tuple[int, int]] | None = None,
+        force_explicit_mask: bool = False,
     ) -> torch.Tensor:
         """Handle continuation chunk by dequanting cached K/V from TQ cache.
 
@@ -776,90 +1113,37 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         q_len, Hq, D = query.shape
         Hk = key_chunk.shape[1]
         device = query.device
-        block_size = kv_cache.shape[1]
-        BLOCK_D = triton.next_power_of_2(D)
 
-        mse_bytes = self._mse_bytes
-        val_data_bytes = self._val_data_bytes
-
-        # Dequant cached K/V from TQ cache
-        # Allocate slightly over to align to block_size for the grid.
-        # Reuse cached buffers to avoid per-call allocation (~16MB at 8K).
-        alloc_len = math.ceil(cached_len / block_size) * block_size
-        buf_shape = (1, Hk, alloc_len, D)
-        # Use WorkspaceManager for dequant buffers.
-        # Shared across all layers — saves 60× memory at long context.
-        # Required for CUDA Graph capture (per-layer growth incompatible with CG).
-        k_buf, v_buf = current_workspace_manager().get_simultaneous(
-            (buf_shape, torch.float16),
-            (buf_shape, torch.float16),
-        )
-        # Skip .zero_() — kernel writes all positions up to cached_len,
-        # and we only read [:cached_len] afterwards.
-        k_cached = k_buf[:, :, :alloc_len, :]
-        v_cached = v_buf[:, :, :alloc_len, :]
-
-        grid = (alloc_len, 1 * Hk)
-        _tq_full_dequant_kv[grid](
+        k_cached_trim, v_cached_trim = self._dequant_kv_cache_prefix(
+            layer,
             kv_cache,
             block_table,
+            cached_len,
             centroids,
-            k_cached,
-            v_cached,
-            k_cached.stride(0),
-            k_cached.stride(1),
-            k_cached.stride(2),
-            v_cached.stride(0),
-            v_cached.stride(1),
-            v_cached.stride(2),
-            kv_cache.stride(0),
-            kv_cache.stride(1),
-            kv_cache.stride(2),
-            block_table.stride(0),
-            HEAD_DIM=D,
-            BLOCK_SIZE=block_size,
-            NUM_KV_HEADS=Hk,
-            MSE_BYTES=mse_bytes,
-            KPS=self.tq_config.key_packed_size,
-            VQB=self.tq_config.effective_value_quant_bits,
-            VAL_DATA_BYTES=val_data_bytes,
-            MSE_BITS=self.tq_config.key_mse_bits,
-            KEY_FP8=1 if self.tq_config.key_fp8 else 0,
-            BLOCK_D=BLOCK_D,
-            NORM_CORRECTION=1 if self.tq_config.norm_correction else 0,
-            FP8_E4B15=_use_fp8_e4b15(device.index or 0),
-            num_warps=4,
+            query.dtype,
         )
-
-        # Inverse-rotate MSE keys back to original space
-        if not self.tq_config.key_fp8:
-            # fp16 matmul for rotation (2× less bandwidth, uses fp16 tensor cores)
-            Pi_half = layer._tq_Pi_half
-            k_flat = k_cached[0, :, :cached_len, :].reshape(-1, D)
-            k_flat = k_flat @ Pi_half
-            k_cached_trim = k_flat.reshape(Hk, cached_len, D).transpose(
-                0, 1
-            )  # (cached_len, Hk, D) — already fp16
-        else:
-            k_cached_trim = k_cached[0, :, :cached_len, :].transpose(
-                0, 1
-            )  # (cached_len, Hk, D)
-
-        # Skip .contiguous() — the copy into k_full/v_full handles layout
-        v_cached_trim = v_cached[0, :, :cached_len, :].transpose(0, 1)
 
         # Concatenate cached + current chunk K/V (match query dtype)
         # Pre-allocate full K/V buffer, copy into slices (no cat alloc)
         qdtype = query.dtype
         k_full = torch.empty(seq_len, Hk, D, dtype=qdtype, device=device)
         v_full = torch.empty(seq_len, Hk, D, dtype=qdtype, device=device)
-        k_full[:cached_len] = k_cached_trim.to(qdtype)
+        k_full[:cached_len] = k_cached_trim
         k_full[cached_len:] = key_chunk
-        v_full[:cached_len] = v_cached_trim.to(qdtype)
+        v_full[:cached_len] = v_cached_trim
         v_full[cached_len:] = val_chunk
 
         # Attention: q_len queries attending to seq_len K/V with causal mask
-        if _HAS_FLASH_ATTN:
+        if force_explicit_mask:
+            return self._masked_sdpa(
+                query,
+                k_full,
+                v_full,
+                query_start_pos=cached_len,
+                mm_prefix_ranges=mm_prefix_ranges,
+            )
+
+        if self._can_use_flash_attn:
             # Reuse pre-allocated cu_seqlens (avoid host→device transfer)
             if not hasattr(self, "_cu_2_q"):
                 self._cu_2_q = torch.zeros(2, device=device, dtype=torch.int32)
@@ -878,28 +1162,50 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 max_seqlen_k=seq_len,
             )
         else:
-            # SDPA fallback: expand KV for GQA, build causal mask
-            q_t = query.transpose(0, 1).unsqueeze(0)  # (1, Hq, q_len, D)
-            k_t = k_full.transpose(0, 1).unsqueeze(0)  # (1, Hk, seq_len, D)
-            v_t = v_full.transpose(0, 1).unsqueeze(0)  # (1, Hk, seq_len, D)
-            # Build causal mask: query position p can attend to K position j
-            # where j <= cached_len + p (p is 0-indexed within chunk)
-            q_pos = torch.arange(q_len, device=device).unsqueeze(1) + cached_len
-            k_pos = torch.arange(seq_len, device=device).unsqueeze(0)
-            mask = k_pos <= q_pos  # (q_len, seq_len)
-            out = F.scaled_dot_product_attention(
-                q_t,
-                k_t,
-                v_t,
-                attn_mask=mask,
-                scale=self.scale,
-                enable_gqa=(Hk < Hq),
-            )  # (1, Hq, q_len, D)
-            return out[0].transpose(0, 1)  # (q_len, Hq, D)
+            return self._masked_sdpa(
+                query,
+                k_full,
+                v_full,
+                query_start_pos=cached_len,
+                mm_prefix_ranges=mm_prefix_ranges,
+            )
 
     # ------------------------------------------------------------------ #
     #  Decode: Triton TQ decode attention                                 #
     # ------------------------------------------------------------------ #
+    def _masked_decode_attention(
+        self,
+        query: torch.Tensor,  # (B, Hq, D)
+        kv_cache: torch.Tensor,
+        attn_metadata: TurboQuantMetadata,
+        centroids: torch.Tensor,
+        layer: torch.nn.Module | None,
+    ) -> torch.Tensor:
+        """Decode fallback for masks not supported by the TQ Triton kernel."""
+        output = torch.empty_like(query)
+        seq_lens = attn_metadata.seq_lens.tolist()
+
+        for req_idx, seq_len in enumerate(seq_lens):
+            block_table = attn_metadata.block_table[req_idx : req_idx + 1]
+            k_full, v_full = self._dequant_kv_cache_prefix(
+                layer,
+                kv_cache,
+                block_table,
+                seq_len,
+                centroids,
+                query.dtype,
+            )
+            mm_prefix_ranges = self._get_mm_prefix_ranges(attn_metadata, req_idx)
+            output[req_idx : req_idx + 1] = self._masked_sdpa(
+                query[req_idx : req_idx + 1],
+                k_full,
+                v_full,
+                query_start_pos=seq_len - 1,
+                mm_prefix_ranges=mm_prefix_ranges,
+            ).to(query.dtype)
+
+        return output
+
     def _decode_attention(
         self,
         query: torch.Tensor,  # (B, Hq, D)
@@ -919,6 +1225,15 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         assert query.shape[-1] == D
         assert Hq == query.shape[1]
 
+        if self._metadata_needs_explicit_decode_mask(attn_metadata):
+            return self._masked_decode_attention(
+                query,
+                kv_cache,
+                attn_metadata,
+                centroids,
+                layer,
+            )
+
         # output_buf in query dtype — matches the in-kernel cast in stage2.
         mid_o_buf, output_buf, lse_buf = self._get_decode_workspace(B, query.dtype)
         buf_holder = (
@@ -933,6 +1248,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             kv_cache=kv_cache,
             block_table=attn_metadata.block_table,
             seq_lens=attn_metadata.seq_lens,
+            mm_prefix_range=getattr(attn_metadata, "mm_prefix_range_tensor", None),
             Pi=Pi,
             centroids=centroids,
             scale=self.scale,
@@ -947,5 +1263,6 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             lse_buf=lse_buf,
             buf_holder=buf_holder,
             max_num_kv_splits=self.max_num_kv_splits,
+            sliding_window=getattr(self, "sliding_window", None),
         )
         return result

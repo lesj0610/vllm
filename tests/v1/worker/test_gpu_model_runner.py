@@ -151,6 +151,29 @@ def _patch_hybrid_block_size_test_model(monkeypatch):
     monkeypatch.setattr(ModelRegistry, "resolve_model_cls", resolve_model_cls)
 
 
+def test_profile_warmups_call_only_opt_in_layers():
+    calls: list[str] = []
+
+    class _HookLayer:
+        def warmup_for_profile_run(self):
+            calls.append("hook")
+
+    runner_stub = SimpleNamespace(
+        vllm_config=SimpleNamespace(
+            compilation_config=SimpleNamespace(
+                static_forward_context={
+                    "hook": _HookLayer(),
+                    "plain": object(),
+                },
+            ),
+        ),
+    )
+
+    GPUModelRunner._run_profile_warmups(runner_stub)
+
+    assert calls == ["hook"]
+
+
 def _reshape_kv_cache_tensor_for_test(
     kv_cache_spec,
     raw_tensor: torch.Tensor,

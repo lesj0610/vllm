@@ -2,8 +2,15 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """TurboQuant configuration."""
 
+import logging
 import math
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from vllm.config import ModelConfig
+
+logger = logging.getLogger(__name__)
 
 # Named TQ presets: each maps to frozen config parameters.
 # key_quant_bits: 8 = FP8 keys, 3-4 = MSE (Lloyd-Max) quantized keys.
@@ -159,20 +166,67 @@ class TurboQuantConfig:
         return s + (s % 2)  # round up to even
 
     @staticmethod
-    def get_boundary_skip_layers(num_layers: int, n: int = 2) -> list[str]:
+    def requires_uniform_backend_for_heterogeneous_heads(
+        head_dim: int | None, global_head_dim: int | None
+    ) -> bool:
+        """Whether heterogeneous head dims require one backend for all layers."""
+        return (
+            head_dim is not None
+            and global_head_dim is not None
+            and head_dim != global_head_dim
+            and max(head_dim, global_head_dim) > 256
+        )
+
+    @staticmethod
+    def get_boundary_skip_layers(
+        model_config_or_num_layers: "ModelConfig | int",
+        n: int = 2,
+    ) -> list[str]:
         """Get layer indices to skip TQ compression (boundary protection).
 
-        Returns first N and last N layer indices as strings, suitable for
-        kv_cache_dtype_skip_layers.
+        Dense models skip first/last N layers. Mixed attention-layout models
+        disable automatic boundary skips because skipped layers would create
+        incompatible KV page sizes across attention/stateful layer groups.
         """
-        if n <= 0 or num_layers <= 0:
+        if isinstance(model_config_or_num_layers, int):
+            return _get_boundary_skip_layers_by_count(model_config_or_num_layers, n)
+
+        model_config = model_config_or_num_layers
+        attn_indices = _get_full_attention_layer_indices(model_config)
+        text_cfg = model_config.hf_text_config
+        num_layers = getattr(text_cfg, "num_hidden_layers", None)
+        has_mixed_attention_layout = (
+            num_layers is not None and 0 < len(attn_indices) < num_layers
+        )
+
+        if model_config.is_hybrid or has_mixed_attention_layout:
+            if not attn_indices:
+                raise NotImplementedError(
+                    "TurboQuant KV cache requires identifiable "
+                    "full-attention layers, but none were found in "
+                    "the mixed-attention model config."
+                )
+            logger.info("TQ hybrid: full-attention layers %s", attn_indices)
             return []
-        n = min(n, num_layers // 2)  # don't skip more than half
-        first = list(range(n))
-        last = list(range(num_layers - n, num_layers))
-        # Deduplicate (if num_layers <= 2*n)
-        indices = sorted(set(first + last))
-        return [str(i) for i in indices]
+
+        return _get_boundary_skip_layers_by_count(text_cfg.num_hidden_layers, n)
+
+    @staticmethod
+    def get_boundary_skip_layers_from_layer_types(
+        layer_types: list[str] | None, n: int = 2
+    ) -> list[str]:
+        """Get boundary skip layers for hybrid models using absolute indices."""
+        if n <= 0 or not layer_types:
+            return []
+        attention_indices = [
+            idx
+            for idx, layer_type in enumerate(layer_types)
+            if "attention" in layer_type and not layer_type.startswith("linear_")
+        ]
+        if not attention_indices:
+            return []
+        boundary = attention_indices[:n] + attention_indices[-n:]
+        return [str(i) for i in sorted(set(boundary))]
 
     @staticmethod
     def from_cache_dtype(cache_dtype: str, head_dim: int) -> "TurboQuantConfig":
@@ -193,3 +247,75 @@ class TurboQuantConfig:
             value_quant_bits=preset["value_quant_bits"],
             norm_correction=preset["norm_correction"],
         )
+
+
+def _get_boundary_skip_layers_by_count(num_layers: int, n: int = 2) -> list[str]:
+    if n <= 0 or num_layers <= 0:
+        return []
+    n = min(n, num_layers // 2)  # don't skip more than half
+    first = list(range(n))
+    last = list(range(num_layers - n, num_layers))
+    # Deduplicate (if num_layers <= 2*n)
+    indices = sorted(set(first + last))
+    return [str(i) for i in indices]
+
+
+def _get_full_attention_layer_indices(model_config: "ModelConfig") -> list[int]:
+    """Global indices of full-attention layers in a hybrid model."""
+    text_cfg = model_config.hf_text_config
+    hf_cfg = model_config.hf_config
+
+    layer_types = getattr(text_cfg, "layer_types", None)
+    if layer_types is not None:
+        return [
+            i for i, t in enumerate(layer_types) if t in ("full_attention", "attention")
+        ]
+
+    layers_block_type = getattr(text_cfg, "layers_block_type", None)
+    if layers_block_type is not None:
+        return [
+            i for i, t in enumerate(layers_block_type) if t in ("attention", "hybrid")
+        ]
+
+    attn_type_list = getattr(hf_cfg, "attn_type_list", None)
+    if attn_type_list is not None:
+        return [i for i, t in enumerate(attn_type_list) if t == 1]
+
+    return []
+
+
+def align_kv_sharing_skip_layers(
+    layer_types: list[str],
+    skip_layers: list[str],
+    num_kv_shared_layers: int,
+) -> list[str]:
+    """Align shared-layer skip decisions to their KV-sharing targets.
+
+    Shared layers reuse the KV cache of the last earlier layer with the same
+    attention type. The shared layer should therefore follow the target's skip
+    decision without causing the target itself to become skipped.
+    """
+    if num_kv_shared_layers <= 0:
+        return sorted(set(skip_layers), key=int)
+
+    num_layers = len(layer_types)
+    first_shared = num_layers - num_kv_shared_layers
+    if first_shared <= 0:
+        return sorted(set(skip_layers), key=int)
+
+    skip_set = set(skip_layers)
+    for shared_idx in range(first_shared, num_layers):
+        current_type = layer_types[shared_idx]
+        target_idx: int | None = None
+        for candidate_idx in range(first_shared - 1, -1, -1):
+            if layer_types[candidate_idx] == current_type:
+                target_idx = candidate_idx
+                break
+        if target_idx is None:
+            continue
+        if str(target_idx) in skip_set:
+            skip_set.add(str(shared_idx))
+        else:
+            skip_set.discard(str(shared_idx))
+
+    return sorted(skip_set, key=int)

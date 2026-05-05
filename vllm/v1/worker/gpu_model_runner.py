@@ -5904,6 +5904,8 @@ class GPUModelRunner(
                         for i, output in enumerate(dummy_encoder_outputs):
                             self.encoder_cache[f"tmp_{i}"] = output
 
+        self._run_profile_warmups()
+
         # Add `is_profile` here to pre-allocate communication buffers
         hidden_states, last_hidden_states = self._dummy_run(
             self.max_num_tokens, is_profile=True
@@ -5919,6 +5921,30 @@ class GPUModelRunner(
         del hidden_states, output
         self.encoder_cache.clear()
         gc.collect()
+
+    def _run_profile_warmups(self) -> None:
+        """Run opt-in layer warmups before profile dummy forward.
+
+        Some no-compile layers need to autotune kernels before KV cache
+        allocation, but doing that from inside a compiled/profile dummy forward
+        can allocate temporary tensors in an unsafe execution context.  Layers
+        opt in by exposing ``warmup_for_profile_run``.
+        """
+        static_forward_context = (
+            self.vllm_config.compilation_config.static_forward_context
+        )
+        for layer_name, layer in static_forward_context.items():
+            warmup = getattr(layer, "warmup_for_profile_run", None)
+            if warmup is None:
+                continue
+            logger.debug("Running profile warmup hook for layer %s", layer_name)
+            try:
+                warmup()
+            except Exception:
+                logger.exception(
+                    "Profile warmup hook failed for layer %s", layer_name
+                )
+                raise
 
     def _init_minimal_kv_cache_for_profiling(self) -> None:
         from vllm.v1.core.kv_cache_utils import (
@@ -6486,10 +6512,6 @@ class GPUModelRunner(
         computing mm_prefix_range_tensor once and sharing it across all
         metadata objects to avoid redundant host-to-device transfers.
         """
-        from vllm.v1.attention.backends.triton_attn import (
-            TritonAttentionMetadata,
-        )
-
         # Get all metadata objects from either list or dict structure
         metadata_list = []
         if isinstance(attn_metadata, list):
@@ -6498,22 +6520,29 @@ class GPUModelRunner(
         else:
             metadata_list.extend(attn_metadata.values())
 
-        # Set mm_prefix_range for all metadata and compute tensor once
-        shared_tensor = None
+        # Set mm_prefix_range for all metadata and compute backend-specific
+        # tensor form for any metadata class that declares the converter.
+        # This keeps mm-prefix support generic instead of importing one backend
+        # here and special-casing every future backend.
+        tensor_cache: dict[
+            tuple[type[Any], int, torch.device], torch.Tensor | None
+        ] = {}
         for metadata in metadata_list:
             metadata.mm_prefix_range = req_doc_ranges  # type: ignore[attr-defined]
 
-            # Only compute tensor for TritonAttentionMetadata
-            if isinstance(metadata, TritonAttentionMetadata):
-                if shared_tensor is None:
-                    shared_tensor = (
-                        TritonAttentionMetadata.compute_mm_prefix_range_tensor(
-                            req_doc_ranges,
-                            metadata.seq_lens.shape[0],  # type: ignore[attr-defined]
-                            metadata.seq_lens.device,  # type: ignore[attr-defined]
-                        )
-                    )
-                metadata.mm_prefix_range_tensor = shared_tensor
+            compute_fn = getattr(type(metadata), "compute_mm_prefix_range_tensor", None)
+            if not callable(compute_fn):
+                continue
+
+            seq_lens = metadata.seq_lens  # type: ignore[attr-defined]
+            cache_key = (type(metadata), seq_lens.shape[0], seq_lens.device)
+            if cache_key not in tensor_cache:
+                tensor_cache[cache_key] = compute_fn(
+                    req_doc_ranges,
+                    seq_lens.shape[0],
+                    seq_lens.device,
+                )
+            metadata.mm_prefix_range_tensor = tensor_cache[cache_key]
 
     def may_reinitialize_input_batch(
         self, kv_cache_config: KVCacheConfig, kernel_block_sizes: list[int]

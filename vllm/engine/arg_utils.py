@@ -1697,29 +1697,35 @@ class EngineArgs:
             kv_offloading_backend=self.kv_offloading_backend,
         )
 
-        # TurboQuant: auto-skip first/last 2 layers (boundary protection).
-        # These layers are most sensitive to quantization error.
-        # Users can add extra layers via --kv-cache-dtype-skip-layers.
         if resolved_cache_dtype.startswith("turboquant_"):
-            if model_config.is_hybrid:
-                raise NotImplementedError(
-                    "TurboQuant KV cache is not supported for hybrid "
-                    "(attention + Mamba) models. Boundary layer protection "
-                    "requires uniform attention layers."
-                )
             from vllm.model_executor.layers.quantization.turboquant.config import (
                 TurboQuantConfig,
+                align_kv_sharing_skip_layers,
             )
 
-            num_layers = model_config.hf_text_config.num_hidden_layers
-            boundary = TurboQuantConfig.get_boundary_skip_layers(num_layers)
+            boundary = TurboQuantConfig.get_boundary_skip_layers(model_config)
             existing = set(cache_config.kv_cache_dtype_skip_layers)
-            merged = sorted(existing | set(boundary), key=lambda x: int(x))
+            merged = sorted(existing | set(boundary), key=int)
+
+            hf_cfg = model_config.hf_text_config
+            layer_types = getattr(hf_cfg, "layer_types", None)
+            num_layers = getattr(hf_cfg, "num_hidden_layers", None)
+            num_kv_shared = getattr(hf_cfg, "num_kv_shared_layers", 0)
+            if num_layers is not None and num_kv_shared > 0 and layer_types is not None:
+                merged = align_kv_sharing_skip_layers(
+                    layer_types=layer_types,
+                    skip_layers=merged,
+                    num_kv_shared_layers=num_kv_shared,
+                )
+                logger.info(
+                    "TQ: after KV-sharing alignment, skip list: %s",
+                    merged,
+                )
+
             cache_config.kv_cache_dtype_skip_layers = merged
             logger.info(
-                "TQ: skipping layers %s for boundary protection (num_layers=%d)",
+                "TQ: skipping layers %s for boundary protection",
                 merged,
-                num_layers,
             )
 
         ray_runtime_env = None
@@ -1972,6 +1978,11 @@ class EngineArgs:
             async_scheduling=self.async_scheduling,
             stream_interval=self.stream_interval,
         )
+
+        if model_config.multimodal_config is not None:
+            model_config.multimodal_config.default_mm_token_budget = (
+                scheduler_config.max_num_batched_tokens
+            )
 
         if not model_config.is_multimodal_model and self.default_mm_loras:
             raise ValueError(
