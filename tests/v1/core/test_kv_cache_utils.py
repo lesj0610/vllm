@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import hashlib
 import importlib
+import math
 from collections.abc import Callable
 from typing import Any
 
@@ -47,6 +48,8 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
     MLAAttentionSpec,
     SlidingWindowSpec,
+    TQFullAttentionSpec,
+    TQSlidingWindowSpec,
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.metrics.stats import CachingMetrics, PrefixCacheStats
@@ -2187,6 +2190,45 @@ def test_unify_hybrid_kv_cache_specs():
 
     with pytest.raises(ValueError):
         kv_cache_utils.unify_hybrid_kv_cache_specs(kv_cache_spec)
+
+
+def test_unify_kv_cache_spec_page_size_pads_tq_hybrid_without_lcm_blowup():
+    kv_cache_spec = {
+        "full": TQFullAttentionSpec(
+            block_size=16,
+            num_kv_heads=1,
+            head_size=512,
+            head_size_v=512,
+            dtype=torch.bfloat16,
+            tq_slot_size=518,
+        ),
+        "sliding": TQSlidingWindowSpec(
+            block_size=16,
+            num_kv_heads=4,
+            head_size=256,
+            dtype=torch.bfloat16,
+            sliding_window=1024,
+            tq_slot_size=262,
+        ),
+    }
+
+    original_page_sizes = {
+        name: spec.page_size_bytes for name, spec in kv_cache_spec.items()
+    }
+    max_page_size = max(original_page_sizes.values())
+    lcm_page_size = math.lcm(*original_page_sizes.values())
+    assert lcm_page_size > max_page_size
+
+    unified = kv_cache_utils.unify_kv_cache_spec_page_size(kv_cache_spec)
+
+    assert unified["full"].page_size_bytes == max_page_size
+    assert unified["sliding"].page_size_bytes == max_page_size
+    assert unified["full"].block_size == 16
+    assert unified["sliding"].block_size == 16
+    assert unified["full"].page_size_padded == max_page_size
+    assert unified["sliding"].page_size_padded is None
+    assert isinstance(unified["sliding"], TQSlidingWindowSpec)
+    assert unified["sliding"].sliding_window == 1024
 
 
 def test_hma_not_disabled_when_kv_events_enabled():
