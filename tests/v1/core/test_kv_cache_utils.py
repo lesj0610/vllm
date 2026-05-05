@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import hashlib
 import importlib
+import math
 from collections.abc import Callable
 from typing import Any
 
@@ -44,6 +45,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheGroupSpec,
     KVCacheSpec,
     KVCacheTensor,
+    KVQuantMode,
     MambaSpec,
     MLAAttentionSpec,
     SlidingWindowSpec,
@@ -1742,16 +1744,30 @@ def test_get_kv_cache_config_one_worker():
         ],
     )
 
-    # different hidden size that cannot be aligned by using different block size
+    # Different hidden size and different type, align by the least common
+    # multiple page size. This used to be rejected when only the maximum page
+    # size was considered.
     kv_cache_specs_hybrid = {
         "layer_1": new_kv_cache_spec(head_size=64),
         "layer_2": new_sliding_window_spec(head_size=96),
     }
-
-    with pytest.raises(NotImplementedError):
-        get_kv_cache_configs(
-            vllm_config, [kv_cache_specs_hybrid], [mem_per_block_per_layer * 2 * 32]
-        )[0]
+    kv_cache_config_hybrid = get_kv_cache_configs(
+        vllm_config, [kv_cache_specs_hybrid], [mem_per_block_per_layer * 2 * 32]
+    )[0]
+    assert kv_cache_config_hybrid == KVCacheConfig(
+        num_blocks=21,
+        kv_cache_tensors=[
+            KVCacheTensor(size=49152 * 21, shared_by=["layer_1", "layer_2"]),
+        ],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["layer_1"], new_kv_cache_spec(head_size=64, block_size=48)
+            ),
+            KVCacheGroupSpec(
+                ["layer_2"], new_sliding_window_spec(head_size=96, block_size=32)
+            ),
+        ],
+    )
 
     # Test num_gpu_blocks_override
     vllm_config.cache_config.num_gpu_blocks_override = 16
@@ -2187,6 +2203,44 @@ def test_unify_hybrid_kv_cache_specs():
 
     with pytest.raises(ValueError):
         kv_cache_utils.unify_hybrid_kv_cache_specs(kv_cache_spec)
+
+
+def test_unify_kv_cache_spec_page_size_uses_common_multiple_for_int8_hybrid():
+    kv_cache_spec = {
+        "full": FullAttentionSpec(
+            block_size=16,
+            num_kv_heads=2,
+            head_size=512,
+            head_size_v=512,
+            dtype=torch.float16,
+            kv_quant_mode=KVQuantMode.INT8_PER_TOKEN_HEAD,
+        ),
+        "sliding": SlidingWindowSpec(
+            block_size=16,
+            num_kv_heads=8,
+            head_size=256,
+            dtype=torch.float16,
+            kv_quant_mode=KVQuantMode.INT8_PER_TOKEN_HEAD,
+            sliding_window=1024,
+        ),
+    }
+
+    original_page_sizes = {
+        name: spec.page_size_bytes for name, spec in kv_cache_spec.items()
+    }
+    unified = kv_cache_utils.unify_kv_cache_spec_page_size(kv_cache_spec)
+    expected_page_size = math.lcm(*original_page_sizes.values())
+
+    assert unified["full"].page_size_bytes == unified["sliding"].page_size_bytes
+    assert unified["full"].page_size_bytes == expected_page_size
+    assert unified["full"].block_size == (
+        16 * expected_page_size // original_page_sizes["full"]
+    )
+    assert unified["sliding"].block_size == (
+        16 * expected_page_size // original_page_sizes["sliding"]
+    )
+    assert isinstance(unified["sliding"], SlidingWindowSpec)
+    assert unified["sliding"].sliding_window == 1024
 
 
 def test_hma_not_disabled_when_kv_events_enabled():
