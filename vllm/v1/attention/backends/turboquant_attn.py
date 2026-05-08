@@ -26,6 +26,9 @@ import torch.nn.functional as F
 
 from vllm.config import get_current_vllm_config
 from vllm.config.cache import CacheDType
+from vllm.model_executor.layers.quantization.turboquant.centroids import (
+    get_centroids,
+)
 from vllm.triton_utils import triton
 from vllm.v1.attention.backend import (
     AttentionBackend,
@@ -49,6 +52,10 @@ from vllm.v1.attention.ops.triton_turboquant_decode import (
     triton_turboquant_decode_attention,
 )
 from vllm.v1.attention.ops.triton_turboquant_store import triton_turboquant_store
+from vllm.v1.worker.workspace import (
+    current_workspace_manager,
+    is_workspace_manager_initialized,
+)
 
 _HAS_FLASH_ATTN = is_flash_attn_varlen_func_available()
 if _HAS_FLASH_ATTN:
@@ -60,6 +67,54 @@ if _HAS_FLASH_ATTN:
 # kernel can read them efficiently. This avoids O(cached_len) dequant work
 # per continuation, eliminating the O(N²/chunk_size) collapse at long context.
 _CONTINUATION_DECODE_THRESHOLD = 128
+
+
+def _get_turboquant_decode_workspace_shapes(
+    batch_size: int,
+    num_heads: int,
+    head_size: int,
+    max_num_kv_splits: int,
+    output_dtype: torch.dtype = torch.float32,
+) -> tuple[tuple[tuple[int, ...], torch.dtype], ...]:
+    """Workspace views required by one TurboQuant decode kernel call."""
+    return (
+        ((batch_size, num_heads, max_num_kv_splits, head_size + 1), torch.float32),
+        ((batch_size, num_heads, head_size), output_dtype),
+        ((batch_size, num_heads), torch.float32),
+    )
+
+
+def reserve_turboquant_decode_workspace(
+    *,
+    vllm_config: Any,
+    num_heads: int,
+    head_size: int,
+) -> bool:
+    """Pre-grow WorkspaceManager for TurboQuant decode scratch buffers.
+
+    WorkspaceManager has no separate reservation API; the supported way to
+    size it is to request the largest views during model initialization or
+    profiling, before ``lock_workspace()`` freezes workspace size. The output
+    buffer is reserved as float32 so runtime requests with fp16/bf16 query
+    dtypes cannot exceed the reservation.
+    """
+    if not is_workspace_manager_initialized():
+        return False
+
+    batch_size = max(
+        vllm_config.scheduler_config.max_num_seqs,
+        _CONTINUATION_DECODE_THRESHOLD,
+    )
+    max_num_kv_splits = vllm_config.attention_config.tq_max_kv_splits_for_cuda_graph
+    current_workspace_manager().get_simultaneous(
+        *_get_turboquant_decode_workspace_shapes(
+            batch_size=batch_size,
+            num_heads=num_heads,
+            head_size=head_size,
+            max_num_kv_splits=max_num_kv_splits,
+        )
+    )
+    return True
 
 
 def _build_hadamard(d: int, device_str: str) -> torch.Tensor:
@@ -180,6 +235,10 @@ class TurboQuantMetadata(AttentionMetadata):
     is_prefill: bool = False
     num_decodes: int = 0  # number of decode requests (first in batch)
     num_decode_tokens: int = 0  # tokens from decode requests
+    # CPU-resident copies used by the prefill path for per-request iteration
+    # without per-step D2H syncs.
+    query_start_loc_cpu: torch.Tensor | None = None
+    seq_lens_cpu: torch.Tensor | None = None
 
 
 class TurboQuantMetadataBuilder(AttentionMetadataBuilder[TurboQuantMetadata]):
@@ -223,6 +282,8 @@ class TurboQuantMetadataBuilder(AttentionMetadataBuilder[TurboQuantMetadata]):
             is_prefill=(cam.max_query_len > 1),
             num_decodes=num_decodes,
             num_decode_tokens=num_decode_tokens,
+            query_start_loc_cpu=cam.query_start_loc_cpu,
+            seq_lens_cpu=cam.seq_lens_cpu_upper_bound,
         )
 
 
@@ -281,6 +342,11 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         self.max_num_kv_splits = (
             vllm_config.attention_config.tq_max_kv_splits_for_cuda_graph
         )
+        reserve_turboquant_decode_workspace(
+            vllm_config=vllm_config,
+            num_heads=self.num_heads,
+            head_size=self.head_size,
+        )
 
     def _flash_attn_varlen(
         self,
@@ -335,11 +401,37 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             H = _build_hadamard(D, str(device))
             layer._tq_PiT = H
             layer._tq_Pi = H
+            # fp16 copy for rotation in continuation prefill path
+            layer._tq_Pi_half = H.to(torch.float16)
 
-            c = layer._tq_centroids.to(device=device, dtype=torch.float32)
-            c_sorted, _ = c.sort()
+            # Centroids for Lloyd-Max quantization.
+            layer._tq_centroids = get_centroids(D, self.tq_config.centroid_bits).to(
+                device=device, dtype=torch.float32
+            )
+
+            c_sorted, _ = layer._tq_centroids.sort()
             layer._tq_midpoints = (c_sorted[:-1] + c_sorted[1:]) / 2
             layer._tq_cached = True
+
+    def _get_decode_workspace(
+        self,
+        batch_size: int,
+        output_dtype: torch.dtype,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
+        if not is_workspace_manager_initialized():
+            return None, None, None
+
+        return tuple(
+            current_workspace_manager().get_simultaneous(
+                *_get_turboquant_decode_workspace_shapes(
+                    batch_size=batch_size,
+                    num_heads=self.num_heads,
+                    head_size=self.head_size,
+                    max_num_kv_splits=self.max_num_kv_splits,
+                    output_dtype=output_dtype,
+                )
+            )
+        )
 
     def do_kv_cache_update(
         self,
@@ -461,11 +553,21 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             # first-chunk prefills. Using full-batch max_seq_len breaks
             # this because decode requests inflate max_seq_len.
             prefill_seq_lens = attn_metadata.seq_lens[num_decodes:]
-            # Use CPU-side max to avoid GPU→CPU sync from .item()
-            prefill_max_seq = max(attn_metadata.seq_lens[num_decodes:].tolist())
+            # Use the CPU-resident `seq_lens` upper-bound from the metadata
+            # (populated in the builder) to compute the prefill sub-batch
+            # max without a GPU→CPU sync.
+            if attn_metadata.seq_lens_cpu is not None:
+                prefill_max_seq = int(attn_metadata.seq_lens_cpu[num_decodes:].max())
+            else:
+                prefill_max_seq = attn_metadata.max_seq_len
             prefill_qsl = (
                 attn_metadata.query_start_loc[num_decodes:] - num_decode_tokens
             )
+            prefill_qsl_cpu = None
+            if attn_metadata.query_start_loc_cpu is not None:
+                prefill_qsl_cpu = (
+                    attn_metadata.query_start_loc_cpu[num_decodes:] - num_decode_tokens
+                )
             prefill_meta = TurboQuantMetadata(
                 seq_lens=prefill_seq_lens,
                 slot_mapping=attn_metadata.slot_mapping[num_decode_tokens:N],
@@ -475,6 +577,10 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 max_query_len=attn_metadata.max_query_len,
                 max_seq_len=prefill_max_seq,
                 is_prefill=True,
+                query_start_loc_cpu=prefill_qsl_cpu,
+                seq_lens_cpu=attn_metadata.seq_lens_cpu[num_decodes:]
+                if attn_metadata.seq_lens_cpu is not None
+                else None,
             )
             k = key[:N].view(N, self.num_kv_heads, self.head_size)
             v = value[:N].view(N, self.num_kv_heads, self.head_size)
@@ -565,14 +671,30 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
 
         output = torch.zeros(N, Hq, D, device=query.device, dtype=query.dtype)
 
-        # Convert to Python lists once (single CPU-GPU sync) instead of
-        # per-request .item() calls that each force a sync.
-        qsl = query_start_loc.tolist()
-        seq_lens_list = attn_metadata.seq_lens.tolist()
+        # Prefer the CPU-resident copies from the metadata if populated —
+        # otherwise `.tolist()` on GPU tensors forces a synchronizing copy.
+        if attn_metadata.query_start_loc_cpu is not None:
+            qsl = attn_metadata.query_start_loc_cpu.tolist()
+        else:
+            qsl = query_start_loc.tolist()
+        if attn_metadata.seq_lens_cpu is not None:
+            seq_lens_list = attn_metadata.seq_lens_cpu.tolist()
+        else:
+            seq_lens_list = attn_metadata.seq_lens.tolist()
 
         # Pre-allocate cu_seqlens for single-request flash_attn calls
         # to avoid per-request host→device tensor creation.
-        _cu_2 = torch.zeros(2, device=query.device, dtype=torch.int32)
+        if not hasattr(self, "_cu_2"):
+            self._cu_2 = torch.zeros(2, device=query.device, dtype=torch.int32)
+        # Cache arange on self (avoid per-call kernel launch).
+        _max_seq = attn_metadata.max_seq_len
+        _ac: torch.Tensor | None = getattr(self, "_arange_cache", None)
+        if _ac is None or _ac.shape[0] <= _max_seq:
+            _ac = torch.arange(
+                0, _max_seq + 1, device=query.device, dtype=attn_metadata.seq_lens.dtype
+            )
+            self._arange_cache = _ac
+        _arange_cache: torch.Tensor = _ac
 
         for i in range(num_reqs):
             q_start = qsl[i]
@@ -589,8 +711,9 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             if q_len == seq_len:
                 # First-chunk prefill: all K/V are in the current batch.
                 if _HAS_FLASH_ATTN:
-                    _cu_2[1] = q_len
-                    cu = _cu_2
+                    # Assign to slice to avoid gpu/cpu sync.
+                    self._cu_2[1:2] = q_len
+                    cu = self._cu_2
                     out = self._flash_attn_varlen(
                         q=q_seq,
                         k=k_seq,
@@ -622,12 +745,8 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 if q_len <= _CONTINUATION_DECODE_THRESHOLD:
                     # Fast path: treat each query as a decode request
                     # with incremental seq_lens for causal masking.
-                    synth_seq_lens = torch.arange(
-                        cached_len + 1,
-                        seq_len + 1,
-                        device=query.device,
-                        dtype=attn_metadata.seq_lens.dtype,
-                    )
+                    # Slice from pre-built arange (no kernel launch)
+                    synth_seq_lens = _arange_cache[cached_len + 1 : seq_len + 1]
                     synth_bt = attn_metadata.block_table[i : i + 1].expand(q_len, -1)
                     out = triton_turboquant_decode_attention(
                         query=q_seq,
@@ -695,16 +814,17 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         # Reuse cached buffers to avoid per-call allocation (~16MB at 8K).
         alloc_len = math.ceil(cached_len / block_size) * block_size
         buf_shape = (1, Hk, alloc_len, D)
-        k_buf = getattr(layer, "_tq_k_dequant_buf", None)
-        if k_buf is None or k_buf.shape[2] < alloc_len:
-            k_buf = torch.empty(buf_shape, dtype=torch.float16, device=device)
-            v_buf = torch.empty(buf_shape, dtype=torch.float16, device=device)
-            layer._tq_k_dequant_buf = k_buf
-            layer._tq_v_dequant_buf = v_buf
-        else:
-            v_buf = layer._tq_v_dequant_buf
-        k_cached = k_buf[:, :, :alloc_len, :].zero_()
-        v_cached = v_buf[:, :, :alloc_len, :].zero_()
+        # Use WorkspaceManager for dequant buffers.
+        # Shared across all layers — saves 60× memory at long context.
+        # Required for CUDA Graph capture (per-layer growth incompatible with CG).
+        k_buf, v_buf = current_workspace_manager().get_simultaneous(
+            (buf_shape, torch.float16),
+            (buf_shape, torch.float16),
+        )
+        # Skip .zero_() — kernel writes all positions up to cached_len,
+        # and we only read [:cached_len] afterwards.
+        k_cached = k_buf[:, :, :alloc_len, :]
+        v_cached = v_buf[:, :, :alloc_len, :]
 
         grid = (alloc_len, 1 * Hk)
         _tq_full_dequant_kv[grid](
@@ -740,29 +860,42 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
 
         # Inverse-rotate MSE keys back to original space
         if not self.tq_config.key_fp8:
-            k_flat = k_cached[0, :, :cached_len, :].reshape(-1, D).float()
-            k_flat = k_flat @ Pi
-            k_cached_trim = (
-                k_flat.to(torch.float16).reshape(Hk, cached_len, D).transpose(0, 1)
-            )  # (cached_len, Hk, D)
+            # fp16 matmul for rotation (2× less bandwidth, uses fp16 tensor cores)
+            Pi_half = layer._tq_Pi_half
+            k_flat = k_cached[0, :, :cached_len, :].reshape(-1, D)
+            k_flat = k_flat @ Pi_half
+            k_cached_trim = k_flat.reshape(Hk, cached_len, D).transpose(
+                0, 1
+            )  # (cached_len, Hk, D) — already fp16
         else:
-            k_cached_trim = (
-                k_cached[0, :, :cached_len, :].transpose(0, 1).contiguous()
+            k_cached_trim = k_cached[0, :, :cached_len, :].transpose(
+                0, 1
             )  # (cached_len, Hk, D)
 
-        v_cached_trim = (
-            v_cached[0, :, :cached_len, :].transpose(0, 1).contiguous()
-        )  # (cached_len, Hk, D)
+        # Skip .contiguous() — the copy into k_full/v_full handles layout
+        v_cached_trim = v_cached[0, :, :cached_len, :].transpose(0, 1)
 
         # Concatenate cached + current chunk K/V (match query dtype)
+        # Pre-allocate full K/V buffer, copy into slices (no cat alloc)
         qdtype = query.dtype
-        k_full = torch.cat([k_cached_trim.to(qdtype), key_chunk], dim=0)
-        v_full = torch.cat([v_cached_trim.to(qdtype), val_chunk], dim=0)
+        k_full = torch.empty(seq_len, Hk, D, dtype=qdtype, device=device)
+        v_full = torch.empty(seq_len, Hk, D, dtype=qdtype, device=device)
+        k_full[:cached_len] = k_cached_trim.to(qdtype)
+        k_full[cached_len:] = key_chunk
+        v_full[:cached_len] = v_cached_trim.to(qdtype)
+        v_full[cached_len:] = val_chunk
 
         # Attention: q_len queries attending to seq_len K/V with causal mask
         if _HAS_FLASH_ATTN:
-            cu_seqlens_q = torch.tensor([0, q_len], device=device, dtype=torch.int32)
-            cu_seqlens_k = torch.tensor([0, seq_len], device=device, dtype=torch.int32)
+            # Reuse pre-allocated cu_seqlens (avoid host→device transfer)
+            if not hasattr(self, "_cu_2_q"):
+                self._cu_2_q = torch.zeros(2, device=device, dtype=torch.int32)
+                self._cu_2_k = torch.zeros(2, device=device, dtype=torch.int32)
+            # Assigning to slice uses fill_ which avoids cpu/gpu sync.
+            self._cu_2_q[1:2] = q_len
+            self._cu_2_k[1:2] = seq_len
+            cu_seqlens_q = self._cu_2_q
+            cu_seqlens_k = self._cu_2_k
             return self._flash_attn_varlen(
                 q=query,
                 k=k_full,
@@ -805,12 +938,23 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         PiT: torch.Tensor | None = None,
         layer: torch.nn.Module | None = None,
     ) -> torch.Tensor:
-        # Grab cached decode buffers from the layer (lazily allocated).
-        mid_o_buf = output_buf = lse_buf = None
-        if layer is not None:
-            mid_o_buf = getattr(layer, "_tq_mid_o_buf", None)
-            output_buf = getattr(layer, "_tq_output_buf", None)
-            lse_buf = getattr(layer, "_tq_lse_buf", None)
+        # Acquire shared decode scratch buffers from WorkspaceManager.
+        # Layers execute sequentially so one set of buffers is sufficient.
+        # Falls back to kernel-internal allocation if workspace unavailable.
+        B = query.shape[0]
+        D = self.head_size
+        Hq = self.num_heads
+        assert query.shape[-1] == D
+        assert Hq == query.shape[1]
+
+        # output_buf in query dtype — matches the in-kernel cast in stage2.
+        mid_o_buf, output_buf, lse_buf = self._get_decode_workspace(B, query.dtype)
+        buf_holder = (
+            layer
+            if layer is not None
+            and (mid_o_buf is None or output_buf is None or lse_buf is None)
+            else None
+        )
 
         result = triton_turboquant_decode_attention(
             query=query,
@@ -829,7 +973,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             mid_o_buf=mid_o_buf,
             output_buf=output_buf,
             lse_buf=lse_buf,
-            buf_holder=layer,
+            buf_holder=buf_holder,
             max_num_kv_splits=self.max_num_kv_splits,
         )
         return result
