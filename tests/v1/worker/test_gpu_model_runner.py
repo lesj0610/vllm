@@ -8,6 +8,9 @@ import numpy as np
 import pytest
 import torch
 
+import vllm.distributed.ec_transfer.ec_transfer_state as ec_transfer_state
+import vllm.distributed.kv_transfer.kv_transfer_state as kv_transfer_state
+import vllm.v1.worker.gpu.warmup as gpu_warmup
 import vllm.v1.worker.gpu_model_runner as gpu_model_runner_module
 from vllm.config import (
     AttentionConfig,
@@ -173,6 +176,129 @@ def test_profile_warmups_call_only_opt_in_layers():
     GPUModelRunner._run_profile_warmups(runner_stub)
 
     assert calls == ["hook"]
+
+
+def _make_v1_warmup_runner_stub():
+    return SimpleNamespace(
+        num_spec_tokens=0,
+        kv_cache_config=SimpleNamespace(
+            num_blocks=12,
+            kv_cache_groups=[
+                SimpleNamespace(kv_cache_spec=SimpleNamespace(block_size=2))
+            ],
+        ),
+        scheduler_config=SimpleNamespace(
+            max_num_seqs=3,
+            max_num_batched_tokens=16,
+        ),
+        is_pooling_model=False,
+        model_config=SimpleNamespace(get_vocab_size=lambda: 64),
+    )
+
+
+def test_v1_warmup_runs_prefill_decode_cleanup_and_restores_connectors(
+    monkeypatch,
+):
+    kv_connector_agent = object()
+    ec_connector_agent = object()
+    monkeypatch.setattr(kv_transfer_state, "_KV_CONNECTOR_AGENT", kv_connector_agent)
+    monkeypatch.setattr(ec_transfer_state, "_EC_CONNECTOR_AGENT", ec_connector_agent)
+    monkeypatch.setattr(
+        gpu_warmup, "get_pp_group", lambda: SimpleNamespace(is_last_rank=True)
+    )
+    monkeypatch.setattr(gpu_warmup.torch.accelerator, "synchronize", lambda: None)
+
+    runner = _make_v1_warmup_runner_stub()
+    execute_outputs: list[SchedulerOutput] = []
+    sample_outputs = []
+
+    def worker_execute_model(scheduler_output):
+        assert kv_transfer_state._KV_CONNECTOR_AGENT is None
+        assert ec_transfer_state._EC_CONNECTOR_AGENT is None
+        execute_outputs.append(scheduler_output)
+
+    def worker_sample_tokens(grammar_output):
+        assert kv_transfer_state._KV_CONNECTOR_AGENT is None
+        assert ec_transfer_state._EC_CONNECTOR_AGENT is None
+        sample_outputs.append(grammar_output)
+
+    gpu_warmup.warmup_v1_kernels(
+        runner,
+        worker_execute_model,
+        worker_sample_tokens,
+    )
+
+    assert kv_transfer_state._KV_CONNECTOR_AGENT is kv_connector_agent
+    assert ec_transfer_state._EC_CONNECTOR_AGENT is ec_connector_agent
+
+    assert len(execute_outputs) == 3
+    prefill_output, decode_output, cleanup_output = execute_outputs
+
+    assert len(prefill_output.scheduled_new_reqs) == 3
+    assert prefill_output.total_num_scheduled_tokens == 6
+    assert prefill_output.num_common_prefix_blocks == [0]
+    assert prefill_output.scheduled_new_reqs[0].block_ids == ([1],)
+    assert prefill_output.scheduled_new_reqs[1].block_ids == ([2],)
+    assert prefill_output.scheduled_new_reqs[2].block_ids == ([3],)
+
+    decode_reqs = decode_output.scheduled_cached_reqs
+    assert decode_reqs.req_ids == ["_v1_warmup_0_", "_v1_warmup_1_", "_v1_warmup_2_"]
+    assert decode_reqs.num_computed_tokens == [2, 2, 2]
+    assert decode_reqs.new_block_ids == [([4],), ([5],), ([6],)]
+    assert decode_output.total_num_scheduled_tokens == 3
+    assert decode_output.num_common_prefix_blocks == [0]
+
+    assert cleanup_output.finished_req_ids == {
+        "_v1_warmup_0_",
+        "_v1_warmup_1_",
+        "_v1_warmup_2_",
+    }
+
+    assert len(sample_outputs) == 2
+    assert sample_outputs[0].structured_output_request_ids == [
+        "_v1_warmup_0_",
+        "_v1_warmup_1_",
+        "_v1_warmup_2_",
+    ]
+    assert sample_outputs[0].grammar_bitmask.shape == (3, 2)
+    assert sample_outputs[1] is None
+
+
+def test_v1_warmup_restores_connectors_if_execute_model_fails(monkeypatch):
+    kv_connector_agent = object()
+    ec_connector_agent = object()
+    monkeypatch.setattr(kv_transfer_state, "_KV_CONNECTOR_AGENT", kv_connector_agent)
+    monkeypatch.setattr(ec_transfer_state, "_EC_CONNECTOR_AGENT", ec_connector_agent)
+    monkeypatch.setattr(
+        gpu_warmup, "get_pp_group", lambda: SimpleNamespace(is_last_rank=True)
+    )
+    monkeypatch.setattr(gpu_warmup.torch.accelerator, "synchronize", lambda: None)
+
+    runner = _make_v1_warmup_runner_stub()
+    execute_outputs: list[SchedulerOutput] = []
+
+    def worker_execute_model(scheduler_output):
+        assert kv_transfer_state._KV_CONNECTOR_AGENT is None
+        assert ec_transfer_state._EC_CONNECTOR_AGENT is None
+        execute_outputs.append(scheduler_output)
+        if len(execute_outputs) == 1:
+            raise RuntimeError("warmup failed")
+
+    with pytest.raises(RuntimeError, match="warmup failed"):
+        gpu_warmup.warmup_v1_kernels(
+            runner,
+            worker_execute_model,
+            lambda grammar_output: None,
+        )
+
+    assert kv_transfer_state._KV_CONNECTOR_AGENT is kv_connector_agent
+    assert ec_transfer_state._EC_CONNECTOR_AGENT is ec_connector_agent
+    assert len(execute_outputs) == 2
+    assert execute_outputs[1].finished_req_ids == {
+        "_v1_warmup_0_",
+        "_v1_warmup_1_",
+        "_v1_warmup_2_",
+    }
 
 
 def _reshape_kv_cache_tensor_for_test(
