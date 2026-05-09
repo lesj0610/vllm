@@ -84,6 +84,7 @@ logger = init_logger(__name__)
 _SUPPORTED_SOFT_TOKENS = (70, 140, 280, 560, 1120)
 _VIDEO_MAX_SOFT_TOKENS = 70  # soft tokens per video frame (vs 280 for images)
 _VIDEO_MAX_FRAMES = 32  # max sampled frames per video
+_VIDEO_TOKENS_PER_FRAME = _VIDEO_MAX_SOFT_TOKENS + 2 + 6
 
 
 def _get_max_soft_tokens(
@@ -228,6 +229,81 @@ class Gemma4ProcessingInfo(BaseProcessingInfo):
         limits["video"] = None
         return limits
 
+    def _get_limit_mm_video_num_frames(self) -> int | None:
+        mm_config = self.ctx.model_config.get_multimodal_config()
+        video_opts = mm_config.limit_per_prompt.get("video")
+        if (
+            isinstance(video_opts, VideoDummyOptions)
+            and video_opts.num_frames is not None
+        ):
+            return min(_VIDEO_MAX_FRAMES, video_opts.num_frames)
+        return None
+
+    def _get_media_io_video_num_frames(self) -> int | None:
+        mm_config = self.ctx.model_config.get_multimodal_config()
+        video_kwargs = mm_config.media_io_kwargs.get("video", {})
+        if not isinstance(video_kwargs, Mapping):
+            return None
+
+        num_frames = video_kwargs.get("num_frames")
+        if isinstance(num_frames, int) and num_frames > 0:
+            return num_frames
+        return None
+
+    def _get_auto_video_num_frames_from_batched_tokens(self) -> int | None:
+        token_budget = self.ctx.max_num_batched_tokens_hint
+        if token_budget is None:
+            return None
+
+        num_frames = min(_VIDEO_MAX_FRAMES, token_budget // _VIDEO_TOKENS_PER_FRAME)
+        # Keep the existing minimum used by dummy video construction. If this
+        # still exceeds max_num_batched_tokens, startup should keep raising and
+        # ask the user to increase the scheduler budget.
+        num_frames = max(2, num_frames)
+        if num_frames < _VIDEO_MAX_FRAMES:
+            logger.info_once(
+                "Gemma4 default video frames are capped from %d to %d based "
+                "on max_num_batched_tokens=%d. Increase "
+                "--max-num-batched-tokens, or set --media-io-kwargs "
+                '\'{"video": {"num_frames": ...}}\' explicitly, to '
+                "use more frames.",
+                _VIDEO_MAX_FRAMES,
+                num_frames,
+                token_budget,
+            )
+        return num_frames
+
+    def get_video_num_frames_for_budget(self) -> int:
+        # limit_mm_per_prompt is the current profiling hint and takes priority
+        # for budget/dummy generation.
+        if (num_frames := self._get_limit_mm_video_num_frames()) is not None:
+            return num_frames
+
+        # media_io_kwargs controls runtime video loading. If the user sets it,
+        # budget should account for that instead of the default 32 frames.
+        if (num_frames := self._get_media_io_video_num_frames()) is not None:
+            return num_frames
+
+        if (
+            num_frames := self._get_auto_video_num_frames_from_batched_tokens()
+        ) is not None:
+            return num_frames
+
+        return _VIDEO_MAX_FRAMES
+
+    def get_video_num_frames_for_runtime(self, frame_count: int) -> int:
+        # Only auto-cap the default runtime path. Explicit runtime loading via
+        # media_io_kwargs must remain user controlled.
+        if self._get_media_io_video_num_frames() is not None:
+            return frame_count
+        if self._get_limit_mm_video_num_frames() is not None:
+            return frame_count
+        if (
+            num_frames := self._get_auto_video_num_frames_from_batched_tokens()
+        ) is not None:
+            return min(frame_count, num_frames)
+        return frame_count
+
     def get_mm_max_tokens_per_item(
         self, seq_len: int, mm_counts: Mapping[str, int]
     ) -> Mapping[str, int] | None:
@@ -246,15 +322,8 @@ class Gemma4ProcessingInfo(BaseProcessingInfo):
             processor = self.get_hf_processor()
             tokens["audio"] = processor.audio_seq_length
         # Video: each frame ≤ 70 soft tokens + boi + eoi + ~6 ts tokens.
-        num_frames = _VIDEO_MAX_FRAMES
-        mm_config = self.ctx.model_config.get_multimodal_config()
-        video_opts = mm_config.limit_per_prompt.get("video")
-        if (
-            isinstance(video_opts, VideoDummyOptions)
-            and video_opts.num_frames is not None
-        ):
-            num_frames = min(num_frames, video_opts.num_frames)
-        tokens["video"] = num_frames * (_VIDEO_MAX_SOFT_TOKENS + 2 + 6)
+        num_frames = self.get_video_num_frames_for_budget()
+        tokens["video"] = num_frames * _VIDEO_TOKENS_PER_FRAME
         return tokens
 
     def get_data_parser(self) -> MultiModalDataParser:
@@ -465,7 +534,7 @@ class Gemma4DummyInputsBuilder(BaseDummyInputsBuilder[Gemma4ProcessingInfo]):
             data["video"] = self._get_dummy_videos(
                 width=img_width,
                 height=img_height,
-                num_frames=_VIDEO_MAX_FRAMES,
+                num_frames=self.info.get_video_num_frames_for_budget(),
                 num_videos=num_videos,
                 overrides=video_overrides,
             )
@@ -558,6 +627,13 @@ class Gemma4MultiModalProcessor(BaseMultiModalProcessor[Gemma4ProcessingInfo]):
                     ]
                 else:
                     frames = list(video_array)
+
+                num_frames = self.info.get_video_num_frames_for_runtime(len(frames))
+                frames = frames[:num_frames]
+                metadata = dict(metadata)
+                metadata["frames_indices"] = metadata.get(
+                    "frames_indices", list(range(len(frames)))
+                )[:num_frames]
 
                 # Compute timestamps from metadata (same as transformers)
                 fps = metadata.get("fps") or 24
