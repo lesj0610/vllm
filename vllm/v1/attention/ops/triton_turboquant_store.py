@@ -225,7 +225,7 @@ def _store_mse_value(
 def _tq_fused_store_fp8(
     Key_ptr,  # [NH, D] float16/bfloat16 — raw keys
     Value_ptr,  # [NH, D] float16/bfloat16 — raw values
-    KV_cache_ptr,  # [total_bytes] uint8 (flattened view)
+    KV_cache_ptr,  # uint8 KV cache pointer, offsets use explicit strides
     Slot_mapping_ptr,  # [N] int32 — per-token slot indices
     # Cache strides (for computing byte offsets)
     stride_cache_block: tl.constexpr,
@@ -381,7 +381,7 @@ def _tq_fused_store_mse(
     Midpoints_ptr,  # [n_centroids-1] float32
     ValueMidpoints_ptr,  # [n_value_centroids-1] float32
     # Cache and indexing
-    KV_cache_ptr,  # [total_bytes] uint8 (flattened view)
+    KV_cache_ptr,  # uint8 KV cache pointer, offsets use explicit strides
     Slot_mapping_ptr,  # [N] int32 — per-token slot indices
     # Cache strides
     stride_cache_block: tl.constexpr,
@@ -586,7 +586,7 @@ def triton_turboquant_store(
                 v_store,
                 v_norms.squeeze(1),
                 value_midpoints,
-                kv_cache.view(-1),
+                kv_cache,
                 slot_mapping,
                 stride_cache_block=stride_block,
                 stride_cache_pos=stride_pos,
@@ -609,7 +609,7 @@ def triton_turboquant_store(
             _tq_fused_store_fp8[grid](
                 k_flat,
                 v_flat,
-                kv_cache.view(-1),
+                kv_cache,
                 slot_mapping,
                 stride_cache_block=stride_block,
                 stride_cache_pos=stride_pos,
@@ -661,7 +661,7 @@ def triton_turboquant_store(
         v_norms_arg,
         midpoints,
         value_midpoints,
-        kv_cache.view(-1),
+        kv_cache,
         slot_mapping,
         stride_cache_block=stride_block,
         stride_cache_pos=stride_pos,
