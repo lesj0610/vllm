@@ -729,6 +729,18 @@ def triton_turboquant_decode_attention(
             f"{value_layout} value path (requires {required_slot_size}B)"
         )
 
+    use_mm_prefix = False
+    max_mm_ranges = 0
+    mm_prefix_range_arg: torch.Tensor = block_table
+    if mm_prefix_range is not None:
+        if mm_prefix_range.ndim != 3:
+            raise ValueError(
+                f"Unsupported mm_prefix_range shape: {mm_prefix_range.shape}"
+            )
+        use_mm_prefix = True
+        max_mm_ranges = mm_prefix_range.shape[1]
+        mm_prefix_range_arg = mm_prefix_range
+
     # Compute q_rot = q @ Pi.T (rotated query for MSE key scoring)
     # FP8 path: pass query directly (float16); kernel casts inline.
     # MSE path: still needs external GEMM (cuBLAS), so q_rot is float32.

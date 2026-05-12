@@ -491,6 +491,50 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
     def _needs_sliding_window_mask(self, seq_len: int) -> bool:
         return self.sliding_window is not None and seq_len > self.sliding_window
 
+    def _can_use_flash_prefill(
+        self,
+        seq_len: int,
+        mm_prefix_ranges: torch.Tensor | None,
+    ) -> bool:
+        return (
+            self._can_use_flash_attn
+            and not self._needs_sliding_window_mask(seq_len)
+            and mm_prefix_ranges is None
+        )
+
+    def _get_arange_cache(
+        self,
+        max_value: int,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        arange_cache: torch.Tensor | None = getattr(self, "_arange_cache", None)
+        if (
+            arange_cache is None
+            or arange_cache.shape[0] <= max_value
+            or arange_cache.device != device
+            or arange_cache.dtype != dtype
+        ):
+            arange_cache = torch.arange(
+                0,
+                max_value + 1,
+                device=device,
+                dtype=dtype,
+            )
+            self._arange_cache = arange_cache
+        return arange_cache
+
+    def _get_mm_prefix_ranges(
+        self,
+        attn_metadata: TurboQuantMetadata,
+        req_idx: int,
+    ) -> torch.Tensor | None:
+        mm_prefix_range_tensor = getattr(attn_metadata, "mm_prefix_range_tensor", None)
+        if mm_prefix_range_tensor is None:
+            return None
+        return mm_prefix_range_tensor[req_idx]
+
     def _sdpa_with_causal_and_sliding_mask(
         self,
         query: torch.Tensor,
@@ -534,6 +578,84 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             enable_gqa=(key.shape[1] < query.shape[1]),
         )
         return out[0].transpose(0, 1)
+
+    def _decode_prefill_from_cache(
+        self,
+        query: torch.Tensor,
+        kv_cache: torch.Tensor,
+        block_table: torch.Tensor,
+        *,
+        query_start_pos: int,
+        Pi: torch.Tensor,
+        centroids: torch.Tensor,
+        PiT: torch.Tensor | None = None,
+        mm_prefix_ranges: torch.Tensor | None = None,
+        seq_lens_dtype: torch.dtype = torch.int32,
+        layer: Any = None,
+    ) -> torch.Tensor:
+        q_len, Hq, D = query.shape
+        out = torch.empty_like(query)
+        arange_cache = self._get_arange_cache(
+            query_start_pos + q_len,
+            device=query.device,
+            dtype=seq_lens_dtype,
+        )
+
+        for chunk_start in range(0, q_len, _CONTINUATION_DECODE_THRESHOLD):
+            chunk_end = min(chunk_start + _CONTINUATION_DECODE_THRESHOLD, q_len)
+            chunk = query[chunk_start:chunk_end]
+            chunk_len = chunk_end - chunk_start
+            synth_seq_lens = arange_cache[
+                query_start_pos + chunk_start + 1 : query_start_pos + chunk_end + 1
+            ]
+            synth_block_table = block_table.expand(chunk_len, -1)
+            mm_prefix_range = None
+            if mm_prefix_ranges is not None:
+                mm_prefix_range = mm_prefix_ranges.unsqueeze(0).expand(
+                    chunk_len, -1, -1
+                )
+
+            mid_o_buf = output_buf = lse_buf = None
+            if is_workspace_manager_initialized():
+                mid_o_buf, output_buf, lse_buf = (
+                    current_workspace_manager().get_simultaneous(
+                        (
+                            (chunk_len, Hq, self.max_num_kv_splits, D + 1),
+                            torch.float32,
+                        ),
+                        ((chunk_len, Hq, D), query.dtype),
+                        ((chunk_len, Hq), torch.float32),
+                    )
+                )
+
+            out[chunk_start:chunk_end] = triton_turboquant_decode_attention(
+                query=chunk,
+                kv_cache=kv_cache,
+                block_table=synth_block_table,
+                seq_lens=synth_seq_lens,
+                Pi=Pi,
+                centroids=centroids,
+                scale=self.scale,
+                mse_bits=self.tq_config.key_mse_bits,
+                key_packed_size=self.tq_config.key_packed_size,
+                value_quant_bits=self.tq_config.effective_value_quant_bits,
+                key_fp8=self.tq_config.key_fp8,
+                value_centroids=(
+                    layer._tq_value_centroids if layer is not None else None
+                ),
+                value_mse=self.tq_config.value_mse_supported,
+                norm_correction=self.tq_config.norm_correction,
+                PiT=PiT,
+                mid_o_buf=mid_o_buf,
+                output_buf=output_buf,
+                lse_buf=lse_buf,
+                buf_holder=layer,
+                max_num_kv_splits=self.max_num_kv_splits,
+                sliding_window=self.sliding_window,
+                mm_prefix_range=mm_prefix_range,
+            )
+
+        return out
 
     def _ensure_on_device(self, layer, device):
         """One-time derivation of TQ buffers (rotation matrix, midpoints).
@@ -837,15 +959,11 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         # to avoid per-request host→device tensor creation.
         if not hasattr(self, "_cu_2"):
             self._cu_2 = torch.zeros(2, device=query.device, dtype=torch.int32)
-        # Cache arange on self (avoid per-call kernel launch).
-        _max_seq = attn_metadata.max_seq_len
-        _ac: torch.Tensor | None = getattr(self, "_arange_cache", None)
-        if _ac is None or _ac.shape[0] <= _max_seq:
-            _ac = torch.arange(
-                0, _max_seq + 1, device=query.device, dtype=attn_metadata.seq_lens.dtype
-            )
-            self._arange_cache = _ac
-        _arange_cache: torch.Tensor = _ac
+        arange_cache = self._get_arange_cache(
+            attn_metadata.max_seq_len,
+            device=query.device,
+            dtype=attn_metadata.seq_lens.dtype,
+        )
 
         for i in range(num_reqs):
             q_start = qsl[i]
@@ -873,6 +991,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                     seq_len - q_len,
                     Pi,
                     centroids,
+                    mm_prefix_ranges=mm_prefix_ranges,
                 )
             elif q_len == seq_len:
                 # First-chunk prefill: all K/V are in the current batch.
@@ -886,7 +1005,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                         query_start_pos=0,
                         mm_prefix_ranges=mm_prefix_ranges,
                     )
-                elif self._can_use_flash_attn:
+                elif self._can_use_flash_attn and mm_prefix_ranges is None:
                     # Assign to slice to avoid gpu/cpu sync.
                     self._cu_2[1:2] = q_len
                     cu = self._cu_2
@@ -905,38 +1024,29 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                         k_seq,
                         v_seq,
                         query_start_pos=0,
+                        mm_prefix_ranges=mm_prefix_ranges,
                     )
             else:
                 # Continuation chunk: tokens already stored to TQ cache
                 # by do_kv_cache_update. Use decode kernel directly to
                 # avoid O(cached_len) full-dequant per continuation.
-                # For large continuations, fall back to _continuation_prefill.
+                # For large continuations, use flash-attn when that path is
+                # available; otherwise run decode kernel chunks.
                 cached_len = seq_len - q_len
-                if q_len <= _CONTINUATION_DECODE_THRESHOLD and (
-                    mm_prefix_ranges is None
+                if q_len <= _CONTINUATION_DECODE_THRESHOLD or not (
+                    self._can_use_flash_prefill(seq_len, mm_prefix_ranges)
                 ):
-                    # Fast path: treat each query as a decode request
-                    # with incremental seq_lens for causal masking.
-                    # Slice from pre-built arange (no kernel launch)
-                    synth_seq_lens = _arange_cache[cached_len + 1 : seq_len + 1]
-                    synth_bt = attn_metadata.block_table[i : i + 1].expand(q_len, -1)
-                    out = triton_turboquant_decode_attention(
-                        query=q_seq,
-                        kv_cache=kv_cache,
-                        block_table=synth_bt,
-                        seq_lens=synth_seq_lens,
+                    out = self._decode_prefill_from_cache(
+                        q_seq,
+                        kv_cache,
+                        attn_metadata.block_table[i : i + 1],
+                        query_start_pos=cached_len,
                         Pi=Pi,
                         centroids=centroids,
-                        scale=self.scale,
-                        mse_bits=self.tq_config.key_mse_bits,
-                        key_packed_size=self.tq_config.key_packed_size,
-                        value_quant_bits=(self.tq_config.effective_value_quant_bits),
-                        key_fp8=self.tq_config.key_fp8,
-                        value_centroids=layer._tq_value_centroids,
-                        value_mse=self.tq_config.value_mse_supported,
-                        norm_correction=self.tq_config.norm_correction,
                         PiT=PiT,
-                        sliding_window=self.sliding_window,
+                        mm_prefix_ranges=mm_prefix_ranges,
+                        seq_lens_dtype=arange_cache.dtype,
+                        layer=layer,
                     )
                 else:
                     # Large continuation: dequant cached K/V and use
@@ -1099,10 +1209,20 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         query_start_pos: int,
         Pi: torch.Tensor,
         centroids: torch.Tensor,
+        mm_prefix_ranges: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        # Pi and centroids are kept in the signature to match the existing
-        # TQ call chain and make the cache-only prefill path explicit.
-        del Pi, centroids
+        if not self._can_use_flash_prefill(seq_len, mm_prefix_ranges):
+            return self._decode_prefill_from_cache(
+                query,
+                kv_cache,
+                block_table,
+                query_start_pos=query_start_pos,
+                Pi=Pi,
+                centroids=centroids,
+                PiT=getattr(layer, "_tq_PiT", None),
+                mm_prefix_ranges=mm_prefix_ranges,
+                layer=layer,
+            )
 
         k_full, v_full = self._dequant_cached_kv(
             layer,
@@ -1116,6 +1236,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             k_full,
             v_full,
             query_start_pos=query_start_pos,
+            mm_prefix_ranges=mm_prefix_ranges,
         )
 
     def _continuation_prefill(
