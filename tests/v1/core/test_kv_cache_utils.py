@@ -11,7 +11,7 @@ import pytest
 import torch
 
 import vllm.v1.core.kv_cache_utils as kv_cache_utils
-from vllm.config import ModelConfig, SchedulerConfig, VllmConfig
+from vllm.config import ModelConfig, ParallelConfig, SchedulerConfig, VllmConfig
 from vllm.config.compilation import CompilationConfig, CUDAGraphMode
 from vllm.config.kv_events import KVEventsConfig
 from vllm.lora.request import LoRARequest
@@ -2585,6 +2585,357 @@ def test_multi_pool_config_deterministic_across_workers():
     scheduler_config = generate_scheduler_kv_cache_config(kv_cache_configs)
     assert scheduler_config.pool_configs == kv_cache_configs[0].pool_configs
     assert scheduler_config.group_to_pool_id == (0, 1)
+
+
+def test_multi_pool_kv_cache_manager_uses_pool_local_blocks():
+    block_size = 4
+    spec_0 = new_kv_cache_spec(block_size=block_size)
+    spec_1 = new_kv_cache_spec(block_size=block_size, head_size=128)
+    config = KVCacheConfig(
+        num_blocks=2,
+        kv_cache_tensors=[
+            KVCacheTensor(size=3 * 128, shared_by=["layer_1"]),
+            KVCacheTensor(size=2 * 256, shared_by=["layer_2"]),
+        ],
+        kv_cache_groups=[
+            KVCacheGroupSpec(["layer_1"], spec_0, pool_id=0),
+            KVCacheGroupSpec(["layer_2"], spec_1, pool_id=1),
+        ],
+        pool_configs=(
+            KVCachePoolConfig(
+                pool_id=0,
+                memory_model=MemoryModel.TOKEN_PROPORTIONAL,
+                group_ids=(0,),
+                num_blocks=3,
+                accounting_page_size_bytes=128,
+                physical_page_size_bytes=128,
+            ),
+            KVCachePoolConfig(
+                pool_id=1,
+                memory_model=MemoryModel.TOKEN_PROPORTIONAL,
+                group_ids=(1,),
+                num_blocks=2,
+                accounting_page_size_bytes=256,
+                physical_page_size_bytes=256,
+            ),
+        ),
+        group_to_pool_id=(0, 1),
+    )
+    kv_cache_manager = KVCacheManager(
+        kv_cache_config=config,
+        max_model_len=16,
+        hash_block_size=block_size,
+        enable_caching=False,
+    )
+
+    too_large = make_request(
+        request_id="too_large",
+        prompt_token_ids=[0] * 8,
+        block_size=block_size,
+    )
+    assert kv_cache_manager.allocate_slots(too_large, num_new_tokens=8) is None
+    assert {
+        pool_id: pool.get_num_free_blocks()
+        for pool_id, pool in enumerate(kv_cache_manager.coordinator._block_pools)
+    } == {0: 2, 1: 1}
+
+    request = make_request(
+        request_id="0",
+        prompt_token_ids=[0] * 4,
+        block_size=block_size,
+    )
+    blocks = kv_cache_manager.allocate_slots(request, num_new_tokens=4)
+    assert blocks is not None
+    assert blocks.get_block_ids() == ([1], [1])
+    assert kv_cache_manager.take_new_block_ids_by_pool() == {
+        0: [1],
+        1: [1],
+    }
+    assert kv_cache_manager.take_new_block_ids_by_pool() == {}
+    assert {
+        pool_id: pool.get_num_free_blocks()
+        for pool_id, pool in enumerate(kv_cache_manager.coordinator._block_pools)
+    } == {0: 1, 1: 0}
+    assert kv_cache_manager.usage == pytest.approx(2 / 3)
+    with pytest.raises(NotImplementedError):
+        kv_cache_manager.evict_blocks({1})
+    assert not kv_cache_manager.reset_prefix_cache()
+
+    second_request = make_request(
+        request_id="1",
+        prompt_token_ids=[1] * 4,
+        block_size=block_size,
+    )
+    assert kv_cache_manager.allocate_slots(second_request, num_new_tokens=4) is None
+
+    kv_cache_manager.free(request)
+    assert {
+        pool_id: pool.get_num_free_blocks()
+        for pool_id, pool in enumerate(kv_cache_manager.coordinator._block_pools)
+    } == {0: 2, 1: 1}
+    assert kv_cache_manager.usage == 0.0
+    assert kv_cache_manager.reset_prefix_cache()
+    blocks = kv_cache_manager.allocate_slots(second_request, num_new_tokens=4)
+    assert blocks is not None
+    assert len(blocks.get_block_ids()[0]) == 1
+    assert len(blocks.get_block_ids()[1]) == 1
+
+
+def test_multi_pool_mixed_attention_page_sizes():
+    model_config = ModelConfig(max_model_len=16)
+    vllm_config = VllmConfig(model_config=model_config)
+
+    kv_cache_specs = {
+        "sw_1": new_tq_sliding_window_spec(
+            block_size=4, tq_slot_size=8, sliding_window=4
+        ),
+        "sw_2": new_tq_sliding_window_spec(
+            block_size=4, tq_slot_size=8, sliding_window=4
+        ),
+        "full": new_tq_full_attention_spec(block_size=4, tq_slot_size=16),
+        "native": new_sliding_window_spec(
+            block_size=4, num_kv_heads=1, head_size=16, sliding_window=4
+        ),
+    }
+    max_page_size = max(spec.page_size_bytes for spec in kv_cache_specs.values())
+    kv_cache_config = get_kv_cache_configs(
+        vllm_config, [kv_cache_specs], [max_page_size * 128]
+    )[0]
+
+    assert kv_cache_config.is_multi_pool
+    assert [group.layer_names for group in kv_cache_config.kv_cache_groups] == [
+        ["sw_1"],
+        ["sw_2"],
+        ["full"],
+        ["native"],
+    ]
+    expected_page_sizes = sorted(
+        {spec.page_size_bytes for spec in kv_cache_specs.values()}
+    )
+    assert [pool.physical_page_size_bytes for pool in kv_cache_config.pool_configs] == (
+        expected_page_sizes
+    )
+    assert kv_cache_config.num_blocks == kv_cache_config.pool_configs[0].num_blocks
+    for pool in kv_cache_config.pool_configs:
+        assert kv_cache_config.get_pool_num_blocks(pool.pool_id) == pool.num_blocks
+    assert [group.pool_id for group in kv_cache_config.kv_cache_groups] == [
+        expected_page_sizes.index(group.kv_cache_spec.page_size_bytes)
+        for group in kv_cache_config.kv_cache_groups
+    ]
+    for tensor in kv_cache_config.kv_cache_tensors:
+        pool_id = kv_cache_utils._get_tensor_pool_id(kv_cache_config, tensor)
+        pool = kv_cache_config.pool_configs[pool_id]
+        assert tensor.size == pool.physical_page_size_bytes * pool.num_blocks
+
+    scheduler_config = generate_scheduler_kv_cache_config([kv_cache_config])
+    assert scheduler_config.pool_configs == kv_cache_config.pool_configs
+    assert scheduler_config.group_to_pool_id == kv_cache_config.group_to_pool_id
+
+    vllm_config.cache_config.num_gpu_blocks_override = 32
+    override_config = get_kv_cache_configs(
+        vllm_config, [kv_cache_specs], [max_page_size * 128]
+    )[0]
+    assert not override_config.is_multi_pool
+    assert override_config.num_blocks == 32
+    vllm_config.cache_config.num_gpu_blocks_override = None
+
+
+def test_multi_pool_grouped_layers_use_position_tensors():
+    model_config = ModelConfig(max_model_len=16)
+    vllm_config = VllmConfig(model_config=model_config)
+
+    small_sliding = new_tq_sliding_window_spec(
+        block_size=4, tq_slot_size=8, sliding_window=4
+    )
+    large_full = new_tq_full_attention_spec(block_size=4, tq_slot_size=16)
+    kv_cache_specs = {
+        "sw_0": small_sliding,
+        "sw_1": small_sliding,
+        "sw_2": small_sliding,
+        "sw_3": small_sliding,
+        "sw_4": small_sliding,
+        "full_0": large_full,
+        "full_1": large_full,
+    }
+
+    max_page_size = max(spec.page_size_bytes for spec in kv_cache_specs.values())
+    kv_cache_config = get_kv_cache_configs(
+        vllm_config,
+        [kv_cache_specs],
+        [max_page_size * 1024],
+    )[0]
+
+    assert kv_cache_config.is_multi_pool
+    assert [group.layer_names for group in kv_cache_config.kv_cache_groups] == [
+        ["sw_0", "sw_3"],
+        ["sw_1", "sw_4"],
+        ["sw_2"],
+        ["full_0", "full_1"],
+    ]
+    assert [group.pool_id for group in kv_cache_config.kv_cache_groups] == [
+        0,
+        0,
+        0,
+        1,
+    ]
+    assert kv_cache_config.kv_cache_tensors == [
+        KVCacheTensor(
+            size=small_sliding.page_size_bytes
+            * kv_cache_config.pool_configs[0].num_blocks,
+            shared_by=["sw_0", "sw_1", "sw_2"],
+        ),
+        KVCacheTensor(
+            size=small_sliding.page_size_bytes
+            * kv_cache_config.pool_configs[0].num_blocks,
+            shared_by=["sw_3", "sw_4"],
+        ),
+        KVCacheTensor(
+            size=large_full.page_size_bytes
+            * kv_cache_config.pool_configs[1].num_blocks,
+            shared_by=["full_0"],
+        ),
+        KVCacheTensor(
+            size=large_full.page_size_bytes
+            * kv_cache_config.pool_configs[1].num_blocks,
+            shared_by=["full_1"],
+        ),
+    ]
+
+
+def test_multi_pool_falls_back_when_capacity_gain_is_too_small(monkeypatch):
+    model_config = ModelConfig(max_model_len=16)
+    vllm_config = VllmConfig(model_config=model_config)
+
+    monkeypatch.setattr(
+        kv_cache_utils,
+        "_MULTI_POOL_MIN_CAPACITY_IMPROVEMENT",
+        10.0,
+    )
+    kv_cache_specs = {
+        "layer_1": new_tq_sliding_window_spec(
+            block_size=4, tq_slot_size=8, sliding_window=4
+        ),
+        "layer_2": new_tq_full_attention_spec(block_size=4, tq_slot_size=16),
+    }
+    available_memory = (
+        max(spec.page_size_bytes for spec in kv_cache_specs.values()) * 64
+    )
+
+    kv_cache_config = get_kv_cache_configs(
+        vllm_config,
+        [kv_cache_specs],
+        [available_memory],
+    )[0]
+
+    assert not kv_cache_config.is_multi_pool
+
+
+def test_multi_pool_disabled_for_pipeline_parallelism():
+    model_config = ModelConfig(max_model_len=16)
+    vllm_config = VllmConfig(
+        model_config=model_config,
+        parallel_config=ParallelConfig(pipeline_parallel_size=2),
+    )
+    kv_cache_specs = {
+        "layer_1": new_tq_sliding_window_spec(
+            block_size=4, tq_slot_size=8, sliding_window=4
+        ),
+        "layer_2": new_tq_full_attention_spec(block_size=4, tq_slot_size=16),
+    }
+    available_memory = (
+        max(spec.page_size_bytes for spec in kv_cache_specs.values()) * 64
+    )
+
+    kv_cache_config = get_kv_cache_configs(
+        vllm_config,
+        [kv_cache_specs],
+        [available_memory],
+    )[0]
+
+    assert not kv_cache_config.is_multi_pool
+
+
+def test_multi_pool_max_concurrency_uses_limiting_pool():
+    model_config = ModelConfig(max_model_len=8)
+    vllm_config = VllmConfig(model_config=model_config)
+    block_size = 4
+
+    kv_cache_config = KVCacheConfig(
+        num_blocks=3,
+        kv_cache_tensors=[
+            KVCacheTensor(size=128 * 10, shared_by=["layer_1"]),
+            KVCacheTensor(size=256 * 3, shared_by=["layer_2"]),
+        ],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["layer_1"],
+                new_kv_cache_spec(block_size=block_size),
+                pool_id=0,
+            ),
+            KVCacheGroupSpec(
+                ["layer_2"],
+                new_kv_cache_spec(block_size=block_size, head_size=128),
+                pool_id=1,
+            ),
+        ],
+        pool_configs=(
+            KVCachePoolConfig(
+                pool_id=0,
+                memory_model=MemoryModel.TOKEN_PROPORTIONAL,
+                group_ids=(0,),
+                num_blocks=10,
+                accounting_page_size_bytes=128,
+                physical_page_size_bytes=128,
+            ),
+            KVCachePoolConfig(
+                pool_id=1,
+                memory_model=MemoryModel.TOKEN_PROPORTIONAL,
+                group_ids=(1,),
+                num_blocks=3,
+                accounting_page_size_bytes=256,
+                physical_page_size_bytes=256,
+            ),
+        ),
+        group_to_pool_id=(0, 1),
+    )
+
+    assert get_max_concurrency_for_kv_cache_config(
+        vllm_config, kv_cache_config
+    ) == pytest.approx(1.5)
+
+
+def test_multi_pool_kv_cache_configs_shrink_each_pool_across_workers():
+    model_config = ModelConfig(max_model_len=16)
+    vllm_config = VllmConfig(model_config=model_config)
+
+    kv_cache_specs = {
+        "sw_1": new_tq_sliding_window_spec(
+            block_size=4, tq_slot_size=8, sliding_window=4
+        ),
+        "sw_2": new_tq_sliding_window_spec(
+            block_size=4, tq_slot_size=8, sliding_window=4
+        ),
+        "full": new_tq_full_attention_spec(block_size=4, tq_slot_size=16),
+        "native": new_sliding_window_spec(
+            block_size=4, num_kv_heads=1, head_size=16, sliding_window=4
+        ),
+    }
+    max_page_size = max(spec.page_size_bytes for spec in kv_cache_specs.values())
+    kv_cache_configs = get_kv_cache_configs(
+        vllm_config,
+        [kv_cache_specs, kv_cache_specs],
+        [max_page_size * 128, max_page_size * 64],
+    )
+
+    for kv_cache_config in kv_cache_configs:
+        assert kv_cache_config.is_multi_pool
+        assert kv_cache_config.num_blocks == kv_cache_config.pool_configs[0].num_blocks
+        for pool in kv_cache_config.pool_configs:
+            assert kv_cache_config.get_pool_num_blocks(pool.pool_id) == pool.num_blocks
+        for tensor in kv_cache_config.kv_cache_tensors:
+            pool_id = kv_cache_utils._get_tensor_pool_id(kv_cache_config, tensor)
+            pool = kv_cache_config.pool_configs[pool_id]
+            assert tensor.size == pool.physical_page_size_bytes * pool.num_blocks
 
 
 def test_request_constant_prefix_caching_fails_early():

@@ -167,6 +167,18 @@ class KVCacheManager:
         Returns:
             The KV cache usage (between 0.0 and 1.0).
         """
+        if self.kv_cache_config.is_multi_pool:
+            total_blocks = sum(
+                max(pool.num_gpu_blocks - 1, 0)
+                for pool in self.coordinator._block_pools
+            )
+            if total_blocks == 0:
+                return 0.0
+            used_blocks = sum(
+                max(pool.num_gpu_blocks - 1, 0) - pool.get_num_free_blocks()
+                for pool in self.coordinator._block_pools
+            )
+            return max(used_blocks, 0) / total_blocks
         return self.block_pool.get_usage()
 
     def _cacheable_block_pool(self) -> CacheableBlockPoolProtocol:
@@ -481,6 +493,10 @@ class KVCacheManager:
         Args:
             block_ids: Set of block IDs to evict from cache.
         """
+        if self.kv_cache_config.is_multi_pool:
+            raise NotImplementedError(
+                "Flat block-id eviction is not supported with multi-pool KV cache"
+            )
         self._cacheable_block_pool().evict_blocks(block_ids)
 
     def reset_prefix_cache(self) -> bool:
@@ -492,6 +508,26 @@ class KVCacheManager:
             bool: True if the prefix cache is successfully reset,
             False otherwise.
         """
+        if self.kv_cache_config.is_multi_pool:
+            for block_pool in self.coordinator._block_pools:
+                num_used_blocks = (
+                    block_pool.num_gpu_blocks - block_pool.get_num_free_blocks()
+                )
+                if num_used_blocks != 1:
+                    logger.warning(
+                        "Failed to reset prefix cache because some blocks are not freed"
+                    )
+                    return False
+            for block_pool in self.coordinator._block_pools:
+                if not cast(
+                    CacheableBlockPoolProtocol, block_pool
+                ).reset_prefix_cache():
+                    return False
+            if self.log_stats:
+                assert self.prefix_cache_stats is not None
+                self.prefix_cache_stats.reset = True
+            return True
+
         if not self._cacheable_block_pool().reset_prefix_cache():
             return False
         if self.log_stats:
@@ -572,6 +608,18 @@ class KVCacheManager:
         for mgr in self.coordinator.single_type_managers:
             ids.extend(mgr.take_new_block_ids())
         return ids
+
+    def take_new_block_ids_by_pool(self) -> dict[int, list[int]]:
+        """Drain and return new attention block IDs grouped by pool id."""
+        ids_by_pool: dict[int, list[int]] = {}
+        for pool_id, mgr in zip(
+            self.kv_cache_config.group_to_pool_id,
+            self.coordinator.single_type_managers,
+        ):
+            ids = mgr.take_new_block_ids()
+            if ids:
+                ids_by_pool.setdefault(pool_id, []).extend(ids)
+        return ids_by_pool
 
     def new_step_starts(self) -> None:
         """Called when a new step is started."""

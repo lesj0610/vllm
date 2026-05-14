@@ -858,6 +858,8 @@ class KVCacheGroupSpec:
     kv_cache_spec: KVCacheSpec
     # Whether this group contains EAGLE/MTP draft attention layers.
     is_eagle_group: bool = False
+    # Pool-local block namespace used by multi-pool KV cache layouts.
+    pool_id: int = 0
 
 
 @dataclass(frozen=True)
@@ -1015,6 +1017,19 @@ class KVCacheConfig:
         pool_configs, group_to_pool_id = self._make_legacy_pool_metadata()
         self.pool_configs = pool_configs
         self.group_to_pool_id = group_to_pool_id
+
+    @property
+    def is_multi_pool(self) -> bool:
+        return len(self.pool_configs) > 1
+
+    def get_pool_num_blocks(self, pool_id: int) -> int:
+        if not self.pool_configs:
+            assert pool_id == 0
+            return self.num_blocks
+        for pool in self.pool_configs:
+            if pool.pool_id == pool_id:
+                return pool.num_blocks
+        raise KeyError(f"Unknown KV cache pool id: {pool_id}")
 
     @property
     def has_mamba_layers(self) -> bool:

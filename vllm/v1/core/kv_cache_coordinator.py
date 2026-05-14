@@ -63,9 +63,9 @@ class KVCacheCoordinator(ABC):
         )
         # Public legacy alias. Existing consumers assume a single shared pool.
         self.block_pool = self._block_pools[0]
+        self.manager_pool_ids = self.kv_cache_config.group_to_pool_id
         self._group_to_pool = tuple(
-            self._block_pools[pool_id]
-            for pool_id in self.kv_cache_config.group_to_pool_id
+            self._block_pools[pool_id] for pool_id in self.manager_pool_ids
         )
 
         # KV cache group indices that get the EAGLE last-block drop.
@@ -97,12 +97,15 @@ class KVCacheCoordinator(ABC):
             len(self.kv_cache_config.pool_configs),
             len(pool_ids),
         )
-        if num_distinct_pools > 1 and self.enable_caching:
+        has_request_constant_pool = any(
+            pool.memory_model == MemoryModel.REQUEST_CONSTANT
+            for pool in self.kv_cache_config.pool_configs
+        )
+        if num_distinct_pools > 1 and self.enable_caching and has_request_constant_pool:
             raise NotImplementedError(
-                "KVCacheCoordinator currently supports multi-pool configs only "
-                "when prefix caching is disabled. Got "
-                f"{num_distinct_pools} distinct pools in kv_cache_config. "
-                "Pool-aware prefix-cache dispatch is not implemented yet."
+                "KVCacheCoordinator currently supports prefix caching for "
+                "multi-pool configs only when all pools are token-proportional. "
+                f"Got {num_distinct_pools} distinct pools in kv_cache_config."
             )
 
     def _make_block_pools(
@@ -661,7 +664,11 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                     _max_length = min(
                         curr_hit_length + spec.block_size, max_cache_hit_length
                     )
-                block_pool = cast(CacheableBlockPoolProtocol, self.block_pool)
+                pool_id = self.manager_pool_ids[group_ids[0]]
+                assert all(self.manager_pool_ids[gid] == pool_id for gid in group_ids)
+                block_pool = cast(
+                    CacheableBlockPoolProtocol, self._block_pools[pool_id]
+                )
                 hit_blocks = manager_cls.find_longest_cache_hit(
                     block_hashes=_get_block_hashes(spec),
                     max_length=_max_length,

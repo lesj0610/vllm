@@ -1048,12 +1048,18 @@ class GPUModelRunner(
             cache_dtype=self.cache_config.cache_dtype,
             runner_only_attn_layers=self.runner_only_attn_layers,
             static_forward_context=(self.compilation_config.static_forward_context),
+            group_pool_ids=list(self.kv_cache_config.group_to_pool_id),
         )
 
     def _zero_block_ids(self, block_ids: list[int]) -> None:
         """Zero the KV cache memory for the given block IDs."""
         if hasattr(self, "_kv_block_zeroer"):
             self._kv_block_zeroer.zero_block_ids(block_ids)
+
+    def _zero_block_ids_by_pool(self, block_ids_by_pool: dict[int, list[int]]) -> None:
+        """Zero KV cache memory for pool-local block IDs."""
+        if hasattr(self, "_kv_block_zeroer"):
+            self._kv_block_zeroer.zero_block_ids_by_pool(block_ids_by_pool)
 
     # Note: used for model runner override.
     def _init_device_properties(self) -> None:
@@ -1106,6 +1112,8 @@ class GPUModelRunner(
 
         # Zero GPU memory for freshly allocated cache blocks to prevent
         # stale NaN/data from corrupting attention or SSM computation.
+        if scheduler_output.new_block_ids_to_zero_by_pool:
+            self._zero_block_ids_by_pool(scheduler_output.new_block_ids_to_zero_by_pool)
         if scheduler_output.new_block_ids_to_zero:
             self._zero_block_ids(scheduler_output.new_block_ids_to_zero)
 
