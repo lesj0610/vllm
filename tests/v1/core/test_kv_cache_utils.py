@@ -1576,10 +1576,15 @@ def test_multi_pool_kv_cache_manager_uses_pool_local_blocks():
         0: [1],
         1: [1],
     }
+    assert kv_cache_manager.take_new_block_ids_by_pool() == {}
     assert {
         pool_id: pool.get_num_free_blocks()
         for pool_id, pool in kv_cache_manager.coordinator.block_pools.items()
     } == {0: 1, 1: 0}
+    assert kv_cache_manager.usage == pytest.approx(2 / 3)
+    with pytest.raises(NotImplementedError):
+        kv_cache_manager.evict_blocks({1})
+    assert not kv_cache_manager.reset_prefix_cache()
 
     second_request = make_request(
         request_id="1",
@@ -1593,6 +1598,8 @@ def test_multi_pool_kv_cache_manager_uses_pool_local_blocks():
         pool_id: pool.get_num_free_blocks()
         for pool_id, pool in kv_cache_manager.coordinator.block_pools.items()
     } == {0: 2, 1: 1}
+    assert kv_cache_manager.usage == 0.0
+    assert kv_cache_manager.reset_prefix_cache()
     blocks = kv_cache_manager.allocate_slots(second_request, num_new_tokens=4)
     assert blocks is not None
     assert len(blocks.get_block_ids()[0]) == 1

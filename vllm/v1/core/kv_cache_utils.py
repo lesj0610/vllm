@@ -1274,6 +1274,46 @@ def _is_multi_pool_kv_cache_groups(
     return len({group.pool_id for group in kv_cache_groups}) > 1
 
 
+@dataclass
+class _MultiPoolLayout:
+    pool_page_sizes: dict[int, int]
+    pool_blocks_per_request: dict[int, int]
+    pool_group_sizes: dict[int, int]
+    pool_layers_by_position: dict[int, dict[int, list[str]]]
+
+
+def _collect_multi_pool_layout(
+    vllm_config: VllmConfig,
+    kv_cache_groups: list[KVCacheGroupSpec],
+) -> _MultiPoolLayout:
+    pool_page_sizes: dict[int, int] = {}
+    pool_blocks_per_request: dict[int, int] = defaultdict(int)
+    pool_group_sizes: dict[int, int] = defaultdict(int)
+    pool_layers_by_position: dict[int, dict[int, list[str]]] = defaultdict(
+        lambda: defaultdict(list)
+    )
+
+    for group in kv_cache_groups:
+        page_size = group.kv_cache_spec.page_size_bytes
+        existing_page_size = pool_page_sizes.setdefault(group.pool_id, page_size)
+        assert existing_page_size == page_size
+        pool_blocks_per_request[group.pool_id] += cdiv(
+            group.kv_cache_spec.max_memory_usage_bytes(vllm_config), page_size
+        )
+        pool_group_sizes[group.pool_id] = max(
+            pool_group_sizes[group.pool_id], len(group.layer_names)
+        )
+        for position, layer_name in enumerate(group.layer_names):
+            pool_layers_by_position[group.pool_id][position].append(layer_name)
+
+    return _MultiPoolLayout(
+        pool_page_sizes=pool_page_sizes,
+        pool_blocks_per_request=pool_blocks_per_request,
+        pool_group_sizes=dict(pool_group_sizes),
+        pool_layers_by_position=pool_layers_by_position,
+    )
+
+
 def _get_kv_cache_config_multi_pool(
     vllm_config: VllmConfig,
     kv_cache_groups: list[KVCacheGroupSpec],
@@ -1289,34 +1329,29 @@ def _get_kv_cache_config_multi_pool(
 
     assert _is_multi_pool_kv_cache_groups(kv_cache_groups)
 
-    pool_page_sizes: dict[int, int] = {}
-    pool_blocks_per_request: dict[int, int] = defaultdict(int)
-    pool_layers_by_position: dict[int, dict[int, list[str]]] = defaultdict(
-        lambda: defaultdict(list)
-    )
-    for group in kv_cache_groups:
-        page_size = group.kv_cache_spec.page_size_bytes
-        existing_page_size = pool_page_sizes.setdefault(group.pool_id, page_size)
-        assert existing_page_size == page_size
-        pool_blocks_per_request[group.pool_id] += cdiv(
-            group.kv_cache_spec.max_memory_usage_bytes(vllm_config), page_size
-        )
-        for position, layer_name in enumerate(group.layer_names):
-            pool_layers_by_position[group.pool_id][position].append(layer_name)
+    layout = _collect_multi_pool_layout(vllm_config, kv_cache_groups)
 
     bytes_per_request = sum(
-        pool_page_sizes[pool_id] * len(pool_layers_by_position[pool_id]) * blocks
-        for pool_id, blocks in pool_blocks_per_request.items()
+        layout.pool_page_sizes[pool_id]
+        * layout.pool_group_sizes.get(pool_id, 0)
+        * blocks
+        for pool_id, blocks in layout.pool_blocks_per_request.items()
     )
-    num_requests = available_memory / bytes_per_request
+    num_requests = available_memory / bytes_per_request if bytes_per_request > 0 else 0
 
     kv_cache_pools: list[KVCachePoolSpec] = []
     kv_cache_tensors: list[KVCacheTensor] = []
-    for pool_id in sorted(pool_page_sizes):
-        page_size = pool_page_sizes[pool_id]
-        blocks_per_request = pool_blocks_per_request[pool_id]
-        num_blocks = int(num_requests * blocks_per_request)
-        num_blocks = max(num_blocks, 0)
+    for pool_id in sorted(layout.pool_page_sizes):
+        page_size = layout.pool_page_sizes[pool_id]
+        blocks_per_request = layout.pool_blocks_per_request[pool_id]
+        if layout.pool_group_sizes.get(pool_id, 0) == 0:
+            # This worker has no local layers in this pool (for example after
+            # pipeline-parallel projection). Keep only the null block; there is
+            # no GPU tensor to back for this pool on this worker.
+            num_blocks = 1
+        else:
+            num_blocks = int(num_requests * blocks_per_request)
+            num_blocks = max(num_blocks, 0)
         kv_cache_pools.append(
             KVCachePoolSpec(
                 pool_id=pool_id,
@@ -1324,7 +1359,7 @@ def _get_kv_cache_config_multi_pool(
                 page_size_bytes=page_size,
             )
         )
-        layers_by_position = pool_layers_by_position.get(pool_id, {})
+        layers_by_position = layout.pool_layers_by_position.get(pool_id, {})
         for position in sorted(layers_by_position):
             shared_by = layers_by_position[position]
             kv_cache_tensors.append(
@@ -1646,24 +1681,12 @@ def _max_memory_usage_bytes_multi_pool(
 ) -> int:
     """Maximum per-request KV bytes for a pool-local block layout."""
 
-    pool_page_sizes: dict[int, int] = {}
-    pool_blocks_per_request: dict[int, int] = defaultdict(int)
-    pool_group_sizes: dict[int, int] = defaultdict(int)
-    for group in kv_cache_groups:
-        page_size = group.kv_cache_spec.page_size_bytes
-        existing_page_size = pool_page_sizes.setdefault(group.pool_id, page_size)
-        assert existing_page_size == page_size
-        pool_blocks_per_request[group.pool_id] += cdiv(
-            group.kv_cache_spec.max_memory_usage_bytes(vllm_config), page_size
-        )
-        pool_group_sizes[group.pool_id] = max(
-            pool_group_sizes[group.pool_id], len(group.layer_names)
-        )
+    layout = _collect_multi_pool_layout(vllm_config, kv_cache_groups)
     return sum(
-        pool_page_sizes[pool_id]
-        * pool_group_sizes[pool_id]
-        * pool_blocks_per_request[pool_id]
-        for pool_id in pool_page_sizes
+        layout.pool_page_sizes[pool_id]
+        * layout.pool_group_sizes.get(pool_id, 0)
+        * layout.pool_blocks_per_request[pool_id]
+        for pool_id in layout.pool_page_sizes
     )
 
 
@@ -1699,6 +1722,8 @@ def _get_kv_cache_groups_multi_pool_candidate(
     if vllm_config.cache_config.num_gpu_blocks_override is not None:
         return None
     if vllm_config.kv_transfer_config is not None:
+        return None
+    if vllm_config.parallel_config.pipeline_parallel_size > 1:
         return None
     if is_kv_cache_spec_uniform(kv_cache_spec):
         return None
