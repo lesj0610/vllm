@@ -46,7 +46,7 @@ def _tq_decode_stage1(
     # Block table and sequence info
     Block_table_ptr,  # [B, max_num_blocks] int32
     Seq_lens_ptr,  # [B] int32
-    Mm_prefix_range_ptr,  # [B, max_mm_ranges, 2] int32 or dummy
+    MM_prefix_range_ptr,  # [B, MAX_MM_RANGES, 2] int32
     # TQ parameters
     Centroids_ptr,  # [n_centroids] float32
     # Output (intermediate for stage2)
@@ -79,9 +79,9 @@ def _tq_decode_stage1(
     BLOCK_D: tl.constexpr,  # next_power_of_2(HEAD_DIM)
     BLOCK_KV: tl.constexpr,  # tokens per tile (16)
     KEY_FP8: tl.constexpr,  # 1 if K is stored as FP8
-    SLIDING_WINDOW: tl.constexpr = -1,
+    SLIDING_WINDOW: tl.constexpr = -1,  # -1 disables sliding-window masking
     USE_MM_PREFIX: tl.constexpr = False,
-    MAX_MM_RANGES: tl.constexpr = 1,
+    MAX_MM_RANGES: tl.constexpr = 0,
     NORM_CORRECTION: tl.constexpr = 0,  # 1 = re-normalize centroids
     FP8_E4B15: tl.constexpr = 0,  # 1 = use e4b15 (Ampere/Ada), 0 = e4nv (Hopper+)
 ):
@@ -110,7 +110,6 @@ def _tq_decode_stage1(
         return
 
     kv_range = tl.arange(0, BLOCK_KV)
-    query_pos = seq_len - 1
 
     # Load query vector: q_rot — [BLOCK_D] float32
     q_base = bid * stride_qb + hid * stride_qh
@@ -141,18 +140,16 @@ def _tq_decode_stage1(
     # ================================================================
     for start_n in range(split_start, split_end, BLOCK_KV):
         kv_offs = start_n + kv_range
-        base_kv_mask = kv_offs < split_end
-        kv_mask = base_kv_mask
-        if SLIDING_WINDOW > 0:
-            kv_mask = kv_mask & ((query_pos - kv_offs) < SLIDING_WINDOW)
+        kv_mask = kv_offs < split_end
         if USE_MM_PREFIX:
-            mm_mask = tl.full([BLOCK_KV], False, dtype=tl.int1)
-            for i in range(MAX_MM_RANGES):
+            query_pos = seq_len - 1
+            mm_prefix_mask = kv_offs < 0
+            for range_idx in range(MAX_MM_RANGES):
                 range_start = tl.load(
-                    Mm_prefix_range_ptr + bid * MAX_MM_RANGES * 2 + i * 2
+                    MM_prefix_range_ptr + bid * MAX_MM_RANGES * 2 + range_idx * 2
                 )
                 range_end = tl.load(
-                    Mm_prefix_range_ptr + bid * MAX_MM_RANGES * 2 + i * 2 + 1
+                    MM_prefix_range_ptr + bid * MAX_MM_RANGES * 2 + range_idx * 2 + 1
                 )
                 is_valid = range_start < range_end
                 q_in_range = (
@@ -161,29 +158,35 @@ def _tq_decode_stage1(
                 k_in_range = (
                     (kv_offs >= range_start) & (kv_offs <= range_end) & is_valid
                 )
-                mm_mask |= q_in_range & k_in_range
-            kv_mask = base_kv_mask & (kv_mask | mm_mask)
+                mm_prefix_mask = mm_prefix_mask | (q_in_range & k_in_range)
+        if SLIDING_WINDOW > 0:
+            # Decode query is the last token in this sequence.
+            query_pos = seq_len - 1
+            kv_mask = kv_mask & ((query_pos - kv_offs) < SLIDING_WINDOW)
+        if USE_MM_PREFIX:
+            # Multimodal prefix ranges remain visible even when they sit
+            # outside the sliding window.
+            kv_mask = (kv_offs < split_end) & (kv_mask | mm_prefix_mask)
 
         has_valid_kv = tl.max(kv_mask.to(tl.int32), axis=0) > 0
-
-        page_idx = kv_offs // BLOCK_SIZE
-        page_off = kv_offs % BLOCK_SIZE
-        block_nums = tl.load(
-            Block_table_ptr + bt_base + page_idx,
-            mask=kv_mask,
-            other=0,
-        ).to(tl.int64)
-
-        slot_bases = (
-            block_nums * stride_cache_block
-            + page_off.to(tl.int64) * stride_cache_pos
-            + tl.cast(kv_head, tl.int64) * stride_cache_head
-        )
-
-        # ============================================================
-        # COMPUTE ATTENTION SCORES: [BLOCK_KV]
-        # ============================================================
         if has_valid_kv:
+            page_idx = kv_offs // BLOCK_SIZE
+            page_off = kv_offs % BLOCK_SIZE
+            block_nums = tl.load(
+                Block_table_ptr + bt_base + page_idx,
+                mask=kv_mask,
+                other=0,
+            ).to(tl.int64)
+
+            slot_bases = (
+                block_nums * stride_cache_block
+                + page_off.to(tl.int64) * stride_cache_pos
+                + tl.cast(kv_head, tl.int64) * stride_cache_head
+            )
+
+            # ============================================================
+            # COMPUTE ATTENTION SCORES: [BLOCK_KV]
+            # ============================================================
             if KEY_FP8:
                 k_addrs = slot_bases[:, None] + d_offs[None, :]
                 k_raw = tl.load(
@@ -216,8 +219,8 @@ def _tq_decode_stage1(
                     mask=kv_mask[:, None] & d_mask[None, :],
                     other=0,
                 ).to(tl.int32)
-                raw16 = mse_raw0 | (mse_raw1 << 8)
-                mse_idx = (raw16 >> mse_bit_shift[None, :]) & mse_mask
+                mse_raw16 = mse_raw0 | (mse_raw1 << 8)
+                mse_idx = (mse_raw16 >> mse_bit_shift[None, :]) & mse_mask
 
                 # Centroid gather + dot product
                 c_vals = tl.load(
@@ -279,8 +282,8 @@ def _tq_decode_stage1(
                     mask=kv_mask[:, None] & d_mask[None, :],
                     other=0,
                 ).to(tl.int32)
-                raw16 = val_raw0 | (val_raw1 << 8)
-                v_idx = ((raw16 >> val_bit_shift[None, :]) & 0x7).to(tl.float32)
+                val_raw16 = val_raw0 | (val_raw1 << 8)
+                v_idx = ((val_raw16 >> val_bit_shift[None, :]) & 0x7).to(tl.float32)
 
                 sc_bases = val_bases + VAL_DATA_BYTES
                 sc_lo = tl.load(KV_cache_ptr + sc_bases, mask=kv_mask, other=0).to(
@@ -349,11 +352,17 @@ def _tq_decode_stage1(
     tl.store(Mid_o_ptr + out_base + HEAD_DIM, lse)
 
 
+# ---------------------------------------------------------------------------
+# Stage 2: log-sum-exp reduction across TQ split-KV partials
+# ---------------------------------------------------------------------------
+
+
 @triton.jit
 def _tq_decode_stage2(
     Mid_O,
     o,
     lse,
+    B_Seqlen,
     stride_mid_ob,
     stride_mid_oh,
     stride_mid_os,
@@ -593,7 +602,6 @@ def triton_turboquant_decode_attention(
     mse_bits: int,
     key_packed_size: int,
     value_quant_bits: int,
-    mm_prefix_range: torch.Tensor | None = None,  # [B, max_ranges, 2] int32
     key_fp8: bool = False,
     norm_correction: bool = False,
     PiT: torch.Tensor | None = None,  # [D, D] pre-computed Pi.T contiguous
@@ -604,6 +612,7 @@ def triton_turboquant_decode_attention(
     buf_holder: Any = None,
     max_num_kv_splits: int = 32,  # fixed split count (must be constant for cudagraph)
     sliding_window: int | None = None,
+    mm_prefix_range: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Launch fused TQ decode attention (Triton stage1 + stage2).
 
@@ -616,6 +625,17 @@ def triton_turboquant_decode_attention(
     device = query.device
 
     cfg = _get_layout(D, mse_bits, value_quant_bits, key_packed_size)
+    use_mm_prefix = False
+    max_mm_ranges = 0
+    mm_prefix_range_arg: torch.Tensor = block_table
+    if mm_prefix_range is not None:
+        if mm_prefix_range.ndim != 3:
+            raise ValueError(
+                f"Unsupported mm_prefix_range shape: {mm_prefix_range.shape}"
+            )
+        use_mm_prefix = True
+        max_mm_ranges = mm_prefix_range.shape[1]
+        mm_prefix_range_arg = mm_prefix_range
 
     # Compute q_rot = q @ Pi.T (rotated query for MSE key scoring)
     # FP8 path: pass query directly (float16); kernel casts inline.
@@ -650,18 +670,15 @@ def triton_turboquant_decode_attention(
 
     # Stage 1: split-KV tiled attention scoring + value accumulation
     fp8_e4b15 = _use_fp8_e4b15(device.index or 0)
-    BLOCK_KV = 4
-    use_mm_prefix = mm_prefix_range is not None
-    max_mm_ranges = mm_prefix_range.shape[1] if use_mm_prefix else 1
-    mm_prefix_range_ptr = mm_prefix_range if use_mm_prefix else seq_lens
     sliding_window_arg = -1 if sliding_window is None else sliding_window
+    BLOCK_KV = 4
     grid = (B, Hq, NUM_KV_SPLITS)
     _tq_decode_stage1[grid](
         q_rot,
         kv_cache,
         block_table,
         seq_lens,
-        mm_prefix_range_ptr,
+        mm_prefix_range_arg,
         centroids,
         mid_o,
         q_rot.stride(0),
@@ -721,6 +738,7 @@ def triton_turboquant_decode_attention(
         mid_o,
         output,
         lse,
+        seq_lens,
         mid_o.stride(0),
         mid_o.stride(1),
         mid_o.stride(2),

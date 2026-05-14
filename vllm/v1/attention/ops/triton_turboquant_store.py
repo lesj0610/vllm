@@ -145,7 +145,7 @@ def _store_quantized_value(
 def _tq_fused_store_fp8(
     Key_ptr,  # [NH, D] float16/bfloat16 — raw keys
     Value_ptr,  # [NH, D] float16/bfloat16 — raw values
-    KV_cache_ptr,  # [total_bytes] uint8 (flattened view)
+    KV_cache_ptr,  # uint8 KV cache pointer, offsets use explicit strides
     Slot_mapping_ptr,  # [N] int32 — per-token slot indices
     # Cache strides (for computing byte offsets)
     stride_cache_block: tl.constexpr,
@@ -226,7 +226,7 @@ def _tq_fused_store_mse(
     # Quantization tables
     Midpoints_ptr,  # [n_centroids-1] float32
     # Cache and indexing
-    KV_cache_ptr,  # [total_bytes] uint8 (flattened view)
+    KV_cache_ptr,  # uint8 KV cache pointer, offsets use explicit strides
     Slot_mapping_ptr,  # [N] int32 — per-token slot indices
     # Cache strides
     stride_cache_block: tl.constexpr,

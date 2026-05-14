@@ -865,6 +865,11 @@ def is_kv_cache_spec_uniform(kv_cache_spec: dict[str, KVCacheSpec]) -> bool:
         # Encoder-only models do not have KV cache, kv_cache_type can be
         # regarded as uniform.
         return True
+    spec_types = {type(spec) for spec in kv_cache_spec.values()}
+    if (TQFullAttentionSpec in spec_types and FullAttentionSpec in spec_types) or (
+        TQSlidingWindowSpec in spec_types and SlidingWindowSpec in spec_types
+    ):
+        return False
     try:
         kv_cache_spec_values = list(kv_cache_spec.values())
         _ = kv_cache_spec_values[0].merge(kv_cache_spec_values)
@@ -1106,8 +1111,7 @@ def unify_kv_cache_spec_page_size(
     unified_page_size = max(page_sizes)
     tq_spec_types = (TQFullAttentionSpec, TQSlidingWindowSpec)
     can_pad_to_max_page_size = all(
-        layer.page_size_bytes == unified_page_size
-        or isinstance(layer, tq_spec_types)
+        layer.page_size_bytes == unified_page_size or isinstance(layer, tq_spec_types)
         for layer in kv_cache_spec.values()
     )
     if not can_pad_to_max_page_size and any(
@@ -1115,7 +1119,7 @@ def unify_kv_cache_spec_page_size(
     ):
         unified_page_size = math.lcm(*page_sizes)
 
-    new_kv_cache_spec = {}
+    new_kv_cache_spec: dict[str, KVCacheSpec] = {}
     for layer_name, layer_spec in kv_cache_spec.items():
         if layer_spec.page_size_bytes == unified_page_size:
             new_kv_cache_spec[layer_name] = layer_spec
@@ -1134,12 +1138,12 @@ def unify_kv_cache_spec_page_size(
                 )
             ratio = unified_page_size // layer_page_size
             new_block_size = layer_spec.block_size * ratio
-            new_spec = layer_spec.copy_with_new_block_size(new_block_size)
-            if new_spec.page_size_bytes != unified_page_size:
+            resized_spec = layer_spec.copy_with_new_block_size(new_block_size)
+            if resized_spec.page_size_bytes != unified_page_size:
                 raise NotImplementedError(
                     "Failed to unify KV cache page size after adjusting block_size."
                 )
-            new_kv_cache_spec[layer_name] = new_spec
+            new_kv_cache_spec[layer_name] = resized_spec
     return new_kv_cache_spec
 
 
@@ -1737,6 +1741,37 @@ def group_and_unify_kv_cache_specs(
     return [mla_uniform_spec, *swa_uniform_specs]
 
 
+def _is_tq_native_mixed_kv_cache_spec(
+    kv_cache_spec: dict[str, KVCacheSpec],
+) -> bool:
+    """Return whether the spec mixes TurboQuant and native attention storage.
+
+    Keep this predicate intentionally narrow. The special mixed path is only
+    for TQ attention specs plus exact native full/sliding attention specs.
+    All-TQ, pure-native, MLA, Mamba, and chunked-local layouts must keep their
+    existing routing.
+    """
+    supported_spec_types = {
+        FullAttentionSpec,
+        SlidingWindowSpec,
+        TQFullAttentionSpec,
+        TQSlidingWindowSpec,
+    }
+    specs = list(kv_cache_spec.values())
+    has_tq = any(
+        type(spec) in (TQFullAttentionSpec, TQSlidingWindowSpec) for spec in specs
+    )
+    has_native = any(
+        type(spec) in (FullAttentionSpec, SlidingWindowSpec) for spec in specs
+    )
+    return (
+        has_tq
+        and has_native
+        and all(type(spec) in supported_spec_types for spec in specs)
+        and any(isinstance(spec, SlidingWindowSpec) for spec in specs)
+    )
+
+
 def _approximate_gcd(values: Sequence[int], *, lower_bound: int | None = None) -> int:
     """Pick a chunk size that minimizes total upward padding.
 
@@ -1902,6 +1937,18 @@ def _get_token_proportional_kv_cache_groups(
 ) -> list[KVCacheGroupSpec]:
     if vllm_config.scheduler_config.disable_hybrid_kv_cache_manager:
         unify_hybrid_kv_cache_specs(kv_cache_spec)
+
+    if (
+        not vllm_config.scheduler_config.disable_hybrid_kv_cache_manager
+        and _is_tq_native_mixed_kv_cache_spec(kv_cache_spec)
+    ):
+        # TQ+native mixed layouts need to preserve the hybrid block manager
+        # semantics. Converting them into one UniformTypeKVCacheSpecs group
+        # loses the sliding-window recycling benefit and significantly reduces
+        # the reported KV token capacity. Pad page sizes only for this mixed
+        # layout and keep all-TQ / pure-native routing unchanged.
+        kv_cache_spec = unify_kv_cache_spec_page_size(kv_cache_spec)
+        return _get_kv_cache_groups_uniform_page_size(kv_cache_spec)
 
     if is_kv_cache_spec_uniform(kv_cache_spec):
         # KV cache of all layers are the same, which is true for

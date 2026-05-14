@@ -70,14 +70,9 @@ class Gemma4Config(VerifyAndUpdateConfig):
 
         The fix detects heterogeneous head dimensions from the model config
         and forces a single backend for all layers when the user hasn't
-        explicitly chosen one:
-
-        - TRITON_ATTN for regular KV-cache dtypes
-        - TURBOQUANT when TurboQuant KV-cache quantization is enabled
-
-        TurboQuant needs to stay on the TurboQuant backend so heterogeneous
-        Gemma4 models can still use TurboQuant KV cache without reintroducing
-        mixed-backend execution.
+        explicitly chosen one. Use TurboQuant when the user requested a
+        TurboQuant KV cache; otherwise use TRITON_ATTN (which has no
+        head_size ceiling).
 
         TODO: Heterogeneous head_sizes (head_dim != global_head_dim)
         require NixlConnector changes to support per-layer KV transfer
