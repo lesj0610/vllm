@@ -4,9 +4,12 @@
 from collections.abc import Mapping
 
 import pytest
+import torch
 from PIL import Image as PILImage
 
+from vllm.model_executor.models.gemma4_mm import Gemma4ImagePixelInputs
 from vllm.multimodal import MULTIMODAL_REGISTRY
+from vllm.multimodal.inputs import MultiModalFieldConfig
 
 from ....conftest import ImageTestAssets
 from ...utils import build_model_context
@@ -33,6 +36,36 @@ def _create_gemma4_processor(
         max_num_batched_tokens_hint=max_num_batched_tokens_hint,
     )
     return ctx, processor
+
+
+def test_gemma4_image_schema_accepts_variable_patch_counts():
+    Gemma4ImagePixelInputs(
+        pixel_values=[
+            torch.randn(10080, 768),
+            torch.randn(2520, 768),
+        ],
+        pixel_position_ids=[
+            torch.zeros(10080, 2, dtype=torch.long),
+            torch.zeros(2520, 2, dtype=torch.long),
+        ],
+    )
+
+
+def test_gemma4_image_batching_keeps_variable_patch_counts_unstacked():
+    field = MultiModalFieldConfig.batched("image").field
+    elems = field.build_elems(
+        "image",
+        "pixel_values",
+        [torch.randn(10080, 768), torch.randn(2520, 768)],
+    )
+
+    reduced = field.reduce_data(list(elems))
+
+    assert isinstance(reduced, list)
+    assert [tensor.shape for tensor in reduced] == [
+        torch.Size([10080, 768]),
+        torch.Size([2520, 768]),
+    ]
 
 
 @pytest.mark.parametrize(

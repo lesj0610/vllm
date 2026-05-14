@@ -49,15 +49,20 @@ from vllm.v1.kv_cache_interface import (
     KVCacheGroupSpec,
     KVCachePoolConfig,
     KVCacheSpec,
+    KVCacheSpecKind,
     KVCacheTensor,
     KVQuantMode,
     MambaSpec,
     MemoryModel,
     MLAAttentionSpec,
+    SinkFullAttentionSpec,
+    SlidingWindowMLASpec,
     SlidingWindowSpec,
     TQFullAttentionSpec,
     TQSlidingWindowSpec,
     UniformTypeKVCacheSpecs,
+    get_kv_cache_spec_kind,
+    get_kv_cache_spec_sliding_window,
 )
 from vllm.v1.metrics.stats import CachingMetrics, PrefixCacheStats
 from vllm.v1.request import Request
@@ -1975,7 +1980,7 @@ def test_get_kv_cache_config_one_worker():
     )
 
 
-def test_tq_native_mixed_kv_cache_uses_hybrid_page_groups():
+def test_tq_native_mixed_kv_cache_uses_multi_pool_page_groups():
     model_config = ModelConfig(max_model_len=16)
     vllm_config = VllmConfig(model_config=model_config)
 
@@ -1997,7 +2002,7 @@ def test_tq_native_mixed_kv_cache_uses_hybrid_page_groups():
         vllm_config, [kv_cache_specs], [max_page_size * 32]
     )[0]
 
-    assert kv_cache_config.num_blocks == 32
+    assert kv_cache_config.is_multi_pool
     assert len(kv_cache_config.kv_cache_groups) == 4
     assert [group.layer_names for group in kv_cache_config.kv_cache_groups] == [
         ["layer_1"],
@@ -2007,7 +2012,12 @@ def test_tq_native_mixed_kv_cache_uses_hybrid_page_groups():
     ]
     group_specs = [group.kv_cache_spec for group in kv_cache_config.kv_cache_groups]
     assert all(not isinstance(spec, UniformTypeKVCacheSpecs) for spec in group_specs)
-    assert all(spec.page_size_bytes == max_page_size for spec in group_specs)
+    assert [spec.page_size_bytes for spec in group_specs] == [
+        tq_sliding_1.page_size_bytes,
+        tq_sliding_2.page_size_bytes,
+        tq_full.page_size_bytes,
+        native_sliding.page_size_bytes,
+    ]
     assert isinstance(group_specs[0], TQSlidingWindowSpec)
     assert isinstance(group_specs[1], TQSlidingWindowSpec)
     assert isinstance(group_specs[2], TQFullAttentionSpec)
@@ -2016,10 +2026,32 @@ def test_tq_native_mixed_kv_cache_uses_hybrid_page_groups():
     assert group_specs[0].tq_slot_size == tq_sliding_1.tq_slot_size
     assert group_specs[2].tq_slot_size == tq_full.tq_slot_size
     assert group_specs[3].sliding_window == native_sliding.sliding_window
+    assert kv_cache_config.group_to_pool_id == (0, 0, 1, 2)
+    assert tuple(
+        pool.physical_page_size_bytes for pool in kv_cache_config.pool_configs
+    ) == (
+        tq_sliding_1.page_size_bytes,
+        tq_full.page_size_bytes,
+        native_sliding.page_size_bytes,
+    )
     assert kv_cache_config.kv_cache_tensors == [
         KVCacheTensor(
-            size=max_page_size * 32,
-            shared_by=["layer_1", "layer_2", "layer_3", "layer_4"],
+            size=(
+                tq_sliding_1.page_size_bytes
+                * kv_cache_config.pool_configs[0].num_blocks
+            ),
+            shared_by=["layer_1", "layer_2"],
+        ),
+        KVCacheTensor(
+            size=tq_full.page_size_bytes * kv_cache_config.pool_configs[1].num_blocks,
+            shared_by=["layer_3"],
+        ),
+        KVCacheTensor(
+            size=(
+                native_sliding.page_size_bytes
+                * kv_cache_config.pool_configs[2].num_blocks
+            ),
+            shared_by=["layer_4"],
         ),
     ]
 
@@ -2027,6 +2059,7 @@ def test_tq_native_mixed_kv_cache_uses_hybrid_page_groups():
     kv_cache_config = get_kv_cache_configs(
         vllm_config, [kv_cache_specs], [max_page_size * 32]
     )[0]
+    assert not kv_cache_config.is_multi_pool
     assert kv_cache_config.num_blocks == 7
     assert kv_cache_config.kv_cache_tensors == [
         KVCacheTensor(
@@ -3201,6 +3234,149 @@ def new_mla_spec(cache_dtype_str=None):
         dtype=torch.float32,
         cache_dtype_str=cache_dtype_str,
     )
+
+
+def test_get_kv_cache_spec_kind_prefers_specific_attention_subclasses():
+    assert get_kv_cache_spec_kind(new_mla_spec()) == KVCacheSpecKind.MLA_ATTENTION
+
+    sliding_window_mla_spec = SlidingWindowMLASpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=576,
+        dtype=torch.float32,
+        sliding_window=128,
+    )
+    assert (
+        get_kv_cache_spec_kind(sliding_window_mla_spec)
+        == KVCacheSpecKind.SLIDING_WINDOW_MLA
+    )
+
+    sink_full_attention_spec = SinkFullAttentionSpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=64,
+        dtype=torch.float32,
+        sink_len=4,
+    )
+    assert (
+        get_kv_cache_spec_kind(sink_full_attention_spec)
+        == KVCacheSpecKind.SINK_FULL_ATTENTION
+    )
+
+
+def test_get_kv_cache_spec_kind_unwraps_uniform_type_specs():
+    uniform_mla_spec = UniformTypeKVCacheSpecs(
+        block_size=16,
+        kv_cache_specs={
+            "layer_1": new_mla_spec(),
+            "layer_2": new_mla_spec(cache_dtype_str="fp8"),
+        },
+    )
+    assert get_kv_cache_spec_kind(uniform_mla_spec) == KVCacheSpecKind.MLA_ATTENTION
+
+    uniform_swa_mla_spec = UniformTypeKVCacheSpecs(
+        block_size=16,
+        kv_cache_specs={
+            "layer_1": SlidingWindowMLASpec(
+                block_size=16,
+                num_kv_heads=1,
+                head_size=576,
+                dtype=torch.float32,
+                sliding_window=128,
+            ),
+            "layer_2": SlidingWindowMLASpec(
+                block_size=16,
+                num_kv_heads=1,
+                head_size=1024,
+                dtype=torch.float32,
+                sliding_window=128,
+            ),
+        },
+    )
+    assert (
+        get_kv_cache_spec_kind(uniform_swa_mla_spec)
+        == KVCacheSpecKind.SLIDING_WINDOW_MLA
+    )
+
+
+def test_get_kv_cache_spec_kind_unknown_for_mixed_uniform_type_specs():
+    uniform_mixed_spec = UniformTypeKVCacheSpecs(
+        block_size=16,
+        kv_cache_specs={
+            "layer_1": new_mla_spec(),
+            "layer_2": SlidingWindowMLASpec(
+                block_size=16,
+                num_kv_heads=1,
+                head_size=576,
+                dtype=torch.float32,
+                sliding_window=128,
+            ),
+        },
+    )
+    assert get_kv_cache_spec_kind(uniform_mixed_spec) == KVCacheSpecKind.UNKNOWN
+
+
+def test_get_kv_cache_spec_sliding_window_reads_windowed_specs():
+    full_attention_spec = FullAttentionSpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=64,
+        dtype=torch.float32,
+    )
+    sliding_window_spec = SlidingWindowSpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=64,
+        dtype=torch.float32,
+        sliding_window=128,
+    )
+
+    assert get_kv_cache_spec_sliding_window(full_attention_spec) is None
+    assert get_kv_cache_spec_sliding_window(sliding_window_spec) == 128
+
+
+def test_get_kv_cache_spec_sliding_window_unwraps_uniform_type_specs():
+    uniform_window_spec = UniformTypeKVCacheSpecs(
+        block_size=16,
+        kv_cache_specs={
+            "layer_1": SlidingWindowSpec(
+                block_size=16,
+                num_kv_heads=1,
+                head_size=64,
+                dtype=torch.float32,
+                sliding_window=128,
+            ),
+            "layer_2": SlidingWindowSpec(
+                block_size=16,
+                num_kv_heads=2,
+                head_size=64,
+                dtype=torch.float32,
+                sliding_window=128,
+            ),
+        },
+    )
+    mixed_window_spec = UniformTypeKVCacheSpecs(
+        block_size=16,
+        kv_cache_specs={
+            "layer_1": SlidingWindowSpec(
+                block_size=16,
+                num_kv_heads=1,
+                head_size=64,
+                dtype=torch.float32,
+                sliding_window=128,
+            ),
+            "layer_2": SlidingWindowSpec(
+                block_size=16,
+                num_kv_heads=1,
+                head_size=64,
+                dtype=torch.float32,
+                sliding_window=256,
+            ),
+        },
+    )
+
+    assert get_kv_cache_spec_sliding_window(uniform_window_spec) == 128
+    assert get_kv_cache_spec_sliding_window(mixed_window_spec) is None
 
 
 def test_merge_mla_spec():

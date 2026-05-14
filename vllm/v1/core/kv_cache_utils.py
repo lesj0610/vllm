@@ -18,12 +18,14 @@ from vllm.logger import init_logger
 from vllm.utils.hashing import sha256_cbor, xxhash_cbor
 from vllm.utils.math_utils import cdiv, round_up
 from vllm.utils.mem_utils import format_gib
+from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     ChunkedLocalAttentionSpec,
     CrossAttentionSpec,
     EncoderOnlyAttentionSpec,
     FullAttentionSpec,
+    HiddenStateCacheSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
     KVCachePoolConfig,
@@ -1129,14 +1131,13 @@ def unify_kv_cache_spec_page_size(
 
     unified_page_size = max(page_sizes)
     tq_spec_types = (TQFullAttentionSpec, TQSlidingWindowSpec)
-    can_pad_to_max_page_size = all(
-        layer.page_size_bytes == unified_page_size or isinstance(layer, tq_spec_types)
+    non_tq_page_sizes = {
+        layer.page_size_bytes
         for layer in kv_cache_spec.values()
-    )
-    if not can_pad_to_max_page_size and any(
-        unified_page_size % page_size != 0 for page_size in page_sizes
-    ):
-        unified_page_size = math.lcm(*page_sizes)
+        if not isinstance(layer, tq_spec_types)
+    }
+    if any(unified_page_size % page_size != 0 for page_size in non_tq_page_sizes):
+        unified_page_size = math.lcm(unified_page_size, *non_tq_page_sizes)
 
     new_kv_cache_spec: dict[str, KVCacheSpec] = {}
     for layer_name, layer_spec in kv_cache_spec.items():
@@ -2255,15 +2256,33 @@ def _get_token_proportional_kv_cache_groups(
         _annotate_eagle_groups_deepseek_v4(vllm_config, kv_cache_spec, kv_cache_groups)
         return kv_cache_groups
 
+    # Pull HiddenStateCacheSpec layers out before the general multi-group
+    # path so they don't affect page-size unification or grouping.
+    hidden_specs = {
+        k: v for k, v in kv_cache_spec.items() if isinstance(v, HiddenStateCacheSpec)
+    }
+    filtered_spec = {
+        k: v
+        for k, v in kv_cache_spec.items()
+        if not isinstance(v, HiddenStateCacheSpec)
+    }
+
     # As KVCacheManager can only allocate memory of one size, we need to unify
     # the page size of the layers. For cases cannot be unified, this function
     # will raise an error.
-    kv_cache_spec = unify_kv_cache_spec_page_size(kv_cache_spec)
-    # Model contains multiple attention types, but KV cache of all layers
-    # have the same physical memory per block per layer. Split the layers
-    # into groups with the same number of layers, and thus same total page
-    # size.
-    return _get_kv_cache_groups_uniform_page_size(kv_cache_spec)
+    filtered_spec = unify_kv_cache_spec_page_size(filtered_spec)
+    groups = _get_kv_cache_groups_uniform_page_size(filtered_spec)
+
+    # Add hidden-state layers back with page aligned to the common page.
+    if hidden_specs:
+        common_page = get_uniform_page_size([g.kv_cache_spec for g in groups])
+        for name, spec in hidden_specs.items():
+            per_token = spec.num_kv_heads * spec.head_size * get_dtype_size(spec.dtype)
+            new_bs = max(common_page // per_token, 1)
+            aligned = replace(spec, block_size=new_bs, page_size_padded=common_page)
+            groups.append(KVCacheGroupSpec([name], aligned))
+
+    return groups
 
 
 def _get_request_constant_kv_cache_groups(
