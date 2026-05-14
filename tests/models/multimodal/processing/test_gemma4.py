@@ -16,6 +16,26 @@ from ...utils import build_model_context
 
 # TODO: to be updated to "google/gemma-4-e2b-it" once the models are available
 GEMMA4_MODEL_ID = "google/gemma-4-E2B-it"
+VIDEO_TOKENS_PER_FRAME = 70 + 2 + 6
+
+
+def _create_gemma4_processor(
+    model_id: str,
+    *,
+    max_num_batched_tokens_hint: int | None = None,
+    limit_mm_per_prompt: Mapping[str, int | Mapping[str, int]] | None = None,
+    model_config_kwargs: dict[str, object] | None = None,
+):
+    ctx = build_model_context(
+        model_id,
+        limit_mm_per_prompt=limit_mm_per_prompt,
+        model_config_kwargs=model_config_kwargs,
+    )
+    processor = MULTIMODAL_REGISTRY.create_processor(
+        ctx.model_config,
+        max_num_batched_tokens_hint=max_num_batched_tokens_hint,
+    )
+    return ctx, processor
 
 
 def test_gemma4_image_schema_accepts_variable_patch_counts():
@@ -168,6 +188,109 @@ def test_get_mm_max_tokens_per_item_respects_configured_video_num_frames(
     assert tokens is not None
     assert tokens["image"] == 280
     assert tokens["video"] == expected_video_tokens
+
+
+@pytest.mark.parametrize(
+    ("max_num_batched_tokens_hint", "expected_video_frames"),
+    [
+        (None, 32),
+        (2048, 26),
+        (2496, 32),
+        (156, 2),
+    ],
+)
+@pytest.mark.parametrize("model_id", [GEMMA4_MODEL_ID])
+def test_gemma4_video_budget_uses_batched_token_hint(
+    model_id: str,
+    max_num_batched_tokens_hint: int | None,
+    expected_video_frames: int,
+):
+    ctx, processor = _create_gemma4_processor(
+        model_id,
+        max_num_batched_tokens_hint=max_num_batched_tokens_hint,
+    )
+
+    tokens = processor.info.get_mm_max_tokens_per_item(
+        seq_len=ctx.model_config.max_model_len,
+        mm_counts={"video": 1},
+    )
+
+    assert tokens is not None
+    assert tokens["video"] == expected_video_frames * VIDEO_TOKENS_PER_FRAME
+
+
+@pytest.mark.parametrize("model_id", [GEMMA4_MODEL_ID])
+def test_gemma4_video_budget_keeps_explicit_profiling_frames(model_id: str):
+    ctx, processor = _create_gemma4_processor(
+        model_id,
+        max_num_batched_tokens_hint=2048,
+        limit_mm_per_prompt={"video": {"count": 1, "num_frames": 32}},
+    )
+
+    tokens = processor.info.get_mm_max_tokens_per_item(
+        seq_len=ctx.model_config.max_model_len,
+        mm_counts={"video": 1},
+    )
+
+    assert tokens is not None
+    assert tokens["video"] == 32 * VIDEO_TOKENS_PER_FRAME
+
+
+@pytest.mark.parametrize("model_id", [GEMMA4_MODEL_ID])
+def test_gemma4_video_budget_keeps_explicit_media_io_frames(model_id: str):
+    ctx, processor = _create_gemma4_processor(
+        model_id,
+        max_num_batched_tokens_hint=2048,
+        model_config_kwargs={"media_io_kwargs": {"video": {"num_frames": 40}}},
+    )
+
+    tokens = processor.info.get_mm_max_tokens_per_item(
+        seq_len=ctx.model_config.max_model_len,
+        mm_counts={"video": 1},
+    )
+
+    assert tokens is not None
+    assert tokens["video"] == 40 * VIDEO_TOKENS_PER_FRAME
+
+
+@pytest.mark.parametrize("model_id", [GEMMA4_MODEL_ID])
+def test_gemma4_dummy_video_uses_batched_token_hint(model_id: str):
+    ctx, processor = _create_gemma4_processor(
+        model_id,
+        max_num_batched_tokens_hint=2048,
+    )
+    mm_config = ctx.model_config.get_multimodal_config()
+
+    data = processor.dummy_inputs.get_dummy_mm_data(
+        seq_len=ctx.model_config.max_model_len,
+        mm_counts={"video": 1},
+        mm_options=mm_config.limit_per_prompt,
+    )
+
+    video, metadata = data["video"][0]
+    assert video.shape[0] == 26
+    assert metadata["total_num_frames"] == 26
+
+
+@pytest.mark.parametrize("model_id", [GEMMA4_MODEL_ID])
+def test_gemma4_runtime_video_uses_batched_token_hint(model_id: str):
+    _, processor = _create_gemma4_processor(
+        model_id,
+        max_num_batched_tokens_hint=2048,
+    )
+
+    assert processor.info.get_video_num_frames_for_runtime(32) == 26
+
+
+@pytest.mark.parametrize("model_id", [GEMMA4_MODEL_ID])
+def test_gemma4_runtime_video_keeps_explicit_media_io_frames(model_id: str):
+    _, processor = _create_gemma4_processor(
+        model_id,
+        max_num_batched_tokens_hint=2048,
+        model_config_kwargs={"media_io_kwargs": {"video": {"num_frames": 40}}},
+    )
+
+    assert processor.info.get_video_num_frames_for_runtime(40) == 40
 
 
 @pytest.mark.parametrize("model_id", [GEMMA4_MODEL_ID])

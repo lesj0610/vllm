@@ -144,6 +144,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheGroupSpec,
     KVCacheSpec,
     MambaSpec,
+    MemoryModel,
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
 )
@@ -193,6 +194,7 @@ from vllm.v1.worker.cp_utils import (
 )
 from vllm.v1.worker.dp_utils import coordinate_batch_across_dp
 from vllm.v1.worker.ec_connector_model_runner_mixin import ECConnectorModelRunnerMixin
+from vllm.v1.worker.gpu.attn_utils import get_block_layout_page_size_bytes
 from vllm.v1.worker.gpu.pool.late_interaction_runner import LateInteractionRunner
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.gpu_ubatch_wrapper import UBatchWrapper
@@ -1072,12 +1074,18 @@ class GPUModelRunner(
             cache_dtype=self.cache_config.cache_dtype,
             runner_only_attn_layers=self.runner_only_attn_layers,
             static_forward_context=(self.compilation_config.static_forward_context),
+            group_pool_ids=list(self.kv_cache_config.group_to_pool_id),
         )
 
     def _zero_block_ids(self, block_ids: list[int]) -> None:
         """Zero the KV cache memory for the given block IDs."""
         if hasattr(self, "_kv_block_zeroer"):
             self._kv_block_zeroer.zero_block_ids(block_ids)
+
+    def _zero_block_ids_by_pool(self, block_ids_by_pool: dict[int, list[int]]) -> None:
+        """Zero KV cache memory for pool-local block IDs."""
+        if hasattr(self, "_kv_block_zeroer"):
+            self._kv_block_zeroer.zero_block_ids_by_pool(block_ids_by_pool)
 
     # Note: used for model runner override.
     def _init_device_properties(self) -> None:
@@ -1124,6 +1132,8 @@ class GPUModelRunner(
 
         # Zero GPU memory for freshly allocated cache blocks to prevent
         # stale NaN/data from corrupting attention or SSM computation.
+        if scheduler_output.new_block_ids_to_zero_by_pool:
+            self._zero_block_ids_by_pool(scheduler_output.new_block_ids_to_zero_by_pool)
         if scheduler_output.new_block_ids_to_zero:
             self._zero_block_ids(scheduler_output.new_block_ids_to_zero)
 
@@ -5436,6 +5446,7 @@ class GPUModelRunner(
             self.model_config,
             mm_counts={modality: 1},
             cache=self.mm_budget.cache,
+            processor=self.mm_budget.processor,
         )
         dummy_mm_item = dummy_mm_inputs["mm_kwargs"][modality][0]
 
@@ -6496,7 +6507,15 @@ class GPUModelRunner(
                 full_cls_name = attn_backend.full_cls_name()
                 layer_kv_cache_spec = kv_cache_group_spec.kv_cache_spec
                 if isinstance(layer_kv_cache_spec, UniformTypeKVCacheSpecs):
-                    layer_kv_cache_spec = layer_kv_cache_spec.kv_cache_specs[layer_name]
+                    # KV-sharing layers do not own a KVCacheSpec entry because
+                    # they reuse the target layer's KV cache. Use the target
+                    # spec when grouping their attention backend.
+                    spec_layer_name = self.shared_kv_cache_layers.get(
+                        layer_name, layer_name
+                    )
+                    layer_kv_cache_spec = layer_kv_cache_spec.kv_cache_specs[
+                        spec_layer_name
+                    ]
                 key = (full_cls_name, layer_kv_cache_spec)
                 attn_backends[key] = AttentionGroupKey(
                     attn_backend, layer_kv_cache_spec
@@ -6664,10 +6683,6 @@ class GPUModelRunner(
         computing mm_prefix_range_tensor once and sharing it across all
         metadata objects to avoid redundant host-to-device transfers.
         """
-        from vllm.v1.attention.backends.triton_attn import (
-            TritonAttentionMetadata,
-        )
-
         # Get all metadata objects from either list or dict structure
         metadata_list = []
         if isinstance(attn_metadata, list):
@@ -6676,22 +6691,29 @@ class GPUModelRunner(
         else:
             metadata_list.extend(attn_metadata.values())
 
-        # Set mm_prefix_range for all metadata and compute tensor once
-        shared_tensor = None
+        # Set mm_prefix_range for all metadata and compute backend-specific
+        # tensor form for any metadata class that declares the converter.
+        # This keeps mm-prefix support generic instead of importing one backend
+        # here and special-casing every future backend.
+        tensor_cache: dict[
+            tuple[type[Any], int, torch.device], torch.Tensor | None
+        ] = {}
         for metadata in metadata_list:
             metadata.mm_prefix_range = req_doc_ranges  # type: ignore[attr-defined]
 
-            # Only compute tensor for TritonAttentionMetadata
-            if isinstance(metadata, TritonAttentionMetadata):
-                if shared_tensor is None:
-                    shared_tensor = (
-                        TritonAttentionMetadata.compute_mm_prefix_range_tensor(
-                            req_doc_ranges,
-                            metadata.seq_lens.shape[0],  # type: ignore[attr-defined]
-                            metadata.seq_lens.device,  # type: ignore[attr-defined]
-                        )
-                    )
-                metadata.mm_prefix_range_tensor = shared_tensor
+            compute_fn = getattr(type(metadata), "compute_mm_prefix_range_tensor", None)
+            if not callable(compute_fn):
+                continue
+
+            seq_lens = metadata.seq_lens  # type: ignore[attr-defined]
+            cache_key = (type(metadata), seq_lens.shape[0], seq_lens.device)
+            if cache_key not in tensor_cache:
+                tensor_cache[cache_key] = compute_fn(
+                    req_doc_ranges,
+                    seq_lens.shape[0],
+                    seq_lens.device,
+                )
+            metadata.mm_prefix_range_tensor = tensor_cache[cache_key]
 
     def may_reinitialize_input_batch(
         self, kv_cache_config: KVCacheConfig, kernel_block_sizes: list[int]
@@ -6828,9 +6850,15 @@ class GPUModelRunner(
                 if layer_name in self.runner_only_attn_layers:
                     continue
                 raw_tensor = kv_cache_raw_tensors[layer_name]
-                assert raw_tensor.numel() % kv_cache_spec.page_size_bytes == 0
-                num_blocks = raw_tensor.numel() // kv_cache_spec.page_size_bytes
+                block_layout_page_size = get_block_layout_page_size_bytes(kv_cache_spec)
+                assert raw_tensor.numel() % block_layout_page_size == 0
+                num_blocks = raw_tensor.numel() // block_layout_page_size
                 if isinstance(kv_cache_spec, AttentionSpec):
+                    if kv_cache_spec.memory_model == MemoryModel.REQUEST_CONSTANT:
+                        raise NotImplementedError(
+                            "REQUEST_CONSTANT AttentionSpec is not supported. "
+                            "Attention KV cache is token-proportional."
+                        )
                     has_attn = True
                     num_blocks_per_kv_block = (
                         kv_cache_spec.block_size // kernel_block_size
@@ -6881,7 +6909,7 @@ class GPUModelRunner(
                         # standard attention backends whose shape starts with
                         # a K/V dimension of size 2.
                         dtype_size = get_dtype_size(dtype)
-                        page_stride = kv_cache_spec.page_size_bytes // dtype_size
+                        page_stride = block_layout_page_size // dtype_size
                         strides = list(torch.empty(kv_cache_shape).stride())
                         strides[inv_order[0]] = page_stride
                         kv_cache = torch.as_strided(
@@ -6901,9 +6929,7 @@ class GPUModelRunner(
                     storage_offset_bytes = 0
                     for shape, dtype in zip(kv_cache_spec.shapes, kv_cache_spec.dtypes):
                         dtype_size = get_dtype_size(dtype)
-                        num_element_per_page = (
-                            kv_cache_spec.page_size_bytes // dtype_size
-                        )
+                        num_element_per_page = block_layout_page_size // dtype_size
                         target_shape = (num_blocks, *shape)
                         stride = torch.empty(target_shape).stride()
                         target_stride = (num_element_per_page, *stride[1:])
