@@ -179,15 +179,16 @@ class KVCacheManager:
         """
         if self.kv_cache_config.is_multi_pool:
             total_blocks = sum(
-                pool.num_gpu_blocks for pool in self.coordinator.block_pools.values()
+                max(pool.num_gpu_blocks - 1, 0)
+                for pool in self.coordinator.block_pools.values()
             )
             if total_blocks == 0:
                 return 0.0
             used_blocks = sum(
-                pool.num_gpu_blocks - pool.get_num_free_blocks()
+                max(pool.num_gpu_blocks - 1, 0) - pool.get_num_free_blocks()
                 for pool in self.coordinator.block_pools.values()
             )
-            return used_blocks / total_blocks
+            return max(used_blocks, 0) / total_blocks
         return self.block_pool.get_usage()
 
     def _has_free_blocks_by_pool(self, blocks_by_pool: dict[int, int]) -> bool:
@@ -491,6 +492,19 @@ class KVCacheManager:
             bool: True if the prefix cache is successfully reset,
             False otherwise.
         """
+        if self.kv_cache_config.is_multi_pool:
+            for block_pool in self.coordinator.block_pools.values():
+                num_used_blocks = (
+                    block_pool.num_gpu_blocks - block_pool.get_num_free_blocks()
+                )
+                if num_used_blocks != 1:
+                    logger.warning(
+                        "Failed to reset prefix cache because some blocks "
+                        "(%d) are not freed yet",
+                        num_used_blocks - 1,
+                    )
+                    return False
+
         for block_pool in self.coordinator.block_pools.values():
             if not block_pool.reset_prefix_cache():
                 return False

@@ -219,6 +219,34 @@ def _is_req_state_block_table_match(model_runner, req_id: str) -> bool:
     ).all()
 
 
+def test_update_states_zeroes_multi_pool_blocks(model_runner, monkeypatch):
+    scheduler_output = SchedulerOutput.make_empty()
+    scheduler_output.new_block_ids_to_zero_by_pool = {0: [1], 1: [2]}
+    monkeypatch.setattr(
+        gpu_model_runner_module,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_last_rank=True),
+    )
+
+    calls = []
+    monkeypatch.setattr(
+        model_runner,
+        "_zero_block_ids_by_pool",
+        lambda block_ids_by_pool: calls.append(block_ids_by_pool),
+    )
+    monkeypatch.setattr(
+        model_runner,
+        "_zero_block_ids",
+        lambda block_ids: pytest.fail(
+            f"flat zeroing path should not be used: {block_ids}"
+        ),
+    )
+
+    model_runner._update_states(scheduler_output)
+
+    assert calls == [{0: [1], 1: [2]}]
+
+
 def _make_mock_backend_for_kernel_block_size(
     supported_sizes: list[int | MultipleOf],
 ):

@@ -9,7 +9,7 @@ import pytest
 import torch
 
 import vllm.v1.core.kv_cache_utils as kv_cache_utils
-from vllm.config import ModelConfig, SchedulerConfig, VllmConfig
+from vllm.config import ModelConfig, ParallelConfig, SchedulerConfig, VllmConfig
 from vllm.config.kv_events import KVEventsConfig
 from vllm.lora.request import LoRARequest
 from vllm.multimodal.inputs import (
@@ -1540,10 +1540,15 @@ def test_multi_pool_kv_cache_manager_uses_pool_local_blocks():
         0: [1],
         1: [1],
     }
+    assert kv_cache_manager.take_new_block_ids_by_pool() == {}
     assert {
         pool_id: pool.get_num_free_blocks()
         for pool_id, pool in kv_cache_manager.coordinator.block_pools.items()
     } == {0: 1, 1: 0}
+    assert kv_cache_manager.usage == pytest.approx(2 / 3)
+    with pytest.raises(NotImplementedError):
+        kv_cache_manager.evict_blocks({1})
+    assert not kv_cache_manager.reset_prefix_cache()
 
     second_request = make_request(
         request_id="1",
@@ -1557,6 +1562,8 @@ def test_multi_pool_kv_cache_manager_uses_pool_local_blocks():
         pool_id: pool.get_num_free_blocks()
         for pool_id, pool in kv_cache_manager.coordinator.block_pools.items()
     } == {0: 2, 1: 1}
+    assert kv_cache_manager.usage == 0.0
+    assert kv_cache_manager.reset_prefix_cache()
     blocks = kv_cache_manager.allocate_slots(second_request, num_new_tokens=4)
     assert blocks is not None
     assert len(blocks.get_block_ids()[0]) == 1
@@ -2005,6 +2012,55 @@ def test_multi_pool_grouped_layers_use_position_tensors():
             pool_id=1,
         ),
     ]
+
+
+def test_multi_pool_falls_back_when_capacity_gain_is_too_small(monkeypatch):
+    model_config = ModelConfig(max_model_len=16)
+    vllm_config = VllmConfig(model_config=model_config)
+
+    monkeypatch.setattr(
+        kv_cache_utils,
+        "_MULTI_POOL_MIN_CAPACITY_IMPROVEMENT",
+        10.0,
+    )
+    kv_cache_specs = {
+        "layer_1": new_sliding_window_spec(head_size=48),
+        "layer_2": new_kv_cache_spec(head_size=96),
+    }
+    available_memory = (
+        max(spec.page_size_bytes for spec in kv_cache_specs.values()) * 64
+    )
+
+    kv_cache_config = get_kv_cache_configs(
+        vllm_config,
+        [kv_cache_specs],
+        [available_memory],
+    )[0]
+
+    assert not kv_cache_config.is_multi_pool
+
+
+def test_multi_pool_disabled_for_pipeline_parallelism():
+    model_config = ModelConfig(max_model_len=16)
+    vllm_config = VllmConfig(
+        model_config=model_config,
+        parallel_config=ParallelConfig(pipeline_parallel_size=2),
+    )
+    kv_cache_specs = {
+        "layer_1": new_sliding_window_spec(head_size=48),
+        "layer_2": new_kv_cache_spec(head_size=96),
+    }
+    available_memory = (
+        max(spec.page_size_bytes for spec in kv_cache_specs.values()) * 64
+    )
+
+    kv_cache_config = get_kv_cache_configs(
+        vllm_config,
+        [kv_cache_specs],
+        [available_memory],
+    )[0]
+
+    assert not kv_cache_config.is_multi_pool
 
 
 def test_multi_pool_max_concurrency_uses_limiting_pool():
