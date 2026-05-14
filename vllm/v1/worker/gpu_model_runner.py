@@ -6078,6 +6078,8 @@ class GPUModelRunner(
                         for i, output in enumerate(dummy_encoder_outputs):
                             self.encoder_cache[f"tmp_{i}"] = output
 
+        self._run_profile_warmups()
+
         # Add `is_profile` here to pre-allocate communication buffers
         hidden_states, last_hidden_states = self._dummy_run(
             self.max_num_tokens, is_profile=True
@@ -6093,6 +6095,28 @@ class GPUModelRunner(
         del hidden_states, output
         self.encoder_cache.clear()
         gc.collect()
+
+    def _run_profile_warmups(self) -> None:
+        """Run opt-in layer warmups before profile dummy forward.
+
+        Some no-compile layers need to autotune kernels before KV cache
+        allocation, but doing that from inside a compiled/profile dummy forward
+        can allocate temporary tensors in an unsafe execution context.  Layers
+        opt in by exposing ``warmup_for_profile_run``.
+        """
+        static_forward_context = (
+            self.vllm_config.compilation_config.static_forward_context
+        )
+        for layer_name, layer in static_forward_context.items():
+            warmup = getattr(layer, "warmup_for_profile_run", None)
+            if warmup is None:
+                continue
+            logger.debug("Running profile warmup hook for layer %s", layer_name)
+            try:
+                warmup()
+            except Exception:
+                logger.exception("Profile warmup hook failed for layer %s", layer_name)
+                raise
 
     def _init_minimal_kv_cache_for_profiling(self) -> None:
         from vllm.v1.core.kv_cache_utils import (

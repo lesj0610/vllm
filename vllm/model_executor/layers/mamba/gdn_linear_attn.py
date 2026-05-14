@@ -881,7 +881,23 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
         core_attn_out = rearrange(core_attn_out, "... h d -> ... (h d)")
         output[:num_tokens], _ = self.out_proj(core_attn_out)
 
-    def _warmup_prefill_kernels(self, qkv_or_qkvz: torch.Tensor, v_dim: int) -> None:
+    def warmup_for_profile_run(self) -> None:
+        """Warm up GDN prefill kernels before profile dummy forward.
+
+        ``profile_run`` can execute the model through the compiled wrapper even
+        when the forward context has no attention metadata. Running the warmup
+        from inside the GDN custom op in that path allocates temporary tensors
+        during compiled/custom-op execution. Keep the existing custom-op
+        fallback, but prefer this explicit hook so profiling sees the warmup
+        memory and the compiled dummy forward only observes the warmed flag.
+        """
+        self._warmup_prefill_kernels()
+
+    def _warmup_prefill_kernels(
+        self,
+        qkv_or_qkvz: torch.Tensor | None = None,
+        v_dim: int = 0,
+    ) -> None:
         """Warm up GDN prefill kernels during V1 profiling.
 
         During V1 profile runs, ``_forward_core`` returns early because
@@ -910,8 +926,17 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
             return
         self._prefill_kernels_warmed_up = True
 
-        device = qkv_or_qkvz.device
-        dtype = qkv_or_qkvz.dtype
+        if qkv_or_qkvz is None:
+            device = self.dt_bias.device
+            dtype = self.model_config.dtype
+            if not isinstance(dtype, torch.dtype):
+                dtype = self.dt_bias.dtype
+            mixed_qkv_width = (self.key_dim * 2 + self.value_dim) // self.tp_size
+        else:
+            device = qkv_or_qkvz.device
+            dtype = qkv_or_qkvz.dtype
+            mixed_qkv_width = qkv_or_qkvz.shape[-1] - v_dim
+
         num_k_heads = self.num_k_heads // self.tp_size
         num_v_heads = self.num_v_heads // self.tp_size
         _, state_dtype = self.get_state_dtype()
@@ -921,9 +946,7 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
         # prefill path here: build q/k/v/g/beta via fused_post_conv_prep and
         # then run chunk_gated_delta_rule with in-kernel L2 norm disabled.
         T = FLA_CHUNK_SIZE
-        dummy_mixed_qkv = torch.randn(
-            T, qkv_or_qkvz.shape[-1] - v_dim, device=device, dtype=dtype
-        )
+        dummy_mixed_qkv = torch.randn(T, mixed_qkv_width, device=device, dtype=dtype)
         dummy_a = torch.randn(T, num_v_heads, device=device, dtype=dtype)
         dummy_b = torch.randn(T, num_v_heads, device=device, dtype=dtype)
         q, k, v, g, beta = fused_post_conv_prep(
