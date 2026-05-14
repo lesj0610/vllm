@@ -852,6 +852,7 @@ class KVCacheTensor:
 
     size: int  # size of the KV cache tensor in bytes
     shared_by: list[str]  # layer names that share the same KV cache tensor
+    pool_id: int = 0  # KV block pool backing this tensor
 
 
 @dataclass
@@ -867,6 +868,23 @@ class KVCacheGroupSpec:
     kv_cache_spec: KVCacheSpec
     # Whether this group contains EAGLE/MTP draft attention layers.
     is_eagle_group: bool = False
+    # The KV block pool used by this group.
+    pool_id: int = 0
+
+
+@dataclass
+class KVCachePoolSpec:
+    """
+    Describes one logical KV block pool.
+
+    The legacy single-pool path is represented by ``kv_cache_pools=None`` on
+    :class:`KVCacheConfig`; when present, each pool has its own block ID
+    namespace and physical tensors.
+    """
+
+    pool_id: int
+    num_blocks: int
+    page_size_bytes: int
 
 
 @dataclass
@@ -887,6 +905,24 @@ class KVCacheConfig:
     For models with multiple types of attention, there will be multiple groups,
     see `_get_kv_cache_config_uniform_page_size` for more details.
     """
+    kv_cache_pools: list[KVCachePoolSpec] | None = None
+    """
+    Optional multi-pool layout. When omitted, all groups use the legacy single
+    block pool with ``num_blocks`` blocks.
+    """
+
+    @property
+    def is_multi_pool(self) -> bool:
+        return self.kv_cache_pools is not None and len(self.kv_cache_pools) > 1
+
+    def get_pool_num_blocks(self, pool_id: int) -> int:
+        if self.kv_cache_pools is None:
+            assert pool_id == 0
+            return self.num_blocks
+        for pool in self.kv_cache_pools:
+            if pool.pool_id == pool_id:
+                return pool.num_blocks
+        raise KeyError(f"Unknown KV cache pool id: {pool_id}")
 
     @property
     def has_mamba_layers(self) -> bool:

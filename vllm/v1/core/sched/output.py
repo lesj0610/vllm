@@ -239,6 +239,7 @@ class SchedulerOutput:
     # The worker zeros the corresponding GPU memory before the blocks are used,
     # preventing stale NaN/data from corrupting attention or SSM computation.
     new_block_ids_to_zero: list[int] | None = None
+    new_block_ids_to_zero_by_pool: dict[int, list[int]] | None = None
 
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":

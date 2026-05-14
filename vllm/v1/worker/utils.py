@@ -89,6 +89,7 @@ class KVBlockZeroer:
         self.device = device
         self.pin_memory = pin_memory
         self._meta: tuple[torch.Tensor, int, int, int] | None = None
+        self._meta_by_pool: dict[int, tuple[torch.Tensor, int, int, int]] = {}
         self._id_cap: int = 0
         self._ids_pinned: torch.Tensor | None = None
         self._ids_gpu: torch.Tensor | None = None
@@ -100,6 +101,7 @@ class KVBlockZeroer:
         cache_dtype: str,
         runner_only_attn_layers: set[str],
         static_forward_context: dict[str, Any],
+        group_pool_ids: list[int] | None = None,
     ) -> None:
         """One-time precomputation for zero_block_ids.
 
@@ -115,8 +117,8 @@ class KVBlockZeroer:
         Only AttentionSpec layers are processed; Mamba layers are skipped.
         """
         seen_ptrs: set[int] = set()
-        seg_addrs: list[int] = []
-        page_size_el: int | None = None
+        seg_addrs_by_pool: dict[int, list[int]] = defaultdict(list)
+        page_size_el_by_pool: dict[int, int] = {}
 
         for group in attn_groups_iter:
             spec = group.kv_cache_spec
@@ -124,6 +126,11 @@ class KVBlockZeroer:
                 continue
             if group.kv_cache_group_id >= len(kernel_block_sizes):
                 continue
+            pool_id = (
+                group_pool_ids[group.kv_cache_group_id]
+                if group_pool_ids is not None
+                else 0
+            )
             kernel_bs = kernel_block_sizes[group.kv_cache_group_id]
             ratio = spec.block_size // kernel_bs
             block_dim = group.backend.get_kv_cache_block_dim(
@@ -149,12 +156,11 @@ class KVBlockZeroer:
                 assert cur_bytes % 4 == 0
                 kernel_block_el = cur_bytes // 4
                 cur_page_el = kernel_block_el * ratio
-                if page_size_el is None:
-                    page_size_el = cur_page_el
-                else:
-                    assert page_size_el == cur_page_el, (
-                        f"Non-uniform page sizes: {page_size_el} vs {cur_page_el}"
-                    )
+                existing_page_el = page_size_el_by_pool.setdefault(pool_id, cur_page_el)
+                assert existing_page_el == cur_page_el, (
+                    f"Non-uniform page sizes in pool {pool_id}: "
+                    f"{existing_page_el} vs {cur_page_el}"
+                )
 
                 block_stride_bytes = cur_bytes
                 outer_dims = [
@@ -165,13 +171,23 @@ class KVBlockZeroer:
                 outer_strides = [kv.stride(d) * el for d in outer_dims]
                 for outer in iprod(*(range(kv.shape[d]) for d in outer_dims)):
                     off_bytes = sum(i * s for i, s in zip(outer, outer_strides))
-                    seg_addrs.append(dp + off_bytes)
+                    seg_addrs_by_pool[pool_id].append(dp + off_bytes)
 
-        if not seg_addrs or page_size_el is None:
+        if not seg_addrs_by_pool:
             self._meta = None
             return
 
-        blk_size = min(largest_power_of_2_divisor(page_size_el), 1024)
+        self._meta_by_pool = {}
+        for pool_id, seg_addrs in seg_addrs_by_pool.items():
+            page_size_el = page_size_el_by_pool[pool_id]
+            blk_size = min(largest_power_of_2_divisor(page_size_el), 1024)
+            self._meta_by_pool[pool_id] = (
+                torch.tensor(seg_addrs, dtype=torch.uint64, device=self.device),
+                page_size_el,
+                blk_size,
+                len(seg_addrs),
+            )
+        self._meta = self._meta_by_pool.get(0)
         self._id_cap = 8192
         self._ids_pinned = torch.empty(
             self._id_cap,
@@ -179,18 +195,26 @@ class KVBlockZeroer:
             pin_memory=self.pin_memory,
         )
         self._ids_gpu = torch.empty(self._id_cap, dtype=torch.int64, device=self.device)
-        self._meta = (
-            torch.tensor(seg_addrs, dtype=torch.uint64, device=self.device),
-            page_size_el,
-            blk_size,
-            len(seg_addrs),
-        )
 
     def zero_block_ids(self, block_ids: list[int]) -> None:
         """Zero the KV cache memory for the given block IDs."""
         if not block_ids or self._meta is None:
             return
-        seg_addrs, page_size_el, blk_size, n_segs = self._meta
+        self._zero_block_ids_with_meta(block_ids, self._meta)
+
+    def zero_block_ids_by_pool(self, block_ids_by_pool: dict[int, list[int]]) -> None:
+        """Zero KV cache blocks whose IDs are local to each pool."""
+        for pool_id, block_ids in block_ids_by_pool.items():
+            meta = self._meta_by_pool.get(pool_id)
+            if block_ids and meta is not None:
+                self._zero_block_ids_with_meta(block_ids, meta)
+
+    def _zero_block_ids_with_meta(
+        self,
+        block_ids: list[int],
+        meta: tuple[torch.Tensor, int, int, int],
+    ) -> None:
+        seg_addrs, page_size_el, blk_size, n_segs = meta
         n_blocks = len(block_ids)
         if n_blocks > self._id_cap:
             self._id_cap = n_blocks * 2
