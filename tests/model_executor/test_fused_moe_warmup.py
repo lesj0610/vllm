@@ -91,6 +91,7 @@ class _FakeWNA16Method:
         x: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
+        shared_experts: object | None,
         shared_experts_input: torch.Tensor | None,
     ) -> torch.Tensor:
         self.calls.append(
@@ -98,6 +99,7 @@ class _FakeWNA16Method:
                 "x_shape": tuple(x.shape),
                 "topk_weights_shape": tuple(topk_weights.shape),
                 "topk_ids": topk_ids.clone(),
+                "shared_experts": shared_experts,
                 "shared_experts_input": shared_experts_input,
             }
         )
@@ -151,6 +153,7 @@ def test_wna16_warmup_uses_local_experts_and_quant_config(monkeypatch):
     call = layer.quant_method.calls[0]
     assert call["x_shape"] == (1, 4)
     assert call["topk_weights_shape"] == (1, 2)
+    assert call["shared_experts"] is None
     assert call["shared_experts_input"] is None
     assert call["topk_ids"].tolist() == [[1, 3]]
 
