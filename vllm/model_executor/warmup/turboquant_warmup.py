@@ -175,8 +175,7 @@ def turboquant_attention_warmup(
     model: torch.nn.Module,
     *,
     device: torch.device,
-    block_size: int,
-    block_table_stride: int,
+    block_table_shapes: Iterable[tuple[int, int]],
     max_num_decode_tokens: int,
     model_dtype: torch.dtype,
 ) -> None:
@@ -189,32 +188,42 @@ def turboquant_attention_warmup(
     """
     if max_num_decode_tokens <= 0:
         return
-    if block_table_stride <= 0:
+
+    valid_block_table_shapes: list[tuple[int, int]] = []
+    for block_size, block_table_stride in block_table_shapes:
+        if block_size <= 0 or block_table_stride <= 0:
+            continue
+        shape = (block_size, block_table_stride)
+        if shape not in valid_block_table_shapes:
+            valid_block_table_shapes.append(shape)
+
+    if not valid_block_table_shapes:
         return
 
     seen: set[_TurboQuantWarmupKey] = set()
     num_warmups = 0
 
     for layer, impl in _iter_turboquant_attention_layers(model):
-        key = _make_warmup_key(
-            impl,
-            block_size=block_size,
-            block_table_stride=block_table_stride,
-            model_dtype=model_dtype,
-        )
-        if key in seen:
-            continue
-        seen.add(key)
-        _warmup_turboquant_layer(
-            layer,
-            impl,
-            device=device,
-            block_size=block_size,
-            block_table_stride=block_table_stride,
-            max_num_decode_tokens=max_num_decode_tokens,
-            model_dtype=model_dtype,
-        )
-        num_warmups += 1
+        for block_size, block_table_stride in valid_block_table_shapes:
+            key = _make_warmup_key(
+                impl,
+                block_size=block_size,
+                block_table_stride=block_table_stride,
+                model_dtype=model_dtype,
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            _warmup_turboquant_layer(
+                layer,
+                impl,
+                device=device,
+                block_size=block_size,
+                block_table_stride=block_table_stride,
+                max_num_decode_tokens=max_num_decode_tokens,
+                model_dtype=model_dtype,
+            )
+            num_warmups += 1
 
     if num_warmups > 0:
         torch.accelerator.synchronize()

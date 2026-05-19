@@ -166,8 +166,7 @@ def test_turboquant_warmup_skips_non_tq_layers() -> None:
     turboquant_warmup.turboquant_attention_warmup(
         model,
         device=torch.device("cpu"),
-        block_size=16,
-        block_table_stride=8,
+        block_table_shapes=((16, 8),),
         max_num_decode_tokens=4,
         model_dtype=torch.bfloat16,
     )
@@ -189,8 +188,7 @@ def test_turboquant_warmup_builds_runtime_shaped_decode_inputs(
     turboquant_warmup.turboquant_attention_warmup(
         model,
         device=torch.device("cpu"),
-        block_size=32,
-        block_table_stride=17,
+        block_table_shapes=((32, 17),),
         max_num_decode_tokens=4,
         model_dtype=torch.bfloat16,
     )
@@ -221,6 +219,43 @@ def test_turboquant_warmup_builds_runtime_shaped_decode_inputs(
     assert impl.dequant_calls == []
 
 
+def test_turboquant_warmup_builds_all_runtime_shapes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        turboquant_warmup, "is_workspace_manager_initialized", lambda: False
+    )
+    impl = _FakeTurboQuantAttentionImpl()
+    model = torch.nn.Sequential(_FakeAttention(impl=impl))
+
+    turboquant_warmup.turboquant_attention_warmup(
+        model,
+        device=torch.device("cpu"),
+        block_table_shapes=((2048, 1), (128, 16), (2048, 1)),
+        max_num_decode_tokens=4,
+        model_dtype=torch.bfloat16,
+    )
+
+    assert len(impl.decode_calls) == 2
+    first, second = impl.decode_calls
+    assert first["kv_cache"].shape == (
+        2,
+        2048,
+        impl.num_kv_heads,
+        impl.tq_config.slot_size_aligned,
+    )
+    assert first["attn_metadata"].block_table.shape == (4, 1)
+    assert second["kv_cache"].shape == (
+        2,
+        128,
+        impl.num_kv_heads,
+        impl.tq_config.slot_size_aligned,
+    )
+    assert second["attn_metadata"].block_table.shape == (4, 16)
+    assert impl.ensure_calls == 2
+    assert impl.dequant_calls == []
+
+
 def test_turboquant_warmup_also_warms_full_dequant(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -233,8 +268,7 @@ def test_turboquant_warmup_also_warms_full_dequant(
     turboquant_warmup.turboquant_attention_warmup(
         model,
         device=torch.device("cpu"),
-        block_size=32,
-        block_table_stride=17,
+        block_table_shapes=((32, 17),),
         max_num_decode_tokens=4,
         model_dtype=torch.float16,
     )
@@ -261,8 +295,7 @@ def test_turboquant_warmup_deduplicates_compile_key(
     turboquant_warmup.turboquant_attention_warmup(
         model,
         device=torch.device("cpu"),
-        block_size=16,
-        block_table_stride=8,
+        block_table_shapes=((16, 8),),
         max_num_decode_tokens=4,
         model_dtype=torch.float16,
     )
@@ -290,8 +323,7 @@ def test_turboquant_warmup_keeps_distinct_compile_keys(
     turboquant_warmup.turboquant_attention_warmup(
         model,
         device=torch.device("cpu"),
-        block_size=16,
-        block_table_stride=8,
+        block_table_shapes=((16, 8),),
         max_num_decode_tokens=4,
         model_dtype=torch.float16,
     )
@@ -326,7 +358,9 @@ def test_kernel_warmup_passes_turboquant_runtime_constants(
             input_batch=SimpleNamespace(
                 block_table=SimpleNamespace(
                     block_tables=[
-                        SimpleNamespace(block_size=16, max_num_blocks_per_req=257)
+                        SimpleNamespace(block_size=2048, max_num_blocks_per_req=1),
+                        SimpleNamespace(block_size=128, max_num_blocks_per_req=16),
+                        SimpleNamespace(block_size=2048, max_num_blocks_per_req=1),
                     ]
                 )
             ),
@@ -344,8 +378,7 @@ def test_kernel_warmup_passes_turboquant_runtime_constants(
         {
             "model": model,
             "device": torch.device("cpu"),
-            "block_size": 16,
-            "block_table_stride": 257,
+            "block_table_shapes": ((2048, 1), (128, 16)),
             "max_num_decode_tokens": 7,
             "model_dtype": torch.bfloat16,
         }
@@ -376,8 +409,12 @@ def test_kernel_warmup_uses_v2_block_table_constants(
             device=torch.device("cpu"),
             dtype=torch.float16,
             block_tables=SimpleNamespace(
-                kernel_block_sizes=[32],
-                input_block_tables=[torch.empty((4, 129), dtype=torch.int32)],
+                kernel_block_sizes=[2048, 128, 2048],
+                input_block_tables=[
+                    torch.zeros((2, 1), dtype=torch.int32),
+                    torch.zeros((2, 16), dtype=torch.int32),
+                    torch.zeros((2, 1), dtype=torch.int32),
+                ],
             ),
             is_pooling_model=False,
             attn_groups=[],
@@ -393,8 +430,7 @@ def test_kernel_warmup_uses_v2_block_table_constants(
         {
             "model": model,
             "device": torch.device("cpu"),
-            "block_size": 32,
-            "block_table_stride": 129,
+            "block_table_shapes": ((2048, 1), (128, 16)),
             "max_num_decode_tokens": 7,
             "model_dtype": torch.float16,
         }
