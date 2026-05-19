@@ -16,6 +16,7 @@ import vllm.envs as envs
 from vllm.compilation.caching import aot_compile_hash_factors
 from vllm.logger import init_logger
 from vllm.model_executor.warmup.deep_gemm_warmup import deep_gemm_warmup
+from vllm.model_executor.warmup.turboquant_warmup import turboquant_attention_warmup
 from vllm.platforms import current_platform
 from vllm.utils.deep_gemm import is_deep_gemm_supported
 from vllm.utils.flashinfer import has_flashinfer
@@ -25,6 +26,34 @@ if TYPE_CHECKING:
     from vllm.v1.worker.gpu_worker import Worker
 
 logger = init_logger(__name__)
+
+
+def _get_runtime_block_table_shape(worker: "Worker") -> tuple[int, int]:
+    """Return attention-kernel block size and block-table row stride.
+
+    V1 and V2 model runners keep block-table state in different attributes.
+    Warmup only needs the launch-time constants that real attention will use.
+    """
+    block_size = worker.cache_config.block_size
+    block_table_stride = 1
+    runner = worker.model_runner
+
+    v1_input_batch = getattr(runner, "input_batch", None)
+    if v1_input_batch is not None:
+        block_table_mgr = getattr(v1_input_batch, "block_table", None)
+        block_tables = getattr(block_table_mgr, "block_tables", None)
+        if block_tables:
+            block_table = block_tables[0]
+            return block_table.block_size, block_table.max_num_blocks_per_req
+
+    v2_block_tables = getattr(runner, "block_tables", None)
+    if v2_block_tables is not None:
+        kernel_block_sizes = getattr(v2_block_tables, "kernel_block_sizes", None)
+        input_block_tables = getattr(v2_block_tables, "input_block_tables", None)
+        if kernel_block_sizes and input_block_tables:
+            return kernel_block_sizes[0], input_block_tables[0].shape[1]
+
+    return block_size, block_table_stride
 
 
 def _flashinfer_autotune_cache_hash(runner: "GPUModelRunner") -> str:
@@ -59,10 +88,29 @@ def kernel_warmup(worker: "Worker"):
         and is_deep_gemm_supported()
         and envs.VLLM_DEEP_GEMM_WARMUP != "skip"
     )
+    model = worker.get_model()
+    max_tokens = worker.scheduler_config.max_num_batched_tokens
+
     if do_deep_gemm_warmup:
-        model = worker.get_model()
-        max_tokens = worker.scheduler_config.max_num_batched_tokens
         deep_gemm_warmup(model, max_tokens)
+
+    # V1 can split KV-manager blocks into attention-kernel blocks, and V2 keeps
+    # block tables on a different runner attribute. Warmup must use the runtime
+    # kernel block size and block-table stride or Triton may compile a different
+    # variant from real decode.
+    block_size, block_table_stride = _get_runtime_block_table_shape(worker)
+    max_num_decode_tokens = min(
+        worker.scheduler_config.max_num_seqs,
+        worker.scheduler_config.max_num_batched_tokens,
+    )
+    turboquant_attention_warmup(
+        model,
+        device=worker.model_runner.device,
+        block_size=block_size,
+        block_table_stride=block_table_stride,
+        max_num_decode_tokens=max_num_decode_tokens,
+        model_dtype=worker.model_runner.dtype,
+    )
 
     enable_flashinfer_autotune = (
         worker.vllm_config.kernel_config.enable_flashinfer_autotune
