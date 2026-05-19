@@ -39,6 +39,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheGroupSpec,
     KVCacheTensor,
+    UniformTypeKVCacheSpecs,
 )
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
@@ -49,6 +50,45 @@ from vllm.v1.worker.utils import AttentionGroup, select_common_block_size
 BLOCK_SIZE = 16
 NUM_BLOCKS = 10
 DEVICE_TYPE = current_platform.device_type
+
+
+class _TestAttentionBackend:
+    @staticmethod
+    def get_kv_cache_shape(
+        num_blocks: int,
+        block_size: int,
+        num_kv_heads: int,
+        head_size: int,
+        cache_dtype_str: str = "auto",
+    ) -> tuple[int, int, int, int, int]:
+        return (2, num_blocks, block_size, num_kv_heads, head_size)
+
+    @staticmethod
+    def get_kv_cache_stride_order():
+        return tuple(range(5))
+
+
+def _reshape_kv_cache_tensor_for_test(
+    kv_cache_spec,
+    raw_tensor: torch.Tensor,
+    layer_name: str = "layer.0",
+):
+    group = AttentionGroup(
+        _TestAttentionBackend,
+        [layer_name],
+        kv_cache_spec,
+        0,
+    )
+    runner_stub = SimpleNamespace(
+        runner_only_attn_layers=set(),
+        cache_config=SimpleNamespace(cache_dtype="auto"),
+        _kv_cache_spec_attn_group_iterator=lambda: iter([group]),
+    )
+    return GPUModelRunner._reshape_kv_cache_tensors(
+        runner_stub,
+        {layer_name: raw_tensor},
+        [kv_cache_spec.block_size],
+    )
 
 
 def initialize_kv_cache(runner: GPUModelRunner):
@@ -217,6 +257,34 @@ def _is_req_state_block_table_match(model_runner, req_id: str) -> bool:
     return (
         block_table.block_table.np[req_index, :num_blocks] == req_state.block_ids[0]
     ).all()
+
+
+def test_update_states_zeroes_multi_pool_blocks(model_runner, monkeypatch):
+    scheduler_output = SchedulerOutput.make_empty()
+    scheduler_output.new_block_ids_to_zero_by_pool = {0: [1], 1: [2]}
+    monkeypatch.setattr(
+        gpu_model_runner_module,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_last_rank=True),
+    )
+
+    calls = []
+    monkeypatch.setattr(
+        model_runner,
+        "_zero_block_ids_by_pool",
+        lambda block_ids_by_pool: calls.append(block_ids_by_pool),
+    )
+    monkeypatch.setattr(
+        model_runner,
+        "_zero_block_ids",
+        lambda block_ids: pytest.fail(
+            f"flat zeroing path should not be used: {block_ids}"
+        ),
+    )
+
+    model_runner._update_states(scheduler_output)
+
+    assert calls == [{0: [1], 1: [2]}]
 
 
 def _make_mock_backend_for_kernel_block_size(
@@ -998,6 +1066,66 @@ def test_init_kv_cache_with_kv_sharing_valid(default_vllm_config):
     assert len(kv_cache_config_after_init.kv_cache_groups[0].layer_names) == 2
     assert kv_cache_config_after_init.kv_cache_groups[0].layer_names[0] == layer_0
     assert kv_cache_config_after_init.kv_cache_groups[0].layer_names[1] == layer_1
+
+
+def test_initialize_attn_backend_kv_sharing_with_uniform_specs(default_vllm_config):
+    torch.set_default_dtype(torch.float16)
+    layer_0 = "model.layers.0.self_attn.attn"
+    layer_1 = "model.layers.1.self_attn.attn"
+    vllm_config = get_vllm_config()
+    with set_current_vllm_config(vllm_config):
+        fwd_context = {
+            layer_0: Attention(
+                num_heads=8,
+                head_size=64,
+                scale=1.0,
+                prefix=layer_0,
+            ),
+            layer_1: Attention(
+                num_heads=8,
+                head_size=64,
+                scale=1.0,
+                prefix=layer_1,
+                kv_sharing_target_layer_name=layer_0,
+            ),
+        }
+        assert fwd_context is not None
+
+    runner = GPUModelRunner(vllm_config, DEVICE_TYPE)
+    attn_spec = FullAttentionSpec(
+        block_size=BLOCK_SIZE,
+        num_kv_heads=runner.model_config.get_num_kv_heads(runner.parallel_config),
+        head_size=runner.model_config.get_head_size(),
+        dtype=runner.kv_cache_dtype,
+    )
+    uniform_spec = UniformTypeKVCacheSpecs(
+        block_size=BLOCK_SIZE,
+        kv_cache_specs={layer_0: attn_spec},
+    )
+    kv_cache_config = KVCacheConfig(
+        num_blocks=NUM_BLOCKS,
+        kv_cache_tensors=[
+            KVCacheTensor(
+                size=attn_spec.page_size_bytes * NUM_BLOCKS,
+                shared_by=[layer_0],
+            ),
+        ],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                layer_names=[layer_0, layer_1],
+                kv_cache_spec=uniform_spec,
+            )
+        ],
+    )
+    runner.shared_kv_cache_layers[layer_1] = layer_0
+    runner.kv_cache_config = kv_cache_config
+
+    runner.initialize_attn_backend(kv_cache_config)
+
+    attn_groups = list(runner._attn_group_iterator())
+    assert len(attn_groups) == 1
+    assert attn_groups[0].layer_names == [layer_0, layer_1]
+    assert attn_groups[0].kv_cache_spec == attn_spec
 
 
 @pytest.mark.skipif(

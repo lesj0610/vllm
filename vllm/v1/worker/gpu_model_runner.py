@@ -1081,12 +1081,20 @@ class GPUModelRunner(
             cache_dtype=self.cache_config.cache_dtype,
             runner_only_attn_layers=self.runner_only_attn_layers,
             static_forward_context=(self.compilation_config.static_forward_context),
+            group_pool_ids=[
+                group.pool_id for group in self.kv_cache_config.kv_cache_groups
+            ],
         )
 
     def _zero_block_ids(self, block_ids: list[int]) -> None:
         """Zero the KV cache memory for the given block IDs."""
         if hasattr(self, "_kv_block_zeroer"):
             self._kv_block_zeroer.zero_block_ids(block_ids)
+
+    def _zero_block_ids_by_pool(self, block_ids_by_pool: dict[int, list[int]]) -> None:
+        """Zero KV cache memory for pool-local block IDs."""
+        if hasattr(self, "_kv_block_zeroer"):
+            self._kv_block_zeroer.zero_block_ids_by_pool(block_ids_by_pool)
 
     # Note: used for model runner override.
     def _init_device_properties(self) -> None:
@@ -1133,6 +1141,8 @@ class GPUModelRunner(
 
         # Zero GPU memory for freshly allocated cache blocks to prevent
         # stale NaN/data from corrupting attention or SSM computation.
+        if scheduler_output.new_block_ids_to_zero_by_pool:
+            self._zero_block_ids_by_pool(scheduler_output.new_block_ids_to_zero_by_pool)
         if scheduler_output.new_block_ids_to_zero:
             self._zero_block_ids(scheduler_output.new_block_ids_to_zero)
 
@@ -6546,7 +6556,15 @@ class GPUModelRunner(
                 full_cls_name = attn_backend.full_cls_name()
                 layer_kv_cache_spec = kv_cache_group_spec.kv_cache_spec
                 if isinstance(layer_kv_cache_spec, UniformTypeKVCacheSpecs):
-                    layer_kv_cache_spec = layer_kv_cache_spec.kv_cache_specs[layer_name]
+                    # KV-sharing layers do not own a KVCacheSpec entry because
+                    # they reuse the target layer's KV cache. Use the target
+                    # spec when grouping their attention backend.
+                    spec_layer_name = self.shared_kv_cache_layers.get(
+                        layer_name, layer_name
+                    )
+                    layer_kv_cache_spec = layer_kv_cache_spec.kv_cache_specs[
+                        spec_layer_name
+                    ]
                 key = (full_cls_name, layer_kv_cache_spec)
                 attn_backends[key] = AttentionGroupKey(
                     attn_backend, layer_kv_cache_spec
@@ -6731,8 +6749,8 @@ class GPUModelRunner(
         for metadata in metadata_list:
             metadata.mm_prefix_range = req_doc_ranges  # type: ignore[attr-defined]
 
-            # Only compute tensor for TritonAttentionMetadata
-            if isinstance(metadata, TritonAttentionMetadata):
+            # Compute tensor for backends that expose mm_prefix_range_tensor.
+            if hasattr(metadata, "mm_prefix_range_tensor"):
                 if shared_tensor is None:
                     shared_tensor = (
                         TritonAttentionMetadata.compute_mm_prefix_range_tensor(
