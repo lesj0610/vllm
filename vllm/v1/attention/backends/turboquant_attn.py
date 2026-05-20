@@ -791,6 +791,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                         value_mse=self.tq_config.value_mse_supported,
                         norm_correction=self.tq_config.norm_correction,
                         PiT=PiT,
+                        max_num_kv_splits=self.max_num_kv_splits,
                     )
                 else:
                     # Large continuation: dequant cached K/V and use
