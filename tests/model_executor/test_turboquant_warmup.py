@@ -135,6 +135,14 @@ def patch_turboquant_types(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(
         turboquant_warmup.torch.accelerator, "synchronize", lambda: None
     )
+    monkeypatch.setattr(
+        turboquant_warmup, "is_workspace_manager_initialized", lambda: False
+    )
+    monkeypatch.setattr(
+        turboquant_warmup,
+        "triton_turboquant_decode_attention",
+        lambda **kwargs: torch.empty_like(kwargs["query"]),
+    )
 
 
 def test_turboquant_kernels_do_not_specialize_runtime_strides() -> None:
@@ -179,11 +187,22 @@ def test_turboquant_warmup_skips_non_tq_layers() -> None:
 def test_turboquant_warmup_builds_runtime_shaped_decode_inputs(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    launcher_calls: list[dict[str, Any]] = []
+
+    def fake_decode_launcher(**kwargs):
+        launcher_calls.append(kwargs)
+        return torch.empty_like(kwargs["query"])
+
     monkeypatch.setattr(
-        turboquant_warmup, "is_workspace_manager_initialized", lambda: False
+        turboquant_warmup, "triton_turboquant_decode_attention", fake_decode_launcher
     )
+
     impl = _FakeTurboQuantAttentionImpl(max_num_kv_splits=64)
     model = torch.nn.Sequential(_FakeAttention(impl=impl))
+    runtime_kv_cache = torch.zeros(
+        (3, 32, impl.num_kv_heads, impl.tq_config.slot_size_aligned),
+        dtype=torch.uint8,
+    )
 
     turboquant_warmup.turboquant_attention_warmup(
         model,
@@ -191,6 +210,7 @@ def test_turboquant_warmup_builds_runtime_shaped_decode_inputs(
         block_table_shapes=((32, 17),),
         max_num_decode_tokens=4,
         model_dtype=torch.bfloat16,
+        kv_caches=(runtime_kv_cache,),
     )
 
     calls = impl.decode_calls
@@ -198,13 +218,7 @@ def test_turboquant_warmup_builds_runtime_shaped_decode_inputs(
     call = calls[0]
     assert call["query"].shape == (4, impl.num_heads, impl.head_size)
     assert call["query"].dtype == torch.bfloat16
-    assert call["kv_cache"].shape == (
-        2,
-        32,
-        impl.num_kv_heads,
-        impl.tq_config.slot_size_aligned,
-    )
-    assert call["kv_cache"].dtype == torch.uint8
+    assert call["kv_cache"] is runtime_kv_cache
     metadata = call["attn_metadata"]
     assert metadata.block_table.shape == (4, 17)
     assert metadata.block_table.tolist()[0][:2] == [1, 0]
@@ -217,6 +231,22 @@ def test_turboquant_warmup_builds_runtime_shaped_decode_inputs(
     assert call["layer"] is model[0]
     assert impl.ensure_calls == 1
     assert impl.dequant_calls == []
+
+    assert [call["query"].shape[0] for call in launcher_calls] == list(range(2, 17))
+    prefix_call = launcher_calls[11]
+    assert prefix_call["query"].shape == (13, impl.num_heads, impl.head_size)
+    assert prefix_call["kv_cache"] is runtime_kv_cache
+    assert prefix_call["block_table"].shape == (13, 17)
+    assert prefix_call["block_table"].stride(0) == 0
+    assert prefix_call["block_table"].storage_offset() == 0
+    assert prefix_call["block_table"].tolist()[0][:3] == [1, 1, 1]
+    assert prefix_call["block_table"].tolist()[12][:3] == [1, 1, 1]
+    assert prefix_call["seq_lens"].storage_offset() == 1
+    assert prefix_call["seq_lens"].tolist() == list(range(65, 78))
+    assert prefix_call.get("mid_o_buf") is None
+    assert prefix_call.get("output_buf") is None
+    assert prefix_call.get("lse_buf") is None
+    assert prefix_call["max_num_kv_splits"] == 64
 
 
 def test_turboquant_warmup_builds_all_runtime_shapes(
@@ -366,6 +396,7 @@ def test_kernel_warmup_passes_turboquant_runtime_constants(
             ),
             is_pooling_model=False,
             attn_groups=[],
+            kv_caches=[],
         ),
         vllm_config=SimpleNamespace(
             kernel_config=SimpleNamespace(enable_flashinfer_autotune=False)
@@ -381,6 +412,7 @@ def test_kernel_warmup_passes_turboquant_runtime_constants(
             "block_table_shapes": ((2048, 1), (128, 16)),
             "max_num_decode_tokens": 7,
             "model_dtype": torch.bfloat16,
+            "kv_caches": [],
         }
     ]
 
@@ -418,6 +450,7 @@ def test_kernel_warmup_uses_v2_block_table_constants(
             ),
             is_pooling_model=False,
             attn_groups=[],
+            kv_caches=[],
         ),
         vllm_config=SimpleNamespace(
             kernel_config=SimpleNamespace(enable_flashinfer_autotune=False)
@@ -433,5 +466,6 @@ def test_kernel_warmup_uses_v2_block_table_constants(
             "block_table_shapes": ((2048, 1), (128, 16)),
             "max_num_decode_tokens": 7,
             "model_dtype": torch.float16,
+            "kv_caches": [],
         }
     ]
