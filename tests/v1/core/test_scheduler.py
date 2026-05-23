@@ -77,7 +77,7 @@ def test_get_num_unfinished_requests():
         assert scheduler.get_num_unfinished_requests() == len(requests) - i - 1
 
 
-def test_routed_experts_capacity_uses_token_proportional_pool(monkeypatch):
+def test_routed_experts_capacity_uses_token_proportional_pool():
     block_size = 16
     num_attention_blocks = 8
     model_config = ModelConfig(
@@ -88,6 +88,8 @@ def test_routed_experts_capacity_uses_token_proportional_pool(monkeypatch):
         skip_tokenizer_init=True,
     )
     model_config.enable_return_routed_experts = True
+    model_config.hf_text_config.num_experts = 4
+    model_config.hf_text_config.num_experts_per_tok = 2
     scheduler_config = SchedulerConfig(
         max_num_seqs=1,
         max_num_batched_tokens=128,
@@ -145,11 +147,6 @@ def test_routed_experts_capacity_uses_token_proportional_pool(monkeypatch):
         group_to_pool_id=(0, 1),
     )
     cache_config.num_gpu_blocks = num_attention_blocks
-    routed_experts_reader = Mock()
-    monkeypatch.setattr(
-        "vllm.v1.core.sched.scheduler.RoutedExpertsReader.create",
-        lambda: routed_experts_reader,
-    )
 
     scheduler = Scheduler(
         vllm_config=vllm_config,
@@ -159,11 +156,10 @@ def test_routed_experts_capacity_uses_token_proportional_pool(monkeypatch):
     )
 
     expected_max_num_kv_tokens = num_attention_blocks * block_size
-    assert scheduler.routed_experts_attn_gid == 0
-    assert scheduler.max_num_kv_tokens == expected_max_num_kv_tokens
-    routed_experts_reader.attach_buffer.assert_called_once_with(
-        max_num_kv_tokens=expected_max_num_kv_tokens,
-        vllm_config=vllm_config,
+    assert scheduler.routed_experts_mgr.attn_gid == 0
+    assert (
+        scheduler.routed_experts_mgr.routed_experts_by_slot.shape[0]
+        == expected_max_num_kv_tokens
     )
 
 
