@@ -43,6 +43,7 @@ class _FakeTurboQuantAttentionImpl:
         num_kv_heads: int = 2,
         max_num_kv_splits: int = 32,
         scale: float = 0.125,
+        sliding_window: int | None = None,
         tq_config: _FakeTQConfig | None = None,
     ) -> None:
         self.num_heads = num_heads
@@ -51,6 +52,7 @@ class _FakeTurboQuantAttentionImpl:
         self.num_kv_groups = num_heads // num_kv_heads
         self.max_num_kv_splits = max_num_kv_splits
         self.scale = scale
+        self.sliding_window = sliding_window
         self.tq_config = tq_config or _FakeTQConfig()
         self.ensure_calls = 0
         self.decode_calls: list[dict[str, Any]] = []
@@ -234,6 +236,7 @@ def test_turboquant_decode_warmup_builds_runtime_shaped_inputs(
     assert prefix_call["max_num_kv_splits"] == 64
     assert prefix_call["value_centroids"] is model[0]._tq_value_centroids
     assert prefix_call["value_mse"] is True
+    assert prefix_call["sliding_window"] is None
     assert impl.ensure_calls == 1
     assert impl.continuation_calls == []
 
@@ -323,6 +326,52 @@ def test_turboquant_decode_warmup_deduplicates_compile_key() -> None:
     assert second.impl.continuation_calls == []
     assert first.impl.ensure_calls == 1
     assert second.impl.ensure_calls == 0
+
+
+def test_turboquant_decode_warmup_keeps_sliding_window_compile_keys_distinct() -> None:
+    full = _FakeAttention(impl=_FakeTurboQuantAttentionImpl(sliding_window=None))
+    sliding = _FakeAttention(impl=_FakeTurboQuantAttentionImpl(sliding_window=128))
+    model = torch.nn.Sequential(full, sliding)
+
+    turboquant_warmup.turboquant_decode_warmup(
+        model,
+        device=torch.device("cpu"),
+        block_table_shapes=((16, 8),),
+        max_num_decode_tokens=4,
+        model_dtype=torch.float16,
+    )
+
+    assert len(full.impl.decode_calls) == 1
+    assert len(sliding.impl.decode_calls) == 1
+
+
+def test_turboquant_prefix_warmup_forwards_sliding_window_when_supported(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    launcher_calls = []
+
+    def fake_decode_launcher(**kwargs):
+        launcher_calls.append(kwargs)
+        return torch.empty_like(kwargs["query"])
+
+    monkeypatch.setattr(
+        turboquant_warmup,
+        "triton_turboquant_decode_attention",
+        fake_decode_launcher,
+    )
+    impl = _FakeTurboQuantAttentionImpl(sliding_window=128)
+    model = torch.nn.Sequential(_FakeAttention(impl=impl))
+
+    turboquant_warmup.turboquant_decode_warmup(
+        model,
+        device=torch.device("cpu"),
+        block_table_shapes=((16, 8),),
+        max_num_decode_tokens=4,
+        model_dtype=torch.float16,
+    )
+
+    assert launcher_calls
+    assert {call["sliding_window"] for call in launcher_calls} == {128}
 
 
 def test_turboquant_decode_warmup_keeps_distinct_compile_keys() -> None:
