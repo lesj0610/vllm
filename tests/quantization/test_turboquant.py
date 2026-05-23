@@ -57,6 +57,7 @@ def _make_turboquant_prefill_impl_stub():
         key_packed_size=2,
         effective_value_quant_bits=4,
         key_fp8=False,
+        value_mse_supported=True,
         norm_correction=True,
     )
     return impl
@@ -1044,7 +1045,10 @@ class TestTurboQuantConfig:
 
         q_len = turboquant_attn._CONTINUATION_DECODE_THRESHOLD + 1
         query = torch.zeros(q_len, 1, 2)
-        layer = SimpleNamespace(_tq_PiT=torch.full((2, 2), 9.0))
+        layer = SimpleNamespace(
+            _tq_PiT=torch.full((2, 2), 9.0),
+            _tq_value_centroids=torch.empty(0),
+        )
         impl._cache_prefill_attention(
             layer=layer,
             query=query,
