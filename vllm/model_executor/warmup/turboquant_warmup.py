@@ -37,6 +37,7 @@ class _TurboQuantDecodeWarmupKey:
     mse_bits: int
     key_packed_size: int
     value_quant_bits: int
+    value_mse: bool
     key_fp8: bool
     norm_correction: bool
     output_fp16: bool
@@ -76,6 +77,7 @@ def _make_warmup_key(
         mse_bits=impl.tq_config.key_mse_bits,
         key_packed_size=impl.tq_config.key_packed_size,
         value_quant_bits=impl.tq_config.effective_value_quant_bits,
+        value_mse=impl.tq_config.value_mse_supported,
         key_fp8=impl.tq_config.key_fp8,
         norm_correction=impl.tq_config.norm_correction,
         output_fp16=model_dtype == torch.float16,
@@ -268,6 +270,8 @@ def _warmup_turboquant_decode_layer(
             norm_correction=impl.tq_config.norm_correction,
             PiT=layer._tq_PiT,
             max_num_kv_splits=impl.max_num_kv_splits,
+            value_centroids=layer._tq_value_centroids,
+            value_mse=impl.tq_config.value_mse_supported,
         )
 
     if not is_workspace_manager_initialized():
