@@ -31,6 +31,7 @@ class _TurboQuantDecodeWarmupKey:
     head_dim: int
     block_size: int
     block_table_stride: int
+    sliding_window: int | None
     num_kv_splits: int
     kv_group_size: int
     scale: float
@@ -71,6 +72,10 @@ def _make_warmup_key(
         # synthetic block table stride equal to the runtime block table stride
         # and include it in the dedupe key so warmup covers the same variant.
         block_table_stride=block_table_stride,
+        # `_tq_decode_stage1` specializes SLIDING_WINDOW. Mixed attention
+        # models can have otherwise-identical full and sliding layers, so the
+        # warmup key must keep those launch variants distinct.
+        sliding_window=impl.sliding_window,
         num_kv_splits=impl.max_num_kv_splits,
         kv_group_size=impl.num_kv_groups,
         scale=impl.scale,
@@ -270,6 +275,7 @@ def _warmup_turboquant_decode_layer(
             norm_correction=impl.tq_config.norm_correction,
             PiT=layer._tq_PiT,
             max_num_kv_splits=impl.max_num_kv_splits,
+            sliding_window=impl.sliding_window,
             value_centroids=layer._tq_value_centroids,
             value_mse=impl.tq_config.value_mse_supported,
         )
