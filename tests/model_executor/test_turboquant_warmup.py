@@ -28,6 +28,7 @@ class _FakeTQConfig:
     key_mse_bits = 4
     key_packed_size = 10
     effective_value_quant_bits = 4
+    value_mse_supported = True
     key_fp8 = False
     norm_correction = True
     slot_size_aligned = 24
@@ -60,6 +61,7 @@ class _FakeTurboQuantAttentionImpl:
         layer._tq_Pi = torch.eye(self.head_size, dtype=torch.float32, device=device)
         layer._tq_PiT = torch.eye(self.head_size, dtype=torch.float32, device=device)
         layer._tq_centroids = torch.zeros(16, dtype=torch.float32, device=device)
+        layer._tq_value_centroids = torch.zeros(16, dtype=torch.float32, device=device)
 
     def _decode_attention(
         self,
@@ -230,6 +232,8 @@ def test_turboquant_decode_warmup_builds_runtime_shaped_inputs(
     assert prefix_call.get("output_buf") is None
     assert prefix_call.get("lse_buf") is None
     assert prefix_call["max_num_kv_splits"] == 64
+    assert prefix_call["value_centroids"] is model[0]._tq_value_centroids
+    assert prefix_call["value_mse"] is True
     assert impl.ensure_calls == 1
     assert impl.continuation_calls == []
 
