@@ -818,6 +818,11 @@ class TestTurboQuantConfig:
             "triton_turboquant_decode_attention",
             fail_decode,
         )
+        monkeypatch.setattr(
+            turboquant_attn,
+            "is_workspace_manager_initialized",
+            lambda: True,
+        )
         monkeypatch.setattr(impl, "_continuation_prefill", fake_continuation)
 
         q_len = turboquant_attn._CONTINUATION_DECODE_THRESHOLD + 1
@@ -848,6 +853,65 @@ class TestTurboQuantConfig:
 
         assert called["ran"]
         assert torch.equal(out, torch.full_like(query, 5))
+
+    def test_large_continuation_without_workspace_uses_decode_chunks(self, monkeypatch):
+        from vllm.v1.attention.backends import turboquant_attn
+
+        impl = _make_turboquant_prefill_impl_stub()
+        impl._can_use_flash_attn = False
+
+        def fail_continuation(*args, **kwargs):
+            raise AssertionError(
+                "streaming/full-dequant continuation requires workspace"
+            )
+
+        calls = []
+
+        def fake_decode_attention(**kwargs):
+            calls.append(kwargs)
+            return torch.zeros_like(kwargs["query"])
+
+        monkeypatch.setattr(impl, "_continuation_prefill", fail_continuation)
+        monkeypatch.setattr(
+            turboquant_attn,
+            "is_workspace_manager_initialized",
+            lambda: False,
+        )
+        monkeypatch.setattr(
+            turboquant_attn,
+            "triton_turboquant_decode_attention",
+            fake_decode_attention,
+        )
+
+        q_len = turboquant_attn._CONTINUATION_DECODE_THRESHOLD + 1
+        cached_len = 200
+        seq_len = cached_len + q_len
+        query = torch.zeros(q_len, 1, 2)
+        metadata = SimpleNamespace(
+            query_start_loc=torch.tensor([0, q_len], dtype=torch.int32),
+            query_start_loc_cpu=torch.tensor([0, q_len], dtype=torch.int32),
+            seq_lens=torch.tensor([seq_len], dtype=torch.int32),
+            seq_lens_cpu=torch.tensor([seq_len], dtype=torch.int32),
+            block_table=torch.tensor([[1, 2, 3]], dtype=torch.int32),
+            max_query_len=q_len,
+            max_seq_len=seq_len,
+        )
+
+        impl._prefill_attention(
+            query,
+            torch.zeros_like(query),
+            torch.zeros_like(query),
+            torch.empty(0),
+            metadata,
+            torch.empty(0),
+            torch.empty(0),
+        )
+
+        assert len(calls) == 2
+        assert (
+            calls[0]["query"].shape[0] == turboquant_attn._CONTINUATION_DECODE_THRESHOLD
+        )
+        assert calls[1]["query"].shape[0] == 1
 
     def test_continuation_threshold_uses_single_decode_chunk(self, monkeypatch):
         from vllm.v1.attention.backends import turboquant_attn
