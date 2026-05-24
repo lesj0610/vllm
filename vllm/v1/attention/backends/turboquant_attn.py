@@ -499,6 +499,23 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
     ) -> bool:
         return not self._needs_sliding_window_mask(seq_len) and mm_prefix_ranges is None
 
+    def _should_use_streaming_prefill(
+        self,
+        q_len: int,
+        seq_len: int,
+        mm_prefix_ranges: torch.Tensor | None,
+    ) -> bool:
+        """Use streaming only for large non-flash continuation prefills."""
+        if q_len <= _CONTINUATION_DECODE_THRESHOLD:
+            return False
+        if seq_len <= q_len:
+            return False
+        if not is_workspace_manager_initialized():
+            return False
+        return self._can_use_dequant_prefill(
+            seq_len, mm_prefix_ranges
+        ) and not self._can_use_flash_prefill(seq_len, mm_prefix_ranges)
+
     def _get_arange_cache(
         self,
         max_value: int,
@@ -1071,15 +1088,13 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 # dequant cached K/V once and use a prefill kernel. This keeps
                 # persistent KV in TQ while avoiding per-query decode replay.
                 cached_len = seq_len - q_len
-                can_flash_prefill = self._can_use_flash_prefill(
-                    seq_len, mm_prefix_ranges
+                can_fast_continuation = q_len > _CONTINUATION_DECODE_THRESHOLD and (
+                    self._can_use_flash_prefill(seq_len, mm_prefix_ranges)
+                    or self._should_use_streaming_prefill(
+                        q_len, seq_len, mm_prefix_ranges
+                    )
                 )
-                can_streaming_prefill = self._can_use_dequant_prefill(
-                    seq_len, mm_prefix_ranges
-                )
-                if q_len <= _CONTINUATION_DECODE_THRESHOLD or not (
-                    can_flash_prefill or can_streaming_prefill
-                ):
+                if not can_fast_continuation:
                     out = self._decode_prefill_from_cache(
                         q_seq,
                         kv_cache,
@@ -1245,7 +1260,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         assert Hq % Hk == 0
 
         device = query.device
-        q = query.transpose(0, 1).float()  # [Hq, q_len, D]
+        q = query.transpose(0, 1).float().contiguous()  # [Hq, q_len, D]
         q_pos = torch.arange(q_len, device=device, dtype=torch.int64) + cached_len
         kv_head_for_q = torch.arange(Hq, device=device, dtype=torch.int64) // (Hq // Hk)
 
@@ -1271,7 +1286,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
 
             k_by_q = k_tile.transpose(0, 1).index_select(0, kv_head_for_q).float()
             v_by_q = v_tile.transpose(0, 1).index_select(0, kv_head_for_q).float()
-            scores = torch.einsum("hmd,hnd->hmn", q, k_by_q) * self.scale
+            scores = torch.bmm(q, k_by_q.transpose(1, 2)) * self.scale
             scores = scores.masked_fill(~causal.unsqueeze(0), -float("inf"))
 
             tile_m = scores.max(dim=-1).values
@@ -1293,7 +1308,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 torch.exp(m - m_new),
                 torch.zeros_like(m),
             )
-            acc = acc * alpha.unsqueeze(-1) + torch.einsum("hmn,hnd->hmd", p, v_by_q)
+            acc = acc * alpha.unsqueeze(-1) + torch.bmm(p, v_by_q)
             denom = denom * alpha + p.sum(dim=-1)
             m = m_new
 
@@ -1419,9 +1434,9 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         mm_prefix_ranges: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Handle continuation chunk with tiled dequant over TQ cached K/V."""
-        if self._can_use_dequant_prefill(
-            seq_len, mm_prefix_ranges
-        ) and not self._can_use_flash_prefill(seq_len, mm_prefix_ranges):
+        if self._should_use_streaming_prefill(
+            query.shape[0], seq_len, mm_prefix_ranges
+        ):
             return self._streaming_prefill_from_tq_cache(
                 layer,
                 query,
