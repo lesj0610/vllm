@@ -795,27 +795,30 @@ class TestTurboQuantConfig:
 
         assert torch.equal(out, torch.full_like(query, 4))
 
-    def test_large_continuation_without_flash_uses_decode_chunks(self, monkeypatch):
+    def test_large_continuation_without_flash_uses_continuation_prefill(
+        self, monkeypatch
+    ):
         from vllm.v1.attention.backends import turboquant_attn
 
         impl = _make_turboquant_prefill_impl_stub()
         impl._can_use_flash_attn = False
 
-        def fail_continuation(*args, **kwargs):
-            raise AssertionError("full-dequant continuation path must not run")
+        def fail_decode(*args, **kwargs):
+            raise AssertionError("large full-layer continuation must not decode replay")
 
-        calls = []
+        called = {}
 
-        def fake_decode_attention(**kwargs):
-            calls.append(kwargs)
-            return torch.full_like(kwargs["query"], len(calls))
+        def fake_continuation(*args, **kwargs):
+            called["ran"] = True
+            query = args[1]
+            return torch.full_like(query, 5)
 
-        monkeypatch.setattr(impl, "_continuation_prefill", fail_continuation)
         monkeypatch.setattr(
             turboquant_attn,
             "triton_turboquant_decode_attention",
-            fake_decode_attention,
+            fail_decode,
         )
+        monkeypatch.setattr(impl, "_continuation_prefill", fake_continuation)
 
         q_len = turboquant_attn._CONTINUATION_DECODE_THRESHOLD + 1
         cached_len = 200
@@ -843,23 +846,8 @@ class TestTurboQuantConfig:
             torch.empty(0),
         )
 
-        assert len(calls) == 2
-        assert (
-            calls[0]["query"].shape[0] == turboquant_attn._CONTINUATION_DECODE_THRESHOLD
-        )
-        assert calls[1]["query"].shape[0] == 1
-        assert calls[0]["seq_lens"].tolist() == list(range(cached_len + 1, seq_len))
-        assert calls[1]["seq_lens"].tolist() == [seq_len]
-        assert calls[0]["mm_prefix_range"] is None
-        assert torch.equal(
-            out,
-            torch.cat(
-                (
-                    torch.ones(turboquant_attn._CONTINUATION_DECODE_THRESHOLD, 1, 2),
-                    torch.full((1, 1, 2), 2.0),
-                )
-            ),
-        )
+        assert called["ran"]
+        assert torch.equal(out, torch.full_like(query, 5))
 
     def test_continuation_threshold_uses_single_decode_chunk(self, monkeypatch):
         from vllm.v1.attention.backends import turboquant_attn
@@ -960,6 +948,48 @@ class TestTurboQuantConfig:
         assert called["ran"]
         assert torch.equal(out, torch.full_like(query, 5))
 
+    def test_continuation_prefill_with_flash_does_not_stream(self, monkeypatch):
+        impl = _make_turboquant_prefill_impl_stub()
+        impl._can_use_flash_attn = True
+
+        def fail_streaming(*args, **kwargs):
+            raise AssertionError("flash-capable continuation must not use streaming")
+
+        def fake_dequant(*args, **kwargs):
+            return torch.zeros(3, 1, 2), torch.zeros(3, 1, 2)
+
+        called = {}
+
+        def fake_prefill(query, key, value, **kwargs):
+            called["key_shape"] = key.shape
+            called["value_shape"] = value.shape
+            return torch.full_like(query, 6)
+
+        monkeypatch.setattr(impl, "_streaming_prefill_from_tq_cache", fail_streaming)
+        monkeypatch.setattr(impl, "_dequant_cached_kv", fake_dequant)
+        monkeypatch.setattr(impl, "_prefill_attention_with_kv", fake_prefill)
+
+        query = torch.zeros(4, 1, 2)
+        key_chunk = torch.ones_like(query)
+        val_chunk = torch.ones_like(query)
+        out = impl._continuation_prefill(
+            layer=SimpleNamespace(),
+            query=query,
+            key_chunk=key_chunk,
+            val_chunk=val_chunk,
+            kv_cache=torch.empty(0),
+            block_table=torch.empty(0, dtype=torch.int32),
+            cached_len=3,
+            seq_len=7,
+            Pi=torch.empty(0),
+            centroids=torch.empty(0),
+            mm_prefix_ranges=None,
+        )
+
+        assert torch.equal(out, torch.full_like(query, 6))
+        assert called["key_shape"] == (7, 1, 2)
+        assert called["value_shape"] == (7, 1, 2)
+
     def test_continuation_with_mm_prefix_uses_decode_chunks(self, monkeypatch):
         from vllm.v1.attention.backends import turboquant_attn
 
@@ -1020,6 +1050,80 @@ class TestTurboQuantConfig:
         assert calls[1]["mm_prefix_range"].shape == (1, 2, 2)
         assert calls[1]["mm_prefix_range"].is_contiguous()
         assert torch.equal(calls[0]["mm_prefix_range"][0], mm_prefix_range_tensor[0])
+
+    def test_streaming_prefill_matches_manual_lower_right_attention(self, monkeypatch):
+        from vllm.v1.attention.backends import turboquant_attn
+
+        impl = _make_turboquant_prefill_impl_stub()
+        impl.scale = 1.0 / math.sqrt(2)
+        impl.num_heads = 2
+        impl.num_kv_heads = 1
+        impl.head_size = 2
+
+        cached_key = torch.tensor(
+            [[[1.0, 0.0]], [[0.0, 1.0]], [[1.0, 1.0]]],
+            dtype=torch.float32,
+        )
+        cached_val = torch.tensor(
+            [[[1.0, 0.0]], [[0.0, 2.0]], [[3.0, 1.0]]],
+            dtype=torch.float32,
+        )
+        key_chunk = torch.tensor(
+            [[[1.0, -1.0]], [[2.0, 0.0]], [[0.5, 0.5]], [[-1.0, 1.0]]],
+            dtype=torch.float32,
+        )
+        val_chunk = torch.tensor(
+            [[[2.0, -1.0]], [[1.0, 3.0]], [[0.0, 4.0]], [[-2.0, 2.0]]],
+            dtype=torch.float32,
+        )
+        query = torch.tensor(
+            [
+                [[1.0, 0.0], [0.0, 1.0]],
+                [[0.5, 1.0], [1.0, 0.5]],
+                [[1.0, 1.0], [-0.5, 1.0]],
+                [[0.0, 1.0], [1.0, -1.0]],
+            ],
+            dtype=torch.float32,
+        )
+        range_calls = []
+
+        def fake_dequant_range(layer, kv_cache, block_table, start, length, dtype):
+            del layer, kv_cache, block_table
+            range_calls.append((start, length))
+            return (
+                cached_key[start : start + length].to(dtype),
+                cached_val[start : start + length].to(dtype),
+            )
+
+        monkeypatch.setattr(impl, "_dequant_cached_kv_range", fake_dequant_range)
+        monkeypatch.setattr(turboquant_attn, "_STREAMING_PREFILL_KV_TILE", 2)
+
+        out = impl._streaming_prefill_from_tq_cache(
+            layer=SimpleNamespace(),
+            query=query,
+            key_chunk=key_chunk,
+            val_chunk=val_chunk,
+            kv_cache=torch.empty(0),
+            block_table=torch.empty(0, dtype=torch.int32),
+            cached_len=cached_key.shape[0],
+            seq_len=cached_key.shape[0] + query.shape[0],
+        )
+
+        full_key = torch.cat((cached_key, key_chunk), dim=0)
+        full_val = torch.cat((cached_val, val_chunk), dim=0)
+        expected = torch.empty_like(query)
+        key_pos = torch.arange(full_key.shape[0])
+        q_pos = torch.arange(query.shape[0]) + cached_key.shape[0]
+        for h in range(query.shape[1]):
+            scores = (query[:, h] @ full_key[:, 0].T) * impl.scale
+            scores = scores.masked_fill(
+                key_pos.unsqueeze(0) > q_pos.unsqueeze(1), -float("inf")
+            )
+            weights = torch.softmax(scores, dim=-1)
+            expected[:, h] = weights @ full_val[:, 0]
+
+        assert range_calls == [(0, 2), (2, 1)]
+        torch.testing.assert_close(out, expected, rtol=1e-5, atol=1e-5)
 
     def test_kv_shared_prefill_without_flash_uses_decode_chunks(self, monkeypatch):
         from vllm.v1.attention.backends import turboquant_attn
@@ -1861,6 +1965,7 @@ class TestStoreDecodeRoundTrip:
             KEY_FP8=1 if cfg.key_fp8 else 0,
             VALUE_MSE=1,
             BLOCK_D=next_power_of_2(D),
+            POS_OFFSET=0,
             NORM_CORRECTION=1 if cfg.norm_correction else 0,
             FP8_E4B15=_use_fp8_e4b15(device.index or 0),
             num_warps=4,
@@ -1878,6 +1983,149 @@ class TestStoreDecodeRoundTrip:
                     f"{preset} token={token_idx} head={head_idx}: "
                     f"cosine_sim={cos_sim:.4f} < 0.85"
                 )
+
+    def test_full_dequant_range_pos_offset_matches_full_slice(self):
+        """Range dequant must index block_table by absolute cache position."""
+        from vllm.model_executor.layers.quantization.turboquant.centroids import (
+            solve_lloyd_max,
+        )
+        from vllm.v1.attention.ops.triton_turboquant_decode import (
+            _tq_full_dequant_kv,
+            _use_fp8_e4b15,
+        )
+        from vllm.v1.attention.ops.triton_turboquant_store import (
+            triton_turboquant_store,
+        )
+
+        cfg = TurboQuantConfig.from_cache_dtype("turboquant_k3v4_nc", head_dim=128)
+        D = 128
+        Hk = 2
+        N = 24
+        block_size = 8
+        num_blocks = 4
+        device = torch.device(DEVICE_TYPE)
+
+        Pi = _build_hadamard(D, DEVICE_TYPE)
+        PiT = Pi
+
+        centroids, _ = solve_lloyd_max(D, cfg.key_centroid_bits)
+        centroids = centroids.float().to(device)
+        c_sorted, _ = centroids.sort()
+        midpoints = ((c_sorted[:-1] + c_sorted[1:]) / 2).to(device)
+
+        value_centroids, _ = solve_lloyd_max(D, cfg.value_centroid_bits)
+        value_centroids = value_centroids.float().to(device)
+        v_sorted, _ = value_centroids.sort()
+        value_midpoints = ((v_sorted[:-1] + v_sorted[1:]) / 2).to(device)
+
+        torch.manual_seed(987)
+        key = torch.randn(N, Hk, D, device=device, dtype=torch.float16)
+        value = torch.randn(N, Hk, D, device=device, dtype=torch.float16)
+
+        kv_cache = torch.zeros(
+            num_blocks,
+            block_size,
+            Hk,
+            cfg.slot_size_aligned,
+            device=device,
+            dtype=torch.uint8,
+        )
+        slot_mapping = torch.arange(N, device=device, dtype=torch.int32)
+        triton_turboquant_store(
+            key,
+            value,
+            kv_cache,
+            slot_mapping,
+            PiT,
+            midpoints,
+            mse_bits=cfg.key_mse_bits,
+            key_packed_size=cfg.key_packed_size,
+            value_quant_bits=cfg.effective_value_quant_bits,
+            key_fp8=cfg.key_fp8,
+            value_midpoints=value_midpoints,
+            value_mse=cfg.value_mse_supported,
+        )
+
+        block_table = torch.tensor([[0, 1, 2, 3]], device=device, dtype=torch.int32)
+        full_k = torch.empty(1, Hk, N, D, device=device, dtype=torch.float16)
+        full_v = torch.empty(1, Hk, N, D, device=device, dtype=torch.float32)
+        range_start = 5
+        range_len = 11
+        range_alloc = math.ceil(range_len / block_size) * block_size
+        range_k = torch.empty(1, Hk, range_alloc, D, device=device, dtype=torch.float16)
+        range_v = torch.empty(1, Hk, range_alloc, D, device=device, dtype=torch.float32)
+
+        common_kwargs = dict(
+            HEAD_DIM=D,
+            BLOCK_SIZE=block_size,
+            NUM_KV_HEADS=Hk,
+            MSE_BYTES=math.ceil(D * cfg.key_mse_bits / 8),
+            KPS=cfg.key_packed_size,
+            VQB=cfg.effective_value_quant_bits,
+            VAL_DATA_BYTES=math.ceil(D * cfg.effective_value_quant_bits / 8),
+            MSE_BITS=cfg.key_mse_bits,
+            KEY_FP8=1 if cfg.key_fp8 else 0,
+            VALUE_MSE=1,
+            BLOCK_D=next_power_of_2(D),
+            NORM_CORRECTION=1 if cfg.norm_correction else 0,
+            FP8_E4B15=_use_fp8_e4b15(device.index or 0),
+            num_warps=4,
+        )
+
+        _tq_full_dequant_kv[(N, Hk)](
+            kv_cache,
+            block_table,
+            centroids,
+            value_centroids,
+            full_k,
+            full_v,
+            full_k.stride(0),
+            full_k.stride(1),
+            full_k.stride(2),
+            full_v.stride(0),
+            full_v.stride(1),
+            full_v.stride(2),
+            kv_cache.stride(0),
+            kv_cache.stride(1),
+            kv_cache.stride(2),
+            block_table.stride(0),
+            POS_OFFSET=0,
+            **common_kwargs,
+        )
+        _tq_full_dequant_kv[(range_alloc, Hk)](
+            kv_cache,
+            block_table,
+            centroids,
+            value_centroids,
+            range_k,
+            range_v,
+            range_k.stride(0),
+            range_k.stride(1),
+            range_k.stride(2),
+            range_v.stride(0),
+            range_v.stride(1),
+            range_v.stride(2),
+            kv_cache.stride(0),
+            kv_cache.stride(1),
+            kv_cache.stride(2),
+            block_table.stride(0),
+            POS_OFFSET=range_start,
+            **common_kwargs,
+        )
+
+        expected_slice = slice(range_start, range_start + range_len)
+        torch.testing.assert_close(
+            range_k[:, :, :range_len, :],
+            full_k[:, :, expected_slice, :],
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(
+            range_v[:, :, :range_len, :],
+            full_v[:, :, expected_slice, :],
+            rtol=0,
+            atol=0,
+        )
 
     @pytest.mark.parametrize(
         "preset",

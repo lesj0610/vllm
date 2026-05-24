@@ -30,6 +30,7 @@ from typing import Any, ClassVar
 
 import torch
 import torch.nn.functional as F
+from torch.nn.attention.bias import causal_lower_right
 
 from vllm.config import get_current_vllm_config
 from vllm.config.cache import CacheDType
@@ -75,6 +76,7 @@ if _HAS_FLASH_ATTN:
 # kernel can read them efficiently. This avoids O(cached_len) dequant work
 # per continuation, eliminating the O(N²/chunk_size) collapse at long context.
 _CONTINUATION_DECODE_THRESHOLD = 128
+_STREAMING_PREFILL_KV_TILE = 1024
 
 
 def _get_turboquant_decode_workspace_shapes(
@@ -490,6 +492,13 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             and mm_prefix_ranges is None
         )
 
+    def _can_use_dequant_prefill(
+        self,
+        seq_len: int,
+        mm_prefix_ranges: torch.Tensor | None,
+    ) -> bool:
+        return not self._needs_sliding_window_mask(seq_len) and mm_prefix_ranges is None
+
     def _get_arange_cache(
         self,
         max_value: int,
@@ -581,6 +590,33 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             k_t,
             v_t,
             is_causal=True,
+            scale=self.scale,
+            enable_gqa=(key.shape[1] < query.shape[1]),
+        )
+        return out[0].transpose(0, 1)
+
+    def _sdpa_lower_right_causal_prefill(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run causal SDPA for continuation prefill without a dense mask.
+
+        `is_causal=True` is top-left aligned when q_len < kv_len, which is
+        incorrect for continuation chunks. `causal_lower_right` matches the
+        cached-prefix alignment while still allowing PyTorch to avoid materializing
+        a q_len × kv_len boolean mask.
+        """
+        q_t = query.transpose(0, 1).unsqueeze(0)
+        k_t = key.transpose(0, 1).unsqueeze(0)
+        v_t = value.transpose(0, 1).unsqueeze(0)
+        bias = causal_lower_right(query.shape[0], key.shape[0])
+        out = F.scaled_dot_product_attention(
+            q_t,
+            k_t,
+            v_t,
+            attn_mask=bias,
             scale=self.scale,
             enable_gqa=(key.shape[1] < query.shape[1]),
         )
@@ -1031,11 +1067,18 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 # Continuation chunk: tokens already stored to TQ cache
                 # by do_kv_cache_update. Use decode kernel directly to
                 # avoid O(cached_len) full-dequant per continuation.
-                # For large continuations, use flash-attn when that path is
-                # available; otherwise run decode kernel chunks.
+                # For large continuations without sliding/mm-prefix masking,
+                # dequant cached K/V once and use a prefill kernel. This keeps
+                # persistent KV in TQ while avoiding per-query decode replay.
                 cached_len = seq_len - q_len
+                can_flash_prefill = self._can_use_flash_prefill(
+                    seq_len, mm_prefix_ranges
+                )
+                can_streaming_prefill = self._can_use_dequant_prefill(
+                    seq_len, mm_prefix_ranges
+                )
                 if q_len <= _CONTINUATION_DECODE_THRESHOLD or not (
-                    self._can_use_flash_prefill(seq_len, mm_prefix_ranges)
+                    can_flash_prefill or can_streaming_prefill
                 ):
                     out = self._decode_prefill_from_cache(
                         q_seq,
@@ -1051,7 +1094,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                     )
                 else:
                     # Large continuation: dequant cached K/V and use
-                    # flash_attn for better throughput.
+                    # flash-attn when available, otherwise lower-right SDPA.
                     out = self._continuation_prefill(
                         layer,
                         q_seq,
@@ -1070,16 +1113,18 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
 
         return output
 
-    def _dequant_cached_kv(
+    def _dequant_cached_kv_range(
         self,
         layer: Any,
         kv_cache: torch.Tensor,  # (num_blocks, block_size, Hk, slot_size)
         block_table: torch.Tensor,  # (1, max_num_blocks)
-        cache_len: int,
+        start: int,
+        length: int,
         output_dtype: torch.dtype,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Dequantize the first cache_len tokens from a single request cache."""
-        assert cache_len > 0
+        """Dequantize a contiguous absolute position range from one cache."""
+        assert start >= 0
+        assert length > 0
 
         Hk = self.num_kv_heads
         D = self.head_size
@@ -1087,7 +1132,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         block_size = kv_cache.shape[1]
         BLOCK_D = triton.next_power_of_2(D)
 
-        alloc_len = math.ceil(cache_len / block_size) * block_size
+        alloc_len = math.ceil(length / block_size) * block_size
         buf_shape = (1, Hk, alloc_len, D)
         # Use WorkspaceManager for dequant buffers. It is shared across layers
         # and avoids per-layer allocations that would break CUDA graph capture.
@@ -1134,28 +1179,147 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             BLOCK_D=BLOCK_D,
             NORM_CORRECTION=1 if self.tq_config.norm_correction else 0,
             FP8_E4B15=_use_fp8_e4b15(device.index or 0),
+            POS_OFFSET=start,
             num_warps=4,
         )
 
         if not self.tq_config.key_fp8:
             Pi_half = layer._tq_Pi_half
-            k_flat = k_cached[0, :, :cache_len, :].reshape(-1, D)
+            k_flat = k_cached[0, :, :length, :].reshape(-1, D)
             k_flat = k_flat @ Pi_half
-            k_cached_trim = k_flat.reshape(Hk, cache_len, D).transpose(0, 1)
+            k_cached_trim = k_flat.reshape(Hk, length, D).transpose(0, 1)
         else:
-            k_cached_trim = k_cached[0, :, :cache_len, :].transpose(0, 1)
+            k_cached_trim = k_cached[0, :, :length, :].transpose(0, 1)
 
         # Value-MSE stores V in rotated space; inverse-rotate after full
         # dequant before returning original-space values to prefill paths.
         if self.tq_config.value_mse_supported:
             Pi = layer._tq_Pi
-            v_flat = v_cached[0, :, :cache_len, :].reshape(-1, D)
+            v_flat = v_cached[0, :, :length, :].reshape(-1, D)
             v_flat = v_flat.float() @ Pi
-            v_cached_trim = v_flat.reshape(Hk, cache_len, D).transpose(0, 1)
+            v_cached_trim = v_flat.reshape(Hk, length, D).transpose(0, 1)
         else:
-            v_cached_trim = v_cached[0, :, :cache_len, :].transpose(0, 1)
+            v_cached_trim = v_cached[0, :, :length, :].transpose(0, 1)
 
         return k_cached_trim.to(output_dtype), v_cached_trim.to(output_dtype)
+
+    def _dequant_cached_kv(
+        self,
+        layer: Any,
+        kv_cache: torch.Tensor,  # (num_blocks, block_size, Hk, slot_size)
+        block_table: torch.Tensor,  # (1, max_num_blocks)
+        cache_len: int,
+        output_dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Dequantize the first cache_len tokens from a single request cache."""
+        assert cache_len > 0
+        return self._dequant_cached_kv_range(
+            layer,
+            kv_cache,
+            block_table,
+            0,
+            cache_len,
+            output_dtype,
+        )
+
+    def _streaming_prefill_from_tq_cache(
+        self,
+        layer: Any,
+        query: torch.Tensor,  # (q_len, Hq, D)
+        key_chunk: torch.Tensor,  # (q_len, Hk, D)
+        val_chunk: torch.Tensor,  # (q_len, Hk, D)
+        kv_cache: torch.Tensor,  # (num_blocks, block_size, Hk, slot_size)
+        block_table: torch.Tensor,  # (1, max_num_blocks)
+        cached_len: int,
+        seq_len: int,
+    ) -> torch.Tensor:
+        """Streaming causal prefill over TQ cached prefix plus raw current chunk.
+
+        This keeps persistent K/V in TQ format and dequants only a KV tile at a
+        time. It avoids both full-cache dequant memory and per-query decode
+        replay for long continuation chunks.
+        """
+        q_len, Hq, D = query.shape
+        Hk = key_chunk.shape[1]
+        assert seq_len == cached_len + q_len
+        assert Hq % Hk == 0
+
+        device = query.device
+        q = query.transpose(0, 1).float()  # [Hq, q_len, D]
+        q_pos = torch.arange(q_len, device=device, dtype=torch.int64) + cached_len
+        kv_head_for_q = torch.arange(Hq, device=device, dtype=torch.int64) // (Hq // Hk)
+
+        m = torch.full((Hq, q_len), -float("inf"), device=device, dtype=torch.float32)
+        denom = torch.zeros((Hq, q_len), device=device, dtype=torch.float32)
+        acc = torch.zeros((Hq, q_len, D), device=device, dtype=torch.float32)
+
+        def update_tile(
+            k_tile: torch.Tensor,
+            v_tile: torch.Tensor,
+            key_start_pos: int,
+        ) -> None:
+            nonlocal m, denom, acc
+
+            tile_len = k_tile.shape[0]
+            if tile_len == 0:
+                return
+
+            key_pos = (
+                torch.arange(tile_len, device=device, dtype=torch.int64) + key_start_pos
+            )
+            causal = key_pos.unsqueeze(0) <= q_pos.unsqueeze(1)  # [q_len, tile]
+
+            k_by_q = k_tile.transpose(0, 1).index_select(0, kv_head_for_q).float()
+            v_by_q = v_tile.transpose(0, 1).index_select(0, kv_head_for_q).float()
+            scores = torch.einsum("hmd,hnd->hmn", q, k_by_q) * self.scale
+            scores = scores.masked_fill(~causal.unsqueeze(0), -float("inf"))
+
+            tile_m = scores.max(dim=-1).values
+            valid_tile = torch.isfinite(tile_m)
+            m_new = torch.maximum(m, torch.where(valid_tile, tile_m, m))
+            finite_m_new = torch.isfinite(m_new)
+
+            shifted = scores - torch.where(
+                finite_m_new,
+                m_new,
+                torch.zeros_like(m_new),
+            ).unsqueeze(-1)
+            p = torch.exp(shifted)
+            p = torch.where(causal.unsqueeze(0) & finite_m_new.unsqueeze(-1), p, 0.0)
+
+            has_prev = torch.isfinite(m)
+            alpha = torch.where(
+                has_prev & finite_m_new,
+                torch.exp(m - m_new),
+                torch.zeros_like(m),
+            )
+            acc = acc * alpha.unsqueeze(-1) + torch.einsum("hmn,hnd->hmd", p, v_by_q)
+            denom = denom * alpha + p.sum(dim=-1)
+            m = m_new
+
+        tile_size = _STREAMING_PREFILL_KV_TILE
+        for tile_start in range(0, cached_len, tile_size):
+            tile_len = min(tile_size, cached_len - tile_start)
+            k_tile, v_tile = self._dequant_cached_kv_range(
+                layer,
+                kv_cache,
+                block_table,
+                tile_start,
+                tile_len,
+                query.dtype,
+            )
+            update_tile(k_tile, v_tile, tile_start)
+
+        for local_start in range(0, q_len, tile_size):
+            local_end = min(local_start + tile_size, q_len)
+            update_tile(
+                key_chunk[local_start:local_end],
+                val_chunk[local_start:local_end],
+                cached_len + local_start,
+            )
+
+        out = acc / denom.clamp_min(1e-20).unsqueeze(-1)
+        return out.transpose(0, 1).to(query.dtype)
 
     def _prefill_attention_with_kv(
         self,
@@ -1190,6 +1354,8 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 max_seqlen_q=q_len,
                 max_seqlen_k=seq_len,
             )
+        if self.sliding_window is None and mm_prefix_ranges is None:
+            return self._sdpa_lower_right_causal_prefill(query, key, value)
         return self._sdpa_with_causal_and_sliding_mask(
             query,
             key,
@@ -1252,14 +1418,21 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         centroids: torch.Tensor,
         mm_prefix_ranges: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Handle continuation chunk by dequanting cached K/V from TQ cache.
+        """Handle continuation chunk with tiled dequant over TQ cached K/V."""
+        if self._can_use_dequant_prefill(
+            seq_len, mm_prefix_ranges
+        ) and not self._can_use_flash_prefill(seq_len, mm_prefix_ranges):
+            return self._streaming_prefill_from_tq_cache(
+                layer,
+                query,
+                key_chunk,
+                val_chunk,
+                kv_cache,
+                block_table,
+                cached_len,
+                seq_len,
+            )
 
-        Dequants previously cached K/V, concatenates with the current
-        chunk's raw K/V, then runs flash_attn with causal masking.
-        """
-        q_len, _, D = query.shape
-        Hk = key_chunk.shape[1]
-        device = query.device
         k_cached_trim, v_cached_trim = self._dequant_cached_kv(
             layer,
             kv_cache,
@@ -1270,6 +1443,9 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
 
         # Concatenate cached + current chunk K/V (match query dtype)
         # Pre-allocate full K/V buffer, copy into slices (no cat alloc)
+        q_len, _, D = query.shape
+        Hk = key_chunk.shape[1]
+        device = query.device
         qdtype = query.dtype
         k_full = torch.empty(seq_len, Hk, D, dtype=qdtype, device=device)
         v_full = torch.empty(seq_len, Hk, D, dtype=qdtype, device=device)

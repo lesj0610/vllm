@@ -110,9 +110,16 @@ def _tq_decode_stage1(
     # Sequence length for this batch
     seq_len = tl.load(Seq_lens_ptr + bid)
 
-    # KV split range
-    split_len = tl.cdiv(seq_len, NUM_KV_SPLITS)
-    split_start = split_len * sid
+    # KV split range. For sliding-window attention without mm-prefix tokens,
+    # old tokens before the visible window can never contribute. Bound the scan
+    # range before split assignment instead of scanning full seq_len and masking
+    # the old tokens inside the tile loop.
+    scan_start = 0
+    if SLIDING_WINDOW > 0 and not USE_MM_PREFIX:
+        scan_start = tl.maximum(seq_len - SLIDING_WINDOW, 0)
+    scan_len = seq_len - scan_start
+    split_len = tl.cdiv(scan_len, NUM_KV_SPLITS)
+    split_start = scan_start + split_len * sid
     split_end = tl.minimum(split_start + split_len, seq_len)
 
     # Dimension offsets
@@ -519,6 +526,7 @@ def _tq_full_dequant_kv(
     KEY_FP8: tl.constexpr,
     VALUE_MSE: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    POS_OFFSET: tl.constexpr = 0,
     NORM_CORRECTION: tl.constexpr = 0,
     FP8_E4B15: tl.constexpr = 0,  # 1 = use e4b15 (Ampere/Ada), 0 = e4nv (Hopper+)
 ):
@@ -533,8 +541,9 @@ def _tq_full_dequant_kv(
     bid = bh // NUM_KV_HEADS
     hid = bh % NUM_KV_HEADS
 
-    page_idx = pos // BLOCK_SIZE
-    page_off = pos % BLOCK_SIZE
+    global_pos = pos + POS_OFFSET
+    page_idx = global_pos // BLOCK_SIZE
+    page_off = global_pos % BLOCK_SIZE
     block_num = tl.load(Block_table_ptr + bid * stride_bt_b + page_idx).to(tl.int64)
     slot_base = (
         block_num * stride_cache_block
