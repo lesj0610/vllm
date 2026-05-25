@@ -210,6 +210,7 @@ def _warmup_wna16_moe_layer(
                     x,
                     topk_weights,
                     topk_ids,
+                    shared_experts=layer.shared_experts,
                     shared_experts_input=None,
                 )
                 if device.type != "cpu":
