@@ -210,6 +210,8 @@ def _dequantize_autoround_gptq_router_weight(
 ) -> torch.Tensor:
     if num_bits not in (4, 8):
         raise ValueError(f"Router dequant: unsupported num_bits={num_bits}")
+    if group_size <= 0:
+        raise ValueError(f"Router dequant: invalid group_size={group_size}")
     weight_type = {
         4: scalar_types.uint4b8,
         8: scalar_types.uint8b128,
@@ -231,6 +233,33 @@ def _dequantize_autoround_gptq_router_weight(
     qzeros_per_row = unpacked_qzeros[row_groups]
     weight = (unpacked_qweight - qzeros_per_row) * scales_per_row
     return weight.t().to(params_dtype)
+
+
+def _infer_autoround_gptq_router_config(
+    qweight: torch.Tensor,
+    scales: torch.Tensor,
+    dense_weight_shape: torch.Size,
+    sym: bool,
+) -> tuple[int, int, bool]:
+    dense_input_size = dense_weight_shape[1]
+    if qweight.shape[0] * 8 == dense_input_size:
+        num_bits = 4
+    elif qweight.shape[0] * 4 == dense_input_size:
+        num_bits = 8
+    else:
+        raise ValueError(
+            "Router dequant: cannot infer AutoRound bit width from "
+            f"qweight shape={tuple(qweight.shape)} and dense weight "
+            f"shape={tuple(dense_weight_shape)}"
+        )
+    if dense_input_size % scales.shape[0] != 0:
+        raise ValueError(
+            "Router dequant: cannot infer group size from "
+            f"scales shape={tuple(scales.shape)} and dense weight "
+            f"shape={tuple(dense_weight_shape)}"
+        )
+    group_size = dense_input_size // scales.shape[0]
+    return num_bits, group_size, sym
 
 
 def _map_gemma4_moe_suffix(name: str, source_base: str, target_base: str) -> str | None:
@@ -1498,13 +1527,31 @@ class Gemma4Model(nn.Module, EagleModelMixin):
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader
                     )
+                    if hasattr(self.quant_config, "get_layer_config"):
+                        num_bits, group_size, sym = self.quant_config.get_layer_config(
+                            object(), router_name
+                        )
+                    else:
+                        num_bits = self.quant_config.weight_bits
+                        group_size = self.quant_config.group_size
+                        sym = self.quant_config.sym
+                    if num_bits >= 16:
+                        # INC/AutoRound may treat this dense router fallback as
+                        # unquantized when queried with a dummy layer. Infer the
+                        # actual GPTQ router layout from checkpoint tensors.
+                        num_bits, group_size, sym = _infer_autoround_gptq_router_config(
+                            qweight=quant_params["qweight"],
+                            scales=quant_params["scales"],
+                            dense_weight_shape=param.shape,
+                            sym=getattr(self.quant_config, "sym", True),
+                        )
                     router_weight = _dequantize_autoround_gptq_router_weight(
                         qweight=quant_params["qweight"],
                         qzeros=quant_params["qzeros"],
                         scales=quant_params["scales"],
-                        num_bits=self.quant_config.weight_bits,
-                        group_size=self.quant_config.group_size,
-                        sym=self.quant_config.sym,
+                        num_bits=num_bits,
+                        group_size=group_size,
+                        sym=sym,
                         params_dtype=param.dtype,
                     )
                     weight_loader(param, router_weight)
