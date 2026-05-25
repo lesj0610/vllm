@@ -10,12 +10,24 @@ import vllm.model_executor.layers.fused_moe as fused_moe
 from vllm.model_executor.layers.fused_moe import GateLinear
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.linear import LinearMethodBase
-from vllm.model_executor.layers.quantization.inc import INCConfig
+from vllm.model_executor.layers.quantization.inc import (
+    INCConfig,
+    INCGPTQRowParallelTailLinearMethod,
+)
 from vllm.model_executor.layers.quantization.moe_wna16 import (
     MoeWNA16Config,
     MoeWNA16Method,
 )
+from vllm.model_executor.layers.quantization.utils.quant_utils import (
+    pack_quantized_values_into_int32,
+)
+from vllm.model_executor.models.gemma4 import (
+    Gemma4Router,
+    _dequantize_autoround_gptq_router_weight,
+    _infer_autoround_gptq_router_config,
+)
 from vllm.model_executor.models.utils import WeightsMapper
+from vllm.scalar_type import scalar_types
 
 
 class DummyLayer:
@@ -153,6 +165,154 @@ def test_gate_linear_accepts_quant_config_for_router_weights() -> None:
     assert output.shape == (2, 3)
     assert output.dtype == torch.float32
     assert bias is None
+
+
+@pytest.mark.parametrize(
+    ("num_bits", "weight_type", "zero_point"),
+    [
+        (4, scalar_types.uint4b8, 7),
+        (8, scalar_types.uint8b128, 127),
+    ],
+)
+def test_autoround_gptq_router_weight_dequantizes_symmetric_zero_point(
+    num_bits: int,
+    weight_type,
+    zero_point: int,
+) -> None:
+    pack_factor = 32 // num_bits
+    qweight_unpacked = (
+        (torch.arange(8 * 8, dtype=torch.int32).reshape(8, 8) % pack_factor)
+        + zero_point
+        + 1
+    )
+    qzeros_unpacked = torch.full((2, 8), zero_point, dtype=torch.int32)
+    scales = torch.stack(
+        (
+            torch.linspace(0.5, 1.2, 8),
+            torch.linspace(1.5, 2.2, 8),
+        )
+    )
+
+    qweight = pack_quantized_values_into_int32(
+        qweight_unpacked, weight_type, packed_dim=0
+    )
+    qzeros = pack_quantized_values_into_int32(
+        qzeros_unpacked, weight_type, packed_dim=1
+    )
+
+    weight = _dequantize_autoround_gptq_router_weight(
+        qweight=qweight,
+        qzeros=qzeros,
+        scales=scales,
+        num_bits=num_bits,
+        group_size=4,
+        sym=True,
+        params_dtype=torch.float16,
+    )
+
+    expected_qzeros = qzeros_unpacked + 1
+    row_groups = torch.arange(qweight_unpacked.shape[0]) // 4
+    expected = (
+        (qweight_unpacked - expected_qzeros[row_groups]) * scales[row_groups]
+    ).t()
+    torch.testing.assert_close(weight, expected.to(torch.float16))
+
+
+def test_gemma4_router_keeps_dense_weight_for_quantized_checkpoint(
+    default_vllm_config,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    del default_vllm_config
+    import vllm.model_executor.layers.linear as linear
+    import vllm.model_executor.parameter as parameter
+
+    monkeypatch.setattr(linear, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(linear, "get_tensor_model_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(parameter, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(parameter, "get_tensor_model_parallel_world_size", lambda: 1)
+    router = Gemma4Router(
+        SimpleNamespace(hidden_size=4, num_experts=3, rms_norm_eps=1e-6),
+        quant_config=_FakeQuantConfig(),
+        prefix="layers.0.router",
+    )
+
+    assert hasattr(router.proj, "weight")
+    assert not hasattr(router.proj, "qweight")
+
+
+def test_autoround_router_config_can_be_inferred_from_packed_shapes() -> None:
+    qweight = torch.empty(352, 128, dtype=torch.int32)
+    scales = torch.empty(22, 128, dtype=torch.float16)
+
+    assert _infer_autoround_gptq_router_config(
+        qweight=qweight,
+        scales=scales,
+        dense_weight_shape=torch.Size([128, 2816]),
+        sym=True,
+    ) == (4, 128, True)
+
+    qweight = torch.empty(704, 128, dtype=torch.int32)
+    assert _infer_autoround_gptq_router_config(
+        qweight=qweight,
+        scales=scales,
+        dense_weight_shape=torch.Size([128, 2816]),
+        sym=True,
+    ) == (8, 128, True)
+
+
+def test_inc_gptq_row_parallel_tail_fallback_uses_global_group_indices(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import vllm.model_executor.layers.quantization.inc as inc
+    import vllm.model_executor.parameter as parameter
+
+    monkeypatch.setattr(inc, "get_tensor_model_parallel_rank", lambda: 1)
+    monkeypatch.setattr(parameter, "get_tensor_model_parallel_rank", lambda: 1)
+    monkeypatch.setattr(parameter, "get_tensor_model_parallel_world_size", lambda: 2)
+
+    method = INCGPTQRowParallelTailLinearMethod(
+        weight_bits=4,
+        group_size=16,
+        sym=True,
+    )
+    layer = torch.nn.Module()
+    layer.input_size_per_partition = 24
+    method.create_weights(
+        layer,
+        input_size_per_partition=24,
+        output_partition_sizes=[8],
+        input_size=48,
+        output_size=8,
+        params_dtype=torch.float32,
+    )
+
+    assert layer.g_idx.tolist() == [1] * 8 + [2] * 16
+
+    qweight_unpacked = torch.full((24, 8), 9, dtype=torch.int32)
+    layer.qweight.data.copy_(
+        pack_quantized_values_into_int32(
+            qweight_unpacked, scalar_types.uint4b8, packed_dim=0
+        )
+    )
+    layer.scales.data.copy_(
+        torch.tensor(
+            [
+                [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+                [2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0],
+                [4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0],
+            ],
+            dtype=torch.float32,
+        )
+    )
+    method.process_weights_after_loading(layer)
+
+    x = torch.ones(1, 24, dtype=torch.float16)
+    output = method.apply(layer, x)
+
+    # qweight 9 minus uint4 symmetric bias 8 gives dequant value 1.
+    expected = 8 * layer.scales.data[1] + 16 * layer.scales.data[2]
+    expected = expected.unsqueeze(0)
+    torch.testing.assert_close(output, expected.to(torch.float16))
 
 
 def test_moe_wna16_forwards_layer_activation(monkeypatch: pytest.MonkeyPatch) -> None:
