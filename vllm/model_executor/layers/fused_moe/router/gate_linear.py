@@ -1,11 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from typing import TYPE_CHECKING
+
 import torch
 from torch.nn.parameter import Parameter
 
 from vllm.model_executor.custom_op import PluggableLayer
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.platforms import current_platform
+
+if TYPE_CHECKING:
+    from vllm.model_executor.layers.quantization import QuantizationConfig
 
 
 @PluggableLayer.register("gate_linear")
@@ -32,8 +37,10 @@ class GateLinear(ReplicatedLinear):
         bias: bool = False,
         out_dtype: torch.dtype | None = None,
         params_dtype: torch.dtype | None = None,
+        quant_config: "QuantizationConfig | None" = None,
         force_fp32_compute: bool = False,
         prefix: str = "",
+        disable_tp: bool = False,
     ):
         is_hopper_or_blackwell = current_platform.is_device_capability(
             (9, 0)
@@ -52,13 +59,17 @@ class GateLinear(ReplicatedLinear):
             output_size,
             bias=bias,
             params_dtype=params_dtype,
-            quant_config=None,
+            quant_config=quant_config,
             prefix=prefix,
+            disable_tp=disable_tp,
         )
         self.out_dtype = out_dtype
 
+        has_unquantized_weight = hasattr(self, "weight")
         # DSV3 specialized kernel eligibility (SM90+, exact dims)
-        self.allow_specialized_router_gemm = can_use_specialized_kernels
+        self.allow_specialized_router_gemm = (
+            can_use_specialized_kernels and has_unquantized_weight
+        )
         self.allow_dsv3_router_gemm = (
             self.allow_specialized_router_gemm
             and output_size in self.DSV3_SUPPORTED_NUM_EXPERTS
@@ -109,7 +120,11 @@ class GateLinear(ReplicatedLinear):
             return output, None
 
         # Tier 3: F.linear (ReplicatedLinear)
-        if self.out_dtype is not None and x.dtype != self.weight.dtype:
+        if (
+            self.out_dtype is not None
+            and hasattr(self, "weight")
+            and x.dtype != self.weight.dtype
+        ):
             x = x.to(self.weight.dtype)
         output, output_bias = super().forward(x)
         if self.out_dtype is not None and output.dtype != self.out_dtype:
