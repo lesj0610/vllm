@@ -795,6 +795,95 @@ class TestTurboQuantConfig:
 
         assert torch.equal(out, torch.full_like(query, 4))
 
+    def test_large_masked_first_chunk_prefill_uses_streaming(self, monkeypatch):
+        from vllm.v1.attention.backends import turboquant_attn
+
+        impl = _make_turboquant_prefill_impl_stub()
+        impl._can_use_flash_attn = True
+        impl.sliding_window = 2
+
+        monkeypatch.setattr(turboquant_attn, "_RAW_PREFILL_STREAMING_THRESHOLD", 2)
+
+        def fail_masked_sdpa(*args, **kwargs):
+            raise AssertionError("large masked prefill must not build a dense mask")
+
+        monkeypatch.setattr(
+            impl,
+            "_sdpa_with_causal_and_sliding_mask",
+            fail_masked_sdpa,
+        )
+        monkeypatch.setattr(
+            impl,
+            "_streaming_prefill_from_raw_kv",
+            lambda query, key, value, **kwargs: torch.full_like(query, 8),
+        )
+
+        query = torch.zeros(3, 1, 2)
+        metadata = SimpleNamespace(
+            query_start_loc=torch.tensor([0, 3], dtype=torch.int32),
+            query_start_loc_cpu=torch.tensor([0, 3], dtype=torch.int32),
+            seq_lens=torch.tensor([3], dtype=torch.int32),
+            seq_lens_cpu=torch.tensor([3], dtype=torch.int32),
+            block_table=torch.tensor([[1]], dtype=torch.int32),
+            max_query_len=3,
+            max_seq_len=3,
+        )
+
+        out = impl._prefill_attention(
+            query,
+            torch.zeros_like(query),
+            torch.zeros_like(query),
+            torch.empty(0),
+            metadata,
+            torch.empty(0),
+            torch.empty(0),
+        )
+
+        assert torch.equal(out, torch.full_like(query, 8))
+
+    def test_flashable_first_chunk_prefill_keeps_flash_path(self, monkeypatch):
+        from vllm.v1.attention.backends import turboquant_attn
+
+        impl = _make_turboquant_prefill_impl_stub()
+        impl._can_use_flash_attn = True
+
+        monkeypatch.setattr(turboquant_attn, "_RAW_PREFILL_STREAMING_THRESHOLD", 2)
+        monkeypatch.setattr(
+            impl,
+            "_streaming_prefill_from_raw_kv",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                AssertionError("flashable prefill must not use streaming")
+            ),
+        )
+        monkeypatch.setattr(
+            impl,
+            "_flash_attn_varlen",
+            lambda q, **kwargs: torch.full_like(q, 9),
+        )
+
+        query = torch.zeros(3, 1, 2)
+        metadata = SimpleNamespace(
+            query_start_loc=torch.tensor([0, 3], dtype=torch.int32),
+            query_start_loc_cpu=torch.tensor([0, 3], dtype=torch.int32),
+            seq_lens=torch.tensor([3], dtype=torch.int32),
+            seq_lens_cpu=torch.tensor([3], dtype=torch.int32),
+            block_table=torch.tensor([[1]], dtype=torch.int32),
+            max_query_len=3,
+            max_seq_len=3,
+        )
+
+        out = impl._prefill_attention(
+            query,
+            torch.zeros_like(query),
+            torch.zeros_like(query),
+            torch.empty(0),
+            metadata,
+            torch.empty(0),
+            torch.empty(0),
+        )
+
+        assert torch.equal(out, torch.full_like(query, 9))
+
     def test_large_continuation_without_flash_uses_continuation_prefill(
         self, monkeypatch
     ):
@@ -1160,6 +1249,7 @@ class TestTurboQuantConfig:
             )
 
         monkeypatch.setattr(impl, "_dequant_cached_kv_range", fake_dequant_range)
+        monkeypatch.setattr(turboquant_attn, "_STREAMING_PREFILL_QUERY_TILE", 2)
         monkeypatch.setattr(turboquant_attn, "_STREAMING_PREFILL_KV_TILE", 2)
 
         out = impl._streaming_prefill_from_tq_cache(
@@ -1186,7 +1276,73 @@ class TestTurboQuantConfig:
             weights = torch.softmax(scores, dim=-1)
             expected[:, h] = weights @ full_val[:, 0]
 
-        assert range_calls == [(0, 2), (2, 1)]
+        assert range_calls == [(0, 2), (2, 1), (0, 2), (2, 1)]
+        torch.testing.assert_close(out, expected, rtol=1e-5, atol=1e-5)
+
+    @pytest.mark.parametrize(
+        "case",
+        [
+            "sliding",
+            "mm_prefix",
+            "sliding_mm_prefix",
+        ],
+    )
+    def test_streaming_raw_prefill_matches_dense_sdpa_masks(self, monkeypatch, case):
+        from vllm.v1.attention.backends import turboquant_attn
+
+        impl = _make_turboquant_prefill_impl_stub()
+        impl.scale = 1.0 / math.sqrt(2)
+        impl.sliding_window = 2 if "sliding" in case else None
+
+        monkeypatch.setattr(turboquant_attn, "_RAW_PREFILL_QUERY_TILE", 2)
+        monkeypatch.setattr(turboquant_attn, "_RAW_PREFILL_KV_TILE", 2)
+
+        query = torch.tensor(
+            [
+                [[1.0, 0.0]],
+                [[0.5, 1.0]],
+                [[1.0, 1.0]],
+                [[0.0, 1.0]],
+            ],
+            dtype=torch.float32,
+        )
+        key = torch.tensor(
+            [
+                [[1.0, 0.0]],
+                [[0.0, 1.0]],
+                [[1.0, 1.0]],
+                [[-1.0, 1.0]],
+            ],
+            dtype=torch.float32,
+        )
+        value = torch.tensor(
+            [
+                [[1.0, 0.0]],
+                [[0.0, 2.0]],
+                [[3.0, 1.0]],
+                [[-2.0, 2.0]],
+            ],
+            dtype=torch.float32,
+        )
+        mm_prefix_ranges = (
+            torch.tensor([[0, 3]], dtype=torch.int32) if "mm_prefix" in case else None
+        )
+
+        out = impl._streaming_prefill_from_raw_kv(
+            query,
+            key,
+            value,
+            query_start_pos=0,
+            mm_prefix_ranges=mm_prefix_ranges,
+        )
+        expected = impl._sdpa_with_causal_and_sliding_mask(
+            query,
+            key,
+            value,
+            query_start_pos=0,
+            mm_prefix_ranges=mm_prefix_ranges,
+        )
+
         torch.testing.assert_close(out, expected, rtol=1e-5, atol=1e-5)
 
     def test_kv_shared_prefill_without_flash_uses_decode_chunks(self, monkeypatch):

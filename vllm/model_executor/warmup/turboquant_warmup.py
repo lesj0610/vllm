@@ -234,6 +234,36 @@ def _warmup_turboquant_decode_layer(
         layer=layer,
     )
 
+    # Multimodal decode passes mm-prefix ranges to keep image prefix tokens
+    # visible outside a sliding window. Triton specializes USE_MM_PREFIX and
+    # MAX_MM_RANGES, so warm both the single-image path and the two-range path
+    # used by chunked continuation tests.
+    for max_mm_ranges in (1, 2):
+        mm_prefix_range = torch.zeros(
+            (batch_size, max_mm_ranges, 2), dtype=torch.int32, device=device
+        )
+        mm_prefix_range[:, 0, 1] = 1
+        triton_turboquant_decode_attention(
+            query=query,
+            kv_cache=kv_cache,
+            block_table=block_table,
+            seq_lens=seq_lens,
+            Pi=layer._tq_Pi,
+            centroids=layer._tq_centroids,
+            scale=impl.scale,
+            mse_bits=impl.tq_config.key_mse_bits,
+            key_packed_size=impl.tq_config.key_packed_size,
+            value_quant_bits=impl.tq_config.effective_value_quant_bits,
+            key_fp8=impl.tq_config.key_fp8,
+            norm_correction=impl.tq_config.norm_correction,
+            PiT=layer._tq_PiT,
+            max_num_kv_splits=impl.max_num_kv_splits,
+            sliding_window=impl.sliding_window,
+            value_centroids=layer._tq_value_centroids,
+            value_mse=impl.tq_config.value_mse_supported,
+            mm_prefix_range=mm_prefix_range,
+        )
+
     prefix_start_blocks = min(2, max(block_table_stride - 1, 0))
     for prefix_batch_size in _prefix_cache_hit_warmup_batch_sizes(block_size):
         prefix_query = torch.zeros(

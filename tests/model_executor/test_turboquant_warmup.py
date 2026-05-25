@@ -219,8 +219,23 @@ def test_turboquant_decode_warmup_builds_runtime_shaped_inputs(
     assert metadata.num_decode_tokens == 4
     assert call["Pi"].shape == (impl.head_size, impl.head_size)
     assert call["layer"] is model[0]
-    assert [call["query"].shape[0] for call in launcher_calls] == list(range(2, 17))
-    prefix_call = launcher_calls[11]
+    assert [call["query"].shape[0] for call in launcher_calls] == [
+        4,
+        4,
+        *range(2, 17),
+    ]
+    first_mm_call, second_mm_call = launcher_calls[:2]
+    assert first_mm_call["mm_prefix_range"].shape == (4, 1, 2)
+    assert first_mm_call["mm_prefix_range"].dtype == torch.int32
+    assert first_mm_call["mm_prefix_range"].tolist()[0] == [[0, 1]]
+    assert second_mm_call["mm_prefix_range"].shape == (4, 2, 2)
+    assert second_mm_call["mm_prefix_range"].tolist()[0] == [[0, 1], [0, 0]]
+    for mm_call in (first_mm_call, second_mm_call):
+        assert mm_call["kv_cache"] is runtime_kv_cache
+        assert mm_call["sliding_window"] is None
+        assert mm_call["value_centroids"] is model[0]._tq_value_centroids
+        assert mm_call["value_mse"] is True
+    prefix_call = launcher_calls[13]
     assert prefix_call["query"].shape == (13, impl.num_heads, impl.head_size)
     assert prefix_call["kv_cache"] is runtime_kv_cache
     assert prefix_call["block_table"].shape == (13, 17)
@@ -530,4 +545,5 @@ def test_turboquant_kernels_do_not_specialize_runtime_strides() -> None:
         "stride_cache_pos",
         "stride_cache_head",
         "stride_bt_b",
+        "POS_OFFSET",
     }

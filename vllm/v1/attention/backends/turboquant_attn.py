@@ -76,7 +76,11 @@ if _HAS_FLASH_ATTN:
 # kernel can read them efficiently. This avoids O(cached_len) dequant work
 # per continuation, eliminating the O(N²/chunk_size) collapse at long context.
 _CONTINUATION_DECODE_THRESHOLD = 128
+_STREAMING_PREFILL_QUERY_TILE = 512
 _STREAMING_PREFILL_KV_TILE = 1024
+_RAW_PREFILL_STREAMING_THRESHOLD = 1024
+_RAW_PREFILL_QUERY_TILE = 512
+_RAW_PREFILL_KV_TILE = 512
 
 
 def _get_turboquant_decode_workspace_shapes(
@@ -515,6 +519,23 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         return self._can_use_dequant_prefill(
             seq_len, mm_prefix_ranges
         ) and not self._can_use_flash_prefill(seq_len, mm_prefix_ranges)
+
+    def _should_use_streaming_raw_prefill(
+        self,
+        q_len: int,
+        seq_len: int,
+        mm_prefix_ranges: torch.Tensor | None,
+    ) -> bool:
+        """Use tiled PyTorch attention for large raw-KV non-flash prefills."""
+        if q_len <= _RAW_PREFILL_STREAMING_THRESHOLD:
+            return False
+        if self._can_use_flash_prefill(seq_len, mm_prefix_ranges):
+            return False
+        return (
+            self._needs_sliding_window_mask(seq_len)
+            or mm_prefix_ranges is not None
+            or not self._can_use_flash_attn
+        )
 
     def _get_arange_cache(
         self,
@@ -1055,7 +1076,17 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 )
             elif q_len == seq_len:
                 # First-chunk prefill: all K/V are in the current batch.
-                if self._needs_sliding_window_mask(seq_len) or (
+                if self._should_use_streaming_raw_prefill(
+                    q_len, seq_len, mm_prefix_ranges
+                ):
+                    out = self._streaming_prefill_from_raw_kv(
+                        q_seq,
+                        k_seq,
+                        v_seq,
+                        query_start_pos=0,
+                        mm_prefix_ranges=mm_prefix_ranges,
+                    )
+                elif self._needs_sliding_window_mask(seq_len) or (
                     mm_prefix_ranges is not None
                 ):
                     out = self._sdpa_with_causal_and_sliding_mask(
@@ -1237,6 +1268,125 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             output_dtype,
         )
 
+    def _streaming_prefill_from_raw_kv(
+        self,
+        query: torch.Tensor,  # (q_len, Hq, D)
+        key: torch.Tensor,  # (seq_len, Hk, D)
+        value: torch.Tensor,  # (seq_len, Hk, D)
+        *,
+        query_start_pos: int,
+        mm_prefix_ranges: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Streaming causal/sliding/mm-prefix prefill over raw K/V tensors.
+
+        This path is used only when flash attention is unavailable or masked
+        SDPA would materialize a large q_len × kv_len mask. It tiles both query
+        and KV dimensions, so scratch memory stays bounded while preserving the
+        same visibility rules as `_sdpa_with_causal_and_sliding_mask`.
+        """
+        q_len, Hq, D = query.shape
+        seq_len, Hk, _ = key.shape
+        assert Hq % Hk == 0
+
+        device = query.device
+        output = torch.empty_like(query)
+        kv_head_for_q = torch.arange(Hq, device=device, dtype=torch.int64) // (Hq // Hk)
+
+        def update_tile(
+            q: torch.Tensor,
+            q_pos: torch.Tensor,
+            m: torch.Tensor,
+            denom: torch.Tensor,
+            acc: torch.Tensor,
+            k_tile: torch.Tensor,
+            v_tile: torch.Tensor,
+            key_start_pos: int,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            tile_len = k_tile.shape[0]
+            key_pos = (
+                torch.arange(tile_len, device=device, dtype=torch.int64) + key_start_pos
+            )
+            visible = key_pos.unsqueeze(0) <= q_pos.unsqueeze(1)
+            if self.sliding_window is not None:
+                visible = visible & (
+                    (q_pos.unsqueeze(1) - key_pos.unsqueeze(0)) < self.sliding_window
+                )
+            if mm_prefix_ranges is not None:
+                starts = mm_prefix_ranges[:, 0]
+                ends = mm_prefix_ranges[:, 1]
+                valid = starts < ends
+                q_in_range = (
+                    (q_pos[:, None] >= starts) & (q_pos[:, None] <= ends) & valid
+                )
+                k_in_range = (
+                    (key_pos[:, None] >= starts) & (key_pos[:, None] <= ends) & valid
+                )
+                visible = visible | (
+                    q_in_range.unsqueeze(1) & k_in_range.unsqueeze(0)
+                ).any(dim=-1)
+
+            k_by_q = k_tile.transpose(0, 1).index_select(0, kv_head_for_q).float()
+            v_by_q = v_tile.transpose(0, 1).index_select(0, kv_head_for_q).float()
+            scores = torch.bmm(q, k_by_q.transpose(1, 2)) * self.scale
+            scores = scores.masked_fill(~visible.unsqueeze(0), -float("inf"))
+
+            tile_m = scores.max(dim=-1).values
+            valid_tile = torch.isfinite(tile_m)
+            m_new = torch.maximum(m, torch.where(valid_tile, tile_m, m))
+            finite_m_new = torch.isfinite(m_new)
+
+            shifted = scores - torch.where(
+                finite_m_new,
+                m_new,
+                torch.zeros_like(m_new),
+            ).unsqueeze(-1)
+            p = torch.exp(shifted)
+            p = torch.where(visible.unsqueeze(0) & finite_m_new.unsqueeze(-1), p, 0.0)
+
+            has_prev = torch.isfinite(m)
+            alpha = torch.where(
+                has_prev & finite_m_new,
+                torch.exp(m - m_new),
+                torch.zeros_like(m),
+            )
+            acc = acc * alpha.unsqueeze(-1) + torch.bmm(p, v_by_q)
+            denom = denom * alpha + p.sum(dim=-1)
+            return m_new, denom, acc
+
+        query_tile = _RAW_PREFILL_QUERY_TILE
+        kv_tile = _RAW_PREFILL_KV_TILE
+        for q_start in range(0, q_len, query_tile):
+            q_end = min(q_start + query_tile, q_len)
+            q_block = query[q_start:q_end]
+            block_len = q_end - q_start
+            q = q_block.transpose(0, 1).float().contiguous()
+            q_pos = (
+                torch.arange(block_len, device=device, dtype=torch.int64)
+                + query_start_pos
+                + q_start
+            )
+            m = torch.full((Hq, block_len), -float("inf"), device=device)
+            denom = torch.zeros((Hq, block_len), device=device)
+            acc = torch.zeros((Hq, block_len, D), device=device)
+
+            for k_start in range(0, seq_len, kv_tile):
+                k_end = min(k_start + kv_tile, seq_len)
+                m, denom, acc = update_tile(
+                    q,
+                    q_pos,
+                    m,
+                    denom,
+                    acc,
+                    key[k_start:k_end],
+                    value[k_start:k_end],
+                    k_start,
+                )
+
+            out = acc / denom.clamp_min(1e-20).unsqueeze(-1)
+            output[q_start:q_end] = out.transpose(0, 1).to(query.dtype)
+
+        return output
+
     def _streaming_prefill_from_tq_cache(
         self,
         layer: Any,
@@ -1260,29 +1410,27 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         assert Hq % Hk == 0
 
         device = query.device
-        q = query.transpose(0, 1).float().contiguous()  # [Hq, q_len, D]
-        q_pos = torch.arange(q_len, device=device, dtype=torch.int64) + cached_len
+        output = torch.empty_like(query)
         kv_head_for_q = torch.arange(Hq, device=device, dtype=torch.int64) // (Hq // Hk)
 
-        m = torch.full((Hq, q_len), -float("inf"), device=device, dtype=torch.float32)
-        denom = torch.zeros((Hq, q_len), device=device, dtype=torch.float32)
-        acc = torch.zeros((Hq, q_len, D), device=device, dtype=torch.float32)
-
         def update_tile(
+            q: torch.Tensor,
+            q_pos: torch.Tensor,
+            m: torch.Tensor,
+            denom: torch.Tensor,
+            acc: torch.Tensor,
             k_tile: torch.Tensor,
             v_tile: torch.Tensor,
             key_start_pos: int,
-        ) -> None:
-            nonlocal m, denom, acc
-
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
             tile_len = k_tile.shape[0]
             if tile_len == 0:
-                return
+                return m, denom, acc
 
             key_pos = (
                 torch.arange(tile_len, device=device, dtype=torch.int64) + key_start_pos
             )
-            causal = key_pos.unsqueeze(0) <= q_pos.unsqueeze(1)  # [q_len, tile]
+            causal = key_pos.unsqueeze(0) <= q_pos.unsqueeze(1)  # [q_block, tile]
 
             k_by_q = k_tile.transpose(0, 1).index_select(0, kv_head_for_q).float()
             v_by_q = v_tile.transpose(0, 1).index_select(0, kv_head_for_q).float()
@@ -1310,31 +1458,59 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             )
             acc = acc * alpha.unsqueeze(-1) + torch.bmm(p, v_by_q)
             denom = denom * alpha + p.sum(dim=-1)
-            m = m_new
+            return m_new, denom, acc
 
-        tile_size = _STREAMING_PREFILL_KV_TILE
-        for tile_start in range(0, cached_len, tile_size):
-            tile_len = min(tile_size, cached_len - tile_start)
-            k_tile, v_tile = self._dequant_cached_kv_range(
-                layer,
-                kv_cache,
-                block_table,
-                tile_start,
-                tile_len,
-                query.dtype,
+        query_tile = _STREAMING_PREFILL_QUERY_TILE
+        kv_tile = _STREAMING_PREFILL_KV_TILE
+        for q_start in range(0, q_len, query_tile):
+            q_end = min(q_start + query_tile, q_len)
+            q_block_len = q_end - q_start
+            q = query[q_start:q_end].transpose(0, 1).float().contiguous()
+            q_pos = (
+                torch.arange(q_block_len, device=device, dtype=torch.int64)
+                + cached_len
+                + q_start
             )
-            update_tile(k_tile, v_tile, tile_start)
-
-        for local_start in range(0, q_len, tile_size):
-            local_end = min(local_start + tile_size, q_len)
-            update_tile(
-                key_chunk[local_start:local_end],
-                val_chunk[local_start:local_end],
-                cached_len + local_start,
+            m = torch.full(
+                (Hq, q_block_len),
+                -float("inf"),
+                device=device,
+                dtype=torch.float32,
             )
+            denom = torch.zeros((Hq, q_block_len), device=device, dtype=torch.float32)
+            acc = torch.zeros((Hq, q_block_len, D), device=device, dtype=torch.float32)
 
-        out = acc / denom.clamp_min(1e-20).unsqueeze(-1)
-        return out.transpose(0, 1).to(query.dtype)
+            for tile_start in range(0, cached_len, kv_tile):
+                tile_len = min(kv_tile, cached_len - tile_start)
+                k_tile, v_tile = self._dequant_cached_kv_range(
+                    layer,
+                    kv_cache,
+                    block_table,
+                    tile_start,
+                    tile_len,
+                    query.dtype,
+                )
+                m, denom, acc = update_tile(
+                    q, q_pos, m, denom, acc, k_tile, v_tile, tile_start
+                )
+
+            for local_start in range(0, q_len, kv_tile):
+                local_end = min(local_start + kv_tile, q_len)
+                m, denom, acc = update_tile(
+                    q,
+                    q_pos,
+                    m,
+                    denom,
+                    acc,
+                    key_chunk[local_start:local_end],
+                    val_chunk[local_start:local_end],
+                    cached_len + local_start,
+                )
+
+            out = acc / denom.clamp_min(1e-20).unsqueeze(-1)
+            output[q_start:q_end] = out.transpose(0, 1).to(query.dtype)
+
+        return output
 
     def _prefill_attention_with_kv(
         self,

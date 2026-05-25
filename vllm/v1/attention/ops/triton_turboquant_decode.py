@@ -496,6 +496,7 @@ def _tq_decode_stage2(
         "stride_cache_pos",
         "stride_cache_head",
         "stride_bt_b",
+        "POS_OFFSET",
     ]
 )
 def _tq_full_dequant_kv(
@@ -515,6 +516,7 @@ def _tq_full_dequant_kv(
     stride_cache_pos,
     stride_cache_head,
     stride_bt_b,
+    POS_OFFSET,
     HEAD_DIM: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     NUM_KV_HEADS: tl.constexpr,
@@ -526,7 +528,6 @@ def _tq_full_dequant_kv(
     KEY_FP8: tl.constexpr,
     VALUE_MSE: tl.constexpr,
     BLOCK_D: tl.constexpr,
-    POS_OFFSET: tl.constexpr = 0,
     NORM_CORRECTION: tl.constexpr = 0,
     FP8_E4B15: tl.constexpr = 0,  # 1 = use e4b15 (Ampere/Ada), 0 = e4nv (Hopper+)
 ):
