@@ -1028,7 +1028,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         # prefill path here: build q/k/v/g/beta via fused_post_conv_prep and
         # then run chunk_gated_delta_rule with in-kernel L2 norm disabled.
         T = FLA_CHUNK_SIZE
-        try:
+
+        def _run_warmup() -> None:
             dummy_mixed_qkv = torch.randn(T, qkv_dim, device=device, dtype=dtype)
             dummy_a = torch.randn(T, num_v_heads, device=device, dtype=dtype)
             dummy_b = torch.randn(T, num_v_heads, device=device, dtype=dtype)
@@ -1146,6 +1147,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 ssm_state_indices=decode_state_indices,
                 use_qk_l2norm_in_kernel=True,
             )
+
+        try:
+            _run_warmup()
         except Exception:
             logger.warning(
                 "GDN/Mamba kernel warmup (T=%d) failed for "
@@ -1161,49 +1165,6 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 T,
                 self.prefix,
             )
-        finally:
-            if "dummy_mixed_qkv" in locals():
-                del dummy_mixed_qkv
-            if "q" in locals():
-                del q
-            if "k" in locals():
-                del k
-            if "v" in locals():
-                del v
-            if "dummy_a" in locals():
-                del dummy_a
-            if "dummy_b" in locals():
-                del dummy_b
-            if "g" in locals():
-                del g
-            if "beta" in locals():
-                del beta
-            if "state" in locals():
-                del state
-            if "cu_seqlens" in locals():
-                del cu_seqlens
-            if "conv_state" in locals():
-                del conv_state
-            if "conv_state_indices" in locals():
-                del conv_state_indices
-            if "query_start_loc" in locals():
-                del query_start_loc
-            if "has_initial_state" in locals():
-                del has_initial_state
-            if "decode_mixed_qkv" in locals():
-                del decode_mixed_qkv
-            if "decode_conv_state" in locals():
-                del decode_conv_state
-            if "decode_state_indices" in locals():
-                del decode_state_indices
-            if "decode_a" in locals():
-                del decode_a
-            if "decode_b" in locals():
-                del decode_b
-            if "decode_state" in locals():
-                del decode_state
-            if "decode_out" in locals():
-                del decode_out
 
         torch.accelerator.empty_cache()
 
