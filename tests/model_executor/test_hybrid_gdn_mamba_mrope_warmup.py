@@ -11,6 +11,25 @@ from vllm.model_executor.warmup import kernel_warmup
 from vllm.v1.worker.gpu.warmup import warmup_kernels
 
 
+@pytest.fixture(autouse=True)
+def skip_unrelated_warmups(monkeypatch) -> None:
+    monkeypatch.setattr(
+        kernel_warmup,
+        "fused_moe_wna16_warmup",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        kernel_warmup,
+        "_get_runtime_block_table_shapes",
+        lambda worker: ((16, 1),),
+    )
+    monkeypatch.setattr(
+        kernel_warmup,
+        "turboquant_decode_warmup",
+        lambda *args, **kwargs: None,
+    )
+
+
 def test_kernel_warmup_runs_hybrid_and_zeroer_warmups(monkeypatch) -> None:
     calls: list[str] = []
 
@@ -50,12 +69,13 @@ def test_kernel_warmup_runs_hybrid_and_zeroer_warmups(monkeypatch) -> None:
 
     worker = SimpleNamespace(
         get_model=lambda: model,
-        scheduler_config=SimpleNamespace(max_num_batched_tokens=16),
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=16, max_num_seqs=16),
         vllm_config=SimpleNamespace(
             kernel_config=SimpleNamespace(enable_flashinfer_autotune=False)
         ),
         model_runner=SimpleNamespace(
             dtype=torch.bfloat16,
+            device=torch.device("cpu"),
             _kv_block_zeroer=FakeZeroer(),
             _dummy_run=fake_dummy_run,
             is_pooling_model=True,
@@ -116,6 +136,7 @@ def test_kernel_warmup_runs_runtime_dummy_for_hybrid_models(monkeypatch) -> None
 
     model_runner = SimpleNamespace(
         dtype=torch.bfloat16,
+        device=torch.device("cpu"),
         _kv_block_zeroer=None,
         _dummy_run=fake_dummy_run,
         is_pooling_model=False,
@@ -123,7 +144,7 @@ def test_kernel_warmup_runs_runtime_dummy_for_hybrid_models(monkeypatch) -> None
     )
     worker = SimpleNamespace(
         get_model=lambda: model,
-        scheduler_config=SimpleNamespace(max_num_batched_tokens=16),
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=16, max_num_seqs=16),
         vllm_config=SimpleNamespace(
             kernel_config=SimpleNamespace(enable_flashinfer_autotune=False)
         ),
@@ -174,12 +195,13 @@ def test_kernel_warmup_skips_scheduler_warmup_for_v2_runner(monkeypatch) -> None
 
     worker = SimpleNamespace(
         get_model=lambda: model,
-        scheduler_config=SimpleNamespace(max_num_batched_tokens=16),
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=16, max_num_seqs=16),
         vllm_config=SimpleNamespace(
             kernel_config=SimpleNamespace(enable_flashinfer_autotune=False)
         ),
         model_runner=SimpleNamespace(
             dtype=torch.bfloat16,
+            device=torch.device("cpu"),
             _kv_block_zeroer=None,
             _dummy_run=fake_dummy_run,
             is_pooling_model=False,
