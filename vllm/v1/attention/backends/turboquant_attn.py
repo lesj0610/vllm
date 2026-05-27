@@ -83,6 +83,44 @@ _RAW_PREFILL_QUERY_TILE = 512
 _RAW_PREFILL_KV_TILE = 512
 
 
+def _build_spec_decode_synth_seq_lens(
+    seq_lens: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    output_size: int,
+) -> torch.Tensor:
+    """Expand per-request final lengths to per-token decode lengths.
+
+    The TQ decode kernel treats each batch row as the last query token of that
+    row's sequence (`query_pos = seq_len - 1`). For speculative verification we
+    flatten the K+1 query tokens into decode rows, so the visible KV length must
+    increase within each request instead of repeating the final sequence length.
+    """
+    query_lens = query_start_loc[1:] - query_start_loc[:-1]
+    if output_size == 0:
+        return seq_lens.new_empty((0,))
+
+    first_visible_len = seq_lens - query_lens + 1
+    repeated_first_len = torch.repeat_interleave(
+        first_visible_len,
+        query_lens,
+        output_size=output_size,
+    )
+    repeated_start = torch.repeat_interleave(
+        query_start_loc[:-1],
+        query_lens,
+        output_size=output_size,
+    )
+    token_offsets = (
+        torch.arange(
+            output_size,
+            dtype=query_start_loc.dtype,
+            device=query_start_loc.device,
+        )
+        - repeated_start
+    )
+    return repeated_first_len + token_offsets.to(repeated_first_len.dtype)
+
+
 def _get_turboquant_decode_workspace_shapes(
     *,
     batch_size: int,
@@ -324,6 +362,16 @@ class TurboQuantMetadata(AttentionMetadata):
     seq_lens_cpu: torch.Tensor | None = None
     mm_prefix_range: dict[int, list[tuple[int, int]]] | None = None
     mm_prefix_range_tensor: torch.Tensor | None = None
+    num_spec_decodes: int = 0
+    num_spec_decode_tokens: int = 0
+    spec_query_start_loc: torch.Tensor | None = None
+    non_spec_query_start_loc: torch.Tensor | None = None
+    non_spec_query_start_loc_cpu: torch.Tensor | None = None
+    non_spec_seq_lens_cpu: torch.Tensor | None = None
+    spec_sequence_masks: torch.Tensor | None = None
+    spec_token_indx: torch.Tensor | None = None
+    non_spec_token_indx: torch.Tensor | None = None
+    num_accepted_tokens: torch.Tensor | None = None
 
 
 class TurboQuantMetadataBuilder(AttentionMetadataBuilder[TurboQuantMetadata]):
@@ -333,7 +381,16 @@ class TurboQuantMetadataBuilder(AttentionMetadataBuilder[TurboQuantMetadata]):
 
     def __init__(self, kv_cache_spec, layer_names, vllm_config, device):
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
-        self._init_reorder_batch_threshold(1, supports_spec_as_decode=False)
+        speculative_config = self.vllm_config.speculative_config
+        if speculative_config is not None:
+            assert speculative_config.num_speculative_tokens is not None
+            self.num_spec: int = speculative_config.num_speculative_tokens
+        else:
+            self.num_spec = 0
+        self.use_spec_decode: bool = self.num_spec > 0
+        self._init_reorder_batch_threshold(
+            1, supports_spec_as_decode=self.use_spec_decode
+        )
 
     def build_for_cudagraph_capture(
         self, common_attn_metadata: CommonAttentionMetadata
@@ -344,17 +401,119 @@ class TurboQuantMetadataBuilder(AttentionMetadataBuilder[TurboQuantMetadata]):
         attn_metadata.seq_lens.fill_(1)
         return attn_metadata
 
-    def build(self, common_prefix_len, common_attn_metadata, fast_build=False):
+    def build(  # type: ignore[override]
+        self,
+        common_prefix_len: int,
+        common_attn_metadata: CommonAttentionMetadata,
+        num_accepted_tokens: torch.Tensor | None = None,
+        num_decode_draft_tokens_cpu: torch.Tensor | None = None,
+        fast_build: bool = False,
+    ) -> TurboQuantMetadata:
         """Build TurboQuantMetadata from common attention metadata."""
         cam = common_attn_metadata
 
-        # With reorder_batch_threshold=1, the model runner guarantees
-        # decodes come first in the batch. split_decodes_and_prefills
-        # finds the boundary (operates on CPU tensors — no GPU sync).
-        assert self.reorder_batch_threshold is not None
-        num_decodes, num_prefills, num_decode_tokens, _ = split_decodes_and_prefills(
-            cam, decode_threshold=self.reorder_batch_threshold
+        spec_sequence_masks: torch.Tensor | None = None
+        spec_query_start_loc: torch.Tensor | None = None
+        non_spec_query_start_loc: torch.Tensor | None = None
+        non_spec_query_start_loc_cpu: torch.Tensor | None = None
+        non_spec_seq_lens_cpu: torch.Tensor | None = None
+        spec_token_indx: torch.Tensor | None = None
+        non_spec_token_indx: torch.Tensor | None = None
+        num_spec_decodes = 0
+        num_spec_decode_tokens = 0
+        spec_num_accepted_tokens: torch.Tensor | None = None
+        has_spec_sequence = (
+            self.use_spec_decode
+            and num_decode_draft_tokens_cpu is not None
+            and num_decode_draft_tokens_cpu[num_decode_draft_tokens_cpu >= 0]
+            .sum()
+            .item()
+            > 0
         )
+
+        if has_spec_sequence:
+            num_decodes = 0
+            num_decode_tokens = 0
+        else:
+            # Even when speculative decoding is configured, a batch may not
+            # contain any speculative verification sequence. TQ's regular
+            # decode kernel handles one query token per request, so keep the
+            # no-spec split at threshold=1 instead of the raised spec threshold.
+            num_decodes, _, num_decode_tokens, _ = split_decodes_and_prefills(
+                cam, decode_threshold=1
+            )
+
+        if has_spec_sequence:
+            assert num_decode_draft_tokens_cpu is not None
+            spec_sequence_masks_cpu = num_decode_draft_tokens_cpu >= 0
+            num_spec_decodes = spec_sequence_masks_cpu.sum().item()
+            if num_spec_decodes > 0:
+                query_lens = cam.query_start_loc[1:] - cam.query_start_loc[:-1]
+                query_lens_cpu = (
+                    cam.query_start_loc_cpu[1:] - cam.query_start_loc_cpu[:-1]
+                )
+                spec_sequence_masks = spec_sequence_masks_cpu.to(
+                    cam.query_start_loc.device, non_blocking=True
+                )
+                num_spec_decode_tokens = int(
+                    query_lens_cpu[spec_sequence_masks_cpu].sum().item()
+                )
+
+                spec_token_masks = torch.repeat_interleave(
+                    spec_sequence_masks,
+                    query_lens,
+                    output_size=cam.query_start_loc_cpu[-1].item(),
+                )
+                index = torch.argsort(spec_token_masks, stable=True)
+                num_non_spec_tokens = cam.num_actual_tokens - num_spec_decode_tokens
+                non_spec_token_indx = index[:num_non_spec_tokens]
+                spec_token_indx = index[num_non_spec_tokens:]
+
+                spec_query_start_loc = torch.zeros(
+                    num_spec_decodes + 1,
+                    dtype=torch.int32,
+                    device=cam.query_start_loc.device,
+                )
+                torch.cumsum(
+                    query_lens[spec_sequence_masks_cpu],
+                    dim=0,
+                    out=spec_query_start_loc[1:],
+                )
+                non_spec_query_start_loc = torch.zeros(
+                    query_lens.size(0) - num_spec_decodes + 1,
+                    dtype=torch.int32,
+                    device=cam.query_start_loc.device,
+                )
+                torch.cumsum(
+                    query_lens[~spec_sequence_masks_cpu],
+                    dim=0,
+                    out=non_spec_query_start_loc[1:],
+                )
+                non_spec_query_start_loc_cpu = torch.zeros(
+                    query_lens_cpu.size(0) - num_spec_decodes + 1,
+                    dtype=torch.int32,
+                )
+                torch.cumsum(
+                    query_lens_cpu[~spec_sequence_masks_cpu],
+                    dim=0,
+                    out=non_spec_query_start_loc_cpu[1:],
+                )
+                non_spec_query_lens_cpu = query_lens_cpu[~spec_sequence_masks_cpu]
+                if non_spec_query_lens_cpu.numel() > 0:
+                    non_spec_is_prefill = non_spec_query_lens_cpu != 1
+                    if torch.any(non_spec_is_prefill):
+                        first_prefill = non_spec_is_prefill.int().argmax(dim=-1).item()
+                        num_decodes = first_prefill
+                    else:
+                        num_decodes = non_spec_query_lens_cpu.numel()
+                    num_decode_tokens = int(non_spec_query_start_loc_cpu[num_decodes])
+                if cam.seq_lens_cpu_upper_bound is not None:
+                    non_spec_seq_lens_cpu = cam.seq_lens_cpu_upper_bound[
+                        ~spec_sequence_masks_cpu
+                    ]
+
+                assert num_accepted_tokens is not None
+                spec_num_accepted_tokens = num_accepted_tokens[spec_sequence_masks_cpu]
 
         return TurboQuantMetadata(
             seq_lens=cam.seq_lens,
@@ -369,6 +528,16 @@ class TurboQuantMetadataBuilder(AttentionMetadataBuilder[TurboQuantMetadata]):
             num_decode_tokens=num_decode_tokens,
             query_start_loc_cpu=cam.query_start_loc_cpu,
             seq_lens_cpu=cam.seq_lens_cpu_upper_bound,
+            num_spec_decodes=num_spec_decodes,
+            num_spec_decode_tokens=num_spec_decode_tokens,
+            spec_query_start_loc=spec_query_start_loc,
+            non_spec_query_start_loc=non_spec_query_start_loc,
+            non_spec_query_start_loc_cpu=non_spec_query_start_loc_cpu,
+            non_spec_seq_lens_cpu=non_spec_seq_lens_cpu,
+            spec_sequence_masks=spec_sequence_masks,
+            spec_token_indx=spec_token_indx,
+            non_spec_token_indx=non_spec_token_indx,
+            num_accepted_tokens=spec_num_accepted_tokens,
         )
 
 
@@ -660,6 +829,64 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         )
         return out[0].transpose(0, 1)
 
+    def _decode_from_cache_with_synth_metadata(
+        self,
+        query: torch.Tensor,
+        kv_cache: torch.Tensor,
+        block_table: torch.Tensor,
+        seq_lens: torch.Tensor,
+        *,
+        Pi: torch.Tensor,
+        centroids: torch.Tensor,
+        PiT: torch.Tensor | None = None,
+        mm_prefix_range: torch.Tensor | None = None,
+        layer: Any = None,
+    ) -> torch.Tensor:
+        """Run TQ decode on caller-provided synthetic decode metadata.
+
+        Continuation prefill and speculative verification use different
+        synthetic sequence length patterns, so callers prepare those tensors.
+        This helper only owns workspace setup and the shared kernel call.
+        """
+        B, Hq, D = query.shape
+        mid_o_buf = output_buf = lse_buf = None
+        if is_workspace_manager_initialized():
+            stage2_dtype = (
+                torch.float32 if self.tq_config.value_mse_supported else query.dtype
+            )
+            mid_o_buf, output_buf, lse_buf = (
+                current_workspace_manager().get_simultaneous(
+                    ((B, Hq, self.max_num_kv_splits, D + 1), torch.float32),
+                    ((B, Hq, D), stage2_dtype),
+                    ((B, Hq), torch.float32),
+                )
+            )
+
+        return triton_turboquant_decode_attention(
+            query=query,
+            kv_cache=kv_cache,
+            block_table=block_table,
+            seq_lens=seq_lens,
+            Pi=Pi,
+            centroids=centroids,
+            scale=self.scale,
+            mse_bits=self.tq_config.key_mse_bits,
+            key_packed_size=self.tq_config.key_packed_size,
+            value_quant_bits=self.tq_config.effective_value_quant_bits,
+            key_fp8=self.tq_config.key_fp8,
+            value_centroids=(layer._tq_value_centroids if layer is not None else None),
+            value_mse=self.tq_config.value_mse_supported,
+            norm_correction=self.tq_config.norm_correction,
+            PiT=PiT,
+            mid_o_buf=mid_o_buf,
+            output_buf=output_buf,
+            lse_buf=lse_buf,
+            buf_holder=layer,
+            max_num_kv_splits=self.max_num_kv_splits,
+            sliding_window=self.sliding_window,
+            mm_prefix_range=mm_prefix_range,
+        )
+
     def _decode_prefill_from_cache(
         self,
         query: torch.Tensor,
@@ -674,7 +901,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         seq_lens_dtype: torch.dtype = torch.int32,
         layer: Any = None,
     ) -> torch.Tensor:
-        q_len, Hq, D = query.shape
+        q_len, _, _ = query.shape
         out = torch.empty_like(query)
         arange_cache = self._get_arange_cache(
             query_start_pos + q_len,
@@ -696,47 +923,247 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                     mm_prefix_ranges.unsqueeze(0).expand(chunk_len, -1, -1).contiguous()
                 )
 
-            mid_o_buf = output_buf = lse_buf = None
-            if is_workspace_manager_initialized():
-                mid_o_buf, output_buf, lse_buf = (
-                    current_workspace_manager().get_simultaneous(
-                        (
-                            (chunk_len, Hq, self.max_num_kv_splits, D + 1),
-                            torch.float32,
-                        ),
-                        ((chunk_len, Hq, D), query.dtype),
-                        ((chunk_len, Hq), torch.float32),
-                    )
-                )
-
-            out[chunk_start:chunk_end] = triton_turboquant_decode_attention(
+            out[chunk_start:chunk_end] = self._decode_from_cache_with_synth_metadata(
                 query=chunk,
                 kv_cache=kv_cache,
                 block_table=synth_block_table,
                 seq_lens=synth_seq_lens,
                 Pi=Pi,
                 centroids=centroids,
-                scale=self.scale,
-                mse_bits=self.tq_config.key_mse_bits,
-                key_packed_size=self.tq_config.key_packed_size,
-                value_quant_bits=self.tq_config.effective_value_quant_bits,
-                key_fp8=self.tq_config.key_fp8,
-                value_centroids=(
-                    layer._tq_value_centroids if layer is not None else None
-                ),
-                value_mse=self.tq_config.value_mse_supported,
-                norm_correction=self.tq_config.norm_correction,
                 PiT=PiT,
-                mid_o_buf=mid_o_buf,
-                output_buf=output_buf,
-                lse_buf=lse_buf,
-                buf_holder=layer,
-                max_num_kv_splits=self.max_num_kv_splits,
-                sliding_window=self.sliding_window,
                 mm_prefix_range=mm_prefix_range,
+                layer=layer,
             )
 
         return out
+
+    def _decode_spec_from_cache(
+        self,
+        query: torch.Tensor,
+        kv_cache: torch.Tensor,
+        attn_metadata: TurboQuantMetadata,
+        *,
+        Pi: torch.Tensor,
+        centroids: torch.Tensor,
+        PiT: torch.Tensor | None = None,
+        layer: Any = None,
+    ) -> torch.Tensor:
+        """Run speculative verification tokens through the TQ decode kernel."""
+        spec_sequence_masks = attn_metadata.spec_sequence_masks
+        spec_token_indx = attn_metadata.spec_token_indx
+        spec_query_start_loc = attn_metadata.spec_query_start_loc
+        assert spec_sequence_masks is not None
+        assert spec_token_indx is not None
+        assert spec_query_start_loc is not None
+
+        spec_query = query.index_select(0, spec_token_indx)
+        spec_query_lens = spec_query_start_loc[1:] - spec_query_start_loc[:-1]
+        total_spec_tokens = attn_metadata.num_spec_decode_tokens
+        spec_seq_lens = attn_metadata.seq_lens[spec_sequence_masks]
+        synth_seq_lens = _build_spec_decode_synth_seq_lens(
+            spec_seq_lens,
+            spec_query_start_loc,
+            total_spec_tokens,
+        )
+        synth_block_table = torch.repeat_interleave(
+            attn_metadata.block_table[spec_sequence_masks],
+            spec_query_lens,
+            dim=0,
+            output_size=total_spec_tokens,
+        )
+
+        mm_prefix_range = None
+        if attn_metadata.mm_prefix_range_tensor is not None:
+            mm_prefix_range = torch.repeat_interleave(
+                attn_metadata.mm_prefix_range_tensor[spec_sequence_masks],
+                spec_query_lens,
+                dim=0,
+                output_size=total_spec_tokens,
+            )
+
+        return self._decode_from_cache_with_synth_metadata(
+            query=spec_query,
+            kv_cache=kv_cache,
+            block_table=synth_block_table,
+            seq_lens=synth_seq_lens,
+            Pi=Pi,
+            centroids=centroids,
+            PiT=PiT,
+            mm_prefix_range=mm_prefix_range,
+            layer=layer,
+        )
+
+    def _make_non_spec_metadata(
+        self,
+        attn_metadata: TurboQuantMetadata,
+        non_spec_token_indx: torch.Tensor,
+    ) -> TurboQuantMetadata:
+        """Build a metadata view for non-spec tokens in a mixed spec batch."""
+        spec_sequence_masks = attn_metadata.spec_sequence_masks
+        non_spec_query_start_loc = attn_metadata.non_spec_query_start_loc
+        assert spec_sequence_masks is not None
+        assert non_spec_query_start_loc is not None
+
+        non_spec_sequence_masks = ~spec_sequence_masks
+        num_non_spec_tokens = non_spec_token_indx.numel()
+        # Spec sequences have K+1 query tokens, so they are not counted as
+        # regular decodes by split_decodes_and_prefills(). The existing decode
+        # count therefore already belongs to the non-spec subset.
+        num_non_spec_decodes = min(
+            attn_metadata.num_decodes, non_spec_query_start_loc.shape[0] - 1
+        )
+        num_non_spec_decode_tokens = min(
+            attn_metadata.num_decode_tokens, num_non_spec_tokens
+        )
+        mm_prefix_range_tensor = attn_metadata.mm_prefix_range_tensor
+        non_spec_query_start_loc_cpu = attn_metadata.non_spec_query_start_loc_cpu
+        non_spec_seq_lens_cpu = attn_metadata.non_spec_seq_lens_cpu
+        non_spec_is_prefill = num_non_spec_tokens > num_non_spec_decode_tokens
+        non_spec_max_query_len = 1
+        if non_spec_is_prefill and non_spec_query_start_loc_cpu is not None:
+            non_spec_query_lens_cpu = (
+                non_spec_query_start_loc_cpu[1:] - non_spec_query_start_loc_cpu[:-1]
+            )
+            non_spec_max_query_len = int(non_spec_query_lens_cpu.max())
+        elif non_spec_is_prefill:
+            non_spec_max_query_len = attn_metadata.max_query_len
+
+        if non_spec_seq_lens_cpu is not None and non_spec_seq_lens_cpu.numel() > 0:
+            non_spec_max_seq_len = int(non_spec_seq_lens_cpu.max())
+        else:
+            non_spec_max_seq_len = attn_metadata.max_seq_len
+
+        return TurboQuantMetadata(
+            seq_lens=attn_metadata.seq_lens[non_spec_sequence_masks],
+            slot_mapping=attn_metadata.slot_mapping.index_select(
+                0, non_spec_token_indx
+            ),
+            block_table=attn_metadata.block_table[non_spec_sequence_masks],
+            query_start_loc=non_spec_query_start_loc,
+            num_actual_tokens=num_non_spec_tokens,
+            max_query_len=non_spec_max_query_len,
+            max_seq_len=non_spec_max_seq_len,
+            is_prefill=non_spec_is_prefill,
+            num_decodes=num_non_spec_decodes,
+            num_decode_tokens=num_non_spec_decode_tokens,
+            query_start_loc_cpu=non_spec_query_start_loc_cpu,
+            seq_lens_cpu=non_spec_seq_lens_cpu,
+            mm_prefix_range_tensor=mm_prefix_range_tensor[non_spec_sequence_masks]
+            if mm_prefix_range_tensor is not None
+            else None,
+        )
+
+    def _attention_without_spec_routing(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        kv_cache: torch.Tensor,
+        attn_metadata: TurboQuantMetadata,
+        Pi: torch.Tensor,
+        centroids: torch.Tensor,
+        PiT: torch.Tensor | None,
+        layer: AttentionLayer,
+    ) -> torch.Tensor:
+        """Compute regular TQ attention without speculative token routing."""
+        N = q.shape[0]
+        num_decodes = attn_metadata.num_decodes
+        num_decode_tokens = attn_metadata.num_decode_tokens
+        mm_prefix_range_tensor = attn_metadata.mm_prefix_range_tensor
+
+        if not attn_metadata.is_prefill:
+            # Pure decode batch — fast path
+            return self._decode_attention(
+                q, kv_cache, attn_metadata, Pi, centroids, PiT, layer
+            )
+
+        if num_decodes == 0:
+            # Pure prefill batch
+            return self._prefill_attention(
+                q,
+                k,
+                v,
+                kv_cache,
+                attn_metadata,
+                Pi,
+                centroids,
+                PiT,
+                layer=layer,
+            )
+
+        # Mixed batch: decodes first (guaranteed by reorder_batch).
+        attn_out = torch.empty(
+            N, self.num_heads, self.head_size, device=q.device, dtype=q.dtype
+        )
+
+        # --- Decode portion (first num_decodes requests) ---
+        # Use full-batch max_seq_len as safe upper bound (no GPU sync).
+        decode_meta = TurboQuantMetadata(
+            seq_lens=attn_metadata.seq_lens[:num_decodes],
+            slot_mapping=attn_metadata.slot_mapping[:num_decode_tokens],
+            block_table=attn_metadata.block_table[:num_decodes],
+            query_start_loc=attn_metadata.query_start_loc[: num_decodes + 1],
+            num_actual_tokens=num_decode_tokens,
+            max_query_len=1,
+            max_seq_len=attn_metadata.max_seq_len,
+            is_prefill=False,
+            mm_prefix_range_tensor=mm_prefix_range_tensor[:num_decodes]
+            if mm_prefix_range_tensor is not None
+            else None,
+        )
+        attn_out[:num_decode_tokens] = self._decode_attention(
+            q[:num_decode_tokens], kv_cache, decode_meta, Pi, centroids, PiT, layer
+        )
+
+        # --- Prefill portion (remaining requests) ---
+        # CRITICAL: use prefill-specific max_seq_len so flash_attn's
+        # fast path (max_query_len == max_seq_len) triggers for
+        # first-chunk prefills. Using full-batch max_seq_len breaks
+        # this because decode requests inflate max_seq_len.
+        prefill_seq_lens = attn_metadata.seq_lens[num_decodes:]
+        # Use the CPU-resident `seq_lens` upper-bound from the metadata
+        # (populated in the builder) to compute the prefill sub-batch
+        # max without a GPU→CPU sync.
+        if attn_metadata.seq_lens_cpu is not None:
+            prefill_max_seq = int(attn_metadata.seq_lens_cpu[num_decodes:].max())
+        else:
+            prefill_max_seq = attn_metadata.max_seq_len
+        prefill_qsl = attn_metadata.query_start_loc[num_decodes:] - num_decode_tokens
+        prefill_qsl_cpu = None
+        if attn_metadata.query_start_loc_cpu is not None:
+            prefill_qsl_cpu = (
+                attn_metadata.query_start_loc_cpu[num_decodes:] - num_decode_tokens
+            )
+        prefill_meta = TurboQuantMetadata(
+            seq_lens=prefill_seq_lens,
+            slot_mapping=attn_metadata.slot_mapping[num_decode_tokens:N],
+            block_table=attn_metadata.block_table[num_decodes:],
+            query_start_loc=prefill_qsl,
+            num_actual_tokens=N - num_decode_tokens,
+            max_query_len=attn_metadata.max_query_len,
+            max_seq_len=prefill_max_seq,
+            is_prefill=True,
+            query_start_loc_cpu=prefill_qsl_cpu,
+            seq_lens_cpu=attn_metadata.seq_lens_cpu[num_decodes:]
+            if attn_metadata.seq_lens_cpu is not None
+            else None,
+            mm_prefix_range_tensor=mm_prefix_range_tensor[num_decodes:]
+            if mm_prefix_range_tensor is not None
+            else None,
+        )
+        attn_out[num_decode_tokens:] = self._prefill_attention(
+            q[num_decode_tokens:],
+            k[num_decode_tokens:],
+            v[num_decode_tokens:],
+            kv_cache,
+            prefill_meta,
+            Pi,
+            centroids,
+            PiT,
+            layer=layer,
+        )
+
+        return attn_out
 
     def _ensure_on_device(self, layer, device):
         """One-time derivation of TQ buffers (rotation matrix, midpoints).
@@ -843,101 +1270,59 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         # Compute attention (KV cache was already updated by do_kv_cache_update)
         # With reorder_batch_threshold=1, decodes come first in the batch.
         # num_decodes/num_decode_tokens from metadata give the split point.
-        num_decodes = attn_metadata.num_decodes
-        num_decode_tokens = attn_metadata.num_decode_tokens
-        mm_prefix_range_tensor = attn_metadata.mm_prefix_range_tensor
+        has_spec_decode = attn_metadata.spec_sequence_masks is not None
+        k = key[:N].view(N, self.num_kv_heads, self.head_size)
+        v = value[:N].view(N, self.num_kv_heads, self.head_size)
 
-        if not attn_metadata.is_prefill:
-            # Pure decode batch — fast path
-            attn_out = self._decode_attention(
-                q, kv_cache, attn_metadata, Pi, centroids, PiT, layer
+        if has_spec_decode:
+            assert attn_metadata.spec_token_indx is not None
+            attn_out = torch.empty(
+                N, self.num_heads, self.head_size, device=device, dtype=q.dtype
             )
-        elif num_decodes == 0:
-            # Pure prefill batch
-            k = key[:N].view(N, self.num_kv_heads, self.head_size)
-            v = value[:N].view(N, self.num_kv_heads, self.head_size)
-            attn_out = self._prefill_attention(
+
+            if attn_metadata.num_spec_decode_tokens > 0:
+                # KV for all query tokens has already been stored, so flatten
+                # the K+1 tokens into synthetic decode rows with incrementing
+                # seq_lens to preserve causal order.
+                spec_out = self._decode_spec_from_cache(
+                    q,
+                    kv_cache,
+                    attn_metadata,
+                    Pi=Pi,
+                    centroids=centroids,
+                    PiT=PiT,
+                    layer=layer,
+                )
+                attn_out.index_copy_(0, attn_metadata.spec_token_indx, spec_out)
+
+            non_spec_token_indx = attn_metadata.non_spec_token_indx
+            if non_spec_token_indx is not None and non_spec_token_indx.numel() > 0:
+                non_spec_meta = self._make_non_spec_metadata(
+                    attn_metadata,
+                    non_spec_token_indx,
+                )
+                non_spec_q = q.index_select(0, non_spec_token_indx)
+                non_spec_k = k.index_select(0, non_spec_token_indx)
+                non_spec_v = v.index_select(0, non_spec_token_indx)
+                non_spec_out = self._attention_without_spec_routing(
+                    non_spec_q,
+                    non_spec_k,
+                    non_spec_v,
+                    kv_cache,
+                    non_spec_meta,
+                    Pi,
+                    centroids,
+                    PiT,
+                    layer,
+                )
+                attn_out.index_copy_(0, non_spec_token_indx, non_spec_out)
+        else:
+            attn_out = self._attention_without_spec_routing(
                 q,
                 k,
                 v,
                 kv_cache,
                 attn_metadata,
-                Pi,
-                centroids,
-                PiT,
-                layer=layer,
-            )
-        else:
-            # Mixed batch: decodes first (guaranteed by reorder_batch).
-            attn_out = torch.empty(
-                N, self.num_heads, self.head_size, device=device, dtype=q.dtype
-            )
-
-            # --- Decode portion (first num_decodes requests) ---
-            # Use full-batch max_seq_len as safe upper bound (no GPU sync).
-            decode_meta = TurboQuantMetadata(
-                seq_lens=attn_metadata.seq_lens[:num_decodes],
-                slot_mapping=attn_metadata.slot_mapping[:num_decode_tokens],
-                block_table=attn_metadata.block_table[:num_decodes],
-                query_start_loc=attn_metadata.query_start_loc[: num_decodes + 1],
-                num_actual_tokens=num_decode_tokens,
-                max_query_len=1,
-                max_seq_len=attn_metadata.max_seq_len,
-                is_prefill=False,
-                mm_prefix_range_tensor=mm_prefix_range_tensor[:num_decodes]
-                if mm_prefix_range_tensor is not None
-                else None,
-            )
-            attn_out[:num_decode_tokens] = self._decode_attention(
-                q[:num_decode_tokens], kv_cache, decode_meta, Pi, centroids, PiT, layer
-            )
-
-            # --- Prefill portion (remaining requests) ---
-            # CRITICAL: use prefill-specific max_seq_len so flash_attn's
-            # fast path (max_query_len == max_seq_len) triggers for
-            # first-chunk prefills. Using full-batch max_seq_len breaks
-            # this because decode requests inflate max_seq_len.
-            prefill_seq_lens = attn_metadata.seq_lens[num_decodes:]
-            # Use the CPU-resident `seq_lens` upper-bound from the metadata
-            # (populated in the builder) to compute the prefill sub-batch
-            # max without a GPU→CPU sync.
-            if attn_metadata.seq_lens_cpu is not None:
-                prefill_max_seq = int(attn_metadata.seq_lens_cpu[num_decodes:].max())
-            else:
-                prefill_max_seq = attn_metadata.max_seq_len
-            prefill_qsl = (
-                attn_metadata.query_start_loc[num_decodes:] - num_decode_tokens
-            )
-            prefill_qsl_cpu = None
-            if attn_metadata.query_start_loc_cpu is not None:
-                prefill_qsl_cpu = (
-                    attn_metadata.query_start_loc_cpu[num_decodes:] - num_decode_tokens
-                )
-            prefill_meta = TurboQuantMetadata(
-                seq_lens=prefill_seq_lens,
-                slot_mapping=attn_metadata.slot_mapping[num_decode_tokens:N],
-                block_table=attn_metadata.block_table[num_decodes:],
-                query_start_loc=prefill_qsl,
-                num_actual_tokens=N - num_decode_tokens,
-                max_query_len=attn_metadata.max_query_len,
-                max_seq_len=prefill_max_seq,
-                is_prefill=True,
-                query_start_loc_cpu=prefill_qsl_cpu,
-                seq_lens_cpu=attn_metadata.seq_lens_cpu[num_decodes:]
-                if attn_metadata.seq_lens_cpu is not None
-                else None,
-                mm_prefix_range_tensor=mm_prefix_range_tensor[num_decodes:]
-                if mm_prefix_range_tensor is not None
-                else None,
-            )
-            k = key[:N].view(N, self.num_kv_heads, self.head_size)
-            v = value[:N].view(N, self.num_kv_heads, self.head_size)
-            attn_out[num_decode_tokens:] = self._prefill_attention(
-                q[num_decode_tokens:],
-                k[num_decode_tokens:],
-                v[num_decode_tokens:],
-                kv_cache,
-                prefill_meta,
                 Pi,
                 centroids,
                 PiT,
