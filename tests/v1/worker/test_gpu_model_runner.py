@@ -93,6 +93,23 @@ class _TestAttentionBackend:
     def get_kv_cache_stride_order():
         return tuple(range(5))
 
+    @classmethod
+    def get_kv_cache_block_dim(
+        cls,
+        block_size: int,
+        num_kv_heads: int,
+        head_size: int,
+        cache_dtype_str: str = "auto",
+    ) -> int:
+        shape = cls.get_kv_cache_shape(
+            1234567,
+            block_size,
+            num_kv_heads,
+            head_size,
+            cache_dtype_str=cache_dtype_str,
+        )
+        return shape.index(1234567)
+
 
 class _HybridBlockSizeTestBackend:
     @staticmethod
@@ -171,18 +188,8 @@ def _reshape_kv_cache_tensor_for_test(
         cache_config=SimpleNamespace(cache_dtype="auto"),
         _kv_cache_spec_attn_group_iterator=lambda: iter([group]),
     )
-    kv_cache_config = KVCacheConfig(
-        num_blocks=1,
-        kv_cache_tensors=[
-            KVCacheTensor(size=raw_tensor.numel(), shared_by=[layer_name]),
-        ],
-        kv_cache_groups=[
-            KVCacheGroupSpec(layer_names=[layer_name], kv_cache_spec=kv_cache_spec)
-        ],
-    )
     return GPUModelRunner._reshape_kv_cache_tensors(
         runner_stub,
-        kv_cache_config,
         {layer_name: raw_tensor},
         [kv_cache_spec.block_size],
     )
@@ -1394,8 +1401,6 @@ def test_hybrid_attention_mamba_tensor_shapes():
 
 
 def test_update_hybrid_attention_mamba_layout_with_num_block_2_rewrites_stride():
-    from vllm.v1.attention.backends.flash_attn import FlashAttentionBackend
-
     ambiguous_cache = torch.empty((2, 2, BLOCK_SIZE, 1, 8), dtype=torch.float16)
     """Ambiguous, because both dims[0=kv_dim] and dims[1=num_blocks] == 2"""
     hidden_size = ambiguous_cache.shape[2:].numel()
@@ -1407,7 +1412,7 @@ def test_update_hybrid_attention_mamba_layout_with_num_block_2_rewrites_stride()
     runner_stub = SimpleNamespace(
         cache_config=SimpleNamespace(cache_dtype="auto"),
         _kv_cache_spec_attn_group_iterator=lambda: iter(
-            [AttentionGroup(FlashAttentionBackend, ["attn"], attention_spec, 0)]
+            [AttentionGroup(_TestAttentionBackend, ["attn"], attention_spec, 0)]
         ),
     )
     GPUModelRunner._update_hybrid_attention_mamba_layout(
@@ -1541,7 +1546,9 @@ def test_reshape_token_proportional_attention_unchanged():
     assert kv_cache.shape[1] == num_blocks
     assert (
         kv_cache.numel()
-        == raw_tensor.numel() // torch.empty((), dtype=spec.dtype).element_size()
+        == spec.real_page_size_bytes
+        * num_blocks
+        // torch.empty((), dtype=spec.dtype).element_size()
     )
 
 

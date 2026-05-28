@@ -168,6 +168,9 @@ def make_kv_cache_config_three_types(
             shapes=((1, 1),),
             dtypes=(torch.float32,),
             page_size_padded=8 * block_size,
+            # This helper is used by prefix-caching event tests. Request-constant
+            # Mamba modes intentionally reject prefix caching.
+            mamba_cache_mode="all",
         )
     elif third_spec_type == "sliding_window":
         third_spec = SlidingWindowSpec(
