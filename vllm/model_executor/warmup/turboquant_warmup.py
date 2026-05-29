@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from dataclasses import dataclass
+from inspect import Parameter, signature
 
 import torch
 
@@ -41,6 +42,22 @@ class _TurboQuantDecodeWarmupKey:
     key_fp8: bool
     norm_correction: bool
     output_fp16: bool
+    sliding_window: int | None
+
+
+def _get_impl_sliding_window(impl: TurboQuantAttentionImpl) -> int | None:
+    sliding_window = getattr(impl, "sliding_window", None)
+    return sliding_window if isinstance(sliding_window, int) else None
+
+
+def _decode_launcher_accepts_sliding_window() -> bool:
+    try:
+        parameters = signature(triton_turboquant_decode_attention).parameters
+    except (TypeError, ValueError):
+        return False
+    return "sliding_window" in parameters or any(
+        parameter.kind == Parameter.VAR_KEYWORD for parameter in parameters.values()
+    )
 
 
 def _iter_turboquant_attention_layers(
@@ -81,6 +98,7 @@ def _make_warmup_key(
         key_fp8=impl.tq_config.key_fp8,
         norm_correction=impl.tq_config.norm_correction,
         output_fp16=model_dtype == torch.float16,
+        sliding_window=_get_impl_sliding_window(impl),
     )
 
 
@@ -255,6 +273,9 @@ def _warmup_turboquant_decode_layer(
         # the launcher allocate mid/output/lse tensors internally. Warm this
         # allocation variant explicitly; warming only the workspace-backed
         # helper does not cover the first repeated-prompt decode request.
+        launcher_kwargs: dict[str, object] = {}
+        if _decode_launcher_accepts_sliding_window():
+            launcher_kwargs["sliding_window"] = _get_impl_sliding_window(impl)
         triton_turboquant_decode_attention(
             query=prefix_query,
             kv_cache=kv_cache,
@@ -272,6 +293,7 @@ def _warmup_turboquant_decode_layer(
             max_num_kv_splits=impl.max_num_kv_splits,
             value_centroids=layer._tq_value_centroids,
             value_mse=impl.tq_config.value_mse_supported,
+            **launcher_kwargs,
         )
 
     if not is_workspace_manager_initialized():
