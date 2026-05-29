@@ -4,10 +4,11 @@
 import itertools
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Literal, overload
+from typing import Literal, cast, overload
 
 from vllm.distributed.kv_events import BlockStored, KVCacheEvent
 from vllm.logger import init_logger
+from vllm.v1.core.block_pool import CacheableBlockPoolProtocol
 from vllm.v1.core.kv_cache_coordinator import get_kv_cache_coordinator
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
@@ -177,25 +178,11 @@ class KVCacheManager:
         Returns:
             The KV cache usage (between 0.0 and 1.0).
         """
-        if self.kv_cache_config.is_multi_pool:
-            total_blocks = sum(
-                max(pool.num_gpu_blocks - 1, 0)
-                for pool in self.coordinator.block_pools.values()
-            )
-            if total_blocks == 0:
-                return 0.0
-            used_blocks = sum(
-                max(pool.num_gpu_blocks - 1, 0) - pool.get_num_free_blocks()
-                for pool in self.coordinator.block_pools.values()
-            )
-            return max(used_blocks, 0) / total_blocks
         return self.block_pool.get_usage()
 
-    def _has_free_blocks_by_pool(self, blocks_by_pool: dict[int, int]) -> bool:
-        return all(
-            num_blocks <= self.coordinator.block_pools[pool_id].get_num_free_blocks()
-            for pool_id, num_blocks in blocks_by_pool.items()
-        )
+    def _cacheable_block_pool(self) -> CacheableBlockPoolProtocol:
+        """Return the legacy shared pool as a prefix-cache-capable pool."""
+        return cast(CacheableBlockPoolProtocol, self.block_pool)
 
     def make_prefix_cache_stats(self) -> PrefixCacheStats | None:
         """Get (and reset) the prefix cache stats.
@@ -208,6 +195,38 @@ class KVCacheManager:
         stats = self.prefix_cache_stats
         self.prefix_cache_stats = PrefixCacheStats()
         return stats
+
+    def _has_enough_free_blocks_by_pool(
+        self, num_blocks_to_allocate_by_pool: tuple[int, ...]
+    ) -> bool:
+        num_free_blocks_by_pool = self.coordinator.get_num_free_blocks_by_pool()
+        assert len(num_blocks_to_allocate_by_pool) == len(num_free_blocks_by_pool)
+        return all(
+            num_blocks_to_allocate <= num_free_blocks
+            for num_blocks_to_allocate, num_free_blocks in zip(
+                num_blocks_to_allocate_by_pool, num_free_blocks_by_pool
+            )
+        )
+
+    def _get_num_blocks_to_allocate_by_pool(
+        self,
+        request: Request,
+        num_tokens: int,
+        new_computed_block_list: tuple[Sequence[KVCacheBlock], ...],
+        num_encoder_tokens: int,
+        total_computed_tokens: int,
+        num_tokens_main_model: int,
+        apply_admission_cap: bool = False,
+    ) -> tuple[int, ...]:
+        return self.coordinator.get_num_blocks_to_allocate_by_pool(
+            request_id=request.request_id,
+            num_tokens=num_tokens,
+            new_computed_blocks=new_computed_block_list,
+            num_encoder_tokens=num_encoder_tokens,
+            total_computed_tokens=total_computed_tokens,
+            num_tokens_main_model=num_tokens_main_model,
+            apply_admission_cap=apply_admission_cap,
+        )
 
     def get_computed_blocks(self, request: Request) -> tuple[KVCacheBlocks, int]:
         """Get the computed (cached) blocks for the request.
@@ -365,18 +384,16 @@ class KVCacheManager:
             # First check and fail if the full request sequence won't fit.
             full_num_tokens = min(request.num_tokens, self.max_model_len)
 
-            num_blocks_to_allocate_by_pool = (
-                self.coordinator.get_num_blocks_to_allocate_by_pool(
-                    request_id=request.request_id,
-                    num_tokens=full_num_tokens,
-                    new_computed_blocks=new_computed_block_list,
-                    num_encoder_tokens=num_encoder_tokens,
-                    total_computed_tokens=total_computed_tokens,
-                    num_tokens_main_model=full_num_tokens,
-                    apply_admission_cap=True,
-                )
+            num_blocks_to_allocate_by_pool = self._get_num_blocks_to_allocate_by_pool(
+                request,
+                num_tokens=full_num_tokens,
+                new_computed_block_list=new_computed_block_list,
+                num_encoder_tokens=num_encoder_tokens,
+                total_computed_tokens=total_computed_tokens,
+                num_tokens_main_model=full_num_tokens,
+                apply_admission_cap=True,
             )
-            if not self._has_free_blocks_by_pool(num_blocks_to_allocate_by_pool):
+            if not self._has_enough_free_blocks_by_pool(num_blocks_to_allocate_by_pool):
                 return None
 
         num_tokens_main_model = total_computed_tokens + num_new_tokens
@@ -394,19 +411,17 @@ class KVCacheManager:
             request.request_id, total_computed_tokens
         )
 
-        num_blocks_to_allocate_by_pool = (
-            self.coordinator.get_num_blocks_to_allocate_by_pool(
-                request_id=request.request_id,
-                num_tokens=num_tokens_need_slot,
-                new_computed_blocks=new_computed_block_list,
-                num_encoder_tokens=num_encoder_tokens,
-                total_computed_tokens=num_local_computed_tokens
-                + num_external_computed_tokens,
-                num_tokens_main_model=num_tokens_main_model,
-            )
+        num_blocks_to_allocate_by_pool = self._get_num_blocks_to_allocate_by_pool(
+            request,
+            num_tokens=num_tokens_need_slot,
+            new_computed_block_list=new_computed_block_list,
+            num_encoder_tokens=num_encoder_tokens,
+            total_computed_tokens=num_local_computed_tokens
+            + num_external_computed_tokens,
+            num_tokens_main_model=num_tokens_main_model,
         )
 
-        if not self._has_free_blocks_by_pool(num_blocks_to_allocate_by_pool):
+        if not self._has_enough_free_blocks_by_pool(num_blocks_to_allocate_by_pool):
             # Cannot allocate new blocks
             return None
 
@@ -477,11 +492,7 @@ class KVCacheManager:
         Args:
             block_ids: Set of block IDs to evict from cache.
         """
-        if self.kv_cache_config.is_multi_pool:
-            raise NotImplementedError(
-                "Flat block-id eviction is not supported with multi-pool KV cache"
-            )
-        self.block_pool.evict_blocks(block_ids)
+        self._cacheable_block_pool().evict_blocks(block_ids)
 
     def reset_prefix_cache(self) -> bool:
         """Reset prefix cache. This function may be used in RLHF
@@ -492,22 +503,8 @@ class KVCacheManager:
             bool: True if the prefix cache is successfully reset,
             False otherwise.
         """
-        if self.kv_cache_config.is_multi_pool:
-            for block_pool in self.coordinator.block_pools.values():
-                num_used_blocks = (
-                    block_pool.num_gpu_blocks - block_pool.get_num_free_blocks()
-                )
-                if num_used_blocks != 1:
-                    logger.warning(
-                        "Failed to reset prefix cache because some blocks "
-                        "(%d) are not freed yet",
-                        num_used_blocks - 1,
-                    )
-                    return False
-
-        for block_pool in self.coordinator.block_pools.values():
-            if not block_pool.reset_prefix_cache():
-                return False
+        if not self._cacheable_block_pool().reset_prefix_cache():
+            return False
         if self.log_stats:
             assert self.prefix_cache_stats is not None
             self.prefix_cache_stats.reset = True
@@ -553,11 +550,7 @@ class KVCacheManager:
         Returns:
             A list of KV cache events.
         """
-        events = [
-            event
-            for block_pool in self.coordinator.block_pools.values()
-            for event in block_pool.take_events()
-        ]
+        events = self._cacheable_block_pool().take_events()
         for event in events:
             if not isinstance(event, BlockStored):
                 continue
@@ -610,12 +603,10 @@ class KVCacheManager:
         return ids
 
     def take_new_block_ids_by_pool(self) -> dict[int, list[int]]:
-        """Drain and return new attention block IDs grouped by pool."""
+        """Drain and return new attention block IDs grouped by KV pool."""
         ids_by_pool: dict[int, list[int]] = {}
-        for pool_id, mgr in zip(
-            self.coordinator.manager_pool_ids,
-            self.coordinator.single_type_managers,
-        ):
+        for group_id, mgr in enumerate(self.coordinator.single_type_managers):
+            pool_id = self.kv_cache_config.group_to_pool_id[group_id]
             ids = mgr.take_new_block_ids()
             if ids:
                 ids_by_pool.setdefault(pool_id, []).extend(ids)

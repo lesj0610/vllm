@@ -28,10 +28,11 @@ from vllm.v1.kv_cache_interface import (
     HiddenStateCacheSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
-    KVCachePoolSpec,
+    KVCachePoolConfig,
     KVCacheSpec,
     KVCacheTensor,
     MambaSpec,
+    MemoryModel,
     MLAAttentionSpec,
     SinkFullAttentionSpec,
     SlidingWindowMLASpec,
@@ -892,35 +893,109 @@ def get_max_concurrency_for_kv_cache_config(
     """
     Get the maximum concurrency for the given KV cache configuration.
     """
-    if kv_cache_config.is_multi_pool:
-        assert kv_cache_config.kv_cache_pools is not None
-        blocks_per_request: dict[int, int] = defaultdict(int)
-        for group in kv_cache_config.kv_cache_groups:
+    if _has_request_constant_pools(kv_cache_config):
+        group_ids = [
+            group_id
+            for group_id, group in enumerate(kv_cache_config.kv_cache_groups)
+            if group.kv_cache_spec.memory_model == MemoryModel.TOKEN_PROPORTIONAL
+        ]
+        if not group_ids:
+            return _get_request_constant_max_concurrency(kv_cache_config)
+        groups = [kv_cache_config.kv_cache_groups[group_id] for group_id in group_ids]
+        num_blocks = _get_num_blocks_for_group_ids(kv_cache_config, group_ids)
+    elif kv_cache_config.is_multi_pool:
+        pool_required_blocks: dict[int, int] = defaultdict(int)
+        for group_id, group in enumerate(kv_cache_config.kv_cache_groups):
+            pool_id = kv_cache_config.group_to_pool_id[group_id]
             page_size = group.kv_cache_spec.page_size_bytes
-            blocks_per_request[group.pool_id] += cdiv(
+            pool_required_blocks[pool_id] += cdiv(
                 group.kv_cache_spec.max_memory_usage_bytes(vllm_config),
                 page_size,
             )
         pool_concurrencies = []
-        for pool in kv_cache_config.kv_cache_pools:
-            required = blocks_per_request.get(pool.pool_id, 0)
+        for pool in kv_cache_config.pool_configs:
+            required = pool_required_blocks.get(pool.pool_id, 0)
             if required > 0:
                 pool_concurrencies.append(pool.num_blocks / required)
         return min(pool_concurrencies) if pool_concurrencies else 0.0
+    else:
+        groups = kv_cache_config.kv_cache_groups
+        num_blocks = kv_cache_config.num_blocks
 
-    num_layer_per_group = max(
-        len(group.layer_names) for group in kv_cache_config.kv_cache_groups
-    )
+    num_layer_per_group = max(len(group.layer_names) for group in groups)
     max_memory_usage_per_request = num_layer_per_group * max_memory_usage_bytes(
-        vllm_config, (group.kv_cache_spec for group in kv_cache_config.kv_cache_groups)
+        vllm_config, (group.kv_cache_spec for group in groups)
     )
-    memory_per_block = (
-        kv_cache_config.kv_cache_groups[0].kv_cache_spec.page_size_bytes
-        * num_layer_per_group
-    )
+    memory_per_block = groups[0].kv_cache_spec.page_size_bytes * num_layer_per_group
     num_block_per_request = cdiv(max_memory_usage_per_request, memory_per_block)
-    max_concurrency = kv_cache_config.num_blocks / num_block_per_request
+    max_concurrency = num_blocks / num_block_per_request
     return max_concurrency
+
+
+def _has_request_constant_pools(kv_cache_config: KVCacheConfig) -> bool:
+    return any(
+        pool.memory_model == MemoryModel.REQUEST_CONSTANT
+        for pool in kv_cache_config.pool_configs
+    )
+
+
+def _get_request_constant_max_concurrency(
+    kv_cache_config: KVCacheConfig,
+) -> float:
+    pool_by_id = {pool.pool_id: pool for pool in kv_cache_config.pool_configs}
+    per_group_capacity = []
+    for group_id, group in enumerate(kv_cache_config.kv_cache_groups):
+        if group.kv_cache_spec.memory_model != MemoryModel.REQUEST_CONSTANT:
+            continue
+        pool_id = kv_cache_config.group_to_pool_id[group_id]
+        pool = pool_by_id[pool_id]
+        per_group_capacity.append(
+            (pool.num_blocks - 1) / group.kv_cache_spec.blocks_per_request
+        )
+    if not per_group_capacity:
+        return 0
+    return min(per_group_capacity)
+
+
+def _get_token_proportional_group_ids(
+    kv_cache_config: KVCacheConfig,
+) -> list[int]:
+    group_ids = [
+        group_id
+        for group_id, group in enumerate(kv_cache_config.kv_cache_groups)
+        if group.kv_cache_spec.memory_model == MemoryModel.TOKEN_PROPORTIONAL
+    ]
+    if not group_ids:
+        raise NotImplementedError(
+            "KV cache capacity reporting requires at least one "
+            "TOKEN_PROPORTIONAL group."
+        )
+    return group_ids
+
+
+def _get_num_blocks_for_group_ids(
+    kv_cache_config: KVCacheConfig,
+    group_ids: list[int],
+) -> int:
+    pool_ids = {kv_cache_config.group_to_pool_id[group_id] for group_id in group_ids}
+    return sum(
+        pool.num_blocks
+        for pool in kv_cache_config.pool_configs
+        if pool.pool_id in pool_ids
+    )
+
+
+def get_token_proportional_kv_cache_capacity_tokens(
+    kv_cache_config: KVCacheConfig,
+) -> int:
+    """Return token capacity represented by TOKEN_PROPORTIONAL pools only."""
+    token_group_ids = _get_token_proportional_group_ids(kv_cache_config)
+    min_block_size = min(
+        kv_cache_config.kv_cache_groups[group_id].kv_cache_spec.block_size
+        for group_id in token_group_ids
+    )
+    num_blocks = _get_num_blocks_for_group_ids(kv_cache_config, token_group_ids)
+    return num_blocks // len(token_group_ids) * min_block_size
 
 
 def may_override_num_blocks(vllm_config: VllmConfig, num_blocks: int) -> int:
@@ -1058,13 +1133,12 @@ def unify_kv_cache_spec_page_size(
         return kv_cache_spec
 
     max_page_size = max(page_sizes)
-    tq_spec_types = (TQFullAttentionSpec, TQSlidingWindowSpec)
-    new_kv_cache_spec: dict[str, KVCacheSpec] = {}
+    new_kv_cache_spec = {}
     for layer_name, layer_spec in kv_cache_spec.items():
         if layer_spec.page_size_bytes == max_page_size:
             new_kv_cache_spec[layer_name] = layer_spec
         else:
-            if isinstance(layer_spec, tq_spec_types):
+            if isinstance(layer_spec, (TQFullAttentionSpec, TQSlidingWindowSpec)):
                 padded_spec = replace(layer_spec, page_size_padded=max_page_size)
                 assert padded_spec.page_size_bytes == max_page_size
                 new_kv_cache_spec[layer_name] = padded_spec
@@ -1078,15 +1152,22 @@ def unify_kv_cache_spec_page_size(
                 )
             ratio = max_page_size // layer_page_size
             new_block_size = layer_spec.block_size * ratio
-            resized_spec = replace(layer_spec, block_size=new_block_size)
-            assert resized_spec.page_size_bytes == max_page_size
-            new_kv_cache_spec[layer_name] = resized_spec
+            new_spec = replace(layer_spec, block_size=new_block_size)
+            assert new_spec.page_size_bytes == max_page_size
+            new_kv_cache_spec[layer_name] = new_spec
     return new_kv_cache_spec
 
 
 def is_kv_cache_type_attention_free(kv_cache_spec: dict[str, KVCacheSpec]) -> bool:
     # kv_cache_spec is an empty dict for attention free models
     return not kv_cache_spec
+
+
+def _has_request_constant_specs(kv_cache_spec: dict[str, KVCacheSpec]) -> bool:
+    return any(
+        spec.memory_model == MemoryModel.REQUEST_CONSTANT
+        for spec in kv_cache_spec.values()
+    )
 
 
 def _get_kv_cache_groups_uniform_page_size(
@@ -1268,113 +1349,160 @@ def _get_kv_cache_config_deepseek_v4(
     return num_blocks, kv_cache_tensors
 
 
-def _is_multi_pool_kv_cache_groups(
+def _has_request_constant_groups(
     kv_cache_groups: list[KVCacheGroupSpec],
 ) -> bool:
-    return len({group.pool_id for group in kv_cache_groups}) > 1
-
-
-@dataclass
-class _MultiPoolLayout:
-    pool_page_sizes: dict[int, int]
-    pool_blocks_per_request: dict[int, int]
-    pool_group_sizes: dict[int, int]
-    pool_layers_by_position: dict[int, dict[int, list[str]]]
-
-
-def _collect_multi_pool_layout(
-    vllm_config: VllmConfig,
-    kv_cache_groups: list[KVCacheGroupSpec],
-) -> _MultiPoolLayout:
-    pool_page_sizes: dict[int, int] = {}
-    pool_blocks_per_request: dict[int, int] = defaultdict(int)
-    pool_group_sizes: dict[int, int] = defaultdict(int)
-    pool_layers_by_position: dict[int, dict[int, list[str]]] = defaultdict(
-        lambda: defaultdict(list)
-    )
-
-    for group in kv_cache_groups:
-        page_size = group.kv_cache_spec.page_size_bytes
-        existing_page_size = pool_page_sizes.setdefault(group.pool_id, page_size)
-        assert existing_page_size == page_size
-        pool_blocks_per_request[group.pool_id] += cdiv(
-            group.kv_cache_spec.max_memory_usage_bytes(vllm_config), page_size
-        )
-        pool_group_sizes[group.pool_id] = max(
-            pool_group_sizes[group.pool_id], len(group.layer_names)
-        )
-        for position, layer_name in enumerate(group.layer_names):
-            pool_layers_by_position[group.pool_id][position].append(layer_name)
-
-    return _MultiPoolLayout(
-        pool_page_sizes=pool_page_sizes,
-        pool_blocks_per_request=pool_blocks_per_request,
-        pool_group_sizes=dict(pool_group_sizes),
-        pool_layers_by_position=pool_layers_by_position,
+    return any(
+        group.kv_cache_spec.memory_model == MemoryModel.REQUEST_CONSTANT
+        for group in kv_cache_groups
     )
 
 
-def _get_kv_cache_config_multi_pool(
+def _get_request_constant_num_blocks(
+    vllm_config: VllmConfig, kv_cache_spec: KVCacheSpec
+) -> int:
+    blocks_per_request = kv_cache_spec.blocks_per_request
+    assert blocks_per_request > 0
+    max_num_seqs = vllm_config.scheduler_config.max_num_seqs
+    assert max_num_seqs > 0
+    return max_num_seqs * blocks_per_request + 1
+
+
+def _get_request_constant_reserved_bytes(
+    vllm_config: VllmConfig, kv_cache_groups: list[KVCacheGroupSpec]
+) -> int:
+    return sum(
+        _get_request_constant_num_blocks(vllm_config, group.kv_cache_spec)
+        * group.kv_cache_spec.physical_page_size_bytes
+        * len(group.layer_names)
+        for group in kv_cache_groups
+        if group.kv_cache_spec.memory_model == MemoryModel.REQUEST_CONSTANT
+    )
+
+
+def _get_legacy_num_blocks_from_pool_configs(
+    pool_configs: tuple[KVCachePoolConfig, ...],
+) -> int:
+    assert pool_configs
+    for pool in pool_configs:
+        if pool.memory_model == MemoryModel.TOKEN_PROPORTIONAL:
+            return pool.num_blocks
+    return pool_configs[0].num_blocks
+
+
+def _get_kv_cache_config_mixed_memory_model(
     vllm_config: VllmConfig,
     kv_cache_groups: list[KVCacheGroupSpec],
     available_memory: int,
 ) -> KVCacheConfig:
-    """Plan pool-local block namespaces for each page-size class.
+    token_group_ids = [
+        group_id
+        for group_id, group in enumerate(kv_cache_groups)
+        if group.kv_cache_spec.memory_model == MemoryModel.TOKEN_PROPORTIONAL
+    ]
+    request_constant_group_ids = [
+        group_id
+        for group_id, group in enumerate(kv_cache_groups)
+        if group.kv_cache_spec.memory_model == MemoryModel.REQUEST_CONSTANT
+    ]
 
-    A KV cache group may contain multiple layers that share one block table.
-    In that case each layer position in the group needs a separate physical
-    tensor, while layers at the same position across groups can share one
-    tensor backed by the same pool.
-    """
-
-    assert _is_multi_pool_kv_cache_groups(kv_cache_groups)
-
-    layout = _collect_multi_pool_layout(vllm_config, kv_cache_groups)
-
-    bytes_per_request = sum(
-        layout.pool_page_sizes[pool_id]
-        * layout.pool_group_sizes.get(pool_id, 0)
-        * blocks
-        for pool_id, blocks in layout.pool_blocks_per_request.items()
-    )
-    num_requests = available_memory / bytes_per_request if bytes_per_request > 0 else 0
-
-    kv_cache_pools: list[KVCachePoolSpec] = []
     kv_cache_tensors: list[KVCacheTensor] = []
-    for pool_id in sorted(layout.pool_page_sizes):
-        page_size = layout.pool_page_sizes[pool_id]
-        blocks_per_request = layout.pool_blocks_per_request[pool_id]
-        if layout.pool_group_sizes.get(pool_id, 0) == 0:
-            # This worker has no local layers in this pool (for example after
-            # pipeline-parallel projection). Keep only the null block; there is
-            # no GPU tensor to back for this pool on this worker.
-            num_blocks = 1
+    pool_configs: list[KVCachePoolConfig] = []
+    group_to_pool_id = [-1] * len(kv_cache_groups)
+
+    request_constant_pool_specs: list[tuple[int, KVCachePoolConfig]] = []
+    reserved_bytes = _get_request_constant_reserved_bytes(vllm_config, kv_cache_groups)
+
+    # CUDA graph memory profiling temporarily sets num_gpu_blocks_override and
+    # asks for a minimal KV cache with available_memory=0.  The single-pool
+    # TOKEN_PROPORTIONAL path already honors that override after deriving an
+    # initial block count from available_memory.  Mirror that behavior here so
+    # mixed-memory configs do not fail before the token pool gets a chance to
+    # apply the override.  REQUEST_CONSTANT pool sizes remain deterministic.
+    override = vllm_config.cache_config.num_gpu_blocks_override
+    if override is not None:
+        if token_group_ids:
+            token_groups = [kv_cache_groups[group_id] for group_id in token_group_ids]
+            available_memory = max(
+                available_memory,
+                reserved_bytes + override * _pool_bytes_per_block(token_groups),
+            )
         else:
-            num_blocks = int(num_requests * blocks_per_request)
-            num_blocks = max(num_blocks, 0)
-        kv_cache_pools.append(
-            KVCachePoolSpec(
-                pool_id=pool_id,
-                num_blocks=num_blocks,
-                page_size_bytes=page_size,
+            available_memory = max(available_memory, reserved_bytes)
+
+    next_pool_id = 1 if token_group_ids else 0
+    for group_id in request_constant_group_ids:
+        group = kv_cache_groups[group_id]
+        spec = group.kv_cache_spec
+        num_blocks = _get_request_constant_num_blocks(vllm_config, spec)
+        pool_config = KVCachePoolConfig(
+            pool_id=next_pool_id,
+            memory_model=MemoryModel.REQUEST_CONSTANT,
+            group_ids=(group_id,),
+            num_blocks=num_blocks,
+            accounting_page_size_bytes=spec.accounting_page_size_bytes,
+            physical_page_size_bytes=spec.physical_page_size_bytes,
+        )
+        request_constant_pool_specs.append((group_id, pool_config))
+        next_pool_id += 1
+
+    reservation_exhausts_memory = (
+        reserved_bytes >= available_memory
+        if token_group_ids
+        else reserved_bytes > available_memory
+    )
+    if reservation_exhausts_memory:
+        raise ValueError(
+            "REQUEST_CONSTANT KV cache reservation "
+            f"({format_gib(reserved_bytes)} GiB) is not smaller than the "
+            f"available KV cache memory ({format_gib(available_memory)} GiB). "
+            "Try increasing `gpu_memory_utilization` or decreasing "
+            "`max_num_seqs`."
+        )
+
+    if token_group_ids:
+        token_groups = [kv_cache_groups[group_id] for group_id in token_group_ids]
+        token_kv_cache_config = get_kv_cache_config_from_groups(
+            vllm_config, token_groups, available_memory - reserved_bytes
+        )
+        if token_kv_cache_config.num_blocks <= 0:
+            raise ValueError(
+                "No available memory remains for TOKEN_PROPORTIONAL KV cache "
+                "blocks after REQUEST_CONSTANT KV cache reservation."
+            )
+        token_pool_config = token_kv_cache_config.pool_configs[0]
+        pool_configs.append(
+            replace(
+                token_pool_config,
+                pool_id=0,
+                group_ids=tuple(token_group_ids),
             )
         )
-        layers_by_position = layout.pool_layers_by_position.get(pool_id, {})
-        for position in sorted(layers_by_position):
-            shared_by = layers_by_position[position]
+        for group_id in token_group_ids:
+            group_to_pool_id[group_id] = 0
+        kv_cache_tensors.extend(token_kv_cache_config.kv_cache_tensors)
+
+    for group_id, pool_config in request_constant_pool_specs:
+        group = kv_cache_groups[group_id]
+        spec = group.kv_cache_spec
+        group_to_pool_id[group_id] = pool_config.pool_id
+        pool_configs.append(pool_config)
+        for layer_name in group.layer_names:
             kv_cache_tensors.append(
                 KVCacheTensor(
-                    size=page_size * num_blocks,
-                    shared_by=shared_by,
-                    pool_id=pool_id,
+                    size=pool_config.num_blocks * spec.physical_page_size_bytes,
+                    shared_by=[layer_name],
                 )
             )
 
+    assert all(pool_id >= 0 for pool_id in group_to_pool_id)
+    pool_config_tuple = tuple(pool_configs)
     return KVCacheConfig(
-        num_blocks=min(pool.num_blocks for pool in kv_cache_pools),
+        num_blocks=_get_legacy_num_blocks_from_pool_configs(pool_config_tuple),
         kv_cache_tensors=kv_cache_tensors,
         kv_cache_groups=kv_cache_groups,
-        kv_cache_pools=kv_cache_pools,
+        pool_configs=pool_config_tuple,
+        group_to_pool_id=tuple(group_to_pool_id),
     )
 
 
@@ -1403,11 +1531,18 @@ def get_kv_cache_config_from_groups(
             kv_cache_groups=kv_cache_groups,
         )
 
-    # Determine how model runners should initialize the KV cache tensors.
-    if _is_multi_pool_kv_cache_groups(kv_cache_groups):
-        return _get_kv_cache_config_multi_pool(
+    if _has_request_constant_groups(kv_cache_groups):
+        if vllm_config.cache_config.enable_prefix_caching:
+            raise NotImplementedError(
+                "Prefix caching with REQUEST_CONSTANT groups is not yet "
+                "supported. Either disable prefix caching or use only "
+                "TOKEN_PROPORTIONAL specs."
+            )
+        return _get_kv_cache_config_mixed_memory_model(
             vllm_config, kv_cache_groups, available_memory
         )
+
+    # Determine how model runners should initialize the KV cache tensors.
     if len(kv_cache_groups) == 1 and isinstance(
         kv_cache_groups[0].kv_cache_spec, UniformTypeKVCacheSpecs
     ):
@@ -1433,6 +1568,10 @@ def get_kv_cache_config_from_groups(
         # DeepseekV4: UniformTypeKVCacheSpecs but multiple groups.
         # Delegate to the DeepseekV4-specific allocator.
         num_blocks, kv_cache_tensors = _get_kv_cache_config_deepseek_v4(
+            vllm_config, kv_cache_groups, available_memory
+        )
+    elif _is_multi_pool_kv_cache_groups(kv_cache_groups):
+        return _get_kv_cache_config_multi_pool(
             vllm_config, kv_cache_groups, available_memory
         )
     else:
@@ -1616,16 +1755,136 @@ def group_and_unify_kv_cache_specs(
     return [mla_uniform_spec, *swa_uniform_specs]
 
 
+def _is_multi_pool_kv_cache_groups(
+    kv_cache_groups: list[KVCacheGroupSpec],
+) -> bool:
+    return len({group.kv_cache_spec.page_size_bytes for group in kv_cache_groups}) > 1
+
+
+@dataclass
+class _MultiPoolLayout:
+    pool_page_sizes: dict[int, int]
+    pool_blocks_per_request: dict[int, int]
+    pool_group_sizes: dict[int, int]
+    pool_layers_by_position: dict[int, dict[int, list[str]]]
+    group_to_pool_id: tuple[int, ...]
+
+
+def _collect_multi_pool_layout(
+    vllm_config: VllmConfig,
+    kv_cache_groups: list[KVCacheGroupSpec],
+) -> _MultiPoolLayout:
+    page_sizes = sorted(
+        {group.kv_cache_spec.page_size_bytes for group in kv_cache_groups}
+    )
+    page_size_to_pool_id = {page_size: i for i, page_size in enumerate(page_sizes)}
+    pool_page_sizes = {
+        pool_id: page_size for page_size, pool_id in page_size_to_pool_id.items()
+    }
+    pool_blocks_per_request: dict[int, int] = defaultdict(int)
+    pool_group_sizes: dict[int, int] = defaultdict(int)
+    pool_layers_by_position: dict[int, dict[int, list[str]]] = defaultdict(
+        lambda: defaultdict(list)
+    )
+    group_to_pool_id: list[int] = []
+
+    for group in kv_cache_groups:
+        page_size = group.kv_cache_spec.page_size_bytes
+        pool_id = page_size_to_pool_id[page_size]
+        group_to_pool_id.append(pool_id)
+        pool_blocks_per_request[pool_id] += cdiv(
+            group.kv_cache_spec.max_memory_usage_bytes(vllm_config), page_size
+        )
+        pool_group_sizes[pool_id] = max(
+            pool_group_sizes[pool_id], len(group.layer_names)
+        )
+        for position, layer_name in enumerate(group.layer_names):
+            pool_layers_by_position[pool_id][position].append(layer_name)
+
+    return _MultiPoolLayout(
+        pool_page_sizes=pool_page_sizes,
+        pool_blocks_per_request=pool_blocks_per_request,
+        pool_group_sizes=dict(pool_group_sizes),
+        pool_layers_by_position=pool_layers_by_position,
+        group_to_pool_id=tuple(group_to_pool_id),
+    )
+
+
+def _max_memory_usage_bytes_multi_pool(
+    vllm_config: VllmConfig,
+    kv_cache_groups: list[KVCacheGroupSpec],
+) -> int:
+    layout = _collect_multi_pool_layout(vllm_config, kv_cache_groups)
+    return sum(
+        layout.pool_page_sizes[pool_id]
+        * layout.pool_group_sizes.get(pool_id, 0)
+        * layout.pool_blocks_per_request[pool_id]
+        for pool_id in layout.pool_page_sizes
+    )
+
+
+def _get_kv_cache_config_multi_pool(
+    vllm_config: VllmConfig,
+    kv_cache_groups: list[KVCacheGroupSpec],
+    available_memory: int,
+) -> KVCacheConfig:
+    assert _is_multi_pool_kv_cache_groups(kv_cache_groups)
+    layout = _collect_multi_pool_layout(vllm_config, kv_cache_groups)
+
+    bytes_per_request = sum(
+        layout.pool_page_sizes[pool_id]
+        * layout.pool_group_sizes.get(pool_id, 0)
+        * blocks
+        for pool_id, blocks in layout.pool_blocks_per_request.items()
+    )
+    num_requests = available_memory / bytes_per_request if bytes_per_request > 0 else 0
+
+    pool_configs: list[KVCachePoolConfig] = []
+    kv_cache_tensors: list[KVCacheTensor] = []
+    group_ids_by_pool: dict[int, list[int]] = defaultdict(list)
+    for group_id, pool_id in enumerate(layout.group_to_pool_id):
+        group_ids_by_pool[pool_id].append(group_id)
+
+    for pool_id in sorted(layout.pool_page_sizes):
+        page_size = layout.pool_page_sizes[pool_id]
+        blocks_per_request = layout.pool_blocks_per_request[pool_id]
+        if layout.pool_group_sizes.get(pool_id, 0) == 0:
+            num_blocks = 1
+        else:
+            num_blocks = int(num_requests * blocks_per_request)
+            num_blocks = max(num_blocks, 0)
+        pool_configs.append(
+            KVCachePoolConfig(
+                pool_id=pool_id,
+                memory_model=MemoryModel.TOKEN_PROPORTIONAL,
+                group_ids=tuple(group_ids_by_pool[pool_id]),
+                num_blocks=num_blocks,
+                accounting_page_size_bytes=page_size,
+                physical_page_size_bytes=page_size,
+            )
+        )
+        layers_by_position = layout.pool_layers_by_position.get(pool_id, {})
+        for position in sorted(layers_by_position):
+            kv_cache_tensors.append(
+                KVCacheTensor(
+                    size=page_size * num_blocks,
+                    shared_by=layers_by_position[position],
+                )
+            )
+
+    pool_config_tuple = tuple(pool_configs)
+    return KVCacheConfig(
+        num_blocks=_get_legacy_num_blocks_from_pool_configs(pool_config_tuple),
+        kv_cache_tensors=kv_cache_tensors,
+        kv_cache_groups=kv_cache_groups,
+        pool_configs=pool_config_tuple,
+        group_to_pool_id=layout.group_to_pool_id,
+    )
+
+
 def _is_tq_native_mixed_kv_cache_spec(
     kv_cache_spec: dict[str, KVCacheSpec],
 ) -> bool:
-    """Return whether the spec mixes TurboQuant and native attention storage.
-
-    Keep this predicate intentionally narrow. The special mixed path is only
-    for TQ attention specs plus exact native full/sliding attention specs.
-    All-TQ, pure-native, MLA, Mamba, and chunked-local layouts must keep their
-    existing routing.
-    """
     supported_spec_types = {
         FullAttentionSpec,
         SlidingWindowSpec,
@@ -1651,14 +1910,6 @@ _MULTI_POOL_MIN_CAPACITY_IMPROVEMENT = 1.25
 
 
 def _is_multi_pool_attention_spec(spec: KVCacheSpec) -> bool:
-    """Return whether a spec is safe for the first multi-pool prototype.
-
-    Keep this gate generic: it does not check quantization/backend-specific
-    class names. The first prototype only handles regular attention managers;
-    connector/offload, MLA, Mamba, cross/encoder-only attention, and chunked
-    local variants keep the legacy single-pool layout.
-    """
-
     if not isinstance(spec, AttentionSpec):
         return False
     return not isinstance(
@@ -1675,48 +1926,10 @@ def _is_multi_pool_attention_spec(spec: KVCacheSpec) -> bool:
     )
 
 
-def _max_memory_usage_bytes_multi_pool(
-    vllm_config: VllmConfig,
-    kv_cache_groups: list[KVCacheGroupSpec],
-) -> int:
-    """Maximum per-request KV bytes for a pool-local block layout."""
-
-    layout = _collect_multi_pool_layout(vllm_config, kv_cache_groups)
-    return sum(
-        layout.pool_page_sizes[pool_id]
-        * layout.pool_group_sizes.get(pool_id, 0)
-        * layout.pool_blocks_per_request[pool_id]
-        for pool_id in layout.pool_page_sizes
-    )
-
-
-def _assign_pool_ids_by_page_size(
-    kv_cache_groups: list[KVCacheGroupSpec],
-) -> list[KVCacheGroupSpec]:
-    page_sizes = sorted(
-        {group.kv_cache_spec.page_size_bytes for group in kv_cache_groups}
-    )
-    page_size_to_pool_id = {page_size: i for i, page_size in enumerate(page_sizes)}
-    return [
-        replace(
-            group,
-            pool_id=page_size_to_pool_id[group.kv_cache_spec.page_size_bytes],
-        )
-        for group in kv_cache_groups
-    ]
-
-
 def _get_kv_cache_groups_multi_pool_candidate(
     vllm_config: VllmConfig,
     kv_cache_spec: dict[str, KVCacheSpec],
 ) -> list[KVCacheGroupSpec] | None:
-    """Return a safe multi-pool grouping candidate, or None to fall back.
-
-    This path preserves each group's real page size by assigning groups to
-    pool-local block namespaces. It is intentionally narrow for the prototype:
-    no KV connector/offload, no override, and no MLA/Mamba.
-    """
-
     if vllm_config.scheduler_config.disable_hybrid_kv_cache_manager:
         return None
     if vllm_config.cache_config.num_gpu_blocks_override is not None:
@@ -1732,9 +1945,6 @@ def _get_kv_cache_groups_multi_pool_candidate(
     if not all(_is_multi_pool_attention_spec(spec) for spec in kv_cache_spec.values()):
         return None
     if len({spec.block_size for spec in kv_cache_spec.values()}) > 1:
-        # Keep existing block-size alignment behavior intact. Mixing page-size
-        # classes and block-size classes in one prototype path would also
-        # change block hash/admission semantics.
         return None
     if len({spec.page_size_bytes for spec in kv_cache_spec.values()}) <= 1:
         return None
@@ -1750,8 +1960,6 @@ def _get_kv_cache_groups_multi_pool_candidate(
             if spec.page_size_bytes == max_page_size:
                 legacy_kv_cache_spec[name] = spec
             else:
-                # _is_multi_pool_attention_spec() has already narrowed this
-                # path to regular AttentionSpec subclasses.
                 attention_spec = cast(AttentionSpec, spec)
                 legacy_kv_cache_spec[name] = replace(
                     attention_spec, page_size_padded=max_page_size
@@ -1761,20 +1969,12 @@ def _get_kv_cache_groups_multi_pool_candidate(
             getattr(spec, "page_size_padded", None) is not None
             for spec in legacy_kv_cache_spec.values()
         ):
-            # Native attention can often preserve the legacy single-pool
-            # behavior by increasing block_size for the smaller page. Keep
-            # that established path unless exact page-size unification would
-            # otherwise need padding or fail.
             return None
 
     candidate_groups = _get_kv_cache_groups_uniform_page_size(kv_cache_spec)
-
     padded_groups = _get_kv_cache_groups_uniform_page_size(legacy_kv_cache_spec)
     legacy_bytes = _max_memory_usage_bytes_from_groups(vllm_config, padded_groups)
-    multi_pool_groups = _assign_pool_ids_by_page_size(candidate_groups)
-    multi_pool_bytes = _max_memory_usage_bytes_multi_pool(
-        vllm_config, multi_pool_groups
-    )
+    multi_pool_bytes = _max_memory_usage_bytes_multi_pool(vllm_config, candidate_groups)
     if multi_pool_bytes <= 0:
         return None
     if (
@@ -1783,7 +1983,7 @@ def _get_kv_cache_groups_multi_pool_candidate(
     ):
         return None
 
-    return multi_pool_groups
+    return candidate_groups
 
 
 def _approximate_gcd(values: Sequence[int], *, lower_bound: int | None = None) -> int:
@@ -1946,43 +2146,11 @@ def _annotate_eagle_groups_deepseek_v4(
             break
 
 
-def get_kv_cache_groups(
+def _get_token_proportional_kv_cache_groups(
     vllm_config: VllmConfig, kv_cache_spec: dict[str, KVCacheSpec]
 ) -> list[KVCacheGroupSpec]:
-    """
-    Split the layers in the model into groups with the same KV cache spec.
-
-    Args:
-        vllm_config: The global VllmConfig
-        kv_cache_spec: The kv cache spec of each attention layer in the model
-
-    Returns:
-        The generated KVCacheGroups
-    """
     if vllm_config.scheduler_config.disable_hybrid_kv_cache_manager:
         unify_hybrid_kv_cache_specs(kv_cache_spec)
-
-    if is_kv_cache_type_attention_free(kv_cache_spec):
-        # This returns an empty list to allow for the KVCacheManager to handle
-        # attention free models.
-        return []
-
-    if multi_pool_groups := _get_kv_cache_groups_multi_pool_candidate(
-        vllm_config, kv_cache_spec
-    ):
-        return multi_pool_groups
-
-    if (
-        not vllm_config.scheduler_config.disable_hybrid_kv_cache_manager
-        and _is_tq_native_mixed_kv_cache_spec(kv_cache_spec)
-    ):
-        # TQ+native mixed layouts need to preserve the hybrid block manager
-        # semantics. Converting them into one UniformTypeKVCacheSpecs group
-        # loses the sliding-window recycling benefit and significantly reduces
-        # the reported KV token capacity. Pad page sizes only for this mixed
-        # layout and keep all-TQ / pure-native routing unchanged.
-        kv_cache_spec = unify_kv_cache_spec_page_size(kv_cache_spec)
-        return _get_kv_cache_groups_uniform_page_size(kv_cache_spec)
 
     if is_kv_cache_spec_uniform(kv_cache_spec):
         # KV cache of all layers are the same, which is true for
@@ -2032,6 +2200,80 @@ def get_kv_cache_groups(
     return groups
 
 
+def _get_request_constant_kv_cache_groups(
+    kv_cache_spec: dict[str, KVCacheSpec],
+) -> list[KVCacheGroupSpec]:
+    """Group request-constant specs without page-size unification."""
+    same_spec_layers: dict[KVCacheSpec, list[str]] = defaultdict(list)
+    for layer_name, layer_spec in kv_cache_spec.items():
+        same_spec_layers[layer_spec].append(layer_name)
+    return create_kv_cache_group_specs(kv_cache_spec, list(same_spec_layers.values()))
+
+
+def _get_memory_model_aware_kv_cache_groups(
+    vllm_config: VllmConfig, kv_cache_spec: dict[str, KVCacheSpec]
+) -> list[KVCacheGroupSpec]:
+    token_proportional_specs = {
+        layer_name: spec
+        for layer_name, spec in kv_cache_spec.items()
+        if spec.memory_model == MemoryModel.TOKEN_PROPORTIONAL
+    }
+    request_constant_specs = {
+        layer_name: spec
+        for layer_name, spec in kv_cache_spec.items()
+        if spec.memory_model == MemoryModel.REQUEST_CONSTANT
+    }
+
+    kv_cache_groups: list[KVCacheGroupSpec] = []
+    if token_proportional_specs:
+        kv_cache_groups.extend(
+            _get_token_proportional_kv_cache_groups(
+                vllm_config, token_proportional_specs
+            )
+        )
+    if request_constant_specs:
+        kv_cache_groups.extend(
+            _get_request_constant_kv_cache_groups(request_constant_specs)
+        )
+    return kv_cache_groups
+
+
+def get_kv_cache_groups(
+    vllm_config: VllmConfig, kv_cache_spec: dict[str, KVCacheSpec]
+) -> list[KVCacheGroupSpec]:
+    """
+    Split the layers in the model into groups with the same KV cache spec.
+
+    Args:
+        vllm_config: The global VllmConfig
+        kv_cache_spec: The kv cache spec of each attention layer in the model
+
+    Returns:
+        The generated KVCacheGroups
+    """
+    if is_kv_cache_type_attention_free(kv_cache_spec):
+        # This returns an empty list to allow for the KVCacheManager to handle
+        # attention free models.
+        return []
+
+    if _has_request_constant_specs(kv_cache_spec):
+        return _get_memory_model_aware_kv_cache_groups(vllm_config, kv_cache_spec)
+
+    if multi_pool_groups := _get_kv_cache_groups_multi_pool_candidate(
+        vllm_config, kv_cache_spec
+    ):
+        return multi_pool_groups
+
+    if (
+        not vllm_config.scheduler_config.disable_hybrid_kv_cache_manager
+        and _is_tq_native_mixed_kv_cache_spec(kv_cache_spec)
+    ):
+        kv_cache_spec = unify_kv_cache_spec_page_size(kv_cache_spec)
+        return _get_kv_cache_groups_uniform_page_size(kv_cache_spec)
+
+    return _get_token_proportional_kv_cache_groups(vllm_config, kv_cache_spec)
+
+
 def generate_scheduler_kv_cache_config(
     kv_cache_configs: list[KVCacheConfig],
 ) -> KVCacheConfig:
@@ -2043,7 +2285,21 @@ def generate_scheduler_kv_cache_config(
     )
     assert all(
         [
-            cfg.kv_cache_pools == kv_cache_configs[0].kv_cache_pools
+            cfg.group_to_pool_id == kv_cache_configs[0].group_to_pool_id
+            for cfg in kv_cache_configs
+        ]
+    )
+    assert all(
+        [
+            _get_pool_config_structure(cfg)
+            == _get_pool_config_structure(kv_cache_configs[0])
+            for cfg in kv_cache_configs
+        ]
+    )
+    assert all(
+        [
+            tuple(pool.num_blocks for pool in cfg.pool_configs)
+            == tuple(pool.num_blocks for pool in kv_cache_configs[0].pool_configs)
             for cfg in kv_cache_configs
         ]
     )
@@ -2057,7 +2313,21 @@ def generate_scheduler_kv_cache_config(
             group.kv_cache_spec = next(
                 iter(group.kv_cache_spec.kv_cache_specs.values())
             )
+    cfg.refresh_legacy_pool_metadata()
     return cfg
+
+
+def _get_pool_config_structure(kv_cache_config: KVCacheConfig):
+    return tuple(
+        (
+            pool.pool_id,
+            pool.memory_model,
+            pool.group_ids,
+            pool.accounting_page_size_bytes,
+            pool.physical_page_size_bytes,
+        )
+        for pool in kv_cache_config.pool_configs
+    )
 
 
 def _report_kv_cache_config(
@@ -2106,6 +2376,25 @@ def _max_memory_usage_bytes_from_groups(
     if not kv_cache_groups:
         return 0
 
+    if _has_request_constant_groups(kv_cache_groups):
+        request_constant_memory = _get_request_constant_reserved_bytes(
+            vllm_config, kv_cache_groups
+        )
+        token_proportional_groups = [
+            group
+            for group in kv_cache_groups
+            if group.kv_cache_spec.memory_model == MemoryModel.TOKEN_PROPORTIONAL
+        ]
+        token_proportional_memory = (
+            _max_memory_usage_bytes_from_groups(vllm_config, token_proportional_groups)
+            if token_proportional_groups
+            else 0
+        )
+        return request_constant_memory + token_proportional_memory
+
+    if _is_multi_pool_kv_cache_groups(kv_cache_groups):
+        return _max_memory_usage_bytes_multi_pool(vllm_config, kv_cache_groups)
+
     if len(kv_cache_groups) == 1 and isinstance(
         kv_cache_groups[0].kv_cache_spec, UniformTypeKVCacheSpecs
     ):
@@ -2140,9 +2429,6 @@ def _max_memory_usage_bytes_from_groups(
             )
             total_max_mem_usage_bytes += g_max_mem_usage_page_bytes
         return total_max_mem_usage_bytes
-
-    if _is_multi_pool_kv_cache_groups(kv_cache_groups):
-        return _max_memory_usage_bytes_multi_pool(vllm_config, kv_cache_groups)
 
     # General case: group_size pools, each shared by one layer per group
     # Memory = group_size * page_size * blocks_for_max_len
@@ -2294,10 +2580,84 @@ def _project_kv_cache_groups_to_worker(
                 worker_layer_names,
                 group_spec,
                 is_eagle_group=group.is_eagle_group and bool(worker_layer_names),
-                pool_id=group.pool_id,
             )
         )
     return projected_groups
+
+
+def _get_tensor_pool_id(
+    kv_cache_config: KVCacheConfig,
+    tensor: KVCacheTensor,
+) -> int:
+    layer_to_group_id = {
+        layer_name: group_id
+        for group_id, group in enumerate(kv_cache_config.kv_cache_groups)
+        for layer_name in group.layer_names
+    }
+    pool_ids = {
+        kv_cache_config.group_to_pool_id[layer_to_group_id[layer_name]]
+        for layer_name in tensor.shared_by
+    }
+    assert len(pool_ids) == 1
+    return pool_ids.pop()
+
+
+def _normalize_kv_cache_config_num_blocks(
+    kv_cache_configs: list[KVCacheConfig],
+) -> None:
+    if not kv_cache_configs:
+        return
+    if not kv_cache_configs[0].pool_configs:
+        min_num_blocks = min(
+            kv_cache_config.num_blocks for kv_cache_config in kv_cache_configs
+        )
+        for kv_cache_config in kv_cache_configs:
+            kv_cache_config.num_blocks = min_num_blocks
+            kv_cache_config.refresh_legacy_pool_metadata()
+        return
+
+    num_pools = len(kv_cache_configs[0].pool_configs)
+    assert all(len(config.pool_configs) == num_pools for config in kv_cache_configs)
+
+    normalized_pool_num_blocks: list[int] = []
+    for pool_id in range(num_pools):
+        memory_model = kv_cache_configs[0].pool_configs[pool_id].memory_model
+        assert all(
+            config.pool_configs[pool_id].memory_model == memory_model
+            for config in kv_cache_configs
+        )
+        pool_num_blocks = [
+            config.pool_configs[pool_id].num_blocks for config in kv_cache_configs
+        ]
+        if memory_model == MemoryModel.TOKEN_PROPORTIONAL:
+            normalized_pool_num_blocks.append(min(pool_num_blocks))
+        else:
+            assert len(set(pool_num_blocks)) == 1
+            normalized_pool_num_blocks.append(pool_num_blocks[0])
+
+    for kv_cache_config in kv_cache_configs:
+        old_pool_num_blocks = tuple(
+            pool.num_blocks for pool in kv_cache_config.pool_configs
+        )
+        kv_cache_config.pool_configs = tuple(
+            replace(pool, num_blocks=normalized_pool_num_blocks[pool.pool_id])
+            for pool in kv_cache_config.pool_configs
+        )
+        kv_cache_config.num_blocks = _get_legacy_num_blocks_from_pool_configs(
+            kv_cache_config.pool_configs
+        )
+
+        for tensor in kv_cache_config.kv_cache_tensors:
+            pool_id = _get_tensor_pool_id(kv_cache_config, tensor)
+            old_num_blocks = old_pool_num_blocks[pool_id]
+            new_num_blocks = normalized_pool_num_blocks[pool_id]
+            assert old_num_blocks > 0, (
+                "KV cache pool num_blocks includes the null block and must be positive."
+            )
+            if old_num_blocks == new_num_blocks:
+                continue
+            assert tensor.size % old_num_blocks == 0
+            tensor.size = tensor.size // old_num_blocks * new_num_blocks
 
 
 def get_kv_cache_configs(
@@ -2375,13 +2735,29 @@ def get_kv_cache_configs(
             if not groups:
                 adjusted_memory.append(avail_mem)
                 continue
-            bytes_per_block = _pool_bytes_per_block(groups)
+            if _has_request_constant_groups(groups):
+                token_groups = [
+                    group
+                    for group in groups
+                    if group.kv_cache_spec.memory_model
+                    == MemoryModel.TOKEN_PROPORTIONAL
+                ]
+                request_constant_bytes = _get_request_constant_reserved_bytes(
+                    vllm_config, groups
+                )
+                bytes_per_block = (
+                    _pool_bytes_per_block(token_groups) if token_groups else 0
+                )
+            else:
+                request_constant_bytes = 0
+                bytes_per_block = _pool_bytes_per_block(groups)
+            profiled_blocks = avail_mem // bytes_per_block if bytes_per_block else 0
             logger.info(
                 "Overriding num_gpu_blocks=%d with num_gpu_blocks_override=%d",
-                avail_mem // bytes_per_block,
+                profiled_blocks,
                 override,
             )
-            adjusted_memory.append(override * bytes_per_block)
+            adjusted_memory.append(request_constant_bytes + override * bytes_per_block)
         available_memory = adjusted_memory
 
     if vllm_config.model_config.original_max_model_len == -1:
@@ -2413,63 +2789,13 @@ def get_kv_cache_configs(
             )
         )
 
-    if any(kv_cache_config.is_multi_pool for kv_cache_config in kv_cache_configs):
-        assert all(
-            kv_cache_config.kv_cache_pools is not None
-            for kv_cache_config in kv_cache_configs
-        )
-        pool_ids = {
-            pool.pool_id
-            for kv_cache_config in kv_cache_configs
-            for pool in kv_cache_config.kv_cache_pools or []
-        }
-        min_num_blocks_by_pool = {
-            pool_id: min(
-                kv_cache_config.get_pool_num_blocks(pool_id)
-                for kv_cache_config in kv_cache_configs
-            )
-            for pool_id in pool_ids
-        }
-        for kv_cache_config in kv_cache_configs:
-            assert kv_cache_config.kv_cache_pools is not None
-            old_num_blocks_by_pool = {
-                pool.pool_id: pool.num_blocks for pool in kv_cache_config.kv_cache_pools
-            }
-            kv_cache_config.kv_cache_pools = [
-                replace(
-                    pool,
-                    num_blocks=min_num_blocks_by_pool[pool.pool_id],
-                )
-                for pool in kv_cache_config.kv_cache_pools
-            ]
-            kv_cache_config.num_blocks = min(min_num_blocks_by_pool.values())
-
-            for tensor in kv_cache_config.kv_cache_tensors:
-                num_blocks_old = old_num_blocks_by_pool[tensor.pool_id]
-                num_blocks_new = min_num_blocks_by_pool[tensor.pool_id]
-                assert tensor.size % num_blocks_old == 0
-                tensor.size = tensor.size // num_blocks_old * num_blocks_new
-
-            if len(kv_cache_config.kv_cache_groups) > 0:
-                _report_kv_cache_config(vllm_config, kv_cache_config)
-    else:
-        # Change the num_blocks of each rank to the smallest among all ranks.
-        # We also need to shrink the tensor size proportionally to avoid
-        # allocating unused memory.
-        min_num_blocks = min(
-            kv_cache_config.num_blocks for kv_cache_config in kv_cache_configs
-        )
-        for kv_cache_config in kv_cache_configs:
-            num_blocks_old = kv_cache_config.num_blocks
-            kv_cache_config.num_blocks = min_num_blocks
-
-            # Shrink tensor size proportionally
-            for tensor in kv_cache_config.kv_cache_tensors:
-                assert tensor.size % num_blocks_old == 0
-                tensor.size = tensor.size // num_blocks_old * min_num_blocks
-
-            if len(kv_cache_config.kv_cache_groups) > 0:
-                _report_kv_cache_config(vllm_config, kv_cache_config)
+    # Change token-proportional num_blocks of each rank to the smallest among
+    # all ranks. Request-constant pool sizes are deterministic from
+    # max_num_seqs and are asserted equal rather than normalized.
+    _normalize_kv_cache_config_num_blocks(kv_cache_configs)
+    for kv_cache_config in kv_cache_configs:
+        if len(kv_cache_config.kv_cache_groups) > 0:
+            _report_kv_cache_config(vllm_config, kv_cache_config)
 
     return kv_cache_configs
 

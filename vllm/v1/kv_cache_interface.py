@@ -91,6 +91,13 @@ class KVCacheSpecKind(str, Enum):
     UNKNOWN = "unknown"
 
 
+class MemoryModel(Enum):
+    """How a KV cache spec's memory scales with request properties."""
+
+    TOKEN_PROPORTIONAL = "token_proportional"
+    REQUEST_CONSTANT = "request_constant"
+
+
 @dataclass(frozen=True)
 class KVCacheSpec:
     """
@@ -113,6 +120,34 @@ class KVCacheSpec:
     @property
     def storage_block_size(self) -> int:
         return self.block_size
+
+    @property
+    def memory_model(self) -> MemoryModel:
+        """How memory usage scales for this KV cache spec."""
+        return MemoryModel.TOKEN_PROPORTIONAL
+
+    @property
+    def blocks_per_request(self) -> int:
+        """Maximum compact-pool blocks held by one request.
+
+        This is only meaningful for ``REQUEST_CONSTANT`` specs.
+        """
+        return 1
+
+    @property
+    def accounting_page_size_bytes(self) -> int:
+        """Bytes used for allocator accounting."""
+        return self.page_size_bytes
+
+    @property
+    def physical_page_size_bytes(self) -> int:
+        """Bytes the backing cache tensor physically stores per page."""
+        return self.page_size_bytes
+
+    @property
+    def requires_block_zeroing_on_alloc(self) -> bool:
+        """Whether reused blocks must be zeroed before re-allocation."""
+        return True
 
     def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
         """
@@ -324,6 +359,10 @@ class TQFullAttentionSpec(FullAttentionSpec):
             return self.block_size * self.num_kv_heads * self.tq_slot_size
         return super().real_page_size_bytes
 
+    @property
+    def physical_page_size_bytes(self) -> int:
+        return self.real_page_size_bytes
+
     @classmethod
     def merge(cls, specs: list[Self]) -> Self:
         assert all(isinstance(s, TQFullAttentionSpec) for s in specs), (
@@ -509,6 +548,10 @@ class TQSlidingWindowSpec(SlidingWindowSpec):
             return self.block_size * self.num_kv_heads * self.tq_slot_size
         return super().real_page_size_bytes
 
+    @property
+    def physical_page_size_bytes(self) -> int:
+        return self.real_page_size_bytes
+
     @classmethod
     def merge(cls, specs: list[Self]) -> Self:
         assert all(isinstance(s, TQSlidingWindowSpec) for s in specs), (
@@ -598,22 +641,50 @@ class MambaSpec(KVCacheSpec):
 
     @property
     def page_size_bytes(self) -> int:
-        page_size = sum(
-            prod(shape) * get_dtype_size(dtype)
-            for (shape, dtype) in zip(self.shapes, self.dtypes)
-        )
+        page_size = self.physical_page_size_bytes
         if self.page_size_padded is not None:
             assert self.page_size_padded >= page_size
             return self.page_size_padded
         return page_size
 
+    @property
+    def physical_page_size_bytes(self) -> int:
+        return sum(
+            prod(shape) * get_dtype_size(dtype)
+            for (shape, dtype) in zip(self.shapes, self.dtypes)
+        )
+
+    @property
+    def memory_model(self) -> MemoryModel:
+        # "all" mode preserves the legacy token-proportional shared-pool path,
+        # including prefix-caching compatibility. Other modes store compact
+        # O(1)-per-request state.
+        if self.mamba_cache_mode == "all":
+            return MemoryModel.TOKEN_PROPORTIONAL
+        return MemoryModel.REQUEST_CONSTANT
+
+    @property
+    def blocks_per_request(self) -> int:
+        # "align" may transiently hold previous + current state blocks during a
+        # state-block transition. "none" holds exactly one state block.
+        # Speculative decoding adds one compact slot per speculative block.
+        if self.mamba_cache_mode == "align":
+            return 2 + self.num_speculative_blocks
+        return 1 + self.num_speculative_blocks
+
+    @property
+    def requires_block_zeroing_on_alloc(self) -> bool:
+        # The current KVBlockZeroer skips Mamba tensors in all modes. Mamba
+        # state isolation is handled by the kernel/state-copy path instead.
+        return False
+
     def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
-        if vllm_config.cache_config.mamba_cache_mode == "all":
+        if self.mamba_cache_mode == "all":
             max_model_len = vllm_config.model_config.max_model_len
             return (
                 cdiv(max_model_len, self.block_size) + self.num_speculative_blocks
             ) * self.page_size_bytes
-        elif vllm_config.cache_config.mamba_cache_mode == "align":
+        elif self.mamba_cache_mode == "align":
             return self.page_size_bytes * (2 + self.num_speculative_blocks)
         else:
             return self.page_size_bytes * (1 + self.num_speculative_blocks)
@@ -705,6 +776,12 @@ class UniformTypeKVCacheSpecs(KVCacheSpec):
     @property
     def page_size_bytes(self) -> int:
         return sum(spec.page_size_bytes for spec in self.kv_cache_specs.values())
+
+    @property
+    def physical_page_size_bytes(self) -> int:
+        return sum(
+            spec.physical_page_size_bytes for spec in self.kv_cache_specs.values()
+        )
 
     def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
         max_num_pages = max(
@@ -852,7 +929,6 @@ class KVCacheTensor:
 
     size: int  # size of the KV cache tensor in bytes
     shared_by: list[str]  # layer names that share the same KV cache tensor
-    pool_id: int = 0  # KV block pool backing this tensor
 
 
 @dataclass
@@ -868,23 +944,27 @@ class KVCacheGroupSpec:
     kv_cache_spec: KVCacheSpec
     # Whether this group contains EAGLE/MTP draft attention layers.
     is_eagle_group: bool = False
-    # The KV block pool used by this group.
-    pool_id: int = 0
 
 
-@dataclass
-class KVCachePoolSpec:
-    """
-    Describes one logical KV block pool.
+@dataclass(frozen=True)
+class KVCachePoolConfig:
+    """Metadata for one KV cache block-pool namespace.
 
-    The legacy single-pool path is represented by ``kv_cache_pools=None`` on
-    :class:`KVCacheConfig`; when present, each pool has its own block ID
-    namespace and physical tensors.
+    ``num_blocks`` includes the reserved null sentinel block. Therefore the
+    number of allocatable blocks in the pool is ``num_blocks - 1``.
     """
 
     pool_id: int
+    memory_model: MemoryModel
+    group_ids: tuple[int, ...]
     num_blocks: int
-    page_size_bytes: int
+    accounting_page_size_bytes: int
+    physical_page_size_bytes: int
+
+    @property
+    def page_size_bytes(self) -> int:
+        # Legacy compatibility for the older multi-pool tests/call sites.
+        return self.accounting_page_size_bytes
 
 
 @dataclass
@@ -905,24 +985,138 @@ class KVCacheConfig:
     For models with multiple types of attention, there will be multiple groups,
     see `_get_kv_cache_config_uniform_page_size` for more details.
     """
-    kv_cache_pools: list[KVCachePoolSpec] | None = None
-    """
-    Optional multi-pool layout. When omitted, all groups use the legacy single
-    block pool with ``num_blocks`` blocks.
-    """
+    pool_configs: tuple[KVCachePoolConfig, ...] = ()
+    """Metadata for KV cache block-pool namespaces."""
+    group_to_pool_id: tuple[int, ...] = ()
+    """Mapping from KV cache group id to pool id."""
+
+    def __post_init__(self) -> None:
+        if len(self.kv_cache_groups) == 0:
+            assert self.pool_configs == ()
+            assert self.group_to_pool_id == ()
+            return
+
+        if not self.pool_configs and not self.group_to_pool_id:
+            pool_configs, group_to_pool_id = self._make_legacy_pool_metadata()
+            self.pool_configs = pool_configs
+            self.group_to_pool_id = group_to_pool_id
+            return
+
+        assert len(self.group_to_pool_id) == len(self.kv_cache_groups)
+        pool_ids = {pool.pool_id for pool in self.pool_configs}
+        assert pool_ids == set(range(len(self.pool_configs)))
+        assert set(self.group_to_pool_id).issubset(pool_ids)
+
+    def _make_legacy_pool_metadata(
+        self,
+        num_blocks: int | None = None,
+    ) -> tuple[tuple[KVCachePoolConfig, ...], tuple[int, ...]]:
+        """Derive pool metadata for legacy direct ``KVCacheConfig`` callers.
+
+        Production multi-pool configs should pass explicit pool metadata. This
+        fallback keeps the old single shared block-pool behavior. It cannot
+        compute request-constant compact capacity because it has no scheduler
+        context.
+        """
+        specs = [group.kv_cache_spec for group in self.kv_cache_groups]
+        accounting_page_size = max(spec.accounting_page_size_bytes for spec in specs)
+        physical_page_sizes = {spec.physical_page_size_bytes for spec in specs}
+        if len(physical_page_sizes) == 1:
+            pool_physical_page_size_bytes = physical_page_sizes.pop()
+        else:
+            pool_physical_page_size_bytes = accounting_page_size
+
+        pool_config = KVCachePoolConfig(
+            pool_id=0,
+            memory_model=MemoryModel.TOKEN_PROPORTIONAL,
+            group_ids=tuple(range(len(self.kv_cache_groups))),
+            num_blocks=self.num_blocks if num_blocks is None else num_blocks,
+            accounting_page_size_bytes=accounting_page_size,
+            physical_page_size_bytes=pool_physical_page_size_bytes,
+        )
+        return (pool_config,), tuple(0 for _ in self.kv_cache_groups)
+
+    def _legacy_num_blocks_pool_id(self) -> int | None:
+        """Return the pool represented by the legacy ``num_blocks`` field."""
+        if not self.pool_configs:
+            return None
+        for pool in self.pool_configs:
+            if pool.memory_model == MemoryModel.TOKEN_PROPORTIONAL:
+                return pool.pool_id
+        return self.pool_configs[0].pool_id
+
+    def _refresh_multi_pool_metadata(self) -> None:
+        """Refresh explicit pool metadata without collapsing it to one pool."""
+        assert self.pool_configs
+        assert len(self.group_to_pool_id) == len(self.kv_cache_groups)
+
+        group_ids_by_pool: dict[int, list[int]] = {
+            pool.pool_id: [] for pool in self.pool_configs
+        }
+        for group_id, pool_id in enumerate(self.group_to_pool_id):
+            group_ids_by_pool[pool_id].append(group_id)
+
+        legacy_pool_id = self._legacy_num_blocks_pool_id()
+        refreshed_pool_configs: list[KVCachePoolConfig] = []
+        for pool in self.pool_configs:
+            group_ids = tuple(group_ids_by_pool[pool.pool_id])
+            assert group_ids
+            specs = [
+                self.kv_cache_groups[group_id].kv_cache_spec for group_id in group_ids
+            ]
+            memory_models = {spec.memory_model for spec in specs}
+            assert memory_models == {pool.memory_model}
+
+            accounting_page_sizes = {spec.accounting_page_size_bytes for spec in specs}
+            assert len(accounting_page_sizes) == 1
+            physical_page_sizes = {spec.physical_page_size_bytes for spec in specs}
+            if len(physical_page_sizes) == 1:
+                physical_page_size_bytes = physical_page_sizes.pop()
+            else:
+                physical_page_size_bytes = next(iter(accounting_page_sizes))
+
+            refreshed_pool_configs.append(
+                replace(
+                    pool,
+                    group_ids=group_ids,
+                    num_blocks=(
+                        self.num_blocks
+                        if pool.pool_id == legacy_pool_id
+                        else pool.num_blocks
+                    ),
+                    accounting_page_size_bytes=accounting_page_sizes.pop(),
+                    physical_page_size_bytes=physical_page_size_bytes,
+                )
+            )
+
+        self.pool_configs = tuple(refreshed_pool_configs)
+
+    def refresh_legacy_pool_metadata(self) -> None:
+        """Regenerate pool metadata after mutating config fields."""
+        if len(self.kv_cache_groups) == 0:
+            self.pool_configs = ()
+            self.group_to_pool_id = ()
+            return
+        if len(self.pool_configs) > 1 or any(
+            pool.memory_model == MemoryModel.REQUEST_CONSTANT
+            for pool in self.pool_configs
+        ):
+            self._refresh_multi_pool_metadata()
+            return
+        pool_configs, group_to_pool_id = self._make_legacy_pool_metadata()
+        self.pool_configs = pool_configs
+        self.group_to_pool_id = group_to_pool_id
 
     @property
     def is_multi_pool(self) -> bool:
-        return self.kv_cache_pools is not None and len(self.kv_cache_pools) > 1
+        return len(self.pool_configs) > 1
+
+    @property
+    def kv_cache_pools(self) -> tuple[KVCachePoolConfig, ...]:
+        return self.pool_configs
 
     def get_pool_num_blocks(self, pool_id: int) -> int:
-        if self.kv_cache_pools is None:
-            assert pool_id == 0
-            return self.num_blocks
-        for pool in self.kv_cache_pools:
-            if pool.pool_id == pool_id:
-                return pool.num_blocks
-        raise KeyError(f"Unknown KV cache pool id: {pool_id}")
+        return self.pool_configs[pool_id].num_blocks
 
     @property
     def has_mamba_layers(self) -> bool:
@@ -930,4 +1124,11 @@ class KVCacheConfig:
 
     @property
     def needs_kv_cache_zeroing(self) -> bool:
+        """Whether the GPU worker should initialize the attention KV zeroer.
+
+        Despite the broad name, this gate currently controls the attention-only
+        ``KVBlockZeroer`` in hybrid models. The zeroer skips Mamba tensors, and
+        ``SingleTypeKVCacheManager`` only records full-attention block IDs for
+        zeroing.
+        """
         return self.has_mamba_layers
