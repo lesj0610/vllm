@@ -162,6 +162,75 @@ def test_kernel_warmup_runs_runtime_dummy_for_hybrid_models(monkeypatch) -> None
     assert not hasattr(model_runner, "is_last_pp_rank")
 
 
+def test_kernel_warmup_skips_single_request_for_speculative_models(
+    monkeypatch,
+) -> None:
+    calls: list[str] = []
+
+    model = object()
+
+    monkeypatch.setattr(kernel_warmup.envs, "VLLM_USE_DEEP_GEMM", False)
+    monkeypatch.setattr(kernel_warmup, "has_flashinfer", lambda: False)
+    monkeypatch.setattr(
+        kernel_warmup,
+        "has_hybrid_gdn_mamba_mrope",
+        lambda model: True,
+    )
+    monkeypatch.setattr(
+        kernel_warmup,
+        "hybrid_gdn_mamba_mrope_warmup",
+        lambda *args, **kwargs: calls.append("hybrid"),
+    )
+
+    def fake_scheduler_warmup(model_runner, execute_model, sample_tokens) -> None:
+        assert model_runner.num_speculative_steps == 2
+        calls.append("scheduler")
+
+    monkeypatch.setattr(kernel_warmup, "warmup_kernels", fake_scheduler_warmup)
+    monkeypatch.setattr(
+        kernel_warmup,
+        "_warmup_single_request_decode_kernels",
+        lambda worker: calls.append("single"),
+    )
+    monkeypatch.setattr(
+        parallel_state,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_last_rank=True),
+    )
+
+    def fake_dummy_run(**kwargs) -> None:
+        calls.append("dummy")
+
+    model_runner = SimpleNamespace(
+        dtype=torch.bfloat16,
+        device=torch.device("cpu"),
+        _kv_block_zeroer=None,
+        _dummy_run=fake_dummy_run,
+        is_pooling_model=False,
+        attn_groups=[],
+        num_spec_tokens=2,
+    )
+    worker = SimpleNamespace(
+        get_model=lambda: model,
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=16, max_num_seqs=16),
+        vllm_config=SimpleNamespace(
+            kernel_config=SimpleNamespace(enable_flashinfer_autotune=False)
+        ),
+        model_runner=model_runner,
+        execute_model=object(),
+        sample_tokens=object(),
+        use_v2_model_runner=False,
+    )
+
+    kernel_warmup.kernel_warmup(worker)
+
+    assert calls == ["hybrid", "dummy", "scheduler"]
+    assert model_runner.num_spec_tokens == 2
+    assert not hasattr(model_runner, "num_speculative_steps")
+    assert not hasattr(model_runner, "kv_connector")
+    assert not hasattr(model_runner, "is_last_pp_rank")
+
+
 def test_kernel_warmup_skips_scheduler_warmup_for_v2_runner(monkeypatch) -> None:
     calls: list[str] = []
 

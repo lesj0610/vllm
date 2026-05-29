@@ -151,6 +151,13 @@ def _warmup_scheduler_output_kernels(worker: "Worker") -> None:
             del runner_attrs.num_speculative_steps
 
 
+def _uses_speculative_decode(worker: "Worker") -> bool:
+    runner: Any = worker.model_runner
+    num_spec_tokens = getattr(runner, "num_spec_tokens", 0) or 0
+    num_speculative_steps = getattr(runner, "num_speculative_steps", 0) or 0
+    return num_spec_tokens > 0 or num_speculative_steps > 0
+
+
 @torch.inference_mode()
 def _warmup_single_request_decode_kernels(worker: "Worker") -> None:
     """Warm up single-request scheduler variants used by real chat requests."""
@@ -329,14 +336,22 @@ def kernel_warmup(worker: "Worker"):
                     "First inference may JIT compile scheduler-specific variants.",
                     exc_info=True,
                 )
-            try:
-                _warmup_single_request_decode_kernels(worker)
-            except Exception:
-                logger.warning(
-                    "Hybrid GDN/Mamba/MRoPE single-request warmup failed. "
-                    "First single-request inference may JIT compile decode variants.",
-                    exc_info=True,
+            if _uses_speculative_decode(worker):
+                logger.debug(
+                    "Skipping hybrid single-request decode warmup for "
+                    "speculative decoding; scheduler-output warmup covers "
+                    "the spec-decode path."
                 )
+            else:
+                try:
+                    _warmup_single_request_decode_kernels(worker)
+                except Exception:
+                    logger.warning(
+                        "Hybrid GDN/Mamba/MRoPE single-request warmup failed. "
+                        "First single-request inference may JIT compile decode "
+                        "variants.",
+                        exc_info=True,
+                    )
 
     kv_block_zeroer = getattr(worker.model_runner, "_kv_block_zeroer", None)
     if kv_block_zeroer is not None:
