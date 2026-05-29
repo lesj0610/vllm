@@ -161,13 +161,7 @@ def warmup_kernels(
     # Disable KV connector for warmup run.
     model_runner.kv_connector.set_disabled(True)
     try:
-        # Warm the largest synthetic batch first, then the single-request path.
-        # Triton specializes enough on the request layout that a real first
-        # request with num_seqs=1 can otherwise still compile unified-attention
-        # kernels after the JIT monitor is enabled.
         _run_warmup_pass(num_reqs, pass_idx=0)
-        if num_reqs > 1:
-            _run_warmup_pass(1, pass_idx=1)
     finally:
         model_runner.kv_connector.set_disabled(False)
     torch.accelerator.synchronize()
