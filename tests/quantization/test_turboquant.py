@@ -269,7 +269,7 @@ class TestTurboQuantConfig:
                 value_mse=False,
             )
 
-    def test_backend_supports_mm_prefix(self):
+    def test_backend_import_supports_mm_prefix(self):
         pytest.importorskip("vllm.vllm_flash_attn", exc_type=ImportError)
 
         from vllm.v1.attention.backends.turboquant_attn import (
@@ -278,7 +278,7 @@ class TestTurboQuantConfig:
 
         assert TurboQuantAttentionBackend.supports_mm_prefix()
 
-    def test_decode_launcher_accepts_mm_prefix_range(self):
+    def test_decode_launcher_signature_accepts_mm_prefix_range(self):
         import inspect
 
         from vllm.v1.attention.ops.triton_turboquant_decode import (
