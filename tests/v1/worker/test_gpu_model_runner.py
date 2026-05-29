@@ -201,7 +201,7 @@ def _capture_v2_warmup_call(output: SchedulerOutput, calls: list[tuple]):
         calls.append(("empty", 0))
 
 
-def test_v2_warmup_also_runs_single_request_path(monkeypatch):
+def test_v2_warmup_runs_one_generic_batch(monkeypatch):
     monkeypatch.setattr(gpu_warmup.torch.accelerator, "synchronize", lambda: None)
 
     runner = _make_v2_warmup_runner_stub(max_num_seqs=2)
@@ -222,11 +222,8 @@ def test_v2_warmup_also_runs_single_request_path(monkeypatch):
         ("prefill", 2),
         ("decode", 2),
         ("cleanup", 2),
-        ("prefill", 1),
-        ("decode", 1),
-        ("cleanup", 1),
     ]
-    assert sample_calls == [2, None, 1, None]
+    assert sample_calls == [2, None]
     assert runner.kv_connector.calls == [True, False]
 
 
