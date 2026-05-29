@@ -1398,9 +1398,11 @@ class TestRotationMatrix:
         Pi = generate_rotation_matrix(dim, seed=42, device=DEVICE_TYPE)
         assert Pi.shape == (dim, dim)
         eye = Pi @ Pi.T
-        assert torch.allclose(eye, torch.eye(dim, device=DEVICE_TYPE), atol=1e-5), (
-            f"Pi not orthogonal for dim={dim}"
-        )
+        assert torch.allclose(
+            eye,
+            torch.eye(dim, device=DEVICE_TYPE, dtype=eye.dtype),
+            atol=1e-5,
+        ), f"Pi not orthogonal for dim={dim}"
 
     def test_rotation_matrix_deterministic(self):
         Pi1 = generate_rotation_matrix(128, seed=42)
@@ -1426,7 +1428,7 @@ class TestRotationMatrix:
 
 def _build_hadamard(d: int, device: str = "cpu") -> torch.Tensor:
     """Reproduce the serving-path Hadamard construction."""
-    H = torch.tensor([[1.0]])
+    H = torch.tensor([[1.0]], dtype=torch.float32)
     while H.shape[0] < d:
         H = torch.cat([torch.cat([H, H], 1), torch.cat([H, -H], 1)], 0)
     return (H / math.sqrt(d)).to(torch.device(device))
@@ -1441,9 +1443,11 @@ class TestHadamardRotation:
         """H must be orthonormal: H @ H^T = I."""
         H = _build_hadamard(dim, DEVICE_TYPE)
         eye = H @ H.T
-        assert torch.allclose(eye, torch.eye(dim, device=DEVICE_TYPE), atol=1e-5), (
-            f"Hadamard not orthonormal for dim={dim}"
-        )
+        assert torch.allclose(
+            eye,
+            torch.eye(dim, device=DEVICE_TYPE, dtype=eye.dtype),
+            atol=1e-5,
+        ), f"Hadamard not orthonormal for dim={dim}"
 
     @pytest.mark.parametrize("dim", [64, 128, 256])
     def test_hadamard_symmetric(self, dim):
