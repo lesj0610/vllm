@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from dataclasses import dataclass
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -8,6 +9,7 @@ import numpy as np
 import pytest
 import torch
 
+import vllm.v1.worker.gpu.warmup as gpu_warmup
 import vllm.v1.worker.gpu_model_runner as gpu_model_runner_module
 from vllm.config import (
     AttentionConfig,
@@ -24,7 +26,9 @@ from vllm.distributed.parallel_state import (
 )
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.mamba.mamba_mixer2 import MambaMixer2
+from vllm.model_executor.models import ModelRegistry
 from vllm.platforms import current_platform
+from vllm.platforms.interface import Platform
 from vllm.sampling_params import SamplingParams
 from vllm.utils.mem_constants import GiB_bytes
 from vllm.utils.system_utils import update_environment_variables
@@ -34,21 +38,366 @@ from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.core.kv_cache_utils import estimate_max_model_len, get_kv_cache_configs
 from vllm.v1.core.sched.output import CachedRequestData, NewRequestData, SchedulerOutput
 from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
     KVCacheTensor,
+    MambaSpec,
+    MemoryModel,
+    UniformTypeKVCacheSpecs,
 )
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.worker.gpu_input_batch import InputBatch
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
-from vllm.v1.worker.utils import select_common_block_size
+from vllm.v1.worker.kv_connector_model_runner_mixin import (
+    KVConnectorModelRunnerMixin,
+)
+from vllm.v1.worker.utils import AttentionGroup, select_common_block_size
 
 BLOCK_SIZE = 16
 NUM_BLOCKS = 10
 DEVICE_TYPE = current_platform.device_type
+
+
+class _FakeV1WarmupBlockTable:
+    def __init__(self):
+        self.block_tables = [object(), object()]
+        self.calls = []
+
+    def add_row(self, block_ids, row_idx):
+        self.calls.append(("add_row", block_ids, row_idx))
+
+    def commit_block_table(self, num_reqs):
+        self.calls.append(("commit_block_table", num_reqs))
+
+    def compute_slot_mapping(self, num_reqs, query_start_loc, positions):
+        self.calls.append(
+            (
+                "compute_slot_mapping",
+                num_reqs,
+                query_start_loc.detach().cpu().tolist(),
+                positions.detach().cpu().tolist(),
+                query_start_loc.dtype,
+                positions.dtype,
+            )
+        )
+
+    def clear_row(self, row_idx):
+        self.calls.append(("clear_row", row_idx))
+
+
+def _make_v1_slot_mapping_warmup_runner_stub(block_table=None, num_blocks=12):
+    if block_table is None:
+        block_table = _FakeV1WarmupBlockTable()
+    return SimpleNamespace(
+        device=torch.device("cpu"),
+        kv_cache_config=SimpleNamespace(num_blocks=num_blocks),
+        input_batch=SimpleNamespace(block_table=block_table),
+    )
+
+
+def test_v1_warmup_runs_slot_mapping_and_clears_temporary_row(monkeypatch):
+    monkeypatch.setattr(gpu_warmup.torch.accelerator, "synchronize", lambda: None)
+
+    block_table = _FakeV1WarmupBlockTable()
+    runner = _make_v1_slot_mapping_warmup_runner_stub(block_table)
+
+    gpu_warmup.warmup_v1_slot_mapping_kernel(runner)
+
+    assert block_table.calls == [
+        ("add_row", ([1], [1]), 0),
+        ("commit_block_table", 1),
+        (
+            "compute_slot_mapping",
+            1,
+            [0, 1],
+            [0],
+            torch.int32,
+            torch.int64,
+        ),
+        ("clear_row", 0),
+        ("commit_block_table", 1),
+    ]
+
+
+def test_v1_warmup_clears_row_on_slot_mapping_error(monkeypatch):
+    monkeypatch.setattr(gpu_warmup.torch.accelerator, "synchronize", lambda: None)
+
+    block_table = _FakeV1WarmupBlockTable()
+
+    def raise_on_compute(*args):
+        block_table.calls.append(("compute_slot_mapping_error",))
+        raise RuntimeError("test error")
+
+    monkeypatch.setattr(block_table, "compute_slot_mapping", raise_on_compute)
+    runner = _make_v1_slot_mapping_warmup_runner_stub(block_table)
+
+    with pytest.raises(RuntimeError, match="test error"):
+        gpu_warmup.warmup_v1_slot_mapping_kernel(runner)
+
+    assert block_table.calls == [
+        ("add_row", ([1], [1]), 0),
+        ("commit_block_table", 1),
+        ("compute_slot_mapping_error",),
+        ("clear_row", 0),
+        ("commit_block_table", 1),
+    ]
+
+
+def test_v1_warmup_skips_without_usable_kv_block(monkeypatch):
+    monkeypatch.setattr(gpu_warmup.torch.accelerator, "synchronize", lambda: None)
+
+    block_table = _FakeV1WarmupBlockTable()
+    runner = _make_v1_slot_mapping_warmup_runner_stub(
+        block_table,
+        num_blocks=1,
+    )
+
+    gpu_warmup.warmup_v1_slot_mapping_kernel(runner)
+
+    assert block_table.calls == []
+
+
+class _FakeV2WarmupKVConnector:
+    def __init__(self):
+        self.calls = []
+
+    def set_disabled(self, disabled: bool):
+        self.calls.append(disabled)
+
+
+def _make_v2_warmup_runner_stub(max_num_seqs=2, max_num_batched_tokens=32):
+    kv_connector = _FakeV2WarmupKVConnector()
+    return SimpleNamespace(
+        num_speculative_steps=0,
+        kv_cache_config=SimpleNamespace(
+            num_blocks=16,
+            kv_cache_groups=[
+                SimpleNamespace(kv_cache_spec=SimpleNamespace(block_size=BLOCK_SIZE))
+            ],
+        ),
+        scheduler_config=SimpleNamespace(
+            max_num_seqs=max_num_seqs,
+            max_num_batched_tokens=max_num_batched_tokens,
+        ),
+        is_pooling_model=False,
+        is_last_pp_rank=True,
+        model_config=SimpleNamespace(get_vocab_size=lambda: 64),
+        kv_connector=kv_connector,
+    )
+
+
+def _capture_v2_warmup_call(output: SchedulerOutput, calls: list[tuple]):
+    if output.scheduled_new_reqs:
+        calls.append(("prefill", len(output.scheduled_new_reqs)))
+    elif output.scheduled_cached_reqs.req_ids:
+        calls.append(("decode", len(output.scheduled_cached_reqs.req_ids)))
+    elif output.finished_req_ids:
+        calls.append(("cleanup", len(output.finished_req_ids)))
+    else:
+        calls.append(("empty", 0))
+
+
+def test_v2_warmup_runs_one_generic_batch(monkeypatch):
+    monkeypatch.setattr(gpu_warmup.torch.accelerator, "synchronize", lambda: None)
+
+    runner = _make_v2_warmup_runner_stub(max_num_seqs=2)
+    execute_calls: list[tuple[str, int]] = []
+    sample_calls: list[int | None] = []
+
+    gpu_warmup.warmup_kernels(
+        runner,
+        lambda output: _capture_v2_warmup_call(output, execute_calls),
+        lambda grammar_output: sample_calls.append(
+            None
+            if grammar_output is None
+            else len(grammar_output.structured_output_request_ids)
+        ),
+    )
+
+    assert execute_calls == [
+        ("prefill", 2),
+        ("decode", 2),
+        ("cleanup", 2),
+    ]
+    assert sample_calls == [2, None]
+    assert runner.kv_connector.calls == [True, False]
+
+
+def test_v2_warmup_does_not_duplicate_single_request_path(monkeypatch):
+    monkeypatch.setattr(gpu_warmup.torch.accelerator, "synchronize", lambda: None)
+
+    runner = _make_v2_warmup_runner_stub(max_num_seqs=1)
+    execute_calls: list[tuple[str, int]] = []
+
+    gpu_warmup.warmup_kernels(
+        runner,
+        lambda output: _capture_v2_warmup_call(output, execute_calls),
+        lambda grammar_output: None,
+    )
+
+    assert execute_calls == [
+        ("prefill", 1),
+        ("decode", 1),
+        ("cleanup", 1),
+    ]
+    assert runner.kv_connector.calls == [True, False]
+
+
+def test_v2_warmup_restores_kv_connector_on_error(monkeypatch):
+    monkeypatch.setattr(gpu_warmup.torch.accelerator, "synchronize", lambda: None)
+
+    runner = _make_v2_warmup_runner_stub(max_num_seqs=2)
+
+    def raise_on_execute_model(output):
+        raise RuntimeError("warmup error")
+
+    with pytest.raises(RuntimeError, match="warmup error"):
+        gpu_warmup.warmup_kernels(
+            runner,
+            raise_on_execute_model,
+            lambda grammar_output: None,
+        )
+
+    assert runner.kv_connector.calls == [True, False]
+
+
+@dataclass(frozen=True)
+class _RequestConstantMambaSpec(MambaSpec):
+    """Test-only Mamba-like request-constant spec for worker reshape paths."""
+
+    @property
+    def memory_model(self) -> MemoryModel:
+        return MemoryModel.REQUEST_CONSTANT
+
+
+@dataclass(frozen=True, kw_only=True)
+class _RequestConstantFullAttentionSpec(FullAttentionSpec):
+    """Test-only invalid attention spec used to verify fail-closed guards."""
+
+    @property
+    def memory_model(self) -> MemoryModel:
+        return MemoryModel.REQUEST_CONSTANT
+
+
+class _TestAttentionBackend:
+    @staticmethod
+    def get_kv_cache_shape(
+        num_blocks: int,
+        block_size: int,
+        num_kv_heads: int,
+        head_size: int,
+        cache_dtype_str: str = "auto",
+    ) -> tuple[int, int, int, int, int]:
+        return (2, num_blocks, block_size, num_kv_heads, head_size)
+
+    @staticmethod
+    def get_kv_cache_stride_order():
+        return tuple(range(5))
+
+    @classmethod
+    def get_kv_cache_block_dim(
+        cls,
+        block_size: int,
+        num_kv_heads: int,
+        head_size: int,
+        cache_dtype_str: str = "auto",
+    ) -> int:
+        shape = cls.get_kv_cache_shape(
+            1234567,
+            block_size,
+            num_kv_heads,
+            head_size,
+            cache_dtype_str=cache_dtype_str,
+        )
+        return shape.index(1234567)
+
+
+class _HybridBlockSizeTestBackend:
+    @staticmethod
+    def get_supported_kernel_block_sizes() -> list[int]:
+        return [16, 32, 64]
+
+    @staticmethod
+    def get_name() -> str:
+        return "HYBRID_BLOCK_SIZE_TEST"
+
+
+class _HybridBlockSizeTestModel:
+    @staticmethod
+    def get_mamba_state_shape_from_config(vllm_config):
+        return ((130,),)
+
+    @staticmethod
+    def get_mamba_state_dtype_from_config(vllm_config):
+        return (torch.float32,)
+
+
+class _HybridBlockSizeTestModelConfig:
+    dtype = torch.float16
+    use_mla = False
+    architecture = "HybridBlockSizeTestModel"
+
+    def get_num_kv_heads(self, parallel_config):
+        return 1
+
+    def get_head_size(self):
+        return 1
+
+    def get_mamba_chunk_size(self):
+        return 16
+
+
+def _make_hybrid_block_size_test_config(
+    *,
+    mamba_cache_mode: str,
+    block_size: int = 16,
+    mamba_page_size_padded: int | None = None,
+):
+    cache_config = CacheConfig(
+        block_size=block_size,
+        cache_dtype="auto",
+        mamba_cache_mode=mamba_cache_mode,
+    )
+    cache_config.mamba_page_size_padded = mamba_page_size_padded
+    return SimpleNamespace(
+        cache_config=cache_config,
+        model_config=_HybridBlockSizeTestModelConfig(),
+        parallel_config=ParallelConfig(),
+    )
+
+
+def _patch_hybrid_block_size_test_model(monkeypatch):
+    def resolve_model_cls(*args, **kwargs):
+        return _HybridBlockSizeTestModel, None
+
+    monkeypatch.setattr(ModelRegistry, "resolve_model_cls", resolve_model_cls)
+
+
+def _reshape_kv_cache_tensor_for_test(
+    kv_cache_spec,
+    raw_tensor: torch.Tensor,
+    layer_name: str = "layer.0",
+):
+    group = AttentionGroup(
+        _TestAttentionBackend,
+        [layer_name],
+        kv_cache_spec,
+        0,
+    )
+    runner_stub = SimpleNamespace(
+        runner_only_attn_layers=set(),
+        cache_config=SimpleNamespace(cache_dtype="auto"),
+        _kv_cache_spec_attn_group_iterator=lambda: iter([group]),
+    )
+    return GPUModelRunner._reshape_kv_cache_tensors(
+        runner_stub,
+        {layer_name: raw_tensor},
+        [kv_cache_spec.block_size],
+    )
 
 
 def initialize_kv_cache(runner: GPUModelRunner):
@@ -103,6 +452,7 @@ def get_vllm_config():
         block_size=BLOCK_SIZE,
         gpu_memory_utilization=0.9,
         cache_dtype="auto",
+        mamba_cache_mode="all",
     )
     parallel_config = ParallelConfig()
     vllm_config = VllmConfig(
@@ -217,6 +567,34 @@ def _is_req_state_block_table_match(model_runner, req_id: str) -> bool:
     return (
         block_table.block_table.np[req_index, :num_blocks] == req_state.block_ids[0]
     ).all()
+
+
+def test_update_states_zeroes_multi_pool_blocks(model_runner, monkeypatch):
+    scheduler_output = SchedulerOutput.make_empty()
+    scheduler_output.new_block_ids_to_zero_by_pool = {0: [1], 1: [2]}
+    monkeypatch.setattr(
+        gpu_model_runner_module,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_last_rank=True),
+    )
+
+    calls = []
+    monkeypatch.setattr(
+        model_runner,
+        "_zero_block_ids_by_pool",
+        lambda block_ids_by_pool: calls.append(block_ids_by_pool),
+    )
+    monkeypatch.setattr(
+        model_runner,
+        "_zero_block_ids",
+        lambda block_ids: pytest.fail(
+            f"flat zeroing path should not be used: {block_ids}"
+        ),
+    )
+
+    model_runner._update_states(scheduler_output)
+
+    assert calls == [{0: [1], 1: [2]}]
 
 
 def _make_mock_backend_for_kernel_block_size(
@@ -1002,6 +1380,66 @@ def test_init_kv_cache_with_kv_sharing_valid(default_vllm_config):
     assert kv_cache_config_after_init.kv_cache_groups[0].layer_names[1] == layer_1
 
 
+def test_initialize_attn_backend_kv_sharing_with_uniform_specs(default_vllm_config):
+    torch.set_default_dtype(torch.float16)
+    layer_0 = "model.layers.0.self_attn.attn"
+    layer_1 = "model.layers.1.self_attn.attn"
+    vllm_config = get_vllm_config()
+    with set_current_vllm_config(vllm_config):
+        fwd_context = {
+            layer_0: Attention(
+                num_heads=8,
+                head_size=64,
+                scale=1.0,
+                prefix=layer_0,
+            ),
+            layer_1: Attention(
+                num_heads=8,
+                head_size=64,
+                scale=1.0,
+                prefix=layer_1,
+                kv_sharing_target_layer_name=layer_0,
+            ),
+        }
+        assert fwd_context is not None
+
+    runner = GPUModelRunner(vllm_config, DEVICE_TYPE)
+    attn_spec = FullAttentionSpec(
+        block_size=BLOCK_SIZE,
+        num_kv_heads=runner.model_config.get_num_kv_heads(runner.parallel_config),
+        head_size=runner.model_config.get_head_size(),
+        dtype=runner.kv_cache_dtype,
+    )
+    uniform_spec = UniformTypeKVCacheSpecs(
+        block_size=BLOCK_SIZE,
+        kv_cache_specs={layer_0: attn_spec},
+    )
+    kv_cache_config = KVCacheConfig(
+        num_blocks=NUM_BLOCKS,
+        kv_cache_tensors=[
+            KVCacheTensor(
+                size=attn_spec.page_size_bytes * NUM_BLOCKS,
+                shared_by=[layer_0],
+            ),
+        ],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                layer_names=[layer_0, layer_1],
+                kv_cache_spec=uniform_spec,
+            )
+        ],
+    )
+    runner.shared_kv_cache_layers[layer_1] = layer_0
+    runner.kv_cache_config = kv_cache_config
+
+    runner.initialize_attn_backend(kv_cache_config)
+
+    attn_groups = list(runner._attn_group_iterator())
+    assert len(attn_groups) == 1
+    assert attn_groups[0].layer_names == [layer_0, layer_1]
+    assert attn_groups[0].kv_cache_spec == attn_spec
+
+
 @pytest.mark.skipif(
     current_platform.is_rocm(),
     reason="Attention backend FLASHINFER is not supported on ROCm.",
@@ -1195,6 +1633,206 @@ def test_hybrid_attention_mamba_tensor_shapes():
             expected_ssm = ssm_blocks_constant[i]
             assert torch.equal(actual_conv, expected_conv)
             assert torch.equal(actual_ssm, expected_ssm)
+
+
+def test_update_hybrid_attention_mamba_layout_with_num_block_2_rewrites_stride():
+    ambiguous_cache = torch.empty((2, 2, BLOCK_SIZE, 1, 8), dtype=torch.float16)
+    """Ambiguous, because both dims[0=kv_dim] and dims[1=num_blocks] == 2"""
+    hidden_size = ambiguous_cache.shape[2:].numel()
+    assert ambiguous_cache.stride()[:2] == (2 * hidden_size, hidden_size)
+
+    attention_spec = AttentionSpec(
+        block_size=BLOCK_SIZE, num_kv_heads=1, head_size=8, dtype=torch.float16
+    )
+    runner_stub = SimpleNamespace(
+        cache_config=SimpleNamespace(cache_dtype="auto"),
+        _kv_cache_spec_attn_group_iterator=lambda: iter(
+            [AttentionGroup(_TestAttentionBackend, ["attn"], attention_spec, 0)]
+        ),
+    )
+    GPUModelRunner._update_hybrid_attention_mamba_layout(
+        runner_stub, {"attn": ambiguous_cache}, [BLOCK_SIZE]
+    )
+
+    assert ambiguous_cache.stride()[:2] == (hidden_size, 2 * hidden_size), """\
+        We expect _update_hybrid_attention_mamba_layout to re-stride the cache from:
+        (2, num_blocks) -> (num_blocks, 2), even when num_blocks==2,
+        which was ambiguous before get_kv_cache_block_dim was used"""
+
+
+@pytest.mark.parametrize(
+    (
+        "mamba_cache_mode",
+        "initial_mamba_block_size",
+        "initial_page_size_padded",
+        "expected_block_size",
+        "expected_mamba_block_size",
+        "expected_page_size_padded",
+    ),
+    [
+        ("none", None, 999, 16, None, None),
+        ("align", 2048, 999, 16, 16, None),
+        ("all", None, None, 144, 144, 576),
+    ],
+    ids=["request_constant_none", "request_constant_align", "token_proportional_all"],
+)
+def test_request_constant_mamba_and_token_proportional_mamba_all_platform_padding(
+    monkeypatch,
+    mamba_cache_mode,
+    initial_mamba_block_size,
+    initial_page_size_padded,
+    expected_block_size,
+    expected_mamba_block_size,
+    expected_page_size_padded,
+):
+    _patch_hybrid_block_size_test_model(monkeypatch)
+    vllm_config = _make_hybrid_block_size_test_config(
+        mamba_cache_mode=mamba_cache_mode,
+        mamba_page_size_padded=initial_page_size_padded,
+    )
+    vllm_config.cache_config.mamba_block_size = initial_mamba_block_size
+
+    Platform._align_hybrid_block_size(vllm_config, _HybridBlockSizeTestBackend)
+
+    assert vllm_config.cache_config.block_size == expected_block_size
+    assert vllm_config.cache_config.mamba_block_size == expected_mamba_block_size
+    assert vllm_config.cache_config.mamba_page_size_padded == expected_page_size_padded
+
+
+def test_reshape_request_constant_mamba_uses_physical_page():
+    spec = _RequestConstantMambaSpec(
+        block_size=1,
+        shapes=((2,),),
+        dtypes=(torch.float32,),
+        page_size_padded=16,
+    )
+    num_blocks = 3
+    raw_tensor = torch.empty(
+        spec.physical_page_size_bytes * num_blocks,
+        dtype=torch.int8,
+    )
+
+    kv_caches = _reshape_kv_cache_tensor_for_test(spec, raw_tensor, "state")
+
+    assert kv_caches["state"][0].shape == (num_blocks, 2)
+
+
+def test_reshape_request_constant_mamba_stride_matches_physical():
+    dtype = torch.float32
+    spec = _RequestConstantMambaSpec(
+        block_size=1,
+        shapes=((2,),),
+        dtypes=(dtype,),
+        page_size_padded=16,
+    )
+    raw_tensor = torch.empty(
+        spec.physical_page_size_bytes * 3,
+        dtype=torch.int8,
+    )
+
+    kv_caches = _reshape_kv_cache_tensor_for_test(spec, raw_tensor, "state")
+    state_tensor = kv_caches["state"][0]
+    dtype_size = torch.empty((), dtype=dtype).element_size()
+
+    assert state_tensor.stride()[0] == spec.physical_page_size_bytes // dtype_size
+    assert state_tensor.stride()[0] != spec.page_size_bytes // dtype_size
+
+
+def test_reshape_token_proportional_mamba_uses_padded_page():
+    dtype = torch.float32
+    spec = MambaSpec(
+        block_size=1,
+        shapes=((2,),),
+        dtypes=(dtype,),
+        page_size_padded=16,
+        mamba_cache_mode="all",
+    )
+    num_blocks = 3
+    raw_tensor = torch.empty(
+        spec.page_size_bytes * num_blocks,
+        dtype=torch.int8,
+    )
+
+    kv_caches = _reshape_kv_cache_tensor_for_test(spec, raw_tensor, "state")
+    state_tensor = kv_caches["state"][0]
+    dtype_size = torch.empty((), dtype=dtype).element_size()
+
+    assert state_tensor.shape == (num_blocks, 2)
+    assert state_tensor.stride()[0] == spec.page_size_bytes // dtype_size
+
+
+def test_reshape_token_proportional_attention_unchanged():
+    spec = FullAttentionSpec(
+        block_size=2,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.float32,
+        page_size_padded=32,
+    )
+    num_blocks = 2
+    raw_tensor = torch.empty(
+        spec.page_size_bytes * num_blocks,
+        dtype=torch.int8,
+    )
+
+    kv_caches = _reshape_kv_cache_tensor_for_test(spec, raw_tensor, "attn")
+    kv_cache = kv_caches["attn"]
+
+    assert kv_cache.shape[1] == num_blocks
+    assert (
+        kv_cache.numel()
+        == spec.real_page_size_bytes
+        * num_blocks
+        // torch.empty((), dtype=spec.dtype).element_size()
+    )
+
+
+def test_reshape_attention_request_constant_rejected():
+    spec = _RequestConstantFullAttentionSpec(
+        block_size=2,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.float32,
+    )
+    raw_tensor = torch.empty(spec.page_size_bytes, dtype=torch.int8)
+
+    with pytest.raises(NotImplementedError, match="REQUEST_CONSTANT AttentionSpec"):
+        _reshape_kv_cache_tensor_for_test(spec, raw_tensor, "attn")
+
+
+def test_reshape_connector_request_constant_rejected():
+    spec = _RequestConstantFullAttentionSpec(
+        block_size=2,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.float32,
+    )
+    kv_cache_config = KVCacheConfig(
+        num_blocks=1,
+        kv_cache_tensors=[
+            KVCacheTensor(size=spec.page_size_bytes, shared_by=["attn"]),
+        ],
+        kv_cache_groups=[KVCacheGroupSpec(layer_names=["attn"], kv_cache_spec=spec)],
+    )
+    attn_groups = [
+        [
+            AttentionGroup(
+                _TestAttentionBackend,
+                ["attn"],
+                spec,
+                0,
+            )
+        ]
+    ]
+
+    with pytest.raises(NotImplementedError, match="Cross-layer KV connector"):
+        KVConnectorModelRunnerMixin.allocate_uniform_kv_caches(
+            kv_cache_config,
+            attn_groups,
+            "auto",
+            torch.device("cpu"),
+            [spec.block_size],
+        )
 
 
 def test_hybrid_block_table_initialization():
