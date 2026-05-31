@@ -97,7 +97,11 @@ class SingleTypeKVCacheManager(ABC):
         ``requires_block_zeroing_on_alloc`` spec property is not wired here yet
         because the current zeroing kernel only targets attention KV tensors.
         """
-        return type(self.kv_cache_spec) in (FullAttentionSpec, TQFullAttentionSpec)
+        return type(self.kv_cache_spec) in (
+            FullAttentionSpec,
+            TQFullAttentionSpec,
+            MLAAttentionSpec,
+        )
 
     def _cacheable_block_pool(self) -> CacheableBlockPoolProtocol:
         """Return the block pool as a prefix-cache-capable pool.
