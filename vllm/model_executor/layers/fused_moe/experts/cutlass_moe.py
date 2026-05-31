@@ -379,7 +379,8 @@ class CutlassExpertsFp8Base(mk.FusedMoEExpertsModular):
             topk_ids,
             activation,
             global_num_experts,
-            expert_map,
+            # the fp8 cutlass experts use their own expert map.
+            None,
             self.w1_scale,
             self.w2_scale,
             a1q_scale,
@@ -419,9 +420,6 @@ class CutlassExpertsFp8(CutlassExpertsFp8Base):
             or moe_parallel_config.use_fi_nvl_one_sided_kernels
         )
 
-    def supports_expert_map(self) -> bool:
-        return False
-
     def finalize_weight_and_reduce_impl(self) -> mk.TopKWeightAndReduce:
         # topk weights and reduction are fused in moe_unpermute cuda kernel
         return TopKWeightAndReduceNoOP()
@@ -460,9 +458,6 @@ class CutlassBatchedExpertsFp8(CutlassExpertsFp8Base):
     @staticmethod
     def activation_format() -> mk.FusedMoEActivationFormat:
         return mk.FusedMoEActivationFormat.BatchedExperts
-
-    def supports_expert_map(self) -> bool:
-        return False
 
     def workspace_dtype(self, act_dtype: torch.dtype) -> torch.dtype:
         return self.out_dtype if self.out_dtype is not None else act_dtype
@@ -743,9 +738,6 @@ class CutlassExpertsFp4(mk.FusedMoEExpertsModular):
     @staticmethod
     def activation_format() -> mk.FusedMoEActivationFormat:
         return mk.FusedMoEActivationFormat.Standard
-
-    def supports_expert_map(self) -> bool:
-        return False
 
     def finalize_weight_and_reduce_impl(self) -> mk.TopKWeightAndReduce:
         return TopKWeightAndReduceNoOP()
@@ -1040,9 +1032,6 @@ class CutlassExpertsMxfp4(mk.FusedMoEExpertsModular):
     @staticmethod
     def activation_format() -> mk.FusedMoEActivationFormat:
         return mk.FusedMoEActivationFormat.Standard
-
-    def supports_expert_map(self) -> bool:
-        return False
 
     def finalize_weight_and_reduce_impl(self) -> mk.TopKWeightAndReduce:
         return TopKWeightAndReduceNoOP()
@@ -1341,9 +1330,6 @@ class CutlassExpertsW4A8Fp8(mk.FusedMoEExpertsModular):
 
     @staticmethod
     def _supports_parallel_config(moe_parallel_config: FusedMoEParallelConfig) -> bool:
-        return True
-
-    def supports_expert_map(self) -> bool:
         return True
 
     def finalize_weight_and_reduce_impl(self) -> mk.TopKWeightAndReduce:
