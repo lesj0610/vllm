@@ -1337,6 +1337,7 @@ class CompilationConfig:
         from vllm.v1.attention.backend import AttentionCGSupport
 
         cudagraph_mode = self.cudagraph_mode
+        requested_cudagraph_mode = cudagraph_mode
         if cudagraph_mode is None or cudagraph_mode == CUDAGraphMode.NONE:
             self.cudagraph_mode = CUDAGraphMode.NONE
             return CUDAGraphMode.NONE
@@ -1442,6 +1443,38 @@ class CompilationConfig:
                 uniform_decode_query_len,
                 tensor_parallel_size,
             )
+
+        if (
+            kv_cache_config is not None
+            and cudagraph_mode.has_full_cudagraphs()
+            and not is_profiling
+            and kv_cache_config.has_mamba_layers
+        ):
+            from vllm.v1.kv_cache_interface import MemoryModel
+
+            if any(
+                pool.memory_model == MemoryModel.REQUEST_CONSTANT
+                for pool in kv_cache_config.pool_configs
+            ):
+                if (
+                    requested_cudagraph_mode == CUDAGraphMode.FULL_AND_PIECEWISE
+                    and cudagraph_mode == CUDAGraphMode.FULL_AND_PIECEWISE
+                ):
+                    logger.warning(
+                        "Full CUDA graph capture with REQUEST_CONSTANT KV cache "
+                        "(Mamba in 'none' or 'align' mode) is not yet "
+                        "supported; setting cudagraph_mode=PIECEWISE"
+                    )
+                    cudagraph_mode = CUDAGraphMode.PIECEWISE
+                else:
+                    raise ValueError(
+                        "Full CUDA graph capture with REQUEST_CONSTANT KV cache "
+                        "(Mamba in 'none' or 'align' mode) is not yet "
+                        "supported. Either use cudagraph_mode=PIECEWISE, "
+                        "disable cudagraph capture (e.g., enforce_eager=True), "
+                        "or set mamba_cache_mode='all' to use the legacy "
+                        "shared-pool path."
+                    )
 
         # For Mamba models with FULL decode cudagraphs, each decode
         # sequence needs one Mamba cache block. The decode cudagraph

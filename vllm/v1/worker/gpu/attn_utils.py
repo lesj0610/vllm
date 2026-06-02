@@ -19,7 +19,9 @@ from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheSpec,
     MambaSpec,
+    MemoryModel,
     UniformTypeKVCacheSpecs,
+    get_attn_backend_cache_dtype_str,
 )
 from vllm.v1.worker.gpu.model_states.interface import ModelSpecificAttnMetadata
 from vllm.v1.worker.utils import (
@@ -34,6 +36,13 @@ from vllm.v1.worker.utils import (
 class AttentionCGSupportInfo:
     min_cg_support: AttentionCGSupport = AttentionCGSupport.ALWAYS
     min_cg_attn_backend: str | None = None
+
+
+def get_block_layout_page_size_bytes(spec: KVCacheSpec) -> int:
+    """Page size used for block-count and stride math during reshape."""
+    if spec.memory_model == MemoryModel.REQUEST_CONSTANT:
+        return spec.physical_page_size_bytes
+    return spec.page_size_bytes
 
 
 def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
@@ -70,8 +79,9 @@ def init_attn_backend(
 
     # Add KV-sharing layers to their target's kv cache group so they are
     # discovered alongside the target layer in Phase 1 below.
+    shared_kv_cache_layers = get_shared_kv_cache_layers(vllm_config)
     add_kv_sharing_layers_to_kv_cache_groups(
-        get_shared_kv_cache_layers(vllm_config), kv_cache_config.kv_cache_groups
+        shared_kv_cache_layers, kv_cache_config.kv_cache_groups
     )
 
     # Phase 1: discover attention groups for each kv cache group.
@@ -93,7 +103,12 @@ def init_attn_backend(
 
             layer_kv_cache_spec: KVCacheSpec = kv_cache_group_spec.kv_cache_spec
             if isinstance(layer_kv_cache_spec, UniformTypeKVCacheSpecs):
-                layer_kv_cache_spec = layer_kv_cache_spec.kv_cache_specs[layer_name]
+                # KV-sharing layers reuse the target layer's KV cache and do
+                # not have their own entry in UniformTypeKVCacheSpecs.
+                spec_layer_name = shared_kv_cache_layers.get(layer_name, layer_name)
+                layer_kv_cache_spec = layer_kv_cache_spec.kv_cache_specs[
+                    spec_layer_name
+                ]
 
             key = (attn_backend.full_cls_name(), layer_kv_cache_spec)
             if key not in group_map:
@@ -194,10 +209,16 @@ def _reshape_kv_cache(
                 continue
 
             kv_raw_tensor = kv_cache_raw_tensors[layer_name]
-            assert kv_raw_tensor.numel() % kv_cache_spec.page_size_bytes == 0
-            num_blocks = kv_raw_tensor.numel() // kv_cache_spec.page_size_bytes
+            block_layout_page_size = get_block_layout_page_size_bytes(kv_cache_spec)
+            assert kv_raw_tensor.numel() % block_layout_page_size == 0
+            num_blocks = kv_raw_tensor.numel() // block_layout_page_size
 
             if isinstance(kv_cache_spec, AttentionSpec):
+                if kv_cache_spec.memory_model == MemoryModel.REQUEST_CONSTANT:
+                    raise NotImplementedError(
+                        "REQUEST_CONSTANT AttentionSpec is not supported. "
+                        "Attention KV cache is token-proportional."
+                    )
                 has_attn = True
                 # Use storage_block_size: it equals block_size for uncompressed
                 # specs but is smaller for compressed ones (DeepSeek V4), which
@@ -206,12 +227,13 @@ def _reshape_kv_cache(
                     kv_cache_spec.storage_block_size // kernel_block_size
                 )
                 kernel_num_blocks = num_blocks * num_blocks_per_kv_block
+                cache_dtype_str = get_attn_backend_cache_dtype_str(kv_cache_spec)
                 kv_cache_shape = group.backend.get_kv_cache_shape(
                     kernel_num_blocks,
                     kernel_block_size,
                     kv_cache_spec.num_kv_heads,
                     kv_cache_spec.head_size,
-                    cache_dtype_str=cache_dtype,
+                    cache_dtype_str=cache_dtype_str,
                 )
 
                 # FIXME(woosuk): Add kv_cache_stride_order to all attention backends.
@@ -233,14 +255,17 @@ def _reshape_kv_cache(
                     # Use strided view to handle page_size_bytes that
                     # include padding. This follows the same pattern as
                     # MambaSpec handling in gpu_model_runner.py.
-                    # NOTE: This assumes kv_cache_shape[0] == num_blocks
-                    # (i.e. the first physical dimension is the block
-                    # index), which holds for all current backends
-                    # (MLA, FlashAttention, TritonAttention, etc.).
                     dtype_size = get_dtype_size(dtype)
-                    page_stride = kv_cache_spec.page_size_bytes // dtype_size
+                    page_stride = block_layout_page_size // dtype_size
+                    block_dim = group.backend.get_kv_cache_block_dim(
+                        kernel_block_size,
+                        kv_cache_spec.num_kv_heads,
+                        kv_cache_spec.head_size,
+                        cache_dtype_str=cache_dtype_str,
+                    )
+                    physical_block_dim = kv_cache_stride_order.index(block_dim)
                     strides = list(torch.empty(kv_cache_shape).stride())
-                    strides[inv_order[0]] = page_stride
+                    strides[physical_block_dim] = page_stride
                     kv_cache = torch.as_strided(
                         kv_tensor,
                         size=kv_cache_shape,
@@ -257,7 +282,7 @@ def _reshape_kv_cache(
                 storage_offset_bytes = 0
                 for shape, dtype in zip(kv_cache_spec.shapes, kv_cache_spec.dtypes):
                     dtype_size = get_dtype_size(dtype)
-                    num_element_per_page = kv_cache_spec.page_size_bytes // dtype_size
+                    num_element_per_page = block_layout_page_size // dtype_size
                     target_shape = (num_blocks, *shape)
                     stride = torch.empty(target_shape).stride()
                     target_stride = (num_element_per_page, *stride[1:])
@@ -308,7 +333,7 @@ def _update_hybrid_attention_layout(
             kernel_block_sizes[group.kv_cache_group_id],
             kv_cache_spec.num_kv_heads,
             kv_cache_spec.head_size,
-            cache_dtype_str=cache_dtype,
+            cache_dtype_str=get_attn_backend_cache_dtype_str(kv_cache_spec),
         )
         # if the first dim of the kvcache's layout is already num_blocks, continue
         if block_dim == 0:
