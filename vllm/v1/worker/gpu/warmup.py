@@ -201,7 +201,7 @@ def warmup_kernels(
             max_num_tokens,
             max_model_len,
             model_runner.scheduler_config.max_num_batched_tokens,
-            128,
+            4096,
         )
         if num_tokens <= 1:
             return
@@ -216,6 +216,7 @@ def warmup_kernels(
             is_profile=True,
             force_attention=True,
             uniform_decode=False,
+            num_reqs_override=1,
             profile_seq_lens=profile_seq_lens,
         )
 

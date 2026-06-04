@@ -89,11 +89,12 @@ def test_warmup_kernels_includes_chunked_prefill(monkeypatch) -> None:
     assert len(sample_inputs) == 4
     assert dummy_runs == [
         {
-            "num_tokens": 128,
+            "num_tokens": 256,
             "skip_eplb": True,
             "is_profile": True,
             "force_attention": True,
             "uniform_decode": False,
+            "num_reqs_override": 1,
             "profile_seq_lens": 4096,
         }
     ]
