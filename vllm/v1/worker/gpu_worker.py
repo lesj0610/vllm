@@ -686,11 +686,17 @@ class Worker(WorkerBase):
             logger.debug(msg)
 
         if self.use_v2_model_runner:
-            # V2: Run full execute_model + sample_tokens to JIT compile triton kernels.
+            # V2: Run full execute_model + sample_tokens to JIT compile
+            # triton kernels.
             warmup_kernels(self.model_runner, self.execute_model, self.sample_tokens)
-        elif get_pp_group().is_last_rank:
-            # V1: Warm up sampler and preallocate memory buffer for logits and other
-            # sampling related tensors of max possible shape to avoid memory
+        else:
+            # V1: Run the same request-shaped warmup so uncaptured attention
+            # kernels used by decode/chunked prefill compile before inference.
+            warmup_kernels(self.model_runner, self.execute_model, self.sample_tokens)
+
+        if not self.use_v2_model_runner and get_pp_group().is_last_rank:
+            # V1: Warm up sampler and preallocate memory buffer for logits and
+            # other sampling related tensors of max possible shape to avoid memory
             # fragmentation issue.
             # NOTE: This is called after `capture_model` on purpose to prevent
             # memory buffers from being cleared by `torch.accelerator.empty_cache`.

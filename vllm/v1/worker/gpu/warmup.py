@@ -37,7 +37,7 @@ def warmup_kernels(
     For generation models, an extra small chunked-prefill request warms the
     cached multi-token prefill shape used by long prompts.
     """
-    num_spec_steps = model_runner.num_speculative_steps
+    num_spec_steps = getattr(model_runner, "num_speculative_steps", 0)
     # Use 1 + num_spec_steps + 1 tokens so the prefill batch's per-request
     # query length exceeds decode_query_len (= 1 + num_spec_steps), preventing
     # it from being misclassified as a uniform decode batch.
@@ -75,6 +75,7 @@ def warmup_kernels(
     else:
         sampling_params = SamplingParams.for_sampler_warmup()
         pooling_params = None
+    is_last_pp_rank = getattr(model_runner, "is_last_pp_rank", True)
 
     # Assign distinct block IDs per request per group. 0 null block, start from 1.
     next_block_id = 1
@@ -194,8 +195,11 @@ def warmup_kernels(
     prefill_output.total_num_scheduled_tokens = prompt_len * num_reqs
     prefill_output.num_common_prefix_blocks = [0] * num_kv_cache_groups
 
-    # Disable KV connector for warmup run.
-    model_runner.kv_connector.set_disabled(True)
+    # Disable KV connector for warmup run when the runner has one. The old V1
+    # runner does not expose a connector, but it can still run this warmup.
+    kv_connector = getattr(model_runner, "kv_connector", None)
+    if kv_connector is not None:
+        kv_connector.set_disabled(True)
     try:
         worker_execute_model(prefill_output)
 
@@ -203,7 +207,7 @@ def warmup_kernels(
             # Warm up sampler and perform a decode step for non-pooling models.
 
             grammar_output = None
-            if model_runner.is_last_pp_rank:
+            if is_last_pp_rank:
                 # Build a GrammarOutput to exercise the structured output bitmask
                 # kernel during the prefill step.
                 vocab_size = model_runner.model_config.get_vocab_size()
@@ -255,5 +259,6 @@ def warmup_kernels(
 
         _run_chunked_prefill_warmup()
     finally:
-        model_runner.kv_connector.set_disabled(False)
+        if kv_connector is not None:
+            kv_connector.set_disabled(False)
     torch.accelerator.synchronize()
