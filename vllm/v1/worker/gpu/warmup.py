@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from collections.abc import Callable
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
@@ -16,22 +16,26 @@ from vllm.v1.core.sched.output import (
     SchedulerOutput,
 )
 from vllm.v1.request import Request
-from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+
+if TYPE_CHECKING:
+    from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 
 
 @torch.inference_mode()
 def warmup_kernels(
-    model_runner: GPUModelRunner,
+    model_runner: "GPUModelRunner",
     worker_execute_model: Callable[[SchedulerOutput], Any],
     worker_sample_tokens: Callable[[GrammarOutput | None], Any],
 ) -> None:
-    """Run two execute_model + sample_tokens iterations to JIT compile
+    """Run execute_model + sample_tokens iterations to JIT compile
     triton kernels. We must call the provided worker's execute_model for
     pipeline parallel coordination.
 
     The first iteration simulates a prefill with requests of
     2 + num_spec_steps prompt tokens each. The second iteration simulates
     a decode step with all requests generating 1 + num_spec_steps tokens.
+    For generation models, an extra small chunked-prefill request warms the
+    cached multi-token prefill shape used by long prompts.
     """
     num_spec_steps = model_runner.num_speculative_steps
     # Use 1 + num_spec_steps + 1 tokens so the prefill batch's per-request
@@ -79,6 +83,101 @@ def warmup_kernels(
         nonlocal next_block_id
         return list(range(next_block_id, next_block_id := next_block_id + num_blocks))
 
+    def _run_chunked_prefill_warmup() -> None:
+        """Warm a cached multi-token prefill shape.
+
+        The short synthetic prefill above only covers fresh requests. Long prompts
+        are often resumed as chunked prefills, where a request has cached prefix
+        tokens and schedules multiple new prompt tokens in the same step. That
+        shape drives Triton unified attention's prefill kernel variant.
+        """
+        if model_runner.is_pooling_model:
+            return
+
+        # Two chunks are enough to exercise the cached-prefill path while keeping
+        # warmup cheap. Larger runtime chunks compile to the same prefill variant.
+        chunk_len = min(64, model_runner.scheduler_config.max_num_batched_tokens // 2)
+        if chunk_len <= 1:
+            return
+
+        first_chunk_len = chunk_len
+        second_chunk_len = chunk_len
+        chunked_prompt_len = first_chunk_len + second_chunk_len
+
+        first_block_counts = [cdiv(first_chunk_len, bs) for bs in group_block_sizes]
+        prompt_block_counts = [cdiv(chunked_prompt_len, bs) for bs in group_block_sizes]
+        second_block_deltas = [
+            prompt - first
+            for prompt, first in zip(prompt_block_counts, first_block_counts)
+        ]
+
+        # The synthetic block IDs are only used for this warmup request. The
+        # previous warmup requests have already been cleaned up, so start from
+        # block 1 again and reserve block 0 as the null block.
+        if sum(prompt_block_counts) > model_runner.kv_cache_config.num_blocks - 1:
+            return
+
+        next_chunk_block_id = 1
+
+        def _alloc_chunk_blocks(num_blocks: int) -> list[int]:
+            nonlocal next_chunk_block_id
+            blocks = list(
+                range(
+                    next_chunk_block_id,
+                    next_chunk_block_id + num_blocks,
+                )
+            )
+            next_chunk_block_id += num_blocks
+            return blocks
+
+        req_id = "_chunked_prefill_warmup_"
+        chunked_prompt_token_ids = list(range(chunked_prompt_len))
+        chunked_request = Request(
+            req_id,
+            chunked_prompt_token_ids,
+            sampling_params,
+            pooling_params,
+        )
+
+        first_output = SchedulerOutput.make_empty()
+        first_output.scheduled_new_reqs = [
+            NewRequestData.from_request(
+                chunked_request,
+                block_ids=tuple(_alloc_chunk_blocks(n) for n in first_block_counts),
+                prefill_token_ids=chunked_prompt_token_ids,
+            )
+        ]
+        first_output.num_scheduled_tokens = {req_id: first_chunk_len}
+        first_output.total_num_scheduled_tokens = first_chunk_len
+        first_output.num_common_prefix_blocks = [0] * num_kv_cache_groups
+
+        cached_req_data = CachedRequestData.make_empty()
+        cached_req_data.req_ids = [req_id]
+        cached_req_data.num_computed_tokens = [first_chunk_len]
+        cached_req_data.num_output_tokens = [0]
+        cached_req_data.new_block_ids = [
+            tuple(_alloc_chunk_blocks(n) for n in second_block_deltas)
+            if any(second_block_deltas)
+            else None
+        ]
+
+        second_output = SchedulerOutput.make_empty()
+        second_output.scheduled_cached_reqs = cached_req_data
+        second_output.num_scheduled_tokens = {req_id: second_chunk_len}
+        second_output.total_num_scheduled_tokens = second_chunk_len
+        second_output.num_common_prefix_blocks = [0] * num_kv_cache_groups
+
+        cleanup_output = SchedulerOutput.make_empty()
+        cleanup_output.finished_req_ids = {req_id}
+
+        try:
+            worker_execute_model(first_output)
+            worker_sample_tokens(None)
+            worker_execute_model(second_output)
+            worker_sample_tokens(None)
+        finally:
+            worker_execute_model(cleanup_output)
+
     # Step 1: Prefill all requests with 2 + num_spec_steps prompt tokens each.
     new_reqs = [
         NewRequestData.from_request(
@@ -97,57 +196,64 @@ def warmup_kernels(
 
     # Disable KV connector for warmup run.
     model_runner.kv_connector.set_disabled(True)
-    worker_execute_model(prefill_output)
+    try:
+        worker_execute_model(prefill_output)
 
-    if not model_runner.is_pooling_model:
-        # Warm up sampler and perform a decode step for non-pooling models.
+        if not model_runner.is_pooling_model:
+            # Warm up sampler and perform a decode step for non-pooling models.
 
-        grammar_output = None
-        if model_runner.is_last_pp_rank:
-            # Build a GrammarOutput to exercise the structured output bitmask
-            # kernel during the prefill step.
-            vocab_size = model_runner.model_config.get_vocab_size()
-            bitmask_width = (vocab_size + 31) // 32
-            grammar_bitmask = np.full(
-                (len(req_ids), bitmask_width), fill_value=-1, dtype=np.int32
-            )
-            grammar_output = GrammarOutput(
-                structured_output_request_ids=req_ids, grammar_bitmask=grammar_bitmask
-            )
+            grammar_output = None
+            if model_runner.is_last_pp_rank:
+                # Build a GrammarOutput to exercise the structured output bitmask
+                # kernel during the prefill step.
+                vocab_size = model_runner.model_config.get_vocab_size()
+                bitmask_width = (vocab_size + 31) // 32
+                grammar_bitmask = np.full(
+                    (len(req_ids), bitmask_width), fill_value=-1, dtype=np.int32
+                )
+                grammar_output = GrammarOutput(
+                    structured_output_request_ids=req_ids,
+                    grammar_bitmask=grammar_bitmask,
+                )
 
-        worker_sample_tokens(grammar_output)
+            worker_sample_tokens(grammar_output)
 
-        # Step 2: Decode all requests with 1 + num_spec_steps tokens each.
-        cached_req_data = CachedRequestData.make_empty()
-        cached_req_data.req_ids = list(req_ids)
-        cached_req_data.num_computed_tokens = [prompt_len] * num_reqs
-        cached_req_data.num_output_tokens = [1] * num_reqs
-        new_block = any(decode_block_deltas)
-        cached_req_data.new_block_ids = [
-            tuple(_alloc_blocks(n) for n in decode_block_deltas) if new_block else None
-            for _ in range(num_reqs)
-        ]
+            # Step 2: Decode all requests with 1 + num_spec_steps tokens each.
+            cached_req_data = CachedRequestData.make_empty()
+            cached_req_data.req_ids = list(req_ids)
+            cached_req_data.num_computed_tokens = [prompt_len] * num_reqs
+            cached_req_data.num_output_tokens = [1] * num_reqs
+            new_block = any(decode_block_deltas)
+            cached_req_data.new_block_ids = [
+                tuple(_alloc_blocks(n) for n in decode_block_deltas)
+                if new_block
+                else None
+                for _ in range(num_reqs)
+            ]
 
-        decode_output = SchedulerOutput.make_empty()
-        decode_output.scheduled_cached_reqs = cached_req_data
-        decode_output.num_scheduled_tokens = {
-            req_id: 1 + num_spec_steps for req_id in req_ids
-        }
-        if num_spec_steps > 0:
-            decode_output.scheduled_spec_decode_tokens = {
-                req_id: [0] * num_spec_steps for req_id in req_ids
+            decode_output = SchedulerOutput.make_empty()
+            decode_output.scheduled_cached_reqs = cached_req_data
+            decode_output.num_scheduled_tokens = {
+                req_id: 1 + num_spec_steps for req_id in req_ids
             }
-        decode_output.total_num_scheduled_tokens = sum(
-            decode_output.num_scheduled_tokens.values()
-        )
-        decode_output.num_common_prefix_blocks = [0] * num_kv_cache_groups
+            if num_spec_steps > 0:
+                decode_output.scheduled_spec_decode_tokens = {
+                    req_id: [0] * num_spec_steps for req_id in req_ids
+                }
+            decode_output.total_num_scheduled_tokens = sum(
+                decode_output.num_scheduled_tokens.values()
+            )
+            decode_output.num_common_prefix_blocks = [0] * num_kv_cache_groups
 
-        worker_execute_model(decode_output)
-        worker_sample_tokens(None)
+            worker_execute_model(decode_output)
+            worker_sample_tokens(None)
 
-    # Clean up - process finish_req_ids.
-    cleanup_output = SchedulerOutput.make_empty()
-    cleanup_output.finished_req_ids = set(req_ids)
-    worker_execute_model(cleanup_output)
-    model_runner.kv_connector.set_disabled(False)
+        # Clean up - process finish_req_ids.
+        cleanup_output = SchedulerOutput.make_empty()
+        cleanup_output.finished_req_ids = set(req_ids)
+        worker_execute_model(cleanup_output)
+
+        _run_chunked_prefill_warmup()
+    finally:
+        model_runner.kv_connector.set_disabled(False)
     torch.accelerator.synchronize()
