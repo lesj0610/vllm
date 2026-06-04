@@ -30,6 +30,8 @@ def test_warmup_kernels_includes_chunked_prefill(monkeypatch) -> None:
             max_num_seqs=2,
             max_num_batched_tokens=256,
         ),
+        max_num_tokens=256,
+        max_model_len=4096,
         is_pooling_model=False,
         is_last_pp_rank=False,
         model_config=SimpleNamespace(get_vocab_size=lambda: 32000),
@@ -37,12 +39,18 @@ def test_warmup_kernels_includes_chunked_prefill(monkeypatch) -> None:
     )
     outputs = []
     sample_inputs = []
+    dummy_runs = []
 
     def execute_model(scheduler_output):
         outputs.append(scheduler_output)
 
     def sample_tokens(grammar_output):
         sample_inputs.append(grammar_output)
+
+    def dummy_run(**kwargs):
+        dummy_runs.append(kwargs)
+
+    runner._dummy_run = dummy_run
 
     gpu_warmup.warmup_kernels(runner, execute_model, sample_tokens)
 
@@ -79,3 +87,13 @@ def test_warmup_kernels_includes_chunked_prefill(monkeypatch) -> None:
     assert len(cleanup_outputs) == 1
     assert kv_connector.disabled_states == [True, False]
     assert len(sample_inputs) == 4
+    assert dummy_runs == [
+        {
+            "num_tokens": 128,
+            "skip_eplb": True,
+            "is_profile": True,
+            "force_attention": True,
+            "uniform_decode": False,
+            "profile_seq_lens": 4096,
+        }
+    ]

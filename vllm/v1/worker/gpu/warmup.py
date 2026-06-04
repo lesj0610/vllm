@@ -179,6 +179,46 @@ def warmup_kernels(
         finally:
             worker_execute_model(cleanup_output)
 
+    def _run_cached_prefill_attention_warmup() -> None:
+        """Warm attention variants for cached multi-token prefill.
+
+        The scheduler-shaped chunked prefill above exercises the full worker
+        path. Some attention backends additionally specialize on the raw-current
+        cached-prefill path when query_len > 1 and seq_len > query_len. A short
+        forced-attention dummy run with a longer synthetic seq_len compiles that
+        kernel shape without running a full long prompt prefill.
+        """
+        if model_runner.is_pooling_model:
+            return
+
+        dummy_run = getattr(model_runner, "_dummy_run", None)
+        max_num_tokens = getattr(model_runner, "max_num_tokens", 0)
+        max_model_len = getattr(model_runner, "max_model_len", 0)
+        if dummy_run is None or max_num_tokens <= 1 or max_model_len <= 1:
+            return
+
+        num_tokens = min(
+            max_num_tokens,
+            max_model_len,
+            model_runner.scheduler_config.max_num_batched_tokens,
+            128,
+        )
+        if num_tokens <= 1:
+            return
+
+        profile_seq_lens = min(max_model_len, max(num_tokens + 1, 8192))
+        if profile_seq_lens <= num_tokens:
+            return
+
+        dummy_run(
+            num_tokens=num_tokens,
+            skip_eplb=True,
+            is_profile=True,
+            force_attention=True,
+            uniform_decode=False,
+            profile_seq_lens=profile_seq_lens,
+        )
+
     # Step 1: Prefill all requests with 2 + num_spec_steps prompt tokens each.
     new_reqs = [
         NewRequestData.from_request(
@@ -258,6 +298,7 @@ def warmup_kernels(
         worker_execute_model(cleanup_output)
 
         _run_chunked_prefill_warmup()
+        _run_cached_prefill_attention_warmup()
     finally:
         if kv_connector is not None:
             kv_connector.set_disabled(False)
