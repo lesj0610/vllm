@@ -194,6 +194,7 @@ IMATRIX_QUANT_TYPES = {
 DEQUANT_TYPES = STANDARD_QUANT_TYPES | KQUANT_TYPES | IMATRIX_QUANT_TYPES
 MMVQ_QUANT_TYPES = STANDARD_QUANT_TYPES | KQUANT_TYPES | IMATRIX_QUANT_TYPES
 MMQ_QUANT_TYPES = STANDARD_QUANT_TYPES | KQUANT_TYPES
+IQ4_XS_MOE_MMQ_V2_BLOCK_SIZE = 8
 
 
 def _fused_mul_mat_gguf(
@@ -213,6 +214,8 @@ def _fused_mul_mat_gguf(
     # enable MMVQ in contiguous batching with batch_size=1
     if x.shape[0] <= mmvq_safe and qweight_type in MMVQ_QUANT_TYPES:
         y = ops.ggml_mul_mat_vec_a8(qweight, x, qweight_type, qweight.shape[0])
+    elif qweight_type == WeightType.IQ4_XS:
+        y = ops.ggml_mul_mat_a8_iq4_xs_mmq_v2(qweight, x, qweight.shape[0])
     # Use MMQ Kernel if it's available (standard + k-quants)
     elif qweight_type in MMQ_QUANT_TYPES:
         y = ops.ggml_mul_mat_a8(qweight, x, qweight_type, qweight.shape[0])
@@ -274,8 +277,108 @@ def _fused_moe_gguf(
     from vllm.model_executor.layers.fused_moe.fused_moe import moe_align_block_size
 
     out_hidden_states = torch.empty_like(x)
-    # unless we decent expert reuse we are better off running moe_vec kernel
+
+    def _fused_moe_gguf_batched_leg(
+        leg_x: torch.Tensor,
+        leg_weight: torch.Tensor,
+        leg_type: int,
+        leg_row: int,
+        leg_top_k: int,
+        leg_tokens: int,
+        num_experts: int,
+    ) -> torch.Tensor | None:
+        if leg_type == WeightType.IQ4_XS:
+            sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
+                topk_ids, IQ4_XS_MOE_MMQ_V2_BLOCK_SIZE, num_experts
+            )
+            return ops.ggml_moe_a8_iq4_xs_mmq_v2(
+                leg_x,
+                leg_weight,
+                sorted_token_ids,
+                expert_ids,
+                num_tokens_post_padded,
+                leg_row,
+                leg_top_k,
+                leg_tokens,
+            )
+        if leg_type in MMQ_QUANT_TYPES:
+            block_size = ops.ggml_moe_get_block_size(leg_type)
+            sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
+                topk_ids, block_size, num_experts
+            )
+            return ops.ggml_moe_a8(
+                leg_x,
+                leg_weight,
+                sorted_token_ids,
+                expert_ids,
+                num_tokens_post_padded,
+                leg_type,
+                leg_row,
+                leg_top_k,
+                leg_tokens,
+            )
+        if leg_type in MMVQ_QUANT_TYPES:
+            return ops.ggml_moe_a8_vec(
+                leg_x, leg_weight, topk_ids, leg_top_k, leg_type, leg_row, leg_tokens
+            )
+        return None
+
+    has_iq4_xs_leg = (
+        qweight_type == WeightType.IQ4_XS or qweight_type2 == WeightType.IQ4_XS
+    )
     if (
+        has_iq4_xs_leg
+        and qweight_type in MMVQ_QUANT_TYPES
+        and qweight_type2 in MMVQ_QUANT_TYPES
+        and x.shape[0] > 64
+    ):
+        num_tokens, _ = x.shape
+        E, N, _ = w1.shape
+        top_k = topk_ids.shape[1]
+
+        out = _fused_moe_gguf_batched_leg(x, w1, qweight_type, N, top_k, num_tokens, E)
+        if out is not None:
+            out = act(out)
+            out = _fused_moe_gguf_batched_leg(
+                out,
+                w2,
+                qweight_type2,
+                w2.shape[1],
+                1,
+                num_tokens * top_k,
+                E,
+            )
+        if out is not None:
+            out = out.reshape(num_tokens, top_k, w2.shape[1]).mul_(
+                topk_weights.view(num_tokens, top_k, 1)
+            )
+            ops.moe_sum(out, out_hidden_states)
+        else:
+            logger.warning_once(
+                "There is no support for fast MoE kernel "
+                "for current quantization method. "
+                "Falling back to slow implementation. "
+            )
+            for tok, (w, idx) in enumerate(zip(topk_weights, topk_ids)):
+                inp = x[tok].reshape((1,) + x.shape[1:])
+                current_hidden_state = None
+                for ww, ii in zip(w, idx):
+                    expert_up = w1[ii]
+
+                    out = fused_mul_mat_gguf(inp, expert_up, qweight_type)
+                    out = act(out)
+
+                    expert_down = w2[ii]
+                    current_state = fused_mul_mat_gguf(
+                        out, expert_down, qweight_type2
+                    ).mul_(ww)
+                    if current_hidden_state is None:
+                        current_hidden_state = current_state
+                    else:
+                        current_hidden_state.add_(current_state)
+                out_hidden_states[tok] = current_hidden_state
+    # unless we decent expert reuse we are better off running moe_vec kernel
+    elif (
         qweight_type2 in MMQ_QUANT_TYPES
         and qweight_type in MMQ_QUANT_TYPES
         and x.shape[0] > 64

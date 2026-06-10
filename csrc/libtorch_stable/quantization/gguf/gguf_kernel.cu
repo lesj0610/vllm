@@ -12,6 +12,7 @@
 #include "dequantize.cuh"
 #include "mmvq.cuh"
 #include "mmq.cuh"
+#include "mmq_v2.cuh"
 #include "moe.cuh"
 #include "moe_vec.cuh"
 
@@ -281,6 +282,111 @@ torch::stable::Tensor ggml_mul_mat_a8(torch::stable::Tensor W,  // quant weight
         break;
     }
   });
+  return Y;
+}
+
+torch::stable::Tensor ggml_mul_mat_a8_q4_0_mmq_v2(
+    torch::stable::Tensor W,  // quant weight
+    torch::stable::Tensor X,  // input
+    int64_t row) {
+  const int col = X.sizes()[1];
+  const int batch = X.sizes()[0];
+  const int padded = (col + 512 - 1) / 512 * 512;
+  const int batch_padded = (batch + VLLM_GGUF_MMQ_X_Q4_0 - 1) /
+                           VLLM_GGUF_MMQ_X_Q4_0 * VLLM_GGUF_MMQ_X_Q4_0;
+  constexpr int q8_1_mmq_ints = sizeof(block_q8_1_mmq_v2) / sizeof(int);
+  const int quant_blocks = padded / (4 * QK8_1);
+  const torch::stable::accelerator::DeviceGuard device_guard(
+      X.get_device_index());
+  auto Y = torch::stable::empty({batch, row}, X.scalar_type(), std::nullopt,
+                                W.device());
+  auto quant_X = torch::stable::empty(
+      {quant_blocks * batch_padded * q8_1_mmq_ints},
+      torch::headeronly::ScalarType::Int, std::nullopt, W.device());
+  cudaStream_t stream = get_current_cuda_stream();
+
+  VLLM_STABLE_DISPATCH_FLOATING_TYPES(
+      X.scalar_type(), "ggml_mul_mat_a8_q4_0_mmq_v2", [&] {
+        vllm_gguf_quantize_mmq_q8_1_cuda<scalar_t>(
+            (scalar_t*)X.data_ptr(), (void*)quant_X.data_ptr(), col, padded,
+            batch, batch_padded, stream);
+        vllm_gguf_mul_mat_q4_0_q8_1_mmq_v2_cuda<scalar_t>(
+            (void*)W.data_ptr(), (void*)quant_X.data_ptr(),
+            (scalar_t*)Y.data_ptr(), col, row, batch, batch_padded, row,
+            stream);
+      });
+  return Y;
+}
+
+torch::stable::Tensor ggml_mul_mat_a8_iq4_xs_mmq_v2(
+    torch::stable::Tensor W,  // quant weight
+    torch::stable::Tensor X,  // input
+    int64_t row) {
+  const int col = X.sizes()[1];
+  const int batch = X.sizes()[0];
+  const int padded = (col + 512 - 1) / 512 * 512;
+  const int batch_padded = (batch + VLLM_GGUF_MMQ_X_IQ4_XS - 1) /
+                           VLLM_GGUF_MMQ_X_IQ4_XS * VLLM_GGUF_MMQ_X_IQ4_XS;
+  constexpr int q8_1_mmq_ints = sizeof(block_q8_1_mmq_v2) / sizeof(int);
+  const int quant_blocks = padded / (4 * QK8_1);
+  const torch::stable::accelerator::DeviceGuard device_guard(
+      X.get_device_index());
+  auto Y = torch::stable::empty({batch, row}, X.scalar_type(), std::nullopt,
+                                W.device());
+  auto quant_X = torch::stable::empty(
+      {quant_blocks * batch_padded * q8_1_mmq_ints},
+      torch::headeronly::ScalarType::Int, std::nullopt, W.device());
+  cudaStream_t stream = get_current_cuda_stream();
+
+  VLLM_STABLE_DISPATCH_FLOATING_TYPES(
+      X.scalar_type(), "ggml_mul_mat_a8_iq4_xs_mmq_v2", [&] {
+        vllm_gguf_quantize_mmq_q8_1_cuda<scalar_t>(
+            (scalar_t*)X.data_ptr(), (void*)quant_X.data_ptr(), col, padded,
+            batch, batch_padded, stream);
+        vllm_gguf_mul_mat_iq4_xs_q8_1_mmq_v2_cuda<scalar_t>(
+            (void*)W.data_ptr(), (void*)quant_X.data_ptr(),
+            (scalar_t*)Y.data_ptr(), col, row, batch, batch_padded, row,
+            stream);
+      });
+  return Y;
+}
+
+torch::stable::Tensor ggml_moe_a8_iq4_xs_mmq_v2(
+    torch::stable::Tensor X,  // input
+    torch::stable::Tensor W,  // expert weights
+    torch::stable::Tensor sorted_token_ids, torch::stable::Tensor expert_ids,
+    torch::stable::Tensor num_tokens_post_padded, int64_t row, int64_t top_k,
+    int64_t tokens) {
+  const int col = X.sizes()[1];
+  const int batch = X.sizes()[0];
+  const int padded = (col + 512 - 1) / 512 * 512;
+  const int sorted_tokens_padded = sorted_token_ids.sizes()[0];
+  constexpr int q8_1_mmq_ints = sizeof(block_q8_1_mmq_v2) / sizeof(int);
+  const int quant_blocks = padded / (4 * QK8_1);
+  const torch::stable::accelerator::DeviceGuard device_guard(
+      X.get_device_index());
+  auto Y = torch::stable::empty({tokens * top_k, row}, X.scalar_type(),
+                                std::nullopt, W.device());
+  auto quant_X = torch::stable::empty(
+      {quant_blocks * sorted_tokens_padded * q8_1_mmq_ints},
+      torch::headeronly::ScalarType::Int, std::nullopt, W.device());
+  cudaStream_t stream = get_current_cuda_stream();
+
+  VLLM_STABLE_DISPATCH_FLOATING_TYPES(
+      X.scalar_type(), "ggml_moe_a8_iq4_xs_mmq_v2", [&] {
+        vllm_gguf_quantize_moe_mmq_q8_1_cuda<scalar_t>(
+            (scalar_t*)X.data_ptr(), (void*)quant_X.data_ptr(),
+            (int*)sorted_token_ids.data_ptr(),
+            (int*)num_tokens_post_padded.data_ptr(), col, padded, batch, top_k,
+            sorted_tokens_padded, stream);
+        vllm_gguf_moe_iq4_xs_q8_1_mmq_v2_cuda<scalar_t>(
+            (void*)W.data_ptr(), (void*)quant_X.data_ptr(),
+            (scalar_t*)Y.data_ptr(), (int*)sorted_token_ids.data_ptr(),
+            (int*)expert_ids.data_ptr(),
+            (int*)num_tokens_post_padded.data_ptr(), W.stride(0), col, row,
+            batch, sorted_tokens_padded, row, top_k, sorted_tokens_padded,
+            stream);
+      });
   return Y;
 }
 
