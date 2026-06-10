@@ -410,6 +410,14 @@ torch::stable::Tensor ggml_mul_mat_a8(torch::stable::Tensor W,
                                       torch::stable::Tensor X, int64_t type,
                                       int64_t row);
 
+torch::stable::Tensor ggml_mul_mat_a8_q4_0_mmq_v2(torch::stable::Tensor W,
+                                                  torch::stable::Tensor X,
+                                                  int64_t row);
+
+torch::stable::Tensor ggml_mul_mat_a8_iq4_xs_mmq_v2(torch::stable::Tensor W,
+                                                    torch::stable::Tensor X,
+                                                    int64_t row);
+
 torch::stable::Tensor ggml_moe_a8(torch::stable::Tensor X,
                                   torch::stable::Tensor W,
                                   torch::stable::Tensor sorted_token_ids,
@@ -425,6 +433,12 @@ torch::stable::Tensor ggml_moe_a8_vec(torch::stable::Tensor X,
                                       int64_t tokens);
 
 int64_t ggml_moe_get_block_size(int64_t type);
+
+torch::stable::Tensor ggml_moe_a8_iq4_xs_mmq_v2(
+    torch::stable::Tensor X, torch::stable::Tensor W,
+    torch::stable::Tensor sorted_token_ids, torch::stable::Tensor expert_ids,
+    torch::stable::Tensor num_tokens_post_padded, int64_t row, int64_t top_k,
+    int64_t tokens);
 
 void paged_attention_v1(
     torch::stable::Tensor& out, torch::stable::Tensor& query,

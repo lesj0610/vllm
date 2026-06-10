@@ -493,6 +493,16 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
   ops.def(
       "ggml_mul_mat_a8(Tensor W, Tensor X, int type, SymInt row) -> Tensor");
 
+  // opt-in Q4_0 v2 MMQ kernel for GGML.
+  ops.def(
+      "ggml_mul_mat_a8_q4_0_mmq_v2(Tensor W, Tensor X, SymInt row) "
+      "-> Tensor");
+
+  // opt-in IQ4_XS v2 MMQ kernel for GGML.
+  ops.def(
+      "ggml_mul_mat_a8_iq4_xs_mmq_v2(Tensor W, Tensor X, SymInt row) "
+      "-> Tensor");
+
   // moe kernel for GGML.
   ops.def(
       "ggml_moe_a8(Tensor X, Tensor W, "
@@ -506,6 +516,13 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
       "int type, SymInt row, SymInt tokens) -> Tensor");
 
   ops.def("ggml_moe_get_block_size(int type) -> int");
+
+  // opt-in IQ4_XS v2 MMQ MoE kernel for GGML.
+  ops.def(
+      "ggml_moe_a8_iq4_xs_mmq_v2(Tensor X, Tensor W, "
+      "Tensor sorted_token_ids, Tensor expert_ids, Tensor "
+      "num_tokens_post_padded, "
+      "SymInt row, SymInt top_k, SymInt tokens) -> Tensor");
 
   // Mamba selective scan kernel
   ops.def(
@@ -667,8 +684,13 @@ STABLE_TORCH_LIBRARY_IMPL(_C, CUDA, ops) {
   ops.impl("ggml_dequantize", TORCH_BOX(&ggml_dequantize));
   ops.impl("ggml_mul_mat_vec_a8", TORCH_BOX(&ggml_mul_mat_vec_a8));
   ops.impl("ggml_mul_mat_a8", TORCH_BOX(&ggml_mul_mat_a8));
+  ops.impl("ggml_mul_mat_a8_q4_0_mmq_v2",
+           TORCH_BOX(&ggml_mul_mat_a8_q4_0_mmq_v2));
+  ops.impl("ggml_mul_mat_a8_iq4_xs_mmq_v2",
+           TORCH_BOX(&ggml_mul_mat_a8_iq4_xs_mmq_v2));
   ops.impl("ggml_moe_a8", TORCH_BOX(&ggml_moe_a8));
   ops.impl("ggml_moe_a8_vec", TORCH_BOX(&ggml_moe_a8_vec));
+  ops.impl("ggml_moe_a8_iq4_xs_mmq_v2", TORCH_BOX(&ggml_moe_a8_iq4_xs_mmq_v2));
   ops.impl("selective_scan_fwd", TORCH_BOX(&selective_scan_fwd));
 
   ops.impl("paged_attention_v1", TORCH_BOX(&paged_attention_v1));
