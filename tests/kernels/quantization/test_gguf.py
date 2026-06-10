@@ -10,7 +10,10 @@ from huggingface_hub import snapshot_download
 
 import vllm._custom_ops as ops
 from vllm.model_executor.layers.fused_moe import fused_experts
-from vllm.model_executor.layers.quantization.gguf import _fused_moe_gguf
+from vllm.model_executor.layers.quantization.gguf import (
+    _fused_moe_gguf,
+    _fused_mul_mat_gguf,
+)
 from vllm.utils.torch_utils import set_random_seed
 
 GGUF_SAMPLE = snapshot_download("Isotr0py/test-gguf-sample")
@@ -157,6 +160,87 @@ def test_mmq(
 
 
 @pytest.mark.parametrize("num_tokens", NUM_TOKENS)
+@pytest.mark.parametrize("hidden_size", HIDDEN_SIZES)
+@pytest.mark.parametrize("dtype", DTYPES)
+@torch.inference_mode()
+def test_mmq_v2_q4_0(
+    num_tokens: int,
+    hidden_size: int,
+    dtype: torch.dtype,
+):
+    set_random_seed(0)
+
+    quant_type = GGMLQuantizationType.Q4_0
+    tensors = get_gguf_sample_tensors(hidden_size, quant_type)
+    x = torch.rand((num_tokens, hidden_size), dtype=dtype, device="cuda")
+    for tensor in tensors:
+        weight = torch.tensor(dequantize(tensor.data, quant_type), device="cuda").to(
+            dtype
+        )
+        ref_output = x @ weight.T
+
+        qweight = torch.tensor(tensor.data, device="cuda")
+        output = ops.ggml_mul_mat_a8_q4_0_mmq_v2(qweight, x, qweight.shape[0])
+        atols = {torch.half: 1, torch.bfloat16: 1.5, torch.float: 1.2}
+        rtols = {torch.half: 1e-1, torch.bfloat16: 1e4, torch.float: 2e1}
+        torch.testing.assert_close(
+            output, ref_output, atol=atols[dtype], rtol=rtols[dtype]
+        )
+
+
+@pytest.mark.parametrize("num_tokens", NUM_TOKENS)
+@pytest.mark.parametrize("hidden_size", HIDDEN_SIZES)
+@pytest.mark.parametrize("dtype", DTYPES)
+@torch.inference_mode()
+def test_mmq_v2_iq4_xs(
+    num_tokens: int,
+    hidden_size: int,
+    dtype: torch.dtype,
+):
+    set_random_seed(0)
+
+    quant_type = GGMLQuantizationType.IQ4_XS
+    tensors = get_gguf_sample_tensors(hidden_size, quant_type)
+    x = torch.rand((num_tokens, hidden_size), dtype=dtype, device="cuda")
+    for tensor in tensors:
+        weight = torch.tensor(dequantize(tensor.data, quant_type), device="cuda").to(
+            dtype
+        )
+        ref_output = x @ weight.T
+
+        qweight = torch.tensor(tensor.data, device="cuda")
+        output = ops.ggml_mul_mat_a8_iq4_xs_mmq_v2(qweight, x, qweight.shape[0])
+        atols = {torch.half: 1, torch.bfloat16: 1.5, torch.float: 1.2}
+        rtols = {torch.half: 1e-1, torch.bfloat16: 1e4, torch.float: 2e1}
+        torch.testing.assert_close(
+            output, ref_output, atol=atols[dtype], rtol=rtols[dtype]
+        )
+
+
+@torch.inference_mode()
+def test_fused_mul_mat_iq4_xs_uses_mmq_v2(monkeypatch):
+    qweight = torch.empty((32, 136), dtype=torch.uint8)
+    x = torch.empty((17, 256), dtype=torch.bfloat16)
+    expected = torch.empty((17, 32), dtype=torch.bfloat16)
+    called = False
+
+    def fake_mmq_v2(qweight_arg, x_arg, row_arg):
+        nonlocal called
+        called = True
+        assert qweight_arg is qweight
+        assert x_arg is x
+        assert row_arg == qweight.shape[0]
+        return expected
+
+    monkeypatch.setattr(ops, "ggml_mul_mat_a8_iq4_xs_mmq_v2", fake_mmq_v2)
+
+    output = _fused_mul_mat_gguf(x, qweight, GGMLQuantizationType.IQ4_XS)
+
+    assert called
+    assert output is expected
+
+
+@pytest.mark.parametrize("num_tokens", NUM_TOKENS)
 @pytest.mark.parametrize("hidden_size", [512])
 @pytest.mark.parametrize("top_k", [4, 8])
 @pytest.mark.parametrize("dtype", DTYPES)
@@ -198,6 +282,52 @@ def test_moe(
         topk_ids,
         quant_type,
         quant_type,
+        "silu",
+    )
+
+    ref_output = fused_experts(
+        x, w13_dequant, w2_dequant, topk_weights, topk_ids
+    ).reshape(output.shape)
+    torch.testing.assert_close(output, ref_output, atol=1, rtol=1e-1)
+
+
+@pytest.mark.parametrize(
+    ("w13_type", "w2_type"),
+    [
+        (GGMLQuantizationType.IQ3_S, GGMLQuantizationType.IQ4_XS),
+        (GGMLQuantizationType.IQ4_XS, GGMLQuantizationType.Q8_0),
+    ],
+)
+@pytest.mark.parametrize("dtype", DTYPES)
+@torch.inference_mode()
+def test_moe_mixed_iq4_xs_mmq_v2(
+    dtype: torch.dtype,
+    w13_type: GGMLQuantizationType,
+    w2_type: GGMLQuantizationType,
+):
+    set_random_seed(0)
+    num_tokens, hidden_size, top_k = 2050, 512, 4
+    H, E = 1024, 256
+
+    x = torch.rand((num_tokens, H), dtype=dtype, device="cuda")
+    topk_weights = torch.rand(num_tokens, top_k, device="cuda", dtype=dtype)
+    topk_ids = torch.randint(
+        0, E, (num_tokens, top_k), device="cuda", dtype=torch.int32
+    )
+
+    w13 = get_gguf_MoE_tensors(hidden_size, w13_type)[0]
+    w2 = get_gguf_MoE_tensors(hidden_size, w2_type)[1]
+    w13_dequant = torch.tensor(dequantize(w13.data, w13_type), device="cuda").to(dtype)
+    w2_dequant = torch.tensor(dequantize(w2.data, w2_type), device="cuda").to(dtype)
+
+    output = _fused_moe_gguf(
+        x,
+        torch.tensor(w13.data, device="cuda"),
+        torch.tensor(w2.data, device="cuda"),
+        topk_weights,
+        topk_ids,
+        w13_type,
+        w2_type,
         "silu",
     )
 

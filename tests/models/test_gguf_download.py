@@ -4,11 +4,29 @@
 from unittest.mock import MagicMock, patch
 
 import pytest
+import torch
 
 from vllm.config import ModelConfig
 from vllm.config.load import LoadConfig
-from vllm.model_executor.model_loader.gguf_loader import GGUFModelLoader
+from vllm.model_executor.model_loader.gguf_loader import (
+    GGUFModelLoader,
+    _add_gemma4_gguf_mappings,
+    _add_gemma4_mtp_gguf_mappings,
+    _add_qwen3_5_mtp_gguf_mappings,
+    _gguf_arch_model_type,
+    _gguf_name_with_suffix,
+    _use_gguf_multimodal_weights,
+)
 from vllm.model_executor.model_loader.weight_utils import download_gguf
+from vllm.model_executor.models.gemma4 import (
+    _load_gemma4_gguf_fused_moe_qweight,
+    _load_gemma4_gguf_fused_moe_qweight_type,
+)
+from vllm.model_executor.models.gemma4_mm import (
+    _gemma4_patch_embed_weight_loader,
+    _set_gemma4_patch_embed_weight_loader,
+)
+from vllm.model_executor.models.qwen3_next import _maybe_reshape_gguf_weight
 
 
 class TestGGUFDownload:
@@ -222,3 +240,250 @@ class TestGGUFModelLoader:
         model_config.model = "invalid-format"
         with pytest.raises(ValueError, match="Unrecognised GGUF reference"):
             loader._prepare_weights(model_config)
+
+    def test_suffixless_gguf_name_has_no_trailing_dot(self):
+        assert _gguf_name_with_suffix("blk.0.ssm_a", "") == "blk.0.ssm_a"
+        assert _gguf_name_with_suffix("blk.0.attn_q", "weight") == "blk.0.attn_q.weight"
+
+    def test_gemma4_gguf_arch_alias(self):
+        assert _gguf_arch_model_type("gemma4") == "gemma3"
+        assert _gguf_arch_model_type("qwen3_5_mtp") == "qwen35moe"
+        assert _gguf_arch_model_type("qwen35") == "qwen35"
+
+    def test_gemma4_manual_gguf_mappings(self):
+        text_config = MagicMock()
+        text_config.num_hidden_layers = 2
+        vision_config = MagicMock()
+        vision_config.num_hidden_layers = 3
+        gguf_to_hf_name_map: dict[str, str] = {}
+
+        _add_gemma4_gguf_mappings(
+            gguf_to_hf_name_map,
+            text_config,
+            vision_config,
+        )
+
+        assert gguf_to_hf_name_map["blk.1.layer_output_scale.weight"] == (
+            "model.language_model.layers.1.layer_scalar"
+        )
+        assert gguf_to_hf_name_map["blk.1.ffn_gate_inp.scale"] == (
+            "model.language_model.layers.1.router.scale"
+        )
+        assert gguf_to_hf_name_map["blk.1.ffn_gate_inp.weight"] == (
+            "model.language_model.layers.1.router.proj.weight"
+        )
+        assert gguf_to_hf_name_map["blk.1.ffn_down_exps.scale"] == (
+            "model.language_model.layers.1.router.per_expert_scale"
+        )
+        assert gguf_to_hf_name_map["blk.1.ffn_gate_up_exps.weight"] == (
+            "model.language_model.layers.1.experts.gate_up_proj.weight"
+        )
+        assert gguf_to_hf_name_map["blk.1.ffn_down_exps.weight"] == (
+            "model.language_model.layers.1.experts.down_proj.weight"
+        )
+        assert gguf_to_hf_name_map["blk.1.post_ffw_norm_1.weight"] == (
+            "model.language_model.layers.1.post_feedforward_layernorm_1.weight"
+        )
+        assert gguf_to_hf_name_map["blk.1.post_ffw_norm_2.weight"] == (
+            "model.language_model.layers.1.post_feedforward_layernorm_2.weight"
+        )
+        assert gguf_to_hf_name_map["blk.1.pre_ffw_norm_2.weight"] == (
+            "model.language_model.layers.1.pre_feedforward_layernorm_2.weight"
+        )
+        assert gguf_to_hf_name_map["v.blk.2.attn_q.weight"] == (
+            "model.vision_tower.encoder.layers.2.self_attn.q_proj.linear.weight"
+        )
+        assert gguf_to_hf_name_map["v.blk.2.ffn_down.weight"] == (
+            "model.vision_tower.encoder.layers.2.mlp.down_proj.linear.weight"
+        )
+        assert gguf_to_hf_name_map["v.patch_embd.weight"] == (
+            "model.vision_tower.patch_embedder.input_proj.weight"
+        )
+        assert gguf_to_hf_name_map["mm.input_projection.weight"] == (
+            "model.embed_vision.embedding_projection.weight"
+        )
+
+    def test_qwen3_5_mtp_gguf_mappings_use_appended_layer_offset(self):
+        text_config = MagicMock()
+        text_config.num_hidden_layers = 40
+        gguf_to_hf_name_map: dict[str, str] = {}
+
+        _add_qwen3_5_mtp_gguf_mappings(gguf_to_hf_name_map, text_config)
+
+        assert gguf_to_hf_name_map["token_embd.weight"] == ("model.embed_tokens.weight")
+        assert gguf_to_hf_name_map["output.weight"] == "lm_head.weight"
+        assert gguf_to_hf_name_map["blk.40.nextn.eh_proj.weight"] == "mtp.fc.weight"
+        assert gguf_to_hf_name_map["blk.40.nextn.enorm.weight"] == (
+            "mtp.pre_fc_norm_embedding.weight"
+        )
+        assert gguf_to_hf_name_map["blk.40.attn_q.weight"] == (
+            "mtp.layers.0.self_attn.q_proj.weight"
+        )
+        assert gguf_to_hf_name_map["blk.40.ffn_gate_inp_shexp.weight"] == (
+            "mtp.layers.0.mlp.shared_expert_gate.weight"
+        )
+
+    def test_gemma4_mtp_gguf_mappings_are_text_only(self):
+        text_config = MagicMock()
+        text_config.num_hidden_layers = 4
+        gguf_to_hf_name_map: dict[str, str] = {}
+
+        _add_gemma4_mtp_gguf_mappings(gguf_to_hf_name_map, text_config)
+
+        assert gguf_to_hf_name_map["nextn.pre_projection.weight"] == (
+            "pre_projection.weight"
+        )
+        assert gguf_to_hf_name_map["nextn.post_projection.weight"] == (
+            "post_projection.weight"
+        )
+        assert gguf_to_hf_name_map["output_norm.weight"] == "model.norm.weight"
+        assert gguf_to_hf_name_map["blk.3.attn_q.weight"] == (
+            "model.layers.3.self_attn.q_proj.weight"
+        )
+        assert gguf_to_hf_name_map["blk.3.ffn_down.weight"] == (
+            "model.layers.3.mlp.down_proj.weight"
+        )
+
+    def test_gguf_mtp_draft_does_not_load_multimodal_weights(self):
+        mtp_config = MagicMock()
+        mtp_config.model_type = "qwen3_5_mtp"
+        mtp_config.architectures = ["Qwen3_5MoeMTP"]
+        mtp_config.vision_config = object()
+
+        mm_config = MagicMock()
+        mm_config.model_type = "qwen3_5_moe"
+        mm_config.architectures = ["Qwen3_5MoeForConditionalGeneration"]
+        mm_config.vision_config = object()
+
+        assert not _use_gguf_multimodal_weights(mtp_config)
+        assert _use_gguf_multimodal_weights(mm_config)
+
+    def test_qwen_gguf_shared_expert_gate_weight_is_2d(self):
+        loaded_weight = torch.arange(4)
+        reshaped = _maybe_reshape_gguf_weight(
+            "model.layers.0.mlp.shared_expert_gate.weight",
+            loaded_weight,
+        )
+
+        assert reshaped.shape == (1, 4)
+        assert torch.equal(reshaped, loaded_weight[None, :])
+        assert (
+            _maybe_reshape_gguf_weight(
+                "model.layers.0.mlp.gate_proj.weight",
+                loaded_weight,
+            )
+            is loaded_weight
+        )
+
+    def test_qwen_gguf_linear_attn_conv1d_weight_is_3d(self):
+        loaded_weight = torch.arange(8).reshape(2, 4)
+        reshaped = _maybe_reshape_gguf_weight(
+            "model.layers.0.linear_attn.conv1d.weight",
+            loaded_weight,
+        )
+
+        assert reshaped.shape == (2, 1, 4)
+        assert torch.equal(reshaped, loaded_weight[:, None, :])
+
+    def test_gemma4_patch_embedder_weight_transform(self):
+        param = torch.nn.Parameter(torch.empty(2, 60), requires_grad=False)
+        loaded_weight = torch.arange(2 * 3 * 4 * 5).reshape(2, 3, 4, 5)
+
+        _gemma4_patch_embed_weight_loader(param, loaded_weight)
+
+        assert torch.equal(param, loaded_weight.flatten(1))
+
+    def test_gemma4_patch_embedder_loader_keeps_flat_weight(self):
+        param = torch.nn.Parameter(torch.empty(2, 60), requires_grad=False)
+        loaded_weight = torch.arange(2 * 60).reshape(2, 60)
+
+        _gemma4_patch_embed_weight_loader(param, loaded_weight)
+
+        assert torch.equal(param, loaded_weight)
+
+    def test_gemma4_patch_embedder_wraps_existing_weight_loader(self):
+        param = torch.nn.Parameter(torch.empty(2, 60), requires_grad=False)
+        loaded_weight = torch.arange(2 * 3 * 4 * 5).reshape(2, 3, 4, 5)
+        seen_weights = []
+
+        def existing_weight_loader(
+            param: torch.Tensor, loaded_weight: torch.Tensor
+        ) -> None:
+            seen_weights.append(loaded_weight)
+            param.data.copy_(loaded_weight)
+
+        param.weight_loader = existing_weight_loader
+
+        _set_gemma4_patch_embed_weight_loader(param)
+        param.weight_loader(param, loaded_weight)
+
+        assert torch.equal(seen_weights[0], loaded_weight.flatten(1))
+        assert torch.equal(param, loaded_weight.flatten(1))
+
+    def test_gemma4_fused_moe_gguf_qweight_type_remap(self):
+        w13_type = torch.nn.Parameter(
+            torch.empty(1, dtype=torch.uint8), requires_grad=False
+        )
+        w13_type.is_gguf_weight_type = True
+        w13_type.weight_type = 0
+        w2_type = torch.nn.Parameter(
+            torch.empty(1, dtype=torch.uint8), requires_grad=False
+        )
+        w2_type.is_gguf_weight_type = True
+        w2_type.weight_type = 0
+        params_dict = {
+            "layers.0.moe.experts.routed_experts.w13_qweight_type": w13_type,
+            "layers.0.moe.experts.routed_experts.w2_qweight_type": w2_type,
+        }
+
+        remapped = _load_gemma4_gguf_fused_moe_qweight_type(
+            "layers.0.moe.gate_up_proj.qweight_type",
+            torch.tensor(12),
+            params_dict,
+        )
+
+        assert remapped == "layers.0.moe.experts.routed_experts.w13_qweight_type"
+        assert w13_type.weight_type == 12
+        assert w13_type.item() == 12
+
+        remapped = _load_gemma4_gguf_fused_moe_qweight_type(
+            "layers.0.moe.down_proj.qweight_type",
+            torch.tensor(13),
+            params_dict,
+        )
+
+        assert remapped == "layers.0.moe.experts.routed_experts.w2_qweight_type"
+        assert w2_type.weight_type == 13
+        assert w2_type.item() == 13
+
+    def test_gemma4_fused_moe_gguf_qweight_remap(self):
+        w13_qweight = torch.nn.parameter.UninitializedParameter(requires_grad=False)
+        w13_qweight.is_gguf_weight = True
+        w2_qweight = torch.nn.parameter.UninitializedParameter(requires_grad=False)
+        w2_qweight.is_gguf_weight = True
+        params_dict = {
+            "layers.0.moe.experts.routed_experts.w13_qweight": w13_qweight,
+            "layers.0.moe.experts.routed_experts.w2_qweight": w2_qweight,
+        }
+
+        w13_loaded = torch.arange(2 * 3 * 4, dtype=torch.uint8).reshape(2, 3, 4)
+        remapped = _load_gemma4_gguf_fused_moe_qweight(
+            "layers.0.moe.gate_up_proj.qweight",
+            w13_loaded,
+            params_dict,
+        )
+
+        assert remapped == "layers.0.moe.experts.routed_experts.w13_qweight"
+        assert tuple(w13_qweight.shape) == (2, 3, 4)
+        assert torch.equal(w13_qweight, w13_loaded)
+
+        w2_loaded = torch.arange(2 * 5 * 6, dtype=torch.uint8).reshape(2, 5, 6)
+        remapped = _load_gemma4_gguf_fused_moe_qweight(
+            "layers.0.moe.down_proj.qweight",
+            w2_loaded,
+            params_dict,
+        )
+
+        assert remapped == "layers.0.moe.experts.routed_experts.w2_qweight"
+        assert tuple(w2_qweight.shape) == (2, 5, 6)
+        assert torch.equal(w2_qweight, w2_loaded)

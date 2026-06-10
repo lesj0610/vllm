@@ -86,6 +86,21 @@ logger = init_logger(__name__)
 KVCache = tuple[torch.Tensor, torch.Tensor]
 
 
+def _maybe_reshape_gguf_weight(
+    name: str,
+    loaded_weight: torch.Tensor,
+) -> torch.Tensor:
+    # GGUF stores this gate as [hidden], while ReplicatedLinear expects
+    # [1, hidden].
+    if "mlp.shared_expert_gate" in name and loaded_weight.ndim == 1:
+        return loaded_weight[None, :]
+    # GGUF stores Qwen GDN conv1d weights as [out, kernel]. MambaMixer2
+    # keeps conv1d weights in Conv1d-compatible [out, 1, kernel] shape.
+    if "linear_attn.conv1d.weight" in name and loaded_weight.ndim == 2:
+        return loaded_weight[:, None, :]
+    return loaded_weight
+
+
 class Qwen3NextSparseMoeBlock(nn.Module):
     def __init__(self, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
@@ -702,6 +717,7 @@ class Qwen3NextModel(nn.Module, EagleModelMixin):
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader
                     )
+                    loaded_weight = _maybe_reshape_gguf_weight(name, loaded_weight)
                     weight_loader(param, loaded_weight)
             loaded_params.add(name)
         return loaded_params

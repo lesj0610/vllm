@@ -88,6 +88,7 @@ from .qwen3_next import (
     Qwen3NextModel,
     Qwen3NextSparseMoeBlock,
     QwenNextMixtureOfExperts,
+    _maybe_reshape_gguf_weight,
 )
 from .qwen3_vl import (
     Qwen3_VisionTransformer,
@@ -108,6 +109,47 @@ from .utils import (
 )
 
 logger = init_logger(__name__)
+
+
+def _load_gguf_tuple_shards(
+    param: torch.nn.Parameter,
+    loaded_weight: torch.Tensor,
+    shard_id: tuple[int, ...],
+    weight_loader: Callable[..., object],
+) -> bool:
+    if not (
+        getattr(param, "is_gguf_weight", False)
+        or getattr(param, "is_gguf_weight_type", False)
+    ):
+        return False
+
+    if getattr(param, "is_gguf_weight_type", False):
+        for idx in shard_id:
+            weight_loader(param, loaded_weight, idx)
+        return True
+
+    output_dim = getattr(param, "output_dim", None)
+    loader = getattr(weight_loader, "__self__", None)
+    output_sizes = getattr(loader, "output_sizes", None)
+    if output_dim is None or output_sizes is None:
+        return False
+
+    shard_sizes = [output_sizes[idx] for idx in shard_id]
+    packed_dim = getattr(param, "packed_dim", None)
+    if packed_dim == output_dim:
+        packed_factor = getattr(param, "packed_factor", 1)
+        if any(size % packed_factor != 0 for size in shard_sizes):
+            return False
+        shard_sizes = [size // packed_factor for size in shard_sizes]
+
+    if loaded_weight.size(output_dim) != sum(shard_sizes):
+        return False
+
+    for idx, loaded_weight_shard in zip(
+        shard_id, torch.split(loaded_weight, shard_sizes, dim=output_dim)
+    ):
+        weight_loader(param, loaded_weight_shard, idx)
+    return True
 
 
 class Qwen3_5ProcessingInfo(Qwen3VLProcessingInfo):
@@ -350,7 +392,13 @@ class Qwen3_5Model(Qwen3NextModel):
                     continue
                 param = params_dict[name]
                 weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
+                if not (
+                    isinstance(shard_id, tuple)
+                    and _load_gguf_tuple_shards(
+                        param, loaded_weight, shard_id, weight_loader
+                    )
+                ):
+                    weight_loader(param, loaded_weight, shard_id)
                 break
             else:
                 is_expert_weight = False
@@ -435,6 +483,7 @@ class Qwen3_5Model(Qwen3NextModel):
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader
                     )
+                    loaded_weight = _maybe_reshape_gguf_weight(name, loaded_weight)
                     weight_loader(param, loaded_weight)
             loaded_params.add(name)
         return loaded_params

@@ -5,6 +5,7 @@
 from functools import cache
 from os import PathLike
 from pathlib import Path
+from typing import Any, NamedTuple
 
 import gguf
 import regex as re
@@ -14,7 +15,7 @@ from transformers import Gemma3Config, PretrainedConfig, SiglipVisionConfig
 
 from vllm.logger import init_logger
 
-from .repo_utils import list_filtered_repo_files
+from .repo_utils import file_or_path_exists, hf_api, list_filtered_repo_files
 
 logger = init_logger(__name__)
 
@@ -85,6 +86,14 @@ def is_nonstandard_gguf_quant_type(quant_type: str) -> bool:
 # Common suffixes used in GGUF file naming conventions
 # e.g., Q4_K_M, Q3_K_S, Q5_K_L, Q2_K_XL
 _GGUF_QUANT_SUFFIXES = ("_M", "_S", "_L", "_XL", "_XS", "_XXS")
+_HF_CONFIG_FILES = ("config.json",)
+_HF_REPO_ID_PATTERN = re.compile(
+    r"^[a-zA-Z0-9][a-zA-Z0-9._-]*/[a-zA-Z0-9][a-zA-Z0-9._-]*$"
+)
+_HF_REPO_URL_PATTERN = re.compile(
+    r"^https?://huggingface\.co/"
+    r"([a-zA-Z0-9][a-zA-Z0-9._-]*/[a-zA-Z0-9][a-zA-Z0-9._-]*)"
+)
 
 
 def is_valid_gguf_quant_type(gguf_quant_type: str) -> bool:
@@ -121,6 +130,362 @@ def split_remote_gguf(model: str | Path) -> tuple[str, str]:
         "- Non-standard GGUF quant types also supported: "
         "dash-separated prefixes (e.g. UD-Q4_K_XL, Custom-Q8_0)",
     )
+
+
+def _normalize_base_model_ids(base_model: Any) -> list[str]:
+    if base_model is None:
+        return []
+    if isinstance(base_model, str):
+        return [base_model] if base_model else []
+    if isinstance(base_model, (list, tuple, set)):
+        return [model_id for model_id in base_model if isinstance(model_id, str)]
+    return []
+
+
+@cache
+def _get_remote_gguf_base_model_ids(
+    repo_id: str,
+    revision: str | None = None,
+) -> tuple[str, ...]:
+    try:
+        info = hf_api().model_info(repo_id, revision=revision)
+    except Exception as e:
+        logger.debug("Failed to inspect GGUF model card for %s: %s", repo_id, e)
+        return ()
+
+    card_data = getattr(info, "card_data", None)
+    base_model = getattr(card_data, "base_model", None)
+    if base_model is None and isinstance(card_data, dict):
+        base_model = card_data.get("base_model")
+
+    base_model_ids: list[str] = []
+    for value in _normalize_base_model_ids(base_model):
+        if normalized_repo_id := _normalize_hf_repo_id(value):
+            base_model_ids.append(normalized_repo_id)
+
+    # Preserve model card order while dropping duplicates.
+    return tuple(dict.fromkeys(base_model_ids))
+
+
+def _normalize_hf_repo_id(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+
+    value = value.strip()
+    if value.endswith(".git"):
+        value = value[:-4]
+
+    if _HF_REPO_ID_PATTERN.fullmatch(value):
+        return value
+
+    match = _HF_REPO_URL_PATTERN.match(value)
+    if match:
+        repo_id = match.group(1)
+        if repo_id.endswith(".git"):
+            repo_id = repo_id[:-4]
+        return repo_id
+
+    return None
+
+
+def _gguf_field_value(field: Any) -> Any:
+    try:
+        return field.contents()
+    except Exception as e:
+        logger.debug("Failed to read GGUF metadata field: %s", e)
+        return None
+
+
+def _gguf_scalar_string(value: Any) -> str | None:
+    if hasattr(value, "item"):
+        value = value.item()
+    if isinstance(value, bytes):
+        try:
+            return value.decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+    return value if isinstance(value, str) else None
+
+
+def _gguf_first_int(value: Any) -> int | None:
+    if hasattr(value, "tolist"):
+        value = value.tolist()
+    if isinstance(value, (list, tuple)):
+        if not value:
+            return None
+        value = value[0]
+    if hasattr(value, "item"):
+        value = value.item()
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _gguf_list(value: Any) -> list[Any]:
+    if value is None:
+        return []
+    if hasattr(value, "tolist"):
+        value = value.tolist()
+    if isinstance(value, (list, tuple)):
+        return list(value)
+    return [value]
+
+
+def _gguf_int_list(value: Any) -> tuple[int, ...]:
+    values: list[int] = []
+    for item in _gguf_list(value):
+        if hasattr(item, "item"):
+            item = item.item()
+        try:
+            values.append(int(item))
+        except (TypeError, ValueError):
+            return ()
+    return tuple(values)
+
+
+def _gguf_bool_list(value: Any) -> tuple[bool, ...]:
+    values: list[bool] = []
+    for item in _gguf_list(value):
+        if hasattr(item, "item"):
+            item = item.item()
+        if isinstance(item, str):
+            if item.lower() not in {"true", "false", "0", "1"}:
+                return ()
+            values.append(item.lower() in {"true", "1"})
+        else:
+            values.append(bool(item))
+    return tuple(values)
+
+
+class _LocalGgufMtpMetadata(NamedTuple):
+    arch: str
+    nextn_layers: int
+    embedding_length: int | None
+    embedding_length_out: int | None
+    feed_forward_length: int | None
+    head_count: int | None
+    head_count_kv: tuple[int, ...]
+    key_length: int | None
+    key_length_swa: int | None
+    sliding_window: int | None
+    sliding_window_pattern: tuple[bool, ...]
+
+
+@cache
+def _get_local_gguf_mtp_metadata(model: str | Path) -> _LocalGgufMtpMetadata | None:
+    try:
+        reader = gguf.GGUFReader(str(model))
+    except Exception as e:
+        logger.debug("Failed to inspect GGUF MTP metadata for %s: %s", model, e)
+        return None
+
+    arch_field = reader.get_field("general.architecture")
+    arch = _gguf_scalar_string(_gguf_field_value(arch_field)) if arch_field else None
+    if arch is None:
+        return None
+
+    def get_int_field(suffix: str) -> int | None:
+        field = reader.get_field(f"{arch}.{suffix}")
+        return _gguf_first_int(_gguf_field_value(field)) if field else None
+
+    def get_int_list_field(suffix: str) -> tuple[int, ...]:
+        field = reader.get_field(f"{arch}.{suffix}")
+        return _gguf_int_list(_gguf_field_value(field)) if field else ()
+
+    def get_bool_list_field(suffix: str) -> tuple[bool, ...]:
+        field = reader.get_field(f"{arch}.{suffix}")
+        return _gguf_bool_list(_gguf_field_value(field)) if field else ()
+
+    nextn_layers = get_int_field("nextn_predict_layers")
+    if nextn_layers is None:
+        return None
+
+    return _LocalGgufMtpMetadata(
+        arch=arch,
+        nextn_layers=nextn_layers,
+        embedding_length=get_int_field("embedding_length"),
+        embedding_length_out=get_int_field("embedding_length_out"),
+        feed_forward_length=get_int_field("feed_forward_length"),
+        head_count=get_int_field("attention.head_count"),
+        head_count_kv=get_int_list_field("attention.head_count_kv"),
+        key_length=get_int_field("attention.key_length"),
+        key_length_swa=get_int_field("attention.key_length_swa"),
+        sliding_window=get_int_field("attention.sliding_window"),
+        sliding_window_pattern=get_bool_list_field("attention.sliding_window_pattern"),
+    )
+
+
+def _update_config_attrs(config: Any, attrs: dict[str, Any]) -> None:
+    if hasattr(config, "update"):
+        config.update(attrs)
+        return
+    for name, value in attrs.items():
+        setattr(config, name, value)
+
+
+def maybe_patch_mtp_config_from_gguf(
+    model: str | Path,
+    hf_config: PretrainedConfig,
+) -> PretrainedConfig:
+    """Patch MTP hints from GGUF metadata before speculative HF overrides.
+
+    GGUF MTP checkpoints store their MTP layer count in
+    ``<architecture>.nextn_predict_layers``.  vLLM's speculative config path
+    already knows how to turn HF configs into MTP draft configs, so this helper
+    only restores the corresponding HF config hints.
+    """
+    if not check_gguf_file(model):
+        return hf_config
+
+    mtp_metadata = _get_local_gguf_mtp_metadata(model)
+    if mtp_metadata is None:
+        return hf_config
+
+    arch = mtp_metadata.arch
+    if arch in {"qwen35", "qwen35moe"}:
+        hf_config.update({"mtp_num_hidden_layers": mtp_metadata.nextn_layers})
+    elif arch in {"gemma4-assistant", "gemma4-unified-assistant"}:
+        hf_config.model_type = arch.replace("-", "_")
+        text_config = getattr(hf_config, "text_config", hf_config)
+        text_attrs: dict[str, Any] = {
+            "num_hidden_layers": mtp_metadata.nextn_layers,
+        }
+        if mtp_metadata.embedding_length is not None:
+            text_attrs["hidden_size"] = mtp_metadata.embedding_length
+        if mtp_metadata.feed_forward_length is not None:
+            text_attrs["intermediate_size"] = mtp_metadata.feed_forward_length
+        if mtp_metadata.head_count is not None:
+            text_attrs["num_attention_heads"] = mtp_metadata.head_count
+        if mtp_metadata.key_length_swa is not None:
+            text_attrs["head_dim"] = mtp_metadata.key_length_swa
+        if mtp_metadata.key_length is not None:
+            text_attrs["global_head_dim"] = mtp_metadata.key_length
+        if mtp_metadata.sliding_window is not None:
+            text_attrs["sliding_window"] = mtp_metadata.sliding_window
+        pattern = mtp_metadata.sliding_window_pattern[: mtp_metadata.nextn_layers]
+        if len(pattern) == mtp_metadata.nextn_layers:
+            text_attrs["layer_types"] = [
+                "sliding_attention" if is_sliding else "full_attention"
+                for is_sliding in pattern
+            ]
+            kv_heads = mtp_metadata.head_count_kv[: mtp_metadata.nextn_layers]
+            if len(kv_heads) == mtp_metadata.nextn_layers:
+                sliding_kv = next(
+                    (
+                        heads
+                        for is_sliding, heads in zip(pattern, kv_heads)
+                        if is_sliding
+                    ),
+                    None,
+                )
+                full_kv = next(
+                    (
+                        heads
+                        for is_sliding, heads in zip(pattern, kv_heads)
+                        if not is_sliding
+                    ),
+                    None,
+                )
+                if sliding_kv is not None:
+                    text_attrs["num_key_value_heads"] = sliding_kv
+                if full_kv is not None:
+                    text_attrs["num_global_key_value_heads"] = full_kv
+        elif mtp_metadata.head_count_kv:
+            text_attrs["num_key_value_heads"] = mtp_metadata.head_count_kv[0]
+        _update_config_attrs(text_config, text_attrs)
+        if mtp_metadata.embedding_length_out is not None:
+            _update_config_attrs(
+                hf_config,
+                {"backbone_hidden_size": mtp_metadata.embedding_length_out},
+            )
+
+    return hf_config
+
+
+@cache
+def _get_local_gguf_base_model_ids(model: str | Path) -> tuple[str, ...]:
+    try:
+        reader = gguf.GGUFReader(str(model))
+    except Exception as e:
+        logger.debug("Failed to inspect GGUF metadata for %s: %s", model, e)
+        return ()
+
+    base_model_ids: list[str] = []
+    for key, field in reader.fields.items():
+        if not (key.startswith("general.base_model.") and key.endswith(".repo_url")):
+            continue
+        if repo_id := _normalize_hf_repo_id(_gguf_field_value(field)):
+            base_model_ids.append(repo_id)
+
+    # Preserve metadata order while dropping duplicates.
+    return tuple(dict.fromkeys(base_model_ids))
+
+
+def _source_has_any_file(
+    model: str | Path,
+    filenames: tuple[str, ...],
+    revision: str | None = None,
+) -> bool:
+    return any(file_or_path_exists(model, filename, revision) for filename in filenames)
+
+
+def _resolve_gguf_hf_source(
+    model: str | Path,
+    filenames: tuple[str, ...],
+    revision: str | None = None,
+) -> str | Path:
+    if is_remote_gguf(model):
+        source: str | Path
+        source, _ = split_remote_gguf(model)
+        base_model_ids = list(
+            _get_remote_gguf_base_model_ids(
+                source,
+                revision=revision,
+            )
+        )
+    elif check_gguf_file(model):
+        source = Path(model).parent
+        base_model_ids = list(_get_local_gguf_base_model_ids(model))
+    else:
+        return model
+
+    if _source_has_any_file(source, filenames, revision=revision):
+        return source
+
+    for base_model in base_model_ids:
+        # GGUF repo revisions are not meaningful for the referenced HF base model.
+        if _source_has_any_file(base_model, filenames, revision=None):
+            logger.warning_once(
+                "GGUF metadata redirects HF config loading from %s to base "
+                "model '%s'. `trust_remote_code` is not inherited across "
+                "implicit GGUF base-model redirects; pass an explicit "
+                "`--hf-config-path` to opt in for that repository.",
+                model,
+                base_model,
+            )
+            return base_model
+
+    return source
+
+
+def resolve_gguf_config_source(
+    model: str | Path,
+    revision: str | None = None,
+) -> str | Path:
+    """Resolve where a GGUF model should load its HF config from.
+
+    Remote GGUF repos often contain only quantized weights.  If their model card
+    points to an original HF base model, use it only after verifying that the
+    candidate actually provides ``config.json``.
+    """
+    if is_gguf(model):
+        return _resolve_gguf_hf_source(
+            model,
+            _HF_CONFIG_FILES,
+            revision=revision,
+        )
+    return model
 
 
 def is_gguf(model: str | Path) -> bool:
@@ -216,6 +581,14 @@ def extract_vision_config_from_gguf(mmproj_path: str) -> "SiglipVisionConfig | N
         Keys.ClipVision.Attention.LAYERNORM_EPS: ("layer_norm_eps", float),
     }
 
+    def get_scalar(field):
+        value = field.parts[-1]
+        if hasattr(value, "shape") and value.shape == (1,):
+            return value[0].item()
+        if hasattr(value, "item"):
+            return value.item()
+        return value
+
     # Extract and validate all required fields
     config_params = {}
     for gguf_key, (param_name, dtype) in VISION_CONFIG_FIELDS.items():
@@ -227,7 +600,7 @@ def extract_vision_config_from_gguf(mmproj_path: str) -> "SiglipVisionConfig | N
             )
             return None
         # Extract scalar value from GGUF field and convert to target type
-        config_params[param_name] = dtype(field.parts[-1])
+        config_params[param_name] = dtype(get_scalar(field))
 
     # Apply model-specific parameters based on projector type
     if projector_type == VisionProjectorType.GEMMA3:
@@ -279,12 +652,13 @@ def maybe_patch_hf_config_from_gguf(
     # Patch multimodal config if mmproj.gguf exists
     mmproj_path = detect_gguf_multimodal(model)
     if mmproj_path is not None:
-        vision_config = extract_vision_config_from_gguf(str(mmproj_path))
-
         # Create HF config for Gemma3 multimodal
         text_config = hf_config.get_text_config()
         is_gemma3 = hf_config.model_type in ("gemma3", "gemma3_text")
-        if vision_config is not None and is_gemma3:
+        vision_config = (
+            extract_vision_config_from_gguf(str(mmproj_path)) if is_gemma3 else None
+        )
+        if vision_config is not None:
             new_hf_config = Gemma3Config(
                 text_config=text_config,
                 vision_config=vision_config,

@@ -128,17 +128,18 @@ def resolve_tokenizer_args(
     # Separate model folder from file path for GGUF models
     if is_gguf(tokenizer_name):
         if check_gguf_file(tokenizer_name):
-            kwargs["gguf_file"] = Path(tokenizer_name).name
-            tokenizer_name = Path(tokenizer_name).parent
+            gguf_path = Path(tokenizer_name)
+            kwargs["gguf_file"] = gguf_path.name
+            tokenizer_name = gguf_path.parent
         elif is_remote_gguf(tokenizer_name):
-            tokenizer_name, quant_type = split_remote_gguf(tokenizer_name)
-            # Get the HuggingFace Hub path for the GGUF file
-            gguf_file = get_gguf_file_path_from_hf(
+            gguf_repo, quant_type = split_remote_gguf(tokenizer_name)
+            tokenizer_name = gguf_repo
+            # Get the HuggingFace Hub path for the GGUF file.
+            kwargs["gguf_file"] = get_gguf_file_path_from_hf(
                 tokenizer_name,
                 quant_type,
                 revision=revision,
             )
-            kwargs["gguf_file"] = gguf_file
 
     if "truncation_side" not in kwargs:
         if runner_type == "generate" or runner_type == "draft":

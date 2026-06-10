@@ -59,6 +59,59 @@ def test_resolve_tokenizer_args_idempotent(runner_type):
     )
 
 
+def test_resolve_tokenizer_args_remote_gguf_keeps_embedded_tokenizer(monkeypatch):
+    from vllm.tokenizers import registry
+
+    def fake_get_gguf_file_path_from_hf(tokenizer_name, quant_type, revision=None):
+        assert tokenizer_name == "org/model-GGUF"
+        assert quant_type == "UD-IQ4_NL"
+        assert revision == "gguf-rev"
+        return "model-UD-IQ4_NL.gguf"
+
+    monkeypatch.setattr(
+        registry,
+        "get_gguf_file_path_from_hf",
+        fake_get_gguf_file_path_from_hf,
+    )
+
+    tokenizer_mode, tokenizer_name, args, kwargs = resolve_tokenizer_args(
+        "org/model-GGUF:UD-IQ4_NL",
+        revision="gguf-rev",
+    )
+
+    assert tokenizer_mode == "hf"
+    assert tokenizer_name == "org/model-GGUF"
+    assert args == ()
+    assert kwargs["gguf_file"] == "model-UD-IQ4_NL.gguf"
+    assert kwargs["revision"] == "gguf-rev"
+
+
+def test_resolve_tokenizer_args_local_gguf_keeps_embedded_tokenizer(monkeypatch):
+    from vllm.tokenizers import registry
+
+    monkeypatch.setattr(
+        registry,
+        "is_gguf",
+        lambda tokenizer_name: tokenizer_name == "/models/qwen.gguf",
+    )
+    monkeypatch.setattr(
+        registry,
+        "check_gguf_file",
+        lambda tokenizer_name: tokenizer_name == "/models/qwen.gguf",
+    )
+
+    tokenizer_mode, tokenizer_name, args, kwargs = resolve_tokenizer_args(
+        "/models/qwen.gguf",
+        revision="local-rev",
+    )
+
+    assert tokenizer_mode == "hf"
+    assert tokenizer_name == Path("/models")
+    assert args == ()
+    assert kwargs["gguf_file"] == "qwen.gguf"
+    assert kwargs["revision"] == "local-rev"
+
+
 def test_customized_tokenizer():
     TokenizerRegistry.register("test_tokenizer", __name__, TestTokenizer.__name__)
 
