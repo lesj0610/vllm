@@ -34,8 +34,6 @@ def warmup_kernels(
     The first iteration simulates a prefill with requests of
     2 + num_spec_steps prompt tokens each. The second iteration simulates
     a decode step with all requests generating 1 + num_spec_steps tokens.
-    For generation models, an extra small chunked-prefill request warms the
-    cached multi-token prefill shape used by long prompts.
     """
     num_spec_steps = getattr(model_runner, "num_speculative_steps", 0)
     # Use 1 + num_spec_steps + 1 tokens so the prefill batch's per-request
@@ -83,142 +81,6 @@ def warmup_kernels(
     def _alloc_blocks(num_blocks: int) -> list[int]:
         nonlocal next_block_id
         return list(range(next_block_id, next_block_id := next_block_id + num_blocks))
-
-    def _run_chunked_prefill_warmup() -> None:
-        """Warm a cached multi-token prefill shape.
-
-        The short synthetic prefill above only covers fresh requests. Long prompts
-        are often resumed as chunked prefills, where a request has cached prefix
-        tokens and schedules multiple new prompt tokens in the same step. That
-        shape drives Triton unified attention's prefill kernel variant.
-        """
-        if model_runner.is_pooling_model:
-            return
-
-        # Two chunks are enough to exercise the cached-prefill path while keeping
-        # warmup cheap. Larger runtime chunks compile to the same prefill variant.
-        chunk_len = min(64, model_runner.scheduler_config.max_num_batched_tokens // 2)
-        if chunk_len <= 1:
-            return
-
-        first_chunk_len = chunk_len
-        second_chunk_len = chunk_len
-        chunked_prompt_len = first_chunk_len + second_chunk_len
-
-        first_block_counts = [cdiv(first_chunk_len, bs) for bs in group_block_sizes]
-        prompt_block_counts = [cdiv(chunked_prompt_len, bs) for bs in group_block_sizes]
-        second_block_deltas = [
-            prompt - first
-            for prompt, first in zip(prompt_block_counts, first_block_counts)
-        ]
-
-        # The synthetic block IDs are only used for this warmup request. The
-        # previous warmup requests have already been cleaned up, so start from
-        # block 1 again and reserve block 0 as the null block.
-        if sum(prompt_block_counts) > model_runner.kv_cache_config.num_blocks - 1:
-            return
-
-        next_chunk_block_id = 1
-
-        def _alloc_chunk_blocks(num_blocks: int) -> list[int]:
-            nonlocal next_chunk_block_id
-            blocks = list(
-                range(
-                    next_chunk_block_id,
-                    next_chunk_block_id + num_blocks,
-                )
-            )
-            next_chunk_block_id += num_blocks
-            return blocks
-
-        req_id = "_chunked_prefill_warmup_"
-        chunked_prompt_token_ids = list(range(chunked_prompt_len))
-        chunked_request = Request(
-            req_id,
-            chunked_prompt_token_ids,
-            sampling_params,
-            pooling_params,
-        )
-
-        first_output = SchedulerOutput.make_empty()
-        first_output.scheduled_new_reqs = [
-            NewRequestData.from_request(
-                chunked_request,
-                block_ids=tuple(_alloc_chunk_blocks(n) for n in first_block_counts),
-                prefill_token_ids=chunked_prompt_token_ids,
-            )
-        ]
-        first_output.num_scheduled_tokens = {req_id: first_chunk_len}
-        first_output.total_num_scheduled_tokens = first_chunk_len
-        first_output.num_common_prefix_blocks = [0] * num_kv_cache_groups
-
-        cached_req_data = CachedRequestData.make_empty()
-        cached_req_data.req_ids = [req_id]
-        cached_req_data.num_computed_tokens = [first_chunk_len]
-        cached_req_data.num_output_tokens = [0]
-        cached_req_data.new_block_ids = [
-            tuple(_alloc_chunk_blocks(n) for n in second_block_deltas)
-            if any(second_block_deltas)
-            else None
-        ]
-
-        second_output = SchedulerOutput.make_empty()
-        second_output.scheduled_cached_reqs = cached_req_data
-        second_output.num_scheduled_tokens = {req_id: second_chunk_len}
-        second_output.total_num_scheduled_tokens = second_chunk_len
-        second_output.num_common_prefix_blocks = [0] * num_kv_cache_groups
-
-        cleanup_output = SchedulerOutput.make_empty()
-        cleanup_output.finished_req_ids = {req_id}
-
-        try:
-            worker_execute_model(first_output)
-            worker_sample_tokens(None)
-            worker_execute_model(second_output)
-            worker_sample_tokens(None)
-        finally:
-            worker_execute_model(cleanup_output)
-
-    def _run_cached_prefill_attention_warmup() -> None:
-        """Warm attention variants for cached multi-token prefill.
-
-        The scheduler-shaped chunked prefill above exercises the full worker
-        path. Some attention backends additionally specialize on the raw-current
-        cached-prefill path when query_len > 1 and seq_len > query_len. A short
-        forced-attention dummy run with a longer synthetic seq_len compiles that
-        kernel shape without running a full long prompt prefill.
-        """
-        if model_runner.is_pooling_model:
-            return
-
-        dummy_run = getattr(model_runner, "_dummy_run", None)
-        max_num_tokens = getattr(model_runner, "max_num_tokens", 0)
-        max_model_len = getattr(model_runner, "max_model_len", 0)
-        if dummy_run is None or max_num_tokens <= 1 or max_model_len <= 1:
-            return
-
-        num_tokens = min(
-            max_num_tokens,
-            max_model_len,
-            model_runner.scheduler_config.max_num_batched_tokens,
-            4096,
-        )
-        if num_tokens <= 1:
-            return
-
-        profile_seq_lens = min(max_model_len, max(num_tokens + 1, 8192))
-        if profile_seq_lens <= num_tokens:
-            return
-
-        dummy_run(
-            num_tokens=num_tokens,
-            skip_eplb=True,
-            is_profile=True,
-            force_attention=True,
-            uniform_decode=False,
-            num_reqs_override=1,
-            profile_seq_lens=profile_seq_lens,
-        )
 
     # Step 1: Prefill all requests with 2 + num_spec_steps prompt tokens each.
     new_reqs = [
@@ -297,10 +159,82 @@ def warmup_kernels(
         cleanup_output = SchedulerOutput.make_empty()
         cleanup_output.finished_req_ids = set(req_ids)
         worker_execute_model(cleanup_output)
-
-        _run_chunked_prefill_warmup()
-        _run_cached_prefill_attention_warmup()
     finally:
         if kv_connector is not None:
             kv_connector.set_disabled(False)
+    torch.accelerator.synchronize()
+
+
+def _get_positive_int(obj: Any, name: str, default: int) -> int:
+    value = getattr(obj, name, default)
+    return value if isinstance(value, int) and value > 0 else default
+
+
+@torch.inference_mode()
+def warmup_v1_attention_kernels(model_runner: Any) -> None:
+    """Warm old V1 attention kernels through the existing dummy-run path.
+
+    V1 profiling does not always build attention metadata, and CUDA graph
+    capture locks the workspace after capture. Run small forced-attention dummy
+    batches before capture so attention backends can size workspace without
+    backend-specific synthetic calls.
+    """
+    dummy_run = getattr(model_runner, "_dummy_run", None)
+    if dummy_run is None:
+        return
+    if getattr(model_runner, "is_pooling_model", False):
+        return
+    if not getattr(model_runner, "attn_groups", None):
+        return
+
+    scheduler_config = getattr(model_runner, "scheduler_config", None)
+    if scheduler_config is None:
+        return
+
+    max_num_tokens = _get_positive_int(model_runner, "max_num_tokens", 0)
+    max_model_len = _get_positive_int(model_runner, "max_model_len", 0)
+    max_num_seqs = _get_positive_int(scheduler_config, "max_num_seqs", 1)
+    max_num_batched_tokens = _get_positive_int(
+        scheduler_config,
+        "max_num_batched_tokens",
+        max_num_tokens,
+    )
+    if max_num_tokens <= 0 or max_model_len <= 0 or max_num_batched_tokens <= 0:
+        return
+
+    decode_query_len = _get_positive_int(model_runner, "uniform_decode_query_len", 1)
+    max_decode_tokens = min(
+        max_num_tokens,
+        max_num_batched_tokens,
+        max_num_seqs * decode_query_len,
+    )
+    if max_decode_tokens >= decode_query_len:
+        decode_seq_len = min(max_model_len, max(decode_query_len + 1, 8192))
+        decode_kwargs = {
+            "num_tokens": max_decode_tokens,
+            "skip_eplb": True,
+            "is_profile": True,
+            "force_attention": True,
+            "uniform_decode": True,
+        }
+        if decode_seq_len > decode_query_len:
+            decode_kwargs["profile_seq_lens"] = decode_seq_len
+        dummy_run(**decode_kwargs)
+
+    # Keep this representative cached-prefill shape intentionally small. It
+    # covers request-shaped attention metadata without turning warmup into a
+    # long-prompt benchmark.
+    prefill_tokens = min(max_num_tokens, max_num_batched_tokens, max_model_len, 64)
+    prefill_seq_len = min(max_model_len, max(prefill_tokens + 1, 8192))
+    if prefill_tokens > 1 and prefill_seq_len > prefill_tokens:
+        dummy_run(
+            num_tokens=prefill_tokens,
+            skip_eplb=True,
+            is_profile=True,
+            force_attention=True,
+            uniform_decode=False,
+            num_reqs_override=1,
+            profile_seq_lens=prefill_seq_len,
+        )
+
     torch.accelerator.synchronize()

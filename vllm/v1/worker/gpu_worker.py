@@ -67,7 +67,7 @@ from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 from vllm.v1.worker.workspace import init_workspace_manager
 
 from ...model_executor.model_loader import TensorizerLoader
-from .gpu.warmup import warmup_kernels
+from .gpu.warmup import warmup_kernels, warmup_v1_attention_kernels
 from .utils import request_memory
 
 logger = init_logger(__name__)
@@ -607,6 +607,8 @@ class Worker(WorkerBase):
         # Warmup and tune the kernels used during model execution before
         # cuda graph capture.
         kernel_warmup(self)
+        if not self.use_v2_model_runner:
+            warmup_v1_attention_kernels(self.model_runner)
 
         cuda_graph_memory_bytes = 0
         if not self.model_config.enforce_eager:
@@ -688,10 +690,6 @@ class Worker(WorkerBase):
         if self.use_v2_model_runner:
             # V2: Run full execute_model + sample_tokens to JIT compile
             # triton kernels.
-            warmup_kernels(self.model_runner, self.execute_model, self.sample_tokens)
-        else:
-            # V1: Run the same request-shaped warmup so uncaptured attention
-            # kernels used by decode/chunked prefill compile before inference.
             warmup_kernels(self.model_runner, self.execute_model, self.sample_tokens)
 
         if not self.use_v2_model_runner and get_pp_group().is_last_rank:
