@@ -46,13 +46,18 @@ def _warmup_triton_nvfp4_prefill_kernels(runner: "GPUModelRunner") -> None:
     different head sizes. Use tiny synthetic tensors with the real layer shapes
     so those variants compile before the JIT monitor is enabled.
     """
+    if not getattr(runner, "attn_groups", None):
+        return
+
+    max_num_tokens = getattr(runner, "max_num_tokens", 0)
+    max_model_len = getattr(runner, "max_model_len", 0)
+    warmup_tokens = min(max_num_tokens, max_model_len, 64)
+    if warmup_tokens <= 0:
+        return
+
     from vllm.config import get_layers_from_vllm_config
     from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
     from vllm.v1.attention.ops.triton_prefill_attention import context_attention_fwd
-
-    warmup_tokens = min(runner.max_num_tokens, runner.max_model_len, 64)
-    if warmup_tokens <= 0:
-        return
 
     b_start_loc = torch.zeros((1,), dtype=torch.int32, device=runner.device)
     b_seq_len = torch.full((1,), warmup_tokens, dtype=torch.int32, device=runner.device)
@@ -141,6 +146,13 @@ def _warmup_triton_nvfp4_raw_current_split_kernels(
     a reducer. Use one synthetic denoise-shaped request per unique layer shape
     so the first real request does not pay that JIT cost.
     """
+    vllm_config = getattr(runner, "vllm_config", None)
+    model_config = getattr(vllm_config, "model_config", None)
+    if not getattr(model_config, "is_diffusion", False):
+        return
+    if not getattr(runner, "attn_groups", None):
+        return
+
     from vllm.config import get_layers_from_vllm_config
     from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
     from vllm.utils.torch_utils import (
@@ -149,10 +161,6 @@ def _warmup_triton_nvfp4_raw_current_split_kernels(
     )
     from vllm.v1.attention.ops import triton_unified_attention
     from vllm.v1.kv_cache_interface import KVQuantMode
-
-    model_config = getattr(runner.vllm_config, "model_config", None)
-    if not getattr(model_config, "is_diffusion", False):
-        return
 
     query_len = min(runner.max_num_tokens, 256)
     if query_len < 256:

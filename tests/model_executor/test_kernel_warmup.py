@@ -4,11 +4,14 @@
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import torch
+
 from vllm.model_executor.warmup import kernel_warmup, minimax_m3_msa_warmup
 
 
 def _make_worker(model_runner):
     return SimpleNamespace(
+        get_model=lambda: SimpleNamespace(modules=lambda: ()),
         model_runner=model_runner,
         scheduler_config=SimpleNamespace(max_num_batched_tokens=1),
         vllm_config=SimpleNamespace(
@@ -24,6 +27,7 @@ def test_kernel_warmup_invokes_private_kv_block_zeroer(monkeypatch):
     zeroer = Mock()
     model_runner = SimpleNamespace(
         _kv_block_zeroer=zeroer,
+        dtype=torch.float16,
         is_pooling_model=True,
         attn_groups=[],
     )
@@ -40,6 +44,7 @@ def test_kernel_warmup_invokes_public_kv_block_zeroer(monkeypatch):
     zeroer = Mock()
     model_runner = SimpleNamespace(
         kv_block_zeroer=zeroer,
+        dtype=torch.float16,
         is_pooling_model=True,
         attn_groups=[],
     )
