@@ -346,29 +346,3 @@ class TestPerTensorScaleCoercion:
         # numel > 1 must fail loudly instead of silently picking an element.
         with pytest.raises(RuntimeError):
             RoutedExperts._to_scalar(torch.tensor([0.1, 0.2]))
-
-
-class TestWeightShapeLoading:
-    def test_loads_per_expert_shape_metadata(self):
-        layer = object.__new__(RoutedExperts)
-        layer.quant_config = None
-        layer.quant_method = object()
-        layer._map_global_expert_id_to_local_expert_id = lambda expert_id: expert_id
-
-        param = torch.nn.Parameter(torch.zeros(2, 2), requires_grad=False)
-        loaded_weight = torch.tensor([2816, 704], dtype=torch.int64)
-
-        RoutedExperts.weight_loader(
-            layer,
-            param,
-            loaded_weight,
-            weight_name="w2_weight_shape",
-            shard_id="w2",
-            expert_id=1,
-        )
-
-        torch.testing.assert_close(
-            param.data[1],
-            torch.tensor([2816, 704], dtype=param.dtype),
-        )
-        torch.testing.assert_close(param.data[0], torch.zeros(2))

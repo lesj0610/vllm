@@ -535,17 +535,6 @@ class RoutedExperts(PluggableLayer):
         # _to_scalar's reshape(()) would reject the size-2 weight_shape.
         param_data[expert_id] = loaded_weight
 
-    def _load_weight_shape(
-        self, param: torch.nn.Parameter, loaded_weight: torch.Tensor, expert_id: int
-    ):
-        target = param.data[expert_id]
-        target.copy_(
-            loaded_weight.reshape(target.shape).to(
-                device=target.device,
-                dtype=target.dtype,
-            )
-        )
-
     def _load_g_idx(
         self,
         shard_id: str,
@@ -853,7 +842,7 @@ class RoutedExperts(PluggableLayer):
         # Case weight_shape
         if "weight_shape" in weight_name:
             # only required by compressed-tensors
-            self._load_weight_shape(
+            self._load_single_value(
                 param=param, loaded_weight=loaded_weight, expert_id=expert_id
             )
             return True if return_success else None
