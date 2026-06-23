@@ -22,7 +22,12 @@ from transformers.models.auto.modeling_auto import (
     MODEL_MAPPING_NAMES,
 )
 from transformers.models.auto.tokenization_auto import get_tokenizer_config
-from transformers.utils import CONFIG_NAME as HF_CONFIG_NAME
+from transformers.utils import (
+    CONFIG_NAME as HF_CONFIG_NAME,
+)
+from transformers.utils import (
+    GENERATION_CONFIG_NAME,
+)
 
 from vllm import envs
 from vllm.logger import init_logger
@@ -1034,6 +1039,18 @@ def get_hf_text_config(config: PretrainedConfig):
     return text_config
 
 
+def _get_generation_config_source(
+    model: str | Path, revision: str | None = None
+) -> str | Path:
+    model_path = Path(model)
+    if model_path.is_file():
+        model_dir = model_path.parent
+        if file_or_path_exists(model_dir, GENERATION_CONFIG_NAME, revision=revision):
+            return model_dir
+
+    return model
+
+
 def try_get_generation_config(
     model: str,
     trust_remote_code: bool,
@@ -1043,7 +1060,7 @@ def try_get_generation_config(
 ) -> GenerationConfig | None:
     try:
         return GenerationConfig.from_pretrained(
-            model,
+            _get_generation_config_source(model, revision=revision),
             revision=revision,
             token=hf_token,
         )
