@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from types import SimpleNamespace
+import sys
+from collections.abc import Callable
+from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -35,6 +37,10 @@ from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.attention.selector import _cached_get_attn_backend, get_attn_backend
 
 
+class _FakeFaUtils(ModuleType):
+    is_fa_version_supported: Callable[[int], bool]
+
+
 def _make_gemma4_vllm_config(
     *,
     backend: AttentionBackendEnum | None = None,
@@ -50,6 +56,15 @@ def _make_gemma4_vllm_config(
         ),
         attention_config=AttentionConfig(backend=backend),
     )
+
+
+def _patch_fa_utils(
+    monkeypatch: pytest.MonkeyPatch,
+    is_fa_version_supported: Callable[[int], bool],
+) -> None:
+    fa_utils = _FakeFaUtils("vllm.v1.attention.backends.fa_utils")
+    fa_utils.is_fa_version_supported = is_fa_version_supported
+    monkeypatch.setitem(sys.modules, "vllm.v1.attention.backends.fa_utils", fa_utils)
 
 
 @pytest.fixture(autouse=True)
@@ -396,6 +411,10 @@ def test_attention_selector_preserves_head_size_v():
         def __init__(self):
             self.attn_selector_config = None
 
+        @staticmethod
+        def import_kernels() -> None:
+            pass
+
         def get_attn_backend_cls(
             self,
             selected_backend,
@@ -432,9 +451,7 @@ def test_gemma4_keeps_auto_backend_when_fa4_unavailable(
     monkeypatch: pytest.MonkeyPatch,
 ):
     """Gemma4 config should not bypass the normal backend selector."""
-    import vllm.v1.attention.backends.fa_utils as fa_utils
-
-    monkeypatch.setattr(fa_utils, "is_fa_version_supported", lambda version: False)
+    _patch_fa_utils(monkeypatch, lambda version: False)
     vllm_config = _make_gemma4_vllm_config()
 
     Gemma4Config.verify_and_update_config(vllm_config)
@@ -444,13 +461,7 @@ def test_gemma4_keeps_auto_backend_when_fa4_unavailable(
 
 
 def test_gemma4_keeps_existing_fa4_selection(monkeypatch: pytest.MonkeyPatch):
-    import vllm.v1.attention.backends.fa_utils as fa_utils
-
-    monkeypatch.setattr(
-        fa_utils,
-        "is_fa_version_supported",
-        lambda version: version == 4,
-    )
+    _patch_fa_utils(monkeypatch, lambda version: version == 4)
     vllm_config = _make_gemma4_vllm_config()
 
     Gemma4Config.verify_and_update_config(vllm_config)
@@ -459,7 +470,8 @@ def test_gemma4_keeps_existing_fa4_selection(monkeypatch: pytest.MonkeyPatch):
     assert vllm_config.attention_config.flash_attn_version == 4
 
 
-def test_diffusion_gemma_keeps_flashinfer_blocker():
+def test_diffusion_gemma_keeps_flashinfer_blocker(monkeypatch: pytest.MonkeyPatch):
+    _patch_fa_utils(monkeypatch, lambda version: False)
     vllm_config = _make_gemma4_vllm_config(
         backend=AttentionBackendEnum.FLASHINFER,
     )
