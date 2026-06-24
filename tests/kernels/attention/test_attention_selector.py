@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -11,6 +12,10 @@ from vllm.config import (
     CacheConfig,
     VllmConfig,
     set_current_vllm_config,
+)
+from vllm.model_executor.models.config import (
+    DiffusionGemmaModelForBlockDiffusionConfig,
+    Gemma4Config,
 )
 from vllm.platforms import current_platform
 from vllm.platforms.cpu import CpuPlatform
@@ -28,6 +33,23 @@ else:
 
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.attention.selector import _cached_get_attn_backend, get_attn_backend
+
+
+def _make_gemma4_vllm_config(
+    *,
+    backend: AttentionBackendEnum | None = None,
+    head_dim: int = 256,
+    global_head_dim: int = 512,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_text_config=SimpleNamespace(
+                head_dim=head_dim,
+                global_head_dim=global_head_dim,
+            ),
+        ),
+        attention_config=AttentionConfig(backend=backend),
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -365,6 +387,83 @@ def test_auto_backend_selection_behavior():
 
     # Both should select the same backend
     assert backend_auto.get_name() == backend_none.get_name()
+
+
+def test_gemma4_keeps_auto_backend_when_fa4_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Gemma4 config should not bypass the normal backend selector."""
+    import vllm.v1.attention.backends.fa_utils as fa_utils
+
+    monkeypatch.setattr(fa_utils, "is_fa_version_supported", lambda version: False)
+    vllm_config = _make_gemma4_vllm_config()
+
+    Gemma4Config.verify_and_update_config(vllm_config)
+
+    assert vllm_config.attention_config.backend is None
+    assert vllm_config.attention_config.flash_attn_version is None
+
+
+def test_gemma4_keeps_existing_fa4_selection(monkeypatch: pytest.MonkeyPatch):
+    import vllm.v1.attention.backends.fa_utils as fa_utils
+
+    monkeypatch.setattr(
+        fa_utils,
+        "is_fa_version_supported",
+        lambda version: version == 4,
+    )
+    vllm_config = _make_gemma4_vllm_config()
+
+    Gemma4Config.verify_and_update_config(vllm_config)
+
+    assert vllm_config.attention_config.backend is None
+    assert vllm_config.attention_config.flash_attn_version == 4
+
+
+def test_diffusion_gemma_keeps_flashinfer_blocker():
+    vllm_config = _make_gemma4_vllm_config(
+        backend=AttentionBackendEnum.FLASHINFER,
+    )
+
+    with pytest.raises(ValueError, match="mixed causal/bidirectional attention"):
+        DiffusionGemmaModelForBlockDiffusionConfig.verify_and_update_config(vllm_config)
+
+
+@pytest.mark.skipif(CudaPlatform is None, reason="CudaPlatform not available")
+def test_cuda_auto_selects_flashinfer_for_gemma4_mm_prefix_without_fa4(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    pytest.importorskip("flashinfer")
+    import vllm.v1.attention.backends.flash_attn as flash_attn
+
+    monkeypatch.setattr(
+        CudaPlatform,
+        "get_device_capability",
+        classmethod(lambda cls, device_id=0: DeviceCapability(8, 6)),
+    )
+    monkeypatch.setattr(
+        flash_attn,
+        "is_fa_version_supported",
+        lambda version: False,
+    )
+
+    vllm_config = VllmConfig(
+        attention_config=AttentionConfig(backend=None),
+        cache_config=CacheConfig(block_size=16),
+    )
+
+    with (
+        set_current_vllm_config(vllm_config),
+        patch("vllm.platforms.current_platform", CudaPlatform()),
+    ):
+        backend = get_attn_backend(
+            head_size=512,
+            dtype=torch.bfloat16,
+            kv_cache_dtype="auto",
+            use_mm_prefix=True,
+        )
+
+    assert backend.get_name() == "FLASHINFER"
 
 
 @pytest.mark.parametrize(
