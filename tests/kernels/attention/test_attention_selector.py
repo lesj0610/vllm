@@ -517,6 +517,79 @@ def test_cuda_auto_selects_flashinfer_for_gemma4_mm_prefix_without_fa4(
     assert backend.get_name() == "FLASHINFER"
 
 
+@pytest.mark.skipif(CudaPlatform is None, reason="CudaPlatform not available")
+def test_cuda_auto_selects_flashinfer_for_gemma4_nvfp4_without_fa4(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    pytest.importorskip("flashinfer")
+    import vllm.v1.attention.backends.flash_attn as flash_attn
+
+    monkeypatch.setattr(
+        CudaPlatform,
+        "get_device_capability",
+        classmethod(lambda cls, device_id=0: DeviceCapability(8, 6)),
+    )
+    monkeypatch.setattr(
+        flash_attn,
+        "is_fa_version_supported",
+        lambda version: False,
+    )
+
+    vllm_config = VllmConfig(
+        attention_config=AttentionConfig(backend=None),
+        cache_config=CacheConfig(block_size=16),
+    )
+
+    with (
+        set_current_vllm_config(vllm_config),
+        patch("vllm.platforms.current_platform", CudaPlatform()),
+    ):
+        backend = get_attn_backend(
+            head_size=512,
+            dtype=torch.bfloat16,
+            kv_cache_dtype="nvfp4",
+        )
+
+    assert backend.get_name() == "FLASHINFER"
+
+
+@pytest.mark.skipif(CudaPlatform is None, reason="CudaPlatform not available")
+def test_cuda_auto_selects_flashinfer_for_gemma4_mm_prefix_nvfp4_without_fa4(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    pytest.importorskip("flashinfer")
+    import vllm.v1.attention.backends.flash_attn as flash_attn
+
+    monkeypatch.setattr(
+        CudaPlatform,
+        "get_device_capability",
+        classmethod(lambda cls, device_id=0: DeviceCapability(8, 6)),
+    )
+    monkeypatch.setattr(
+        flash_attn,
+        "is_fa_version_supported",
+        lambda version: False,
+    )
+
+    vllm_config = VllmConfig(
+        attention_config=AttentionConfig(backend=None),
+        cache_config=CacheConfig(block_size=16),
+    )
+
+    with (
+        set_current_vllm_config(vllm_config),
+        patch("vllm.platforms.current_platform", CudaPlatform()),
+    ):
+        backend = get_attn_backend(
+            head_size=256,
+            dtype=torch.bfloat16,
+            kv_cache_dtype="nvfp4",
+            use_mm_prefix=True,
+        )
+
+    assert backend.get_name() == "FLASHINFER"
+
+
 @pytest.mark.parametrize(
     "backend_name,flash_attn_version,should_succeed",
     [
