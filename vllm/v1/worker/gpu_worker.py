@@ -72,7 +72,7 @@ from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 from vllm.v1.worker.workspace import init_workspace_manager
 
 from ...model_executor.model_loader import TensorizerLoader
-from .gpu.warmup import warmup_kernels
+from .gpu.warmup import warmup_kernels, warmup_v1_attention_kernels
 from .utils import request_memory
 
 logger = init_logger(__name__)
@@ -80,6 +80,14 @@ logger = init_logger(__name__)
 if TYPE_CHECKING:
     from vllm.model_executor.model_loader.tensorizer import TensorizerConfig
     from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+
+
+def _warmup_slot_mapping_kernel(model_runner: "GPUModelRunner") -> None:
+    input_batch = getattr(model_runner, "input_batch", None)
+    block_table = getattr(input_batch, "block_table", None)
+    warmup = getattr(block_table, "warmup_compute_slot_mapping", None)
+    if warmup is not None:
+        warmup()
 
 
 class AsyncIntermediateTensors(IntermediateTensors):
@@ -652,6 +660,9 @@ class Worker(WorkerBase):
         # Warmup and tune the kernels used during model execution before
         # cuda graph capture.
         kernel_warmup(self)
+        _warmup_slot_mapping_kernel(self.model_runner)
+        if not self.use_v2_model_runner:
+            warmup_v1_attention_kernels(self.model_runner)
 
         cuda_graph_memory_bytes = 0
         if not self.model_config.enforce_eager:
