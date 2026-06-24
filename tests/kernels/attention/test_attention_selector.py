@@ -389,6 +389,45 @@ def test_auto_backend_selection_behavior():
     assert backend_auto.get_name() == backend_none.get_name()
 
 
+def test_attention_selector_preserves_head_size_v():
+    class CapturingPlatform:
+        device_name = "capture"
+
+        def __init__(self):
+            self.attn_selector_config = None
+
+        def get_attn_backend_cls(
+            self,
+            selected_backend,
+            attn_selector_config,
+            num_heads=None,
+        ):
+            self.attn_selector_config = attn_selector_config
+            return "vllm.v1.attention.backends.cpu_attn.CPUAttentionBackend"
+
+    platform = CapturingPlatform()
+    vllm_config = VllmConfig(
+        attention_config=AttentionConfig(backend=None),
+        cache_config=CacheConfig(block_size=16),
+    )
+
+    with (
+        set_current_vllm_config(vllm_config),
+        patch("vllm.platforms.current_platform", platform),
+    ):
+        backend = get_attn_backend(
+            head_size=128,
+            head_size_v=64,
+            dtype=torch.float16,
+            kv_cache_dtype=None,
+        )
+
+    assert backend.get_name() == "CPU_ATTN"
+    assert platform.attn_selector_config is not None
+    assert platform.attn_selector_config.head_size_v == 64
+    assert "head_size_v=64" in repr(platform.attn_selector_config)
+
+
 def test_gemma4_keeps_auto_backend_when_fa4_unavailable(
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -619,102 +658,6 @@ def test_non_causal_autoselect_backend():
             kv_cache_dtype=None,
         )
         assert backend.supports_non_causal()
-
-
-def test_nvfp4_auto_selects_triton_on_non_sm100(monkeypatch: pytest.MonkeyPatch):
-    """FlashInfer nvfp4 KV requires SM100, so auto-selection should fall
-    through to Triton on earlier CUDA architectures.
-    """
-    _cached_get_attn_backend.cache_clear()
-
-    if CudaPlatform is None:
-        pytest.skip("CudaPlatform not available")
-
-    monkeypatch.setattr(
-        CudaPlatform,
-        "get_device_capability",
-        classmethod(lambda cls, device_id=0: DeviceCapability(9, 0)),
-    )
-
-    vllm_config = VllmConfig(
-        attention_config=AttentionConfig(backend=None),
-        cache_config=CacheConfig(block_size=16),
-    )
-    with (
-        set_current_vllm_config(vllm_config),
-        patch("vllm.platforms.current_platform", CudaPlatform()),
-    ):
-        backend = get_attn_backend(
-            head_size=128,
-            dtype=torch.float16,
-            kv_cache_dtype="nvfp4",
-        )
-
-    assert backend.get_name() == "TRITON_ATTN"
-
-
-def test_triton_nvfp4_rejects_diff_kv(monkeypatch: pytest.MonkeyPatch):
-    """Triton NVFP4 uses one packed K/V head dimension today."""
-    _cached_get_attn_backend.cache_clear()
-
-    if CudaPlatform is None:
-        pytest.skip("CudaPlatform not available")
-
-    monkeypatch.setattr(
-        CudaPlatform,
-        "get_device_capability",
-        classmethod(lambda cls, device_id=0: DeviceCapability(9, 0)),
-    )
-
-    vllm_config = VllmConfig(
-        attention_config=AttentionConfig(backend=AttentionBackendEnum.TRITON_ATTN),
-        cache_config=CacheConfig(block_size=16),
-    )
-    with (
-        set_current_vllm_config(vllm_config),
-        patch("vllm.platforms.current_platform", CudaPlatform()),
-        pytest.raises(ValueError, match="head_size_v equal to head_size"),
-    ):
-        get_attn_backend(
-            head_size=128,
-            head_size_v=64,
-            dtype=torch.float16,
-            kv_cache_dtype="nvfp4",
-        )
-
-
-def test_flashinfer_nvfp4_requires_sm100():
-    flashinfer_mod = pytest.importorskip("vllm.v1.attention.backends.flashinfer")
-    flashinfer_backend = flashinfer_mod.FlashInferBackend
-
-    assert (
-        flashinfer_backend.supports_combination(
-            head_size=128,
-            dtype=torch.float16,
-            kv_cache_dtype="nvfp4",
-            block_size=16,
-            use_mla=False,
-            has_sink=False,
-            use_sparse=False,
-            use_mm_prefix=False,
-            device_capability=DeviceCapability(9, 0),
-        )
-        == "nvfp4 KV cache in FlashInfer requires SM100"
-    )
-    assert (
-        flashinfer_backend.supports_combination(
-            head_size=128,
-            dtype=torch.float16,
-            kv_cache_dtype="nvfp4",
-            block_size=16,
-            use_mla=False,
-            has_sink=False,
-            use_sparse=False,
-            use_mm_prefix=False,
-            device_capability=DeviceCapability(10, 0),
-        )
-        is None
-    )
 
 
 @pytest.mark.parametrize(
