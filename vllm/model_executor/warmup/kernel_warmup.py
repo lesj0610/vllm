@@ -24,6 +24,9 @@ from vllm.model_executor.warmup.flashinfer_sparse_mla_warmup import (
     deepseek_v4_sparse_mla_attention_warmup,
     flashinfer_sparse_mla_decode_autotune_warmup,
 )
+from vllm.model_executor.warmup.hybrid_gdn_mamba_mrope_warmup import (
+    hybrid_gdn_mamba_mrope_warmup,
+)
 from vllm.platforms import current_platform
 from vllm.utils.deep_gemm import is_deep_gemm_supported
 from vllm.utils.flashinfer import has_flashinfer
@@ -66,6 +69,11 @@ def kernel_warmup(worker: "Worker"):
     if do_deep_gemm_warmup:
         max_tokens = worker.scheduler_config.max_num_batched_tokens
         deep_gemm_warmup(model, max_tokens)
+
+    hybrid_gdn_mamba_mrope_warmup(
+        model,
+        model_dtype=worker.model_runner.dtype,
+    )
 
     minimax_m3_msa_warmup(worker)
 
