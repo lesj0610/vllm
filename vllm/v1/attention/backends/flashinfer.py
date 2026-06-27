@@ -523,8 +523,6 @@ class FlashInferBackend(AttentionBackend):
     ) -> str | None:
         if not use_mm_prefix:
             return None
-        if kv_cache_dtype == "nvfp4":
-            return "mm_prefix is not supported with NVFP4 KV cache"
         if block_size is not None and block_size >= 128:
             return "mm_prefix is not supported with TRTLLM-only FlashInfer block sizes"
         if has_sink:
@@ -1070,10 +1068,6 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             raise NotImplementedError(
                 "FlashInfer mm_prefix prefill is not supported with DCP yet."
             )
-        if self.is_kvcache_nvfp4:
-            raise NotImplementedError(
-                "FlashInfer mm_prefix prefill is not supported with NVFP4 KV cache."
-            )
         if self._mm_prefill_wrapper is None:
             self._mm_prefill_wrapper = BatchPrefillWithPagedKVCacheWrapper(
                 self._get_workspace_buffer(),
@@ -1574,10 +1568,6 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             if self.use_dcp:
                 raise NotImplementedError(
                     "FlashInfer mm_prefix prefill is not supported with DCP yet."
-                )
-            if self.is_kvcache_nvfp4:
-                raise NotImplementedError(
-                    "FlashInfer mm_prefix prefill is not supported with NVFP4 KV cache."
                 )
             if page_size >= 128:
                 raise NotImplementedError(
