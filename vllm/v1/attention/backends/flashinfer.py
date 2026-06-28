@@ -995,6 +995,10 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             or self.model_config.max_model_len
             <= scheduler_config.max_num_batched_tokens
         ):
+            # Without chunked prefill, or when one scheduler chunk can cover
+            # the full context, every prefill is the first chunk
+            # (q_len == seq_len). That path uses the current K/V tensors
+            # directly and does not need a dequant scratch buffer.
             return
 
         scratch_shape = (
@@ -2241,6 +2245,16 @@ class FlashInferImpl(AttentionImpl):
         else:
             self._nvfp4_fp8_out = None
 
+        self._nvfp4_fa2_cu_q: torch.Tensor | None = None
+        self._nvfp4_fa2_cu_k: torch.Tensor | None = None
+        if (
+            self.is_kvcache_nvfp4
+            and self.fa_version is not None
+            and vllm_config is not None
+        ):
+            self._nvfp4_fa2_cu_q = torch.zeros(2, device="cuda", dtype=torch.int32)
+            self._nvfp4_fa2_cu_k = torch.zeros(2, device="cuda", dtype=torch.int32)
+
         dcp_a2a = (
             vllm_config is not None
             and vllm_config.parallel_config.decode_context_parallel_size > 1
@@ -2323,6 +2337,8 @@ class FlashInferImpl(AttentionImpl):
             or not isinstance(attn_metadata.causal, bool)
             or self.dcp_world_size > 1
             or attn_metadata.use_cascade
+            or self._nvfp4_fa2_cu_q is None
+            or self._nvfp4_fa2_cu_k is None
         ):
             return False
 
@@ -2342,11 +2358,6 @@ class FlashInferImpl(AttentionImpl):
 
         qsl = prefill.query_start_loc_cpu.tolist()
         seq_lens = prefill.seq_lens_cpu.tolist()
-        device = prefill_query.device
-
-        if not hasattr(self, "_nvfp4_fa2_cu_q"):
-            self._nvfp4_fa2_cu_q = torch.zeros(2, device=device, dtype=torch.int32)
-            self._nvfp4_fa2_cu_k = torch.zeros(2, device=device, dtype=torch.int32)
 
         for req_idx in range(num_reqs):
             q_start = int(qsl[req_idx])
@@ -2366,6 +2377,11 @@ class FlashInferImpl(AttentionImpl):
             else:
                 if not is_workspace_manager_initialized():
                     return False
+                # FlashInfer's paged NVFP4 dequant helper writes a padded
+                # [batch, max_seq_len, ...] buffer, while flash-attn varlen
+                # consumes compact per-request K/V. The reserved scratch space
+                # is also sized for one request, so continuation chunks are
+                # dequantized and processed one request at a time.
                 k_buf, v_buf = current_workspace_manager().get_simultaneous(
                     (
                         (1, seq_len, self.num_kv_heads, self.head_size),
