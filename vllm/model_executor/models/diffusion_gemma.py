@@ -17,6 +17,7 @@ via Gemma4MultimodalEmbedder.
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
+from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any
 
@@ -51,7 +52,10 @@ from vllm.v1.outputs import LogprobsTensors
 from vllm.v1.worker.gpu.attn_utils import build_attn_metadata
 from vllm.v1.worker.gpu.buffer_utils import UvaBackedTensor, async_copy_to_gpu
 from vllm.v1.worker.gpu.input_batch import InputBatch
-from vllm.v1.worker.gpu.model_states.interface import ModelState
+from vllm.v1.worker.gpu.model_states.interface import (
+    ModelSpecificAttnMetadata,
+    ModelState,
+)
 from vllm.v1.worker.gpu.sample.logprob import compute_topk_logprobs
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
 from vllm.v1.worker.gpu.sample.penalties import use_penalty
@@ -64,6 +68,22 @@ from .interfaces import (
 )
 
 logger = init_logger(__name__)
+
+
+@dataclass
+class DiffusionGemmaAttnMetadata(ModelSpecificAttnMetadata):
+    is_prefilling: torch.Tensor
+    mm_req_doc_ranges: dict[int, list[tuple[int, int]]] | None = None
+
+    def get_extra_common_attn_kwargs(
+        self,
+        kv_cache_group_id: int,
+        num_reqs: int,
+    ) -> dict[str, Any]:
+        return {
+            "is_prefilling": self.is_prefilling[:num_reqs],
+            "mm_req_doc_ranges": self.mm_req_doc_ranges,
+        }
 
 
 class DiffusionGemmaSelfConditioning(nn.Module):
@@ -926,6 +946,37 @@ class DiffusionGemmaModelState(ModelState):
                 inputs_embeds[canvas], soft.to(inputs_embeds.dtype)
             )
 
+    def _build_mm_req_doc_ranges(
+        self,
+        input_batch: InputBatch,
+        num_reqs: int,
+    ) -> dict[int, list[tuple[int, int]]] | None:
+        if not self.supports_mm_inputs or self.encoder_cache is None:
+            return None
+
+        mm_features_by_req = getattr(self.encoder_cache, "mm_features", None)
+        if not mm_features_by_req:
+            return None
+
+        hf_text_config = self.model_config.hf_text_config
+        sliding_window = getattr(hf_text_config, "sliding_window", None)
+        mm_req_doc_ranges: dict[int, list[tuple[int, int]]] = {}
+        for req_idx, req_id in enumerate(input_batch.req_ids[:num_reqs]):
+            ranges: list[tuple[int, int]] = []
+            for mm_feature in mm_features_by_req.get(req_id, []):
+                if mm_feature.modality == "audio":
+                    continue
+                for start, end in mm_feature.mm_position.extract_embeds_range():
+                    if (
+                        sliding_window is not None
+                        and (end - start + 1) > sliding_window
+                    ):
+                        continue
+                    ranges.append((start, end))
+            if ranges:
+                mm_req_doc_ranges[req_idx] = ranges
+        return mm_req_doc_ranges or None
+
     def prepare_inputs(self, input_batch, req_states) -> dict[str, Any]:
         states = self.diffusion_states
         num_tokens = input_batch.num_tokens
@@ -1011,6 +1062,18 @@ class DiffusionGemmaModelState(ModelState):
             self._causal_buf[actual_num_reqs:num_reqs] = False
         causal: bool | torch.Tensor = self._causal_buf[:num_reqs]
 
+        is_prefilling = torch.zeros(num_reqs, dtype=torch.bool, device="cpu")
+        is_prefilling[:actual_num_reqs] = torch.from_numpy(
+            input_batch.is_prefilling_np[:actual_num_reqs]
+        )
+        diffusion_attn_metadata = DiffusionGemmaAttnMetadata(
+            is_prefilling=is_prefilling,
+            mm_req_doc_ranges=self._build_mm_req_doc_ranges(
+                input_batch,
+                actual_num_reqs,
+            ),
+        )
+
         return build_attn_metadata(
             attn_groups=attn_groups,
             num_reqs=num_reqs,
@@ -1024,6 +1087,7 @@ class DiffusionGemmaModelState(ModelState):
             slot_mappings=slot_mappings,
             kv_cache_config=kv_cache_config,
             causal=causal,
+            model_specific_attn_metadata=diffusion_attn_metadata,
         )
 
     num_new_sampled_tokens_per_step: int = 0
