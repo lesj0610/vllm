@@ -253,25 +253,18 @@ class DiffusionGemmaModelForBlockDiffusionConfig(VerifyAndUpdateConfig):
         read straight from generation_config.json at sampler-build time
         (see DiffusionGemma's custom_sampler), not injected here.
         """
-        # Inherit Gemma4's attention backend selection, keeping the Triton
-        # fallback for mixed causal/bidirectional attention.
-        Gemma4Config.verify_and_update_config(vllm_config, fallback_to_triton=True)
-
-        from vllm.v1.attention.backends.registry import AttentionBackendEnum
+        # Inherit Gemma4's attention backend selection. FlashInfer can handle
+        # DiffusionGemma's mixed causal/bidirectional attention through its
+        # dynamic causal custom-mask path, so do not force the Triton fallback.
+        Gemma4Config.verify_and_update_config(vllm_config, fallback_to_triton=False)
 
         attention_config = vllm_config.attention_config
-        if attention_config.backend == AttentionBackendEnum.FLASHINFER:
-            raise ValueError(
-                "FlashInfer does not support DiffusionGemma's mixed "
-                "causal/bidirectional attention. Use --attention-backend "
-                "FLASH_ATTN or TRITON_ATTN instead."
-            )
         if attention_config.backend is None and not attention_config.use_non_causal:
             attention_config.use_non_causal = True
             logger.info(
                 "DiffusionGemma uses mixed causal/bidirectional attention "
-                "within a batch; setting use_non_causal=True to exclude "
-                "FlashInfer from auto-selection."
+                "within a batch; setting use_non_causal=True for backend "
+                "selection."
             )
 
         # Auto-create DiffusionConfig from HF config if not provided.
@@ -496,7 +489,7 @@ class LlamaBidirectionalConfig(VerifyAndUpdateConfig):
             "last": "LAST",
         }
 
-        pooling_type = pooling_type_map.get(hf_config.pooling, None)
+        pooling_type = pooling_type_map.get(hf_config.pooling)
         if pooling_type is None:
             raise ValueError(f"pool_type {hf_config.pooling!r} not supported")
 
@@ -532,6 +525,8 @@ class LlamaNemotronVLConfig(VerifyAndUpdateConfig):
         if pooling is None and hasattr(hf_config, "llm_config"):
             pooling = getattr(hf_config.llm_config, "pooling", "avg")
 
+        if not isinstance(pooling, str):
+            raise ValueError(f"pool_type {pooling!r} not supported")
         pooling_type = pooling_type_map.get(pooling)
         if pooling_type is None:
             raise ValueError(f"pool_type {pooling!r} not supported")

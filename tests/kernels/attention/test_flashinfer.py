@@ -5,6 +5,7 @@
 from itertools import product
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
 from vllm.platforms import current_platform
@@ -149,6 +150,248 @@ def test_flashinfer_mm_prefix_custom_mask_matches_triton_semantics() -> None:
     )
 
     torch.testing.assert_close(custom_mask, expected)
+
+
+def test_flashinfer_dynamic_causal_custom_mask() -> None:
+    from vllm.v1.attention.backends.flashinfer import (
+        _build_dynamic_causal_custom_mask,
+    )
+
+    custom_mask = _build_dynamic_causal_custom_mask(
+        dynamic_causal=torch.tensor([False, True, False], dtype=torch.bool),
+        mm_prefix_range=None,
+        request_offset=1,
+        qo_indptr=torch.tensor([0, 2, 5], dtype=torch.int32),
+        paged_kv_indptr=torch.tensor([0, 1, 3], dtype=torch.int32),
+        paged_kv_last_page_len=torch.tensor([4, 2], dtype=torch.int32),
+        page_size=4,
+        window_left=-1,
+        device=torch.device("cpu"),
+    )
+
+    expected = torch.tensor(
+        [
+            # Request 0: causal, q_abs=[2,3], kv_len=4.
+            True,
+            True,
+            True,
+            False,
+            True,
+            True,
+            True,
+            True,
+            # Request 1: bidirectional, q_abs=[3,4,5], kv_len=6.
+            True,
+            True,
+            True,
+            True,
+            True,
+            True,
+            True,
+            True,
+            True,
+            True,
+            True,
+            True,
+            True,
+            True,
+            True,
+            True,
+            True,
+            True,
+        ],
+        dtype=torch.bool,
+    )
+
+    torch.testing.assert_close(custom_mask, expected)
+
+    windowed_mask = _build_dynamic_causal_custom_mask(
+        dynamic_causal=torch.tensor([False, True, False], dtype=torch.bool),
+        mm_prefix_range=None,
+        request_offset=1,
+        qo_indptr=torch.tensor([0, 2, 5], dtype=torch.int32),
+        paged_kv_indptr=torch.tensor([0, 1, 3], dtype=torch.int32),
+        paged_kv_last_page_len=torch.tensor([4, 2], dtype=torch.int32),
+        page_size=4,
+        window_left=1,
+        device=torch.device("cpu"),
+    )
+    expected_windowed = torch.tensor(
+        [
+            # Request 0: causal plus left window.
+            False,
+            True,
+            True,
+            False,
+            False,
+            False,
+            True,
+            True,
+            # Request 1: bidirectional plus left window.
+            False,
+            False,
+            True,
+            True,
+            True,
+            True,
+            False,
+            False,
+            False,
+            True,
+            True,
+            True,
+            False,
+            False,
+            False,
+            False,
+            True,
+            True,
+        ],
+        dtype=torch.bool,
+    )
+
+    torch.testing.assert_close(windowed_mask, expected_windowed)
+
+    mm_prefix_mask = _build_dynamic_causal_custom_mask(
+        dynamic_causal=torch.tensor([True, True], dtype=torch.bool),
+        mm_prefix_range={0: [(0, 3)]},
+        request_offset=0,
+        qo_indptr=torch.tensor([0, 2, 4], dtype=torch.int32),
+        paged_kv_indptr=torch.tensor([0, 1, 2], dtype=torch.int32),
+        paged_kv_last_page_len=torch.tensor([4, 4], dtype=torch.int32),
+        page_size=4,
+        window_left=1,
+        device=torch.device("cpu"),
+    )
+    expected_mm_prefix = torch.tensor(
+        [
+            # Request 0: mm-prefix range restores all in-range keys.
+            True,
+            True,
+            True,
+            True,
+            True,
+            True,
+            True,
+            True,
+            # Request 1: no mm-prefix, causal plus left window only.
+            False,
+            True,
+            True,
+            False,
+            False,
+            False,
+            True,
+            True,
+        ],
+        dtype=torch.bool,
+    )
+
+    torch.testing.assert_close(mm_prefix_mask, expected_mm_prefix)
+
+
+def test_flashinfer_dynamic_causal_custom_mask_rejects_invalid_lengths() -> None:
+    from vllm.v1.attention.backends.flashinfer import (
+        _build_dynamic_causal_custom_mask,
+    )
+
+    with pytest.raises(ValueError, match="q_len <= kv_len"):
+        _build_dynamic_causal_custom_mask(
+            dynamic_causal=torch.tensor([True], dtype=torch.bool),
+            mm_prefix_range=None,
+            request_offset=0,
+            qo_indptr=torch.tensor([0, 5], dtype=torch.int32),
+            paged_kv_indptr=torch.tensor([0, 1], dtype=torch.int32),
+            paged_kv_last_page_len=torch.tensor([3], dtype=torch.int32),
+            page_size=4,
+            window_left=-1,
+            device=torch.device("cpu"),
+        )
+
+
+def test_diffusion_gemma_prepare_attn_supplies_dynamic_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import vllm.model_executor.models.diffusion_gemma as diffusion_gemma
+    from vllm.config.compilation import CUDAGraphMode
+    from vllm.model_executor.models.diffusion_gemma import DiffusionGemmaModelState
+
+    captured_kwargs = {}
+
+    def fake_build_attn_metadata(**kwargs):
+        captured_kwargs.update(kwargs)
+        return {"layer": "metadata"}
+
+    def make_mm_feature(modality: str, ranges: list[tuple[int, int]]):
+        return SimpleNamespace(
+            modality=modality,
+            mm_position=SimpleNamespace(extract_embeds_range=lambda: ranges),
+        )
+
+    monkeypatch.setattr(
+        diffusion_gemma,
+        "build_attn_metadata",
+        fake_build_attn_metadata,
+    )
+
+    state = object.__new__(DiffusionGemmaModelState)
+    state.max_model_len = 128
+    state.model_config = SimpleNamespace(
+        is_mm_prefix_lm=True,
+        hf_text_config=SimpleNamespace(sliding_window=8),
+    )
+    state.diffusion_states = SimpleNamespace(
+        is_encoder_phase=torch.tensor([True, False], dtype=torch.bool)
+    )
+    state._causal_buf = torch.zeros(4, dtype=torch.bool)
+    state.encoder_cache = SimpleNamespace(
+        mm_features={
+            "req0": [
+                make_mm_feature("image", [(1, 3), (10, 20)]),
+                make_mm_feature("audio", [(2, 4)]),
+            ],
+            "req1": [make_mm_feature("image", [(5, 6)])],
+        }
+    )
+
+    input_batch = SimpleNamespace(
+        req_ids=["req0", "req1"],
+        num_reqs=2,
+        num_reqs_after_padding=4,
+        num_tokens=3,
+        num_tokens_after_padding=5,
+        idx_mapping=torch.tensor([0, 1], dtype=torch.int64),
+        num_scheduled_tokens=np.array([2, 1], dtype=np.int32),
+        query_start_loc=torch.tensor([0, 2, 3, 5, 5], dtype=torch.int32),
+        query_start_loc_np=np.array([0, 2, 3, 5, 5], dtype=np.int32),
+        seq_lens=torch.tensor([2, 3, 0, 0], dtype=torch.int32),
+        is_prefilling_np=np.array([True, False], dtype=np.bool_),
+    )
+
+    attn_metadata = DiffusionGemmaModelState.prepare_attn(
+        state,
+        input_batch,
+        CUDAGraphMode.FULL,
+        block_tables=[torch.zeros((4, 1), dtype=torch.int32)],
+        slot_mappings=[torch.zeros(5, dtype=torch.int64)],
+        attn_groups=[],
+        kv_cache_config=SimpleNamespace(),
+    )
+
+    assert attn_metadata == {"layer": "metadata"}
+    assert captured_kwargs["causal"].tolist() == [True, False, False, False]
+    metadata = captured_kwargs["model_specific_attn_metadata"]
+    common_kwargs = metadata.get_extra_common_attn_kwargs(0, 4)
+    assert common_kwargs["is_prefilling"].tolist() == [
+        True,
+        False,
+        False,
+        False,
+    ]
+    assert common_kwargs["mm_req_doc_ranges"] == {
+        0: [(1, 3)],
+        1: [(5, 6)],
+    }
 
 
 def ref_paged_attn(
@@ -1046,6 +1289,86 @@ def test_flashinfer_prefill_with_mm_prefix_custom_mask() -> None:
         block_size,
         custom_mask=custom_mask,
         causal=True,
+        window_left=-1,
+        q_data_type=dtype,
+        kv_data_type=dtype,
+    )
+
+    output = wrapper.run(query, key_value_cache)
+    ref_output = ref_paged_attn(
+        query=query,
+        key_cache=key_cache,
+        value_cache=value_cache,
+        query_lens=query_lens,
+        kv_lens=kv_lens,
+        block_tables=block_tables,
+        scale=scale,
+        custom_mask=custom_mask,
+    )
+
+    torch.testing.assert_close(output, ref_output, atol=5e-2, rtol=1e-2)
+
+
+@torch.inference_mode
+def test_flashinfer_prefill_with_dynamic_causal_custom_mask() -> None:
+    from vllm.v1.attention.backends.flashinfer import (
+        _build_dynamic_causal_custom_mask,
+    )
+
+    torch.set_default_device("cuda")
+    set_random_seed(0)
+
+    query_lens = [3, 4]
+    kv_lens = [8, 12]
+    num_query_heads = 4
+    num_kv_heads = 1
+    head_size = 128
+    block_size = 16
+    dtype = torch.bfloat16
+    scale = head_size**-0.5
+
+    query = torch.randn(sum(query_lens), num_query_heads, head_size, dtype=dtype)
+    key_value_cache = torch.randn(
+        NUM_BLOCKS, 2, block_size, num_kv_heads, head_size, dtype=dtype
+    )
+    key_cache = key_value_cache[:, 0, :, :, :].squeeze(1)
+    value_cache = key_value_cache[:, 1, :, :, :].squeeze(1)
+    key_cache /= head_size**0.5
+    value_cache /= head_size**0.5
+
+    block_tables = torch.randint(
+        0, NUM_BLOCKS, (len(query_lens), 1), dtype=torch.int32, device="cuda"
+    )
+    qo_indptr = torch.tensor([0, 3, 7], dtype=torch.int32, device="cpu")
+    kv_indptr = torch.tensor([0, 1, 2], dtype=torch.int32, device="cpu")
+    kv_indices = block_tables.reshape(-1).to(torch.int32)
+    kv_last_page_lens = torch.tensor(kv_lens, dtype=torch.int32, device="cpu")
+    dynamic_causal = torch.tensor([True, False], dtype=torch.bool, device="cpu")
+    custom_mask = _build_dynamic_causal_custom_mask(
+        dynamic_causal=dynamic_causal,
+        mm_prefix_range=None,
+        request_offset=0,
+        qo_indptr=qo_indptr,
+        paged_kv_indptr=kv_indptr,
+        paged_kv_last_page_len=kv_last_page_lens,
+        page_size=block_size,
+        window_left=-1,
+        device=torch.device("cuda"),
+    )
+
+    workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8)
+    wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(workspace_buffer, "NHD")
+    wrapper.plan(
+        qo_indptr.to("cuda"),
+        kv_indptr.to("cuda"),
+        kv_indices,
+        kv_last_page_lens.to("cuda"),
+        num_query_heads,
+        num_kv_heads,
+        head_size,
+        block_size,
+        custom_mask=custom_mask,
+        causal=False,
         window_left=-1,
         q_data_type=dtype,
         kv_data_type=dtype,
