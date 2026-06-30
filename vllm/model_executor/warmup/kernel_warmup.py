@@ -24,9 +24,6 @@ from vllm.model_executor.warmup.flashinfer_sparse_mla_warmup import (
     deepseek_v4_sparse_mla_attention_warmup,
     flashinfer_sparse_mla_decode_autotune_warmup,
 )
-from vllm.model_executor.warmup.hybrid_gdn_mamba_mrope_warmup import (
-    hybrid_gdn_mamba_mrope_warmup,
-)
 from vllm.model_executor.warmup.qwen_triton_warmup import qwen_triton_warmup
 from vllm.model_executor.warmup.sparse_mla_triton_warmup import (
     sparse_mla_triton_warmup_if_needed,
@@ -46,6 +43,9 @@ logger = init_logger(__name__)
 
 
 def kernel_warmup(worker: "Worker"):
+    from vllm.model_executor.warmup.hybrid_gdn_mamba_mrope_warmup import (
+        hybrid_gdn_mamba_mrope_warmup,
+    )
     from vllm.model_executor.warmup.minimax_m3_msa_warmup import (
         minimax_m3_msa_warmup,
     )
@@ -85,6 +85,8 @@ def kernel_warmup(worker: "Worker"):
         max_tokens = worker.scheduler_config.max_num_batched_tokens
         deep_gemm_warmup(model, max_tokens)
 
+    minimax_m3_msa_warmup(worker)
+
     hybrid_gdn_mamba_mrope_warmup(
         worker.get_model(),
         model_dtype=worker.model_runner.dtype,
@@ -95,8 +97,6 @@ def kernel_warmup(worker: "Worker"):
         kv_block_zeroer = getattr(worker.model_runner, "kv_block_zeroer", None)
     if kv_block_zeroer is not None:
         kv_block_zeroer.warmup()
-
-    minimax_m3_msa_warmup(worker)
 
     enable_flashinfer_autotune = (
         worker.vllm_config.kernel_config.enable_flashinfer_autotune
