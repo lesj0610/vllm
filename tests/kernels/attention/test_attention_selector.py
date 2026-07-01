@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -364,6 +365,86 @@ def test_auto_backend_selection_behavior():
 
     # Both should select the same backend
     assert backend_auto.get_name() == backend_none.get_name()
+
+
+def _make_diffusion_gemma_vllm_config(
+    *,
+    backend: AttentionBackendEnum | None,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        attention_config=AttentionConfig(backend=backend),
+        diffusion_config=None,
+        model_config=SimpleNamespace(
+            hf_text_config=SimpleNamespace(head_dim=256, global_head_dim=512),
+            hf_config=SimpleNamespace(canvas_length=256),
+            override_generation_config={},
+        ),
+        scheduler_config=SimpleNamespace(max_num_seqs=128),
+    )
+
+
+def test_diffusion_gemma_auto_keeps_backend_open_for_flashinfer(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from vllm.model_executor.models.config import (
+        DiffusionGemmaModelForBlockDiffusionConfig,
+    )
+
+    monkeypatch.setattr(
+        "vllm.v1.attention.backends.fa_utils.is_fa_version_supported",
+        lambda version: False,
+    )
+    vllm_config = _make_diffusion_gemma_vllm_config(backend=None)
+
+    DiffusionGemmaModelForBlockDiffusionConfig.verify_and_update_config(vllm_config)
+
+    assert vllm_config.attention_config.backend is None
+    assert vllm_config.attention_config.use_non_causal is True
+    assert vllm_config.diffusion_config is not None
+    assert vllm_config.diffusion_config.canvas_length == 256
+
+
+def test_diffusion_gemma_explicit_flashinfer_is_not_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from vllm.model_executor.models.config import (
+        DiffusionGemmaModelForBlockDiffusionConfig,
+    )
+
+    monkeypatch.setattr(
+        "vllm.v1.attention.backends.fa_utils.is_fa_version_supported",
+        lambda version: False,
+    )
+    vllm_config = _make_diffusion_gemma_vllm_config(
+        backend=AttentionBackendEnum.FLASHINFER
+    )
+
+    DiffusionGemmaModelForBlockDiffusionConfig.verify_and_update_config(vllm_config)
+
+    assert vllm_config.attention_config.backend == AttentionBackendEnum.FLASHINFER
+
+
+def test_flashinfer_accepts_mm_prefix_backend_selection():
+    if CudaPlatform is None:
+        pytest.skip("CudaPlatform not available")
+
+    attention_config = AttentionConfig(backend=AttentionBackendEnum.FLASHINFER)
+    cache_config = CacheConfig(block_size=16)
+    vllm_config = VllmConfig(
+        attention_config=attention_config, cache_config=cache_config
+    )
+
+    with (
+        set_current_vllm_config(vllm_config),
+        patch("vllm.platforms.current_platform", CudaPlatform()),
+    ):
+        backend = get_attn_backend(
+            head_size=128,
+            dtype=torch.float16,
+            kv_cache_dtype=None,
+            use_mm_prefix=True,
+        )
+    assert backend.get_name() == "FLASHINFER"
 
 
 @pytest.mark.parametrize(

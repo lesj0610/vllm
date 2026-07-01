@@ -26,6 +26,56 @@ SOFT_CAPS = [None, 30.0]
 SLIDING_WINDOWS = [None, 64]
 
 
+def test_prefill_custom_mask_combines_dynamic_causal_window_and_mm_prefix() -> None:
+    from vllm.v1.attention.backends.flashinfer import _build_prefill_custom_mask
+
+    mask = _build_prefill_custom_mask(
+        qo_indptr=torch.tensor([0, 2, 3], dtype=torch.int32),
+        paged_kv_indptr=torch.tensor([0, 1, 2], dtype=torch.int32),
+        paged_kv_last_page_len=torch.tensor([4, 3], dtype=torch.int32),
+        causal=torch.tensor([True, False], dtype=torch.bool),
+        request_offset=0,
+        page_size=4,
+        window_left=2,
+        device=torch.device("cpu"),
+        mm_prefix_range={0: [(1, 3)]},
+    )
+
+    expected = torch.tensor(
+        [
+            True,
+            True,
+            True,
+            True,
+            False,
+            True,
+            True,
+            True,
+            True,
+            True,
+            True,
+        ],
+        dtype=torch.bool,
+    )
+    torch.testing.assert_close(mask, expected)
+
+
+def test_prefill_custom_mask_rejects_query_longer_than_kv() -> None:
+    from vllm.v1.attention.backends.flashinfer import _build_prefill_custom_mask
+
+    with pytest.raises(ValueError, match="custom mask requires q_len <= kv_len"):
+        _build_prefill_custom_mask(
+            qo_indptr=torch.tensor([0, 5], dtype=torch.int32),
+            paged_kv_indptr=torch.tensor([0, 1], dtype=torch.int32),
+            paged_kv_last_page_len=torch.tensor([4], dtype=torch.int32),
+            causal=True,
+            request_offset=0,
+            page_size=4,
+            window_left=-1,
+            device=torch.device("cpu"),
+        )
+
+
 def ref_paged_attn(
     query: torch.Tensor,
     key_cache: torch.Tensor,

@@ -189,7 +189,11 @@ class UnlimitedOCRForCausalLMConfig(VerifyAndUpdateConfig):
 
 class Gemma4Config(VerifyAndUpdateConfig):
     @staticmethod
-    def verify_and_update_config(vllm_config: "VllmConfig") -> None:
+    def verify_and_update_config(
+        vllm_config: "VllmConfig",
+        *,
+        fallback_to_triton: bool = True,
+    ) -> None:
         """Configure attention for heterogeneous head dimensions.
 
         Gemma4 uses different head dimensions for sliding window
@@ -227,7 +231,7 @@ class Gemma4Config(VerifyAndUpdateConfig):
                     head_dim,
                     global_head_dim,
                 )
-        elif vllm_config.attention_config.backend is None:
+        elif fallback_to_triton and vllm_config.attention_config.backend is None:
             vllm_config.attention_config.backend = AttentionBackendEnum.TRITON_ATTN
             logger.info(
                 "Gemma4 model has heterogeneous head dimensions "
@@ -248,25 +252,18 @@ class DiffusionGemmaModelForBlockDiffusionConfig(VerifyAndUpdateConfig):
         read straight from generation_config.json at sampler-build time
         (see DiffusionGemma's custom_sampler), not injected here.
         """
-        # Inherit Gemma4's attention backend selection (FA4 on Hopper,
-        # TRITON_ATTN fallback for heterogeneous head dims).
-        Gemma4Config.verify_and_update_config(vllm_config)
-
-        from vllm.v1.attention.backends.registry import AttentionBackendEnum
+        # Inherit Gemma4's FA4 preference for heterogeneous head dimensions,
+        # but keep auto backend selection open so FlashInfer can be selected
+        # when it supports DiffusionGemma's dynamic causal mask path.
+        Gemma4Config.verify_and_update_config(vllm_config, fallback_to_triton=False)
 
         attention_config = vllm_config.attention_config
-        if attention_config.backend == AttentionBackendEnum.FLASHINFER:
-            raise ValueError(
-                "FlashInfer does not support DiffusionGemma's mixed "
-                "causal/bidirectional attention. Use --attention-backend "
-                "FLASH_ATTN or TRITON_ATTN instead."
-            )
         if attention_config.backend is None and not attention_config.use_non_causal:
             attention_config.use_non_causal = True
             logger.info(
                 "DiffusionGemma uses mixed causal/bidirectional attention "
-                "within a batch; setting use_non_causal=True to exclude "
-                "FlashInfer from auto-selection."
+                "within a batch; setting use_non_causal=True for backend "
+                "selection."
             )
 
         # Auto-create DiffusionConfig from HF config if not provided.
@@ -491,7 +488,7 @@ class LlamaBidirectionalConfig(VerifyAndUpdateConfig):
             "last": "LAST",
         }
 
-        pooling_type = pooling_type_map.get(hf_config.pooling, None)
+        pooling_type = pooling_type_map.get(hf_config.pooling)
         if pooling_type is None:
             raise ValueError(f"pool_type {hf_config.pooling!r} not supported")
 

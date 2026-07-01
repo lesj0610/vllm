@@ -96,6 +96,85 @@ def _get_trtllm_gen_workspace_buffer():
     return trtllm_gen_workspace_buffer
 
 
+def _normalize_mm_prefix_range(
+    mm_prefix_range: dict[int, list[tuple[int, int]]] | None,
+) -> dict[int, list[tuple[int, int]]] | None:
+    if not mm_prefix_range:
+        return None
+
+    normalized: dict[int, list[tuple[int, int]]] = {}
+    for req_idx, ranges in mm_prefix_range.items():
+        valid_ranges = [
+            (int(start), int(end)) for start, end in ranges if int(start) <= int(end)
+        ]
+        if valid_ranges:
+            normalized[int(req_idx)] = valid_ranges
+    return normalized or None
+
+
+def _build_prefill_custom_mask(
+    *,
+    qo_indptr: torch.Tensor,
+    paged_kv_indptr: torch.Tensor,
+    paged_kv_last_page_len: torch.Tensor,
+    causal: bool | torch.Tensor,
+    request_offset: int,
+    page_size: int,
+    window_left: int,
+    device: torch.device,
+    mm_prefix_range: dict[int, list[tuple[int, int]]] | None = None,
+) -> torch.Tensor:
+    """Build FlashInfer flattened custom_mask for native prefill planning."""
+    num_reqs = qo_indptr.shape[0] - 1
+    if isinstance(causal, torch.Tensor):
+        causal_cpu = causal[request_offset : request_offset + num_reqs].to(
+            device="cpu", dtype=torch.bool
+        )
+    else:
+        causal_cpu = torch.full((num_reqs,), causal, dtype=torch.bool, device="cpu")
+
+    mask_parts: list[torch.Tensor] = []
+    for local_req_idx in range(num_reqs):
+        q_len = int((qo_indptr[local_req_idx + 1] - qo_indptr[local_req_idx]).item())
+        num_pages = int(
+            (paged_kv_indptr[local_req_idx + 1] - paged_kv_indptr[local_req_idx]).item()
+        )
+        last_page_len = int(paged_kv_last_page_len[local_req_idx].item())
+        kv_len = 0 if num_pages == 0 else (num_pages - 1) * page_size + last_page_len
+        if q_len == 0 or kv_len == 0:
+            mask_parts.append(torch.empty(0, dtype=torch.bool, device=device))
+            continue
+        if q_len > kv_len:
+            raise ValueError(
+                "FlashInfer dynamic causal custom mask requires q_len <= kv_len, "
+                f"got {q_len=} and {kv_len=}."
+            )
+
+        context_len = kv_len - q_len
+        q_positions = context_len + torch.arange(q_len, device=device)
+        kv_positions = torch.arange(kv_len, device=device)
+        if bool(causal_cpu[local_req_idx].item()):
+            keep = kv_positions.unsqueeze(0) <= q_positions.unsqueeze(1)
+        else:
+            keep = torch.ones((q_len, kv_len), dtype=torch.bool, device=device)
+
+        if window_left >= 0:
+            keep &= (
+                q_positions.unsqueeze(1) - kv_positions.unsqueeze(0)
+            ) <= window_left
+
+        req_idx = request_offset + local_req_idx
+        for start, end in (mm_prefix_range or {}).get(req_idx, ()):
+            q_in_range = (q_positions >= start) & (q_positions <= end)
+            kv_in_range = (kv_positions >= start) & (kv_positions <= end)
+            keep |= q_in_range.unsqueeze(1) & kv_in_range.unsqueeze(0)
+        mask_parts.append(keep.reshape(-1))
+
+    if not mask_parts:
+        return torch.empty(0, dtype=torch.bool, device=device)
+    return torch.cat(mask_parts)
+
+
 @triton.jit
 def _trtllm_prefill_attn_kvfp8_dequant(
     kv_cache_ptr,
@@ -364,6 +443,10 @@ class FlashInferBackend(AttentionBackend):
     def supports_non_causal(cls) -> bool:
         return True
 
+    @classmethod
+    def supports_mm_prefix(cls) -> bool:
+        return True
+
     @staticmethod
     def get_impl_cls() -> type["FlashInferImpl"]:
         return FlashInferImpl
@@ -559,6 +642,9 @@ class FlashInferMetadata:
     """
 
     cascade_wrapper: MultiLevelCascadeAttentionWrapper | None
+
+    uses_dynamic_causal_mask: bool = False
+    uses_custom_prefill_mask: bool = False
 
 
 class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
@@ -950,7 +1036,28 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         num_reqs = common_attn_metadata.num_reqs
         num_actual_tokens = common_attn_metadata.num_actual_tokens
         causal = common_attn_metadata.causal
-        if causal:
+        uses_dynamic_causal_mask = isinstance(causal, torch.Tensor)
+        dynamic_causal = causal if uses_dynamic_causal_mask else None
+        attn_metadata_causal = False if uses_dynamic_causal_mask else bool(causal)
+        mm_prefix_range = _normalize_mm_prefix_range(
+            common_attn_metadata.mm_req_doc_ranges
+        )
+        if uses_dynamic_causal_mask:
+            num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
+                split_decodes_and_prefills(
+                    common_attn_metadata,
+                    decode_threshold=1,
+                    require_uniform=True,
+                    treat_short_extends_as_decodes=False,
+                )
+            )
+            if num_decode_tokens != num_decodes:
+                raise NotImplementedError(
+                    "FlashInfer dynamic causal attention only supports "
+                    "single-token decode requests. Multi-token decode requests "
+                    "must run as native prefill."
+                )
+        elif causal:
             num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
                 split_decodes_and_prefills(
                     common_attn_metadata,
@@ -965,6 +1072,9 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             num_prefills = num_reqs
             num_decode_tokens = 0
             num_prefill_tokens = num_actual_tokens
+        uses_custom_prefill_mask = num_prefills > 0 and (
+            uses_dynamic_causal_mask or mm_prefix_range is not None
+        )
 
         page_size = self.page_size
         max_seq_len = common_attn_metadata.max_seq_len
@@ -979,39 +1089,74 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         # - Decode (FI native or TRTLLM)
         use_cascade = common_prefix_len > 0
         uses_spec_reorder = self.reorder_batch_threshold > 1
+        if uses_custom_prefill_mask:
+            if self.use_dcp:
+                raise NotImplementedError(
+                    "FlashInfer custom-mask prefill is not supported with DCP."
+                )
+            if use_cascade:
+                raise NotImplementedError(
+                    "FlashInfer custom-mask prefill is not supported with "
+                    "cascade attention."
+                )
+            if page_size >= 128:
+                raise NotImplementedError(
+                    "FlashInfer custom-mask prefill requires native FlashInfer "
+                    "prefill, but page_size >= 128 forces TRTLLM."
+                )
+
         # Page sizes >= 128 must use trtllm-gen; force it for prefill too.
         prefill_force_trtllm = (
-            True if page_size >= 128 else self.attention_config.use_trtllm_attention
+            False
+            if uses_custom_prefill_mask
+            else (
+                True if page_size >= 128 else self.attention_config.use_trtllm_attention
+            )
         )
-        prefill_use_trtllm = causal and use_trtllm_attention(
-            self.num_qo_heads,
-            self.num_kv_heads,
-            num_prefill_tokens,
-            max_seq_len,
-            self.dcp_world_size,
-            self.cache_dtype,
-            self.q_data_type,
-            is_prefill=True,
-            force_use_trtllm=prefill_force_trtllm,
-            has_sinks=self.has_sinks,
-            has_spec=uses_spec_reorder,
+        prefill_use_trtllm = (
+            not uses_custom_prefill_mask
+            and attn_metadata_causal
+            and use_trtllm_attention(
+                self.num_qo_heads,
+                self.num_kv_heads,
+                num_prefill_tokens,
+                max_seq_len,
+                self.dcp_world_size,
+                self.cache_dtype,
+                self.q_data_type,
+                is_prefill=True,
+                force_use_trtllm=prefill_force_trtllm,
+                has_sinks=self.has_sinks,
+                has_spec=uses_spec_reorder,
+            )
         )
         decode_use_trtllm = (
-            causal and self.use_trtllm_decode_attention and self.dcp_world_size <= 1
+            not uses_dynamic_causal_mask
+            and attn_metadata_causal
+            and self.use_trtllm_decode_attention
+            and self.dcp_world_size <= 1
         )
 
-        if not causal and self.use_dcp:
+        if not attn_metadata_causal and self.use_dcp:
             raise NotImplementedError(
                 "FlashInfer non-causal prefill is not supported with DCP yet."
             )
-        if not causal and self.use_trtllm_decode_attention:
+        if (
+            not uses_dynamic_causal_mask
+            and not attn_metadata_causal
+            and self.use_trtllm_decode_attention
+        ):
             logger.warning_once(
                 "Using FlashInfer for draft model non-causal attention; TRTLLM "
                 "can still be used for target model causal attention."
             )
-        all_uses_trtllm = causal and (
-            (num_prefills == 0 or prefill_use_trtllm)
-            and (num_decodes == 0 or decode_use_trtllm)
+        all_uses_trtllm = (
+            not uses_dynamic_causal_mask
+            and attn_metadata_causal
+            and (
+                (num_prefills == 0 or prefill_use_trtllm)
+                and (num_decodes == 0 or decode_use_trtllm)
+            )
         )
 
         if not all_uses_trtllm:
@@ -1050,11 +1195,13 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             num_decode_tokens=num_decode_tokens,
             num_prefills=num_prefills,
             num_prefill_tokens=num_prefill_tokens,
-            causal=causal,
+            causal=attn_metadata_causal,
             use_cascade=use_cascade,
             prefill=None,
             decode=None,
             cascade_wrapper=None,
+            uses_dynamic_causal_mask=uses_dynamic_causal_mask,
+            uses_custom_prefill_mask=uses_custom_prefill_mask,
         )
 
         # Guard access to seq_lens_cpu, which may not always be needed
@@ -1243,6 +1390,34 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                         prefill_wrapper,
                         BatchPrefillWithPagedKVCacheWrapper,
                     )
+                    prefill_plan_causal = attn_metadata.causal
+                    prefill_plan_window_left = self.window_left
+                    prefill_custom_mask = None
+                    qo_indptr_prefill = qo_indptr_prefill_cpu
+                    paged_kv_indptr_prefill = paged_kv_indptr_prefill_cpu
+                    if attn_metadata.uses_custom_prefill_mask:
+                        qo_indptr_prefill = (
+                            qo_indptr[prefill_start:] - qo_indptr[prefill_start]
+                        )
+                        paged_kv_indptr_prefill = self.paged_kv_indptr.gpu[
+                            prefill_start : num_reqs + 1
+                        ]
+                        prefill_custom_mask = _build_prefill_custom_mask(
+                            qo_indptr=qo_indptr_prefill_cpu,
+                            paged_kv_indptr=paged_kv_indptr_prefill_cpu,
+                            paged_kv_last_page_len=(paged_kv_last_page_len_prefill_cpu),
+                            causal=dynamic_causal
+                            if dynamic_causal is not None
+                            else attn_metadata.causal,
+                            request_offset=prefill_start,
+                            page_size=self.page_size,
+                            window_left=self.window_left,
+                            device=self.device,
+                            mm_prefix_range=mm_prefix_range,
+                        )
+                        prefill_plan_causal = False
+                        prefill_plan_window_left = -1
+
                     # NVFP4 trtllm kernel only supports FP8 output;
                     # use FP8 o_data_type so the wrapper matches the
                     # FP8 output buffer allocated in forward().
@@ -1250,23 +1425,24 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                         FP8_DTYPE if self.is_kvcache_nvfp4 else self.model_config.dtype
                     )
                     prefill_wrapper.plan(
-                        qo_indptr=qo_indptr_prefill_cpu,
-                        paged_kv_indptr=paged_kv_indptr_prefill_cpu,
+                        qo_indptr=qo_indptr_prefill,
+                        paged_kv_indptr=paged_kv_indptr_prefill,
                         paged_kv_indices=paged_kv_indices,
                         paged_kv_last_page_len=paged_kv_last_page_len_prefill_cpu,
                         num_qo_heads=self.num_qo_heads,
                         num_kv_heads=self.num_kv_heads,
                         head_dim_qk=self.head_dim,
                         page_size=self.page_size,
-                        causal=attn_metadata.causal,
+                        causal=prefill_plan_causal,
                         sm_scale=self.sm_scale,
-                        window_left=self.window_left,
+                        window_left=prefill_plan_window_left,
                         logits_soft_cap=self.logits_soft_cap,
                         q_data_type=self.q_data_type,
                         kv_data_type=self.kv_cache_dtype,
                         o_data_type=o_dtype,
                         fixed_split_size=self.prefill_fixed_split_size,
                         disable_split_kv=self.disable_split_kv,
+                        custom_mask=prefill_custom_mask,
                     )
                 attn_metadata.prefill = FIPrefill(wrapper=prefill_wrapper)
 
@@ -1628,7 +1804,12 @@ class FlashInferImpl(AttentionImpl):
                     assert isinstance(
                         prefill_wrapper, BatchPrefillWithPagedKVCacheWrapper
                     )
-                    assert prefill_wrapper._window_left == self.window_left
+                    expected_window_left = (
+                        -1
+                        if attn_metadata.uses_custom_prefill_mask
+                        else self.window_left
+                    )
+                    assert prefill_wrapper._window_left == expected_window_left
                     assert prefill_wrapper._logits_soft_cap == (
                         self.logits_soft_cap or 0.0
                     )
