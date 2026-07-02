@@ -20,6 +20,7 @@ instead of embedding feature-specific logic directly.
 import functools
 import gc
 import time
+from collections.abc import Callable
 from copy import deepcopy
 from typing import Any, NamedTuple
 
@@ -43,6 +44,7 @@ from vllm.model_executor.layers.mamba.ops.ssu_dispatch import (
 )
 from vllm.model_executor.model_loader import get_model_loader
 from vllm.multimodal import MULTIMODAL_REGISTRY
+from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import SupportedTask
 from vllm.utils.math_utils import cdiv
@@ -762,9 +764,156 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         reserved_after = torch.accelerator.memory_reserved(self.device)
         return max(reserved_after - reserved_before, 0)
 
+    def _capture_model_cudagraphs(
+        self,
+        progress_bar_desc: str = "Capturing CUDA graphs",
+        capture_descs: dict[CUDAGraphMode, list[BatchExecutionDescriptor]]
+        | None = None,
+        capture_speculator: bool = True,
+    ) -> None:
+        assert self.cudagraph_manager is not None
+        with self.maybe_setup_dummy_loras(self.lora_config):
+            attn_states = self.cudagraph_manager.capture(
+                self.model,
+                self.model_state,
+                self.input_buffers,
+                self.intermediate_tensors,
+                self.block_tables,
+                self.attn_groups,
+                self.kv_cache_config,
+                has_lora=self.lora_config is not None,
+                use_aux_hidden_state_outputs=self.use_aux_hidden_state_outputs,
+                lora_capture_hook=create_lora_capture_hook(self.lora_config, self),
+                progress_bar_desc=progress_bar_desc,
+                capture_descs=capture_descs,
+            )
+            if capture_speculator and self.speculator is not None:
+                self.speculator.capture(attn_states)
+
+    def _measure_cuda_graph_pool_sample(self, capture_fn: Callable[[], None]) -> int:
+        torch.accelerator.synchronize()
+        torch.accelerator.empty_cache()
+        free_before = torch.accelerator.get_memory_info()[0]
+        reserved_before = torch.accelerator.memory_reserved(self.device)
+        allocated_before = torch.accelerator.memory_allocated(self.device)
+        torch.accelerator.reset_peak_memory_stats(self.device)
+
+        capture_fn()
+        torch.accelerator.synchronize()
+
+        free_after = torch.accelerator.get_memory_info()[0]
+        residual_delta = max(free_before - free_after, 0)
+        peak_reserved_delta = max(
+            torch.accelerator.max_memory_reserved(self.device) - reserved_before,
+            0,
+        )
+        peak_allocated_delta = max(
+            torch.accelerator.max_memory_allocated(self.device) - allocated_before,
+            0,
+        )
+        return max(residual_delta, peak_reserved_delta, peak_allocated_delta)
+
+    def _profile_cudagraph_memory_graph_pool(self) -> int:
+        assert self.cudagraph_manager is not None
+        capture_descs = self.cudagraph_manager.get_capture_descs()
+        if not capture_descs:
+            return 0
+
+        profiling_pool = current_platform.graph_pool_handle()
+        original_pool = self.cudagraph_manager.pool
+        original_graphs = dict(self.cudagraph_manager.graphs)
+        original_graphs_captured = self.cudagraph_manager._graphs_captured
+        original_hidden_states = self.cudagraph_manager.hidden_states
+        original_aux_hidden_states = self.cudagraph_manager.aux_hidden_states
+        original_intermediate_tensors = self.cudagraph_manager.intermediate_tensors
+        original_use_aux_hidden_state_outputs = (
+            self.cudagraph_manager.use_aux_hidden_state_outputs
+        )
+        saved_num_cudagraph_captured = compilation_counter.num_cudagraph_captured
+
+        original_breakable_runner = self.cudagraph_manager.breakable_cg_runner
+        if self.cudagraph_manager.use_breakable_cg:
+            self.cudagraph_manager.init_breakable_cg_runner(self.model)
+        breakable_runner = self.cudagraph_manager.breakable_cg_runner
+        original_breakable_pool = (
+            breakable_runner.graph_pool if breakable_runner is not None else None
+        )
+        original_breakable_entries = (
+            dict(breakable_runner.entries) if breakable_runner is not None else None
+        )
+
+        shared_memory_estimate: dict[CUDAGraphMode, int] = {}
+        per_graph_estimate: dict[CUDAGraphMode, int] = {}
+
+        try:
+            self.cudagraph_manager.pool = profiling_pool
+            if breakable_runner is not None:
+                breakable_runner.graph_pool = profiling_pool
+
+            for mode, descs in capture_descs:
+                profile_descs = descs[:2]
+                mem_samples: list[int] = []
+
+                for desc in profile_descs:
+                    sample_descs = {mode: [desc]}
+
+                    def capture_sample(
+                        sample_descs: dict[
+                            CUDAGraphMode, list[BatchExecutionDescriptor]
+                        ] = sample_descs,
+                    ) -> None:
+                        self._capture_model_cudagraphs(
+                            progress_bar_desc="Profiling CUDA graph memory",
+                            capture_descs=sample_descs,
+                            capture_speculator=False,
+                        )
+
+                    mem_samples.append(
+                        self._measure_cuda_graph_pool_sample(capture_sample)
+                    )
+
+                first_capture = mem_samples[0]
+                per_graph = max(mem_samples[1] if len(mem_samples) > 1 else 0, 1 << 20)
+                shared_memory_estimate[mode] = first_capture
+                per_graph_estimate[mode] = per_graph * (len(descs) - 1)
+                logger.debug(
+                    "Estimated %s CUDA graph memory: "
+                    "%.2f MiB first-capture + (%d-1) x %.2f MiB per-graph",
+                    mode.name,
+                    first_capture / (1 << 20),
+                    len(descs),
+                    per_graph / (1 << 20),
+                )
+        finally:
+            self.cudagraph_manager.pool = original_pool
+            self.cudagraph_manager.graphs.clear()
+            self.cudagraph_manager.graphs.update(original_graphs)
+            self.cudagraph_manager._graphs_captured = original_graphs_captured
+            self.cudagraph_manager.hidden_states = original_hidden_states
+            self.cudagraph_manager.aux_hidden_states = original_aux_hidden_states
+            self.cudagraph_manager.intermediate_tensors = original_intermediate_tensors
+            self.cudagraph_manager.use_aux_hidden_state_outputs = (
+                original_use_aux_hidden_state_outputs
+            )
+            if breakable_runner is not None:
+                if original_breakable_entries is not None:
+                    breakable_runner.entries.clear()
+                    breakable_runner.entries.update(original_breakable_entries)
+                breakable_runner.graph_pool = original_breakable_pool
+            self.cudagraph_manager.breakable_cg_runner = original_breakable_runner
+            compilation_counter.num_cudagraph_captured = saved_num_cudagraph_captured
+            gc.collect()
+            torch.accelerator.empty_cache()
+
+        return max(shared_memory_estimate.values(), default=0) + sum(
+            per_graph_estimate.values()
+        )
+
     def profile_cudagraph_memory(self) -> int:
         self.cudagraph_memory_persistent_estimate = 0
         self.cudagraph_memory_graph_pool_estimate = 0
+        if not current_platform.is_cuda():
+            return 0
 
         try:
             with set_current_vllm_config(self.vllm_config):
@@ -772,15 +921,21 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             persistent_estimate = (
                 self._reserve_attention_workspace_for_cudagraph_capture()
             )
+            graph_pool_estimate = self._profile_cudagraph_memory_graph_pool()
         finally:
             self._cleanup_profiling_kv_cache()
 
         self.cudagraph_memory_persistent_estimate = int(persistent_estimate)
+        self.cudagraph_memory_graph_pool_estimate = int(graph_pool_estimate)
+        total_estimate = persistent_estimate + graph_pool_estimate
         logger.info(
-            "Estimated CUDA graph persistent workspace memory: %.2f GiB",
+            "Estimated CUDA graph memory: %.2f GiB total "
+            "(%.2f GiB persistent, %.2f GiB graph pool)",
+            total_estimate / (1 << 30),
             persistent_estimate / (1 << 30),
+            graph_pool_estimate / (1 << 30),
         )
-        return int(persistent_estimate)
+        return int(total_estimate)
 
     @torch.inference_mode()
     def capture_model(self) -> int:
@@ -801,21 +956,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         torch.accelerator.empty_cache()
         start_free_gpu_memory = torch.accelerator.get_memory_info()[0]
 
-        with self.maybe_setup_dummy_loras(self.lora_config):
-            attn_states = self.cudagraph_manager.capture(
-                self.model,
-                self.model_state,
-                self.input_buffers,
-                self.intermediate_tensors,
-                self.block_tables,
-                self.attn_groups,
-                self.kv_cache_config,
-                has_lora=self.lora_config is not None,
-                use_aux_hidden_state_outputs=self.use_aux_hidden_state_outputs,
-                lora_capture_hook=create_lora_capture_hook(self.lora_config, self),
-            )
-            if self.speculator is not None:
-                self.speculator.capture(attn_states)
+        self._capture_model_cudagraphs()
 
         end_time = time.perf_counter()
         end_free_gpu_memory = torch.accelerator.get_memory_info()[0]

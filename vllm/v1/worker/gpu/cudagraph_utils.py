@@ -257,11 +257,22 @@ class CudaGraphManager:
     def needs_capture(self) -> bool:
         return len(self._capture_descs) > 0
 
+    def get_capture_descs(
+        self,
+    ) -> list[tuple[CUDAGraphMode, list[BatchExecutionDescriptor]]]:
+        return [
+            (mode, list(self._capture_descs[mode]))
+            for mode in [CUDAGraphMode.PIECEWISE, CUDAGraphMode.FULL]
+            if mode in self._capture_descs
+        ]
+
     @torch.inference_mode()
     def capture(
         self,
         create_forward_fn: CreateForwardFn,
         progress_bar_desc: str = "Capturing CUDA graphs",
+        capture_descs: dict[CUDAGraphMode, list[BatchExecutionDescriptor]]
+        | None = None,
     ) -> dict[BatchExecutionDescriptor, AttentionStatePair]:
         """Capture CUDA graphs.
 
@@ -275,15 +286,18 @@ class CudaGraphManager:
                 capture.
         """
         attn_states: dict[BatchExecutionDescriptor, AttentionStatePair] = {}
+        capture_descs = (
+            capture_descs if capture_descs is not None else self._capture_descs
+        )
         with graph_capture(device=self.device):
             # Capture in order: PIECEWISE first, then FULL. PIECEWISE has larger
             # activations so FULL activations should fit in already allocated
             # buffers in the graph pool.
             for mode in [CUDAGraphMode.PIECEWISE, CUDAGraphMode.FULL]:
-                if mode not in self._capture_descs:
+                if mode not in capture_descs:
                     continue
 
-                descs = self._capture_descs[mode]
+                descs = capture_descs[mode]
                 if is_global_first_rank():
                     descs = tqdm(descs, desc=f"{progress_bar_desc} ({mode.name})")
                 for desc in descs:
@@ -422,6 +436,8 @@ class ModelCudaGraphManager(CudaGraphManager):
         use_aux_hidden_state_outputs: bool = False,
         lora_capture_hook: Callable[[int, int, int], None] | None = None,
         progress_bar_desc: str = "Capturing CUDA graphs",
+        capture_descs: dict[CUDAGraphMode, list[BatchExecutionDescriptor]]
+        | None = None,
     ) -> dict[BatchExecutionDescriptor, AttentionStatePair]:
         """Capture CUDA graphs for model forward pass."""
         self.use_aux_hidden_state_outputs = use_aux_hidden_state_outputs
@@ -534,7 +550,7 @@ class ModelCudaGraphManager(CudaGraphManager):
 
             return forward_fn, AttentionState(attn_metadata, slot_mappings)
 
-        return super().capture(create_forward_fn, progress_bar_desc)
+        return super().capture(create_forward_fn, progress_bar_desc, capture_descs)
 
     def run_fullgraph(
         self, desc: BatchExecutionDescriptor

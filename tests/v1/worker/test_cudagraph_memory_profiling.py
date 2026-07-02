@@ -525,6 +525,11 @@ def test_v2_profile_accounts_attention_workspace(monkeypatch):
         "set_current_vllm_config",
         lambda *args, **kwargs: null_context(),
     )
+    monkeypatch.setattr(
+        gpu_model_runner_v2.current_platform,
+        "is_cuda",
+        lambda: True,
+    )
 
     def reserve_attention_workspace():
         events.append("reserve")
@@ -534,14 +539,212 @@ def test_v2_profile_accounts_attention_workspace(monkeypatch):
     runner._reserve_attention_workspace_for_cudagraph_capture = (
         reserve_attention_workspace
     )
+
+    def profile_cudagraph_memory_graph_pool():
+        events.append("graph_pool")
+        return 2048
+
+    runner._profile_cudagraph_memory_graph_pool = profile_cudagraph_memory_graph_pool
     runner._cleanup_profiling_kv_cache = lambda: events.append("cleanup")
 
     estimate = runner.profile_cudagraph_memory()
 
-    assert estimate == 4096
+    assert estimate == 6144
     assert runner.cudagraph_memory_persistent_estimate == 4096
+    assert runner.cudagraph_memory_graph_pool_estimate == 2048
+    assert events == ["init", "reserve", "graph_pool", "cleanup"]
+
+
+def test_v2_profile_is_noop_on_non_cuda(monkeypatch):
+    from vllm.v1.worker.gpu import model_runner as gpu_model_runner_v2
+    from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+
+    monkeypatch.setattr(
+        gpu_model_runner_v2.current_platform,
+        "is_cuda",
+        lambda: False,
+    )
+    runner._init_minimal_kv_cache_for_profiling = pytest.fail
+
+    assert runner.profile_cudagraph_memory() == 0
+    assert runner.cudagraph_memory_persistent_estimate == 0
     assert runner.cudagraph_memory_graph_pool_estimate == 0
-    assert events == ["init", "reserve", "cleanup"]
+
+
+def test_v2_cuda_graph_pool_sample_uses_peak(monkeypatch):
+    from vllm.v1.worker.gpu import model_runner as gpu_model_runner_v2
+    from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.device = torch.device("cuda:0")
+    events = []
+
+    get_memory_info_values = iter([(10_000, 0), (9_950, 0)])
+    monkeypatch.setattr(
+        gpu_model_runner_v2.torch.accelerator,
+        "synchronize",
+        lambda: events.append("sync"),
+    )
+    monkeypatch.setattr(
+        gpu_model_runner_v2.torch.accelerator,
+        "empty_cache",
+        lambda: events.append("empty_cache"),
+    )
+    monkeypatch.setattr(
+        gpu_model_runner_v2.torch.accelerator,
+        "get_memory_info",
+        lambda: next(get_memory_info_values),
+    )
+    monkeypatch.setattr(
+        gpu_model_runner_v2.torch.accelerator,
+        "memory_reserved",
+        lambda device: 1_000,
+    )
+    monkeypatch.setattr(
+        gpu_model_runner_v2.torch.accelerator,
+        "memory_allocated",
+        lambda device: 500,
+    )
+    monkeypatch.setattr(
+        gpu_model_runner_v2.torch.accelerator,
+        "reset_peak_memory_stats",
+        lambda device: events.append("reset_peak"),
+    )
+    monkeypatch.setattr(
+        gpu_model_runner_v2.torch.accelerator,
+        "max_memory_reserved",
+        lambda device: 1_120,
+    )
+    monkeypatch.setattr(
+        gpu_model_runner_v2.torch.accelerator,
+        "max_memory_allocated",
+        lambda device: 530,
+    )
+
+    assert (
+        runner._measure_cuda_graph_pool_sample(lambda: events.append("capture")) == 120
+    )
+    assert events == [
+        "sync",
+        "empty_cache",
+        "reset_peak",
+        "capture",
+        "sync",
+    ]
+
+
+def test_v2_graph_pool_profile_restores_capture_state(monkeypatch):
+    from vllm.v1.worker.gpu import model_runner as gpu_model_runner_v2
+    from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
+    from vllm.v1.worker.gpu.model_runner import CUDAGraphMode, GPUModelRunner
+
+    piecewise_descs = [
+        BatchExecutionDescriptor(CUDAGraphMode.PIECEWISE, 128, None),
+        BatchExecutionDescriptor(CUDAGraphMode.PIECEWISE, 64, None),
+        BatchExecutionDescriptor(CUDAGraphMode.PIECEWISE, 32, None),
+    ]
+    full_descs = [
+        BatchExecutionDescriptor(CUDAGraphMode.FULL, 80, 4),
+        BatchExecutionDescriptor(CUDAGraphMode.FULL, 40, 2),
+    ]
+    original_graph = object()
+    original_breakable_entry = object()
+    breakable_runner = SimpleNamespace(
+        graph_pool="breakable-original",
+        entries={"old": original_breakable_entry},
+    )
+
+    class FakeCudaGraphManager:
+        def __init__(self):
+            self.pool = "manager-original"
+            self.graphs = {"old": original_graph}
+            self._graphs_captured = False
+            self.hidden_states = "hidden-original"
+            self.aux_hidden_states = ["aux-original"]
+            self.intermediate_tensors = "intermediate-original"
+            self.use_aux_hidden_state_outputs = False
+            self.use_breakable_cg = True
+            self.breakable_cg_runner = breakable_runner
+
+        def get_capture_descs(self):
+            return [
+                (CUDAGraphMode.PIECEWISE, piecewise_descs),
+                (CUDAGraphMode.FULL, full_descs),
+            ]
+
+        def init_breakable_cg_runner(self, model):
+            assert model == "model"
+
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.model = "model"
+    runner.cudagraph_manager = FakeCudaGraphManager()
+    sample_values = iter([1_000, 2_000_000, 800, 3_000_000])
+    capture_calls = []
+
+    monkeypatch.setattr(
+        gpu_model_runner_v2.current_platform,
+        "graph_pool_handle",
+        lambda: "profile-pool",
+    )
+    empty_cache_calls = []
+    monkeypatch.setattr(
+        gpu_model_runner_v2.torch.accelerator,
+        "empty_cache",
+        lambda: empty_cache_calls.append("empty_cache"),
+    )
+    monkeypatch.setattr(
+        gpu_model_runner_v2.compilation_counter,
+        "num_cudagraph_captured",
+        11,
+    )
+    monkeypatch.setattr(
+        runner,
+        "_measure_cuda_graph_pool_sample",
+        lambda capture_fn: capture_fn() or next(sample_values),
+    )
+
+    def capture_model_cudagraphs(**kwargs):
+        capture_calls.append(kwargs)
+        assert kwargs["capture_speculator"] is False
+        assert runner.cudagraph_manager.pool == "profile-pool"
+        assert breakable_runner.graph_pool == "profile-pool"
+        runner.cudagraph_manager.graphs["profile"] = object()
+        runner.cudagraph_manager._graphs_captured = True
+        runner.cudagraph_manager.hidden_states = "hidden-profile"
+        runner.cudagraph_manager.aux_hidden_states = ["aux-profile"]
+        runner.cudagraph_manager.intermediate_tensors = "intermediate-profile"
+        runner.cudagraph_manager.use_aux_hidden_state_outputs = True
+        breakable_runner.entries["profile"] = object()
+        gpu_model_runner_v2.compilation_counter.num_cudagraph_captured = 99
+
+    monkeypatch.setattr(
+        runner,
+        "_capture_model_cudagraphs",
+        capture_model_cudagraphs,
+    )
+
+    estimate = runner._profile_cudagraph_memory_graph_pool()
+
+    assert estimate == 7_001_000
+    assert [call["capture_descs"] for call in capture_calls] == [
+        {CUDAGraphMode.PIECEWISE: [piecewise_descs[0]]},
+        {CUDAGraphMode.PIECEWISE: [piecewise_descs[1]]},
+        {CUDAGraphMode.FULL: [full_descs[0]]},
+        {CUDAGraphMode.FULL: [full_descs[1]]},
+    ]
+    assert runner.cudagraph_manager.pool == "manager-original"
+    assert runner.cudagraph_manager.graphs == {"old": original_graph}
+    assert runner.cudagraph_manager._graphs_captured is False
+    assert runner.cudagraph_manager.hidden_states == "hidden-original"
+    assert runner.cudagraph_manager.aux_hidden_states == ["aux-original"]
+    assert runner.cudagraph_manager.intermediate_tensors == "intermediate-original"
+    assert runner.cudagraph_manager.use_aux_hidden_state_outputs is False
+    assert breakable_runner.graph_pool == "breakable-original"
+    assert breakable_runner.entries == {"old": original_breakable_entry}
+    assert gpu_model_runner_v2.compilation_counter.num_cudagraph_captured == 11
+    assert empty_cache_calls == ["empty_cache"]
 
 
 def test_v2_cleanup_profiling_kv_cache_releases_builder_refs(monkeypatch):
