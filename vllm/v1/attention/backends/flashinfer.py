@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Attention layer with FlashInfer."""
 
+import os
 import weakref
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -99,6 +100,142 @@ FP4_DTYPE = torch.uint8
 logger = init_logger(__name__)
 
 trtllm_gen_workspace_buffer = None
+
+_DIFFUSION_NVFP4_DEBUG_ENV = "VLLM_DEBUG_DIFFUSION_GEMMA_NVFP4"
+_DIFFUSION_NVFP4_REPRO_DUMP_ENV = "VLLM_DUMP_DIFFUSION_GEMMA_NVFP4_REPRO"
+_DIFFUSION_NVFP4_REPRO_PATH_ENV = "VLLM_DIFFUSION_GEMMA_NVFP4_REPRO_PATH"
+_DIFFUSION_NVFP4_REPRO_DEFAULT_PATH = "/tmp/diffusion_gemma_nvfp4_prefill_repro.pt"
+_DIFFUSION_NVFP4_DEBUG_MAX_LOGS = 256
+_diffusion_nvfp4_debug_logs = 0
+_diffusion_nvfp4_repro_dumped = False
+
+
+def _is_diffusion_nvfp4_debug_enabled() -> bool:
+    return os.environ.get(_DIFFUSION_NVFP4_DEBUG_ENV, "").lower() in {
+        "1",
+        "true",
+        "yes",
+    }
+
+
+def _is_diffusion_nvfp4_repro_dump_enabled() -> bool:
+    return os.environ.get(_DIFFUSION_NVFP4_REPRO_DUMP_ENV, "").lower() in {
+        "1",
+        "true",
+        "yes",
+    }
+
+
+def _diffusion_nvfp4_debug_has_budget() -> bool:
+    return (
+        _is_diffusion_nvfp4_debug_enabled()
+        and _diffusion_nvfp4_debug_logs < _DIFFUSION_NVFP4_DEBUG_MAX_LOGS
+    )
+
+
+def _diffusion_nvfp4_debug_log(message: str, *args: Any) -> None:
+    global _diffusion_nvfp4_debug_logs
+    if not _diffusion_nvfp4_debug_has_budget():
+        return
+    _diffusion_nvfp4_debug_logs += 1
+    if args:
+        message = message % args
+    logger.warning("[DiffusionGemma NVFP4 debug] %s", message)
+
+
+def _diffusion_nvfp4_tensor_stats(name: str, tensor: torch.Tensor) -> None:
+    if not _is_diffusion_nvfp4_debug_enabled():
+        return
+    with torch.no_grad():
+        detached = tensor.detach()
+        shape = tuple(detached.shape)
+        dtype = detached.dtype
+        numel = detached.numel()
+        if numel == 0:
+            _diffusion_nvfp4_debug_log(
+                "%s: shape=%s dtype=%s empty", name, shape, dtype
+            )
+            return
+        if detached.is_floating_point():
+            finite = torch.isfinite(detached)
+            finite_count = int(finite.sum().item())
+            if finite_count == 0:
+                _diffusion_nvfp4_debug_log(
+                    "%s: shape=%s dtype=%s finite=0/%d",
+                    name,
+                    shape,
+                    dtype,
+                    numel,
+                )
+                return
+            values = detached[finite].float()
+            abs_values = values.abs()
+            zero_ratio = float((values == 0).float().mean().item())
+            _diffusion_nvfp4_debug_log(
+                "%s: shape=%s dtype=%s finite=%d/%d abs_mean=%.6g "
+                "abs_max=%.6g zero_ratio=%.6g",
+                name,
+                shape,
+                dtype,
+                finite_count,
+                numel,
+                float(abs_values.mean().item()),
+                float(abs_values.max().item()),
+                zero_ratio,
+            )
+            return
+        _diffusion_nvfp4_debug_log(
+            "%s: shape=%s dtype=%s min=%s max=%s",
+            name,
+            shape,
+            dtype,
+            detached.min().item(),
+            detached.max().item(),
+        )
+
+
+def _diffusion_nvfp4_compare_tensors(
+    name: str,
+    reference: torch.Tensor,
+    candidate: torch.Tensor,
+) -> None:
+    if not _is_diffusion_nvfp4_debug_enabled():
+        return
+    with torch.no_grad():
+        ref = reference.detach().float().reshape(-1)
+        cand = candidate.detach().float().reshape(-1)
+        if ref.numel() == 0 or cand.numel() == 0 or ref.numel() != cand.numel():
+            _diffusion_nvfp4_debug_log(
+                "%s: cannot compare ref_shape=%s cand_shape=%s",
+                name,
+                tuple(reference.shape),
+                tuple(candidate.shape),
+            )
+            return
+        diff = (ref - cand).abs()
+        denom = ref.norm() * cand.norm()
+        cosine = float(((ref * cand).sum() / denom.clamp_min(1e-12)).item())
+        _diffusion_nvfp4_debug_log(
+            "%s: shape=%s mean_abs=%.6g max_abs=%.6g cosine=%.6g "
+            "ref_abs_mean=%.6g cand_abs_mean=%.6g",
+            name,
+            tuple(reference.shape),
+            float(diff.mean().item()),
+            float(diff.max().item()),
+            cosine,
+            float(ref.abs().mean().item()),
+            float(cand.abs().mean().item()),
+        )
+
+
+def _diffusion_nvfp4_dump_value(value: Any) -> Any:
+    if torch.is_tensor(value):
+        return value.detach().cpu()
+    if isinstance(value, tuple):
+        return tuple(_diffusion_nvfp4_dump_value(item) for item in value)
+    if isinstance(value, list):
+        return [_diffusion_nvfp4_dump_value(item) for item in value]
+    return value
 
 
 def _buffer_nbytes(buffer: torch.Tensor | None) -> int:
@@ -281,6 +418,139 @@ def _build_mm_prefix_custom_mask(
         torch.cat(mask_parts)
         if mask_parts
         else torch.empty(0, dtype=torch.bool, device=device)
+    )
+
+
+def _build_dynamic_causal_custom_mask(
+    dynamic_causal: torch.Tensor,
+    mm_prefix_range: dict[int, list[tuple[int, int]]] | None,
+    request_offset: int,
+    qo_indptr: torch.Tensor,
+    paged_kv_indptr: torch.Tensor,
+    paged_kv_last_page_len: torch.Tensor,
+    page_size: int,
+    window_left: int,
+    device: torch.device,
+) -> torch.Tensor:
+    mask_parts: list[torch.Tensor] = []
+    num_reqs = qo_indptr.shape[0] - 1
+    dynamic_causal_cpu = dynamic_causal[request_offset : request_offset + num_reqs].to(
+        device="cpu", dtype=torch.bool
+    )
+
+    for local_req_idx in range(num_reqs):
+        q_len = int((qo_indptr[local_req_idx + 1] - qo_indptr[local_req_idx]).item())
+        num_pages = int(
+            (paged_kv_indptr[local_req_idx + 1] - paged_kv_indptr[local_req_idx]).item()
+        )
+        last_page_len = int(paged_kv_last_page_len[local_req_idx].item())
+        kv_len = 0 if num_pages == 0 else (num_pages - 1) * page_size + last_page_len
+        if q_len == 0 or kv_len == 0:
+            mask_parts.append(
+                torch.empty(q_len * kv_len, dtype=torch.bool, device=device)
+            )
+            continue
+        if q_len > kv_len:
+            raise ValueError(
+                "FlashInfer dynamic causal custom mask expects each prefill "
+                f"request to have q_len <= kv_len, got {q_len=} and {kv_len=}."
+            )
+
+        context_len = kv_len - q_len
+        q_positions = context_len + torch.arange(q_len, device=device)
+        kv_positions = torch.arange(kv_len, device=device)
+        if bool(dynamic_causal_cpu[local_req_idx].item()):
+            keep = kv_positions.unsqueeze(0) <= q_positions.unsqueeze(1)
+        else:
+            keep = torch.ones((q_len, kv_len), dtype=torch.bool, device=device)
+
+        if window_left >= 0:
+            keep &= (
+                q_positions.unsqueeze(1) - kv_positions.unsqueeze(0)
+            ) <= window_left
+
+        if mm_prefix_range is not None:
+            req_idx = request_offset + local_req_idx
+            for start, end in mm_prefix_range.get(req_idx, ()):
+                q_in_range = (q_positions >= start) & (q_positions <= end)
+                kv_in_range = (kv_positions >= start) & (kv_positions <= end)
+                keep |= q_in_range.unsqueeze(1) & kv_in_range.unsqueeze(0)
+
+        mask_parts.append(keep.reshape(-1))
+
+    return (
+        torch.cat(mask_parts)
+        if mask_parts
+        else torch.empty(0, dtype=torch.bool, device=device)
+    )
+
+
+def _debug_dynamic_causal_custom_mask(
+    name: str,
+    mask: torch.Tensor,
+    dynamic_causal: torch.Tensor,
+    request_offset: int,
+    qo_indptr: torch.Tensor,
+    paged_kv_indptr: torch.Tensor,
+    paged_kv_last_page_len: torch.Tensor,
+    page_size: int,
+) -> None:
+    if not _is_diffusion_nvfp4_debug_enabled():
+        return
+
+    qo_indptr_cpu = qo_indptr.detach().cpu()
+    paged_kv_indptr_cpu = paged_kv_indptr.detach().cpu()
+    paged_kv_last_page_len_cpu = paged_kv_last_page_len.detach().cpu()
+    dynamic_causal_cpu = dynamic_causal[
+        request_offset : request_offset + qo_indptr_cpu.shape[0] - 1
+    ].to(device="cpu", dtype=torch.bool)
+
+    cursor = 0
+    true_total = 0
+    total = 0
+    zero_rows = 0
+    min_visible: int | None = None
+    max_visible = 0
+    req_summaries: list[str] = []
+    for local_req_idx in range(qo_indptr_cpu.shape[0] - 1):
+        q_len = int(qo_indptr_cpu[local_req_idx + 1] - qo_indptr_cpu[local_req_idx])
+        num_pages = int(
+            paged_kv_indptr_cpu[local_req_idx + 1] - paged_kv_indptr_cpu[local_req_idx]
+        )
+        last_page_len = int(paged_kv_last_page_len_cpu[local_req_idx])
+        kv_len = 0 if num_pages == 0 else (num_pages - 1) * page_size + last_page_len
+        mask_len = q_len * kv_len
+        if mask_len == 0:
+            req_summaries.append(f"req={local_req_idx}:q={q_len}:kv={kv_len}:empty")
+            continue
+
+        req_mask = mask[cursor : cursor + mask_len].reshape(q_len, kv_len)
+        cursor += mask_len
+        visible = req_mask.sum(dim=1)
+        req_true = int(visible.sum().item())
+        req_min = int(visible.min().item())
+        req_max = int(visible.max().item())
+        req_zero = int((visible == 0).sum().item())
+        true_total += req_true
+        total += mask_len
+        zero_rows += req_zero
+        min_visible = req_min if min_visible is None else min(min_visible, req_min)
+        max_visible = max(max_visible, req_max)
+        req_summaries.append(
+            f"req={local_req_idx}:q={q_len}:kv={kv_len}:"
+            f"causal={bool(dynamic_causal_cpu[local_req_idx].item())}:"
+            f"min={req_min}:max={req_max}:zero={req_zero}"
+        )
+
+    _diffusion_nvfp4_debug_log(
+        "%s: true=%d/%d visible_min=%s visible_max=%d zero_rows=%d requests=[%s]",
+        name,
+        true_total,
+        total,
+        "n/a" if min_visible is None else min_visible,
+        max_visible,
+        zero_rows,
+        "; ".join(req_summaries[:4]),
     )
 
 
@@ -757,6 +1027,10 @@ class FIPrefill:
     seq_lens_cpu: torch.Tensor | None = None
     query_start_loc: torch.Tensor | None = None
     query_start_loc_cpu: torch.Tensor | None = None
+    custom_mask: torch.Tensor | None = None
+    paged_kv_indptr_cpu: torch.Tensor | None = None
+    paged_kv_indices: torch.Tensor | None = None
+    paged_kv_last_page_len_cpu: torch.Tensor | None = None
 
 
 @dataclass
@@ -852,6 +1126,7 @@ class FlashInferMetadata:
 
     cascade_wrapper: MultiLevelCascadeAttentionWrapper | None
     mm_prefix_range: dict[int, list[tuple[int, int]]] | None = None
+    uses_dynamic_causal_mask: bool = False
 
 
 class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
@@ -1943,7 +2218,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         )
 
         # write self.paged_kv_last_page_len_cpu inplace
-        paged_kv_last_page_len_np = seq_lens_np % page_size
+        paged_kv_last_page_len_np: np.ndarray = seq_lens_np % page_size
         self.paged_kv_last_page_len.np[:num_reqs] = np.where(
             (paged_kv_last_page_len_np == 0) & (seq_lens_np != 0),
             page_size,
@@ -1963,12 +2238,24 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         num_reqs = common_attn_metadata.num_reqs
         num_actual_tokens = common_attn_metadata.num_actual_tokens
         causal = common_attn_metadata.causal
+        uses_dynamic_causal_mask = isinstance(causal, torch.Tensor)
+        if uses_dynamic_causal_mask:
+            causal_for_split = True
+            dynamic_causal = causal
+        elif isinstance(causal, bool):
+            causal_for_split = causal
+            dynamic_causal = None
+        else:
+            raise TypeError(
+                "FlashInfer expected causal to be a bool or torch.Tensor, "
+                f"got {type(causal)!r}."
+            )
         mm_prefix_range = _normalize_mm_prefix_range(
             common_attn_metadata.mm_req_doc_ranges
         )
         has_mm_prefix = mm_prefix_range is not None
         if has_mm_prefix:
-            if not causal:
+            if not causal_for_split:
                 raise NotImplementedError(
                     "FlashInfer mm_prefix custom mask supports causal attention only."
                 )
@@ -1976,13 +2263,21 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 raise ValueError(
                     "FlashInfer mm_prefix attention requires is_prefilling metadata."
                 )
-        if causal:
+        if uses_dynamic_causal_mask and common_attn_metadata.is_prefilling is None:
+            raise ValueError(
+                "FlashInfer dynamic causal attention requires is_prefilling metadata."
+            )
+        if causal_for_split:
             num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
                 split_decodes_and_prefills(
                     common_attn_metadata,
-                    decode_threshold=self.reorder_batch_threshold,
+                    decode_threshold=1
+                    if uses_dynamic_causal_mask
+                    else self.reorder_batch_threshold,
                     require_uniform=not has_mm_prefix,
-                    treat_short_extends_as_decodes=not has_mm_prefix,
+                    treat_short_extends_as_decodes=(
+                        not has_mm_prefix and not uses_dynamic_causal_mask
+                    ),
                 )
             )
         else:
@@ -1992,6 +2287,11 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             num_prefills = num_reqs
             num_decode_tokens = 0
             num_prefill_tokens = num_actual_tokens
+        if uses_dynamic_causal_mask and num_decode_tokens != num_decodes:
+            raise NotImplementedError(
+                "FlashInfer dynamic causal attention supports native decode only "
+                "when each decode request has one query token."
+            )
 
         if has_mm_prefix and num_decodes > 0:
             query_lens = (
@@ -2017,9 +2317,18 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         # - Decode (FI native or TRTLLM)
         use_cascade = common_prefix_len > 0
         uses_spec_reorder = self.reorder_batch_threshold > 1
+        if uses_dynamic_causal_mask and use_cascade:
+            raise NotImplementedError(
+                "FlashInfer dynamic causal attention does not support cascade "
+                "attention yet."
+            )
         if has_mm_prefix and use_cascade:
             raise NotImplementedError(
                 "FlashInfer mm_prefix attention does not support cascade attention."
+            )
+        if uses_dynamic_causal_mask and self.use_dcp:
+            raise NotImplementedError(
+                "FlashInfer dynamic causal attention is not supported with DCP yet."
             )
         if has_mm_prefix:
             if self.use_dcp:
@@ -2036,43 +2345,59 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     "FlashInfer mm_prefix prefill is not supported with "
                     "attention sinks."
                 )
+        if uses_dynamic_causal_mask and page_size >= 128:
+            raise NotImplementedError(
+                "FlashInfer dynamic causal prefill is not supported with "
+                "TRTLLM-only block sizes."
+            )
         # Page sizes >= 128 must use trtllm-gen; force it for prefill too.
         prefill_force_trtllm = (
             False
-            if has_mm_prefix
+            if has_mm_prefix or uses_dynamic_causal_mask
             else True
             if page_size >= 128
             else self.attention_config.use_trtllm_attention
         )
-        prefill_use_trtllm = causal and use_trtllm_attention(
-            self.num_qo_heads,
-            self.num_kv_heads,
-            num_prefill_tokens,
-            max_seq_len,
-            self.dcp_world_size,
-            self.cache_dtype,
-            self.q_data_type,
-            is_prefill=True,
-            force_use_trtllm=prefill_force_trtllm,
-            has_sinks=self.has_sinks,
-            has_spec=uses_spec_reorder,
+        prefill_use_trtllm = (
+            not uses_dynamic_causal_mask
+            and causal_for_split
+            and use_trtllm_attention(
+                self.num_qo_heads,
+                self.num_kv_heads,
+                num_prefill_tokens,
+                max_seq_len,
+                self.dcp_world_size,
+                self.cache_dtype,
+                self.q_data_type,
+                is_prefill=True,
+                force_use_trtllm=prefill_force_trtllm,
+                has_sinks=self.has_sinks,
+                has_spec=uses_spec_reorder,
+            )
         )
         decode_use_trtllm = (
-            causal and self.use_trtllm_decode_attention and self.dcp_world_size <= 1
+            not uses_dynamic_causal_mask
+            and causal_for_split
+            and self.use_trtllm_decode_attention
+            and self.dcp_world_size <= 1
         )
 
-        if not causal and self.use_dcp:
+        if not causal_for_split and self.use_dcp:
             raise NotImplementedError(
                 "FlashInfer non-causal prefill is not supported with DCP yet."
             )
-        if not causal and self.use_trtllm_decode_attention:
+        if not causal_for_split and self.use_trtllm_decode_attention:
             logger.warning_once(
                 "Using FlashInfer for draft model non-causal attention; TRTLLM "
                 "can still be used for target model causal attention."
             )
-        all_uses_trtllm = causal and (
-            (num_prefills == 0 or prefill_use_trtllm)
-            and (num_decodes == 0 or decode_use_trtllm)
+        all_uses_trtllm = (
+            not uses_dynamic_causal_mask
+            and causal_for_split
+            and (
+                (num_prefills == 0 or prefill_use_trtllm)
+                and (num_decodes == 0 or decode_use_trtllm)
+            )
         )
 
         if not all_uses_trtllm:
@@ -2111,12 +2436,13 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             num_decode_tokens=num_decode_tokens,
             num_prefills=num_prefills,
             num_prefill_tokens=num_prefill_tokens,
-            causal=causal,
+            causal=False if uses_dynamic_causal_mask else causal_for_split,
             use_cascade=use_cascade,
             prefill=None,
             decode=None,
             cascade_wrapper=None,
             mm_prefix_range=mm_prefix_range,
+            uses_dynamic_causal_mask=uses_dynamic_causal_mask,
         )
 
         # Guard access to seq_lens_cpu, which may not always be needed
@@ -2270,7 +2596,11 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     max_seq_len=max_seq_len,
                 )
             else:
-                prefill_wrapper = self._get_prefill_wrapper(causal=attn_metadata.causal)
+                prefill_wrapper = self._get_prefill_wrapper(
+                    causal=True
+                    if attn_metadata.uses_dynamic_causal_mask
+                    else attn_metadata.causal
+                )
                 mm_prefill_wrapper = None
                 # Slicing CPU buffers that are only needed for FI native prefills
                 paged_kv_last_page_len_prefill_cpu = self.paged_kv_last_page_len.cpu[
@@ -2281,6 +2611,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     prefill_start : num_reqs + 1
                 ]
                 assert paged_kv_indptr_prefill_cpu.shape[0] == num_prefills + 1
+                prefill_saved_custom_mask = None
                 if self.use_dcp:
                     assert isinstance(prefill_wrapper, BatchDCPPrefillWrapper)
                     prefill_wrapper.plan(
@@ -2307,30 +2638,77 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                         BatchPrefillWithPagedKVCacheWrapper,
                     )
                     o_dtype = self.model_config.dtype
+                    prefill_custom_mask = None
+                    prefill_plan_causal = attn_metadata.causal
+                    prefill_plan_window_left = self.window_left
+                    prefill_plan_qo_indptr = qo_indptr_prefill_cpu
+                    prefill_plan_paged_kv_indptr = paged_kv_indptr_prefill_cpu
+                    prefill_plan_paged_kv_last_page_len = (
+                        paged_kv_last_page_len_prefill_cpu
+                    )
+                    if attn_metadata.uses_dynamic_causal_mask:
+                        assert dynamic_causal is not None
+                        prefill_custom_mask = _build_dynamic_causal_custom_mask(
+                            dynamic_causal,
+                            mm_prefix_range,
+                            prefill_start,
+                            qo_indptr_prefill_cpu,
+                            paged_kv_indptr_prefill_cpu,
+                            paged_kv_last_page_len_prefill_cpu,
+                            page_size,
+                            self.window_left,
+                            self.device,
+                        )
+                        _debug_dynamic_causal_custom_mask(
+                            "dynamic prefill custom mask",
+                            prefill_custom_mask,
+                            dynamic_causal,
+                            prefill_start,
+                            qo_indptr_prefill_cpu,
+                            paged_kv_indptr_prefill_cpu,
+                            paged_kv_last_page_len_prefill_cpu,
+                            page_size,
+                        )
+                        prefill_saved_custom_mask = prefill_custom_mask
+                        prefill_plan_causal = False
+                        prefill_plan_window_left = -1
+                        # FlashInfer packs custom masks on device, so plan with
+                        # device indptr tensors when a custom mask is present.
+                        prefill_plan_qo_indptr = (
+                            qo_indptr[prefill_start:] - qo_indptr[prefill_start]
+                        )
+                        prefill_plan_paged_kv_indptr = self.paged_kv_indptr.gpu[
+                            prefill_start : num_reqs + 1
+                        ]
+                        prefill_plan_paged_kv_last_page_len = (
+                            self.paged_kv_last_page_len.gpu[prefill_start:num_reqs]
+                        )
                     self._ensure_flashinfer_wrapper_workspace(
                         prefill_wrapper,
                         self._get_prefill_workspace_size(
                             qo_indptr=qo_indptr_prefill_cpu,
                             paged_kv_indptr=paged_kv_indptr_prefill_cpu,
                             paged_kv_last_page_len=(paged_kv_last_page_len_prefill_cpu),
-                            causal=attn_metadata.causal,
-                            window_left=self.window_left,
+                            causal=prefill_plan_causal,
+                            window_left=prefill_plan_window_left,
+                            use_custom_mask=(attn_metadata.uses_dynamic_causal_mask),
                             fixed_split_size=self.prefill_fixed_split_size,
                             disable_split_kv=self.disable_split_kv,
                         ),
                     )
                     prefill_wrapper.plan(
-                        qo_indptr=qo_indptr_prefill_cpu,
-                        paged_kv_indptr=paged_kv_indptr_prefill_cpu,
+                        qo_indptr=prefill_plan_qo_indptr,
+                        paged_kv_indptr=prefill_plan_paged_kv_indptr,
                         paged_kv_indices=paged_kv_indices,
-                        paged_kv_last_page_len=paged_kv_last_page_len_prefill_cpu,
+                        paged_kv_last_page_len=prefill_plan_paged_kv_last_page_len,
                         num_qo_heads=self.num_qo_heads,
                         num_kv_heads=self.num_kv_heads,
                         head_dim_qk=self.head_dim,
                         page_size=self.page_size,
-                        causal=attn_metadata.causal,
+                        custom_mask=prefill_custom_mask,
+                        causal=prefill_plan_causal,
                         sm_scale=self.sm_scale,
-                        window_left=self.window_left,
+                        window_left=prefill_plan_window_left,
                         logits_soft_cap=self.logits_soft_cap,
                         q_data_type=self.q_data_type,
                         kv_data_type=self.kv_cache_dtype,
@@ -2338,7 +2716,21 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                         fixed_split_size=self.prefill_fixed_split_size,
                         disable_split_kv=self.disable_split_kv,
                     )
-                    if has_mm_prefix:
+                    if attn_metadata.uses_dynamic_causal_mask:
+                        _diffusion_nvfp4_debug_log(
+                            "dynamic prefill plan: backend=%s causal=%s "
+                            "window_left=%s sm_scale=%s logits_soft_cap=%s "
+                            "q_dtype=%s kv_dtype=%s o_dtype=%s",
+                            getattr(prefill_wrapper, "_backend", None),
+                            getattr(prefill_wrapper, "_causal", None),
+                            getattr(prefill_wrapper, "_window_left", None),
+                            getattr(prefill_wrapper, "_sm_scale", None),
+                            getattr(prefill_wrapper, "_logits_soft_cap", None),
+                            self.q_data_type,
+                            self.kv_cache_dtype,
+                            self.model_config.dtype,
+                        )
+                    if has_mm_prefix and not attn_metadata.uses_dynamic_causal_mask:
                         assert mm_prefix_range is not None
                         mm_prefill_wrapper = self._get_mm_prefill_wrapper()
                         qo_indptr_prefill_gpu = (
@@ -2408,6 +2800,10 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     else None,
                     query_start_loc=query_start_loc_prefill,
                     query_start_loc_cpu=qo_indptr_prefill_cpu,
+                    custom_mask=prefill_saved_custom_mask,
+                    paged_kv_indptr_cpu=paged_kv_indptr_prefill_cpu,
+                    paged_kv_indices=paged_kv_indices,
+                    paged_kv_last_page_len_cpu=paged_kv_last_page_len_prefill_cpu,
                 )
 
         ## DECODE PATHWAY
@@ -2679,6 +3075,222 @@ class FlashInferImpl(AttentionImpl):
         else:
             output_slice.copy_(attn_out)
 
+    def _debug_nvfp4_prefill_cache(
+        self,
+        layer: torch.nn.Module,
+        prefill_key: torch.Tensor,
+        prefill_value: torch.Tensor,
+        attn_metadata: FlashInferMetadata,
+        nvfp4_kv_data: tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor],
+        nvfp4_kv_block_scales: tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor],
+    ) -> None:
+        if (
+            not _diffusion_nvfp4_debug_has_budget()
+            or not self.is_kvcache_nvfp4
+            or self._nvfp4_paged_dequant is None
+            or not attn_metadata.uses_dynamic_causal_mask
+            or not isinstance(attn_metadata.prefill, FIPrefill)
+        ):
+            return
+
+        prefill = attn_metadata.prefill
+        if (
+            prefill.block_tables is None
+            or prefill.seq_lens is None
+            or prefill.seq_lens_cpu is None
+            or prefill.query_start_loc_cpu is None
+        ):
+            return
+
+        qsl = prefill.query_start_loc_cpu.tolist()
+        seq_lens = prefill.seq_lens_cpu.tolist()
+        num_reqs = len(qsl) - 1
+        for req_idx in range(num_reqs):
+            q_start = int(qsl[req_idx])
+            q_end = int(qsl[req_idx + 1])
+            q_len = q_end - q_start
+            seq_len = int(seq_lens[req_idx])
+            if q_len <= 0 or seq_len <= 0 or q_len > seq_len:
+                continue
+
+            k_buf = torch.empty(
+                (1, seq_len, self.num_kv_heads, self.head_size),
+                dtype=prefill_key.dtype,
+                device=prefill_key.device,
+            )
+            v_buf = torch.empty(
+                (1, seq_len, self.num_kv_heads, self.head_size_v),
+                dtype=prefill_value.dtype,
+                device=prefill_value.device,
+            )
+            self._nvfp4_paged_dequant(
+                nvfp4_kv_data,
+                nvfp4_kv_block_scales,
+                prefill.block_tables[req_idx : req_idx + 1],
+                prefill.seq_lens[req_idx : req_idx + 1],
+                layer._k_scale,
+                layer._v_scale,
+                k_buf,
+                v_buf,
+                kv_layout=get_kv_cache_layout(),
+            )
+            k_tail = k_buf[0, seq_len - q_len : seq_len]
+            v_tail = v_buf[0, seq_len - q_len : seq_len]
+            raw_k = prefill_key[q_start:q_end]
+            raw_v = prefill_value[q_start:q_end]
+            _diffusion_nvfp4_debug_log(
+                "prefill cache compare: req=%d q_len=%d seq_len=%d "
+                "context_len=%d causal=%s",
+                req_idx,
+                q_len,
+                seq_len,
+                seq_len - q_len,
+                attn_metadata.causal,
+            )
+            _diffusion_nvfp4_compare_tensors("prefill K cache tail", raw_k, k_tail)
+            _diffusion_nvfp4_compare_tensors("prefill V cache tail", raw_v, v_tail)
+            return
+
+    def _maybe_dump_diffusion_nvfp4_prefill_repro(
+        self,
+        layer: torch.nn.Module,
+        prefill_wrapper: BatchPrefillWithPagedKVCacheWrapper,
+        prefill_query: torch.Tensor,
+        prefill_key: torch.Tensor,
+        prefill_value: torch.Tensor,
+        attn_metadata: FlashInferMetadata,
+        nvfp4_kv_data: tuple[torch.Tensor, ...],
+        nvfp4_kv_block_scales: tuple[torch.Tensor, ...],
+    ) -> None:
+        global _diffusion_nvfp4_repro_dumped
+        if (
+            _diffusion_nvfp4_repro_dumped
+            or not _is_diffusion_nvfp4_repro_dump_enabled()
+            or not self.is_kvcache_nvfp4
+            or not attn_metadata.uses_dynamic_causal_mask
+            or attn_metadata.num_prefill_tokens < 64
+            or not isinstance(attn_metadata.prefill, FIPrefill)
+        ):
+            return
+
+        prefill = attn_metadata.prefill
+        if (
+            prefill.custom_mask is None
+            or prefill.paged_kv_indptr_cpu is None
+            or prefill.paged_kv_indices is None
+            or prefill.paged_kv_last_page_len_cpu is None
+            or prefill.query_start_loc_cpu is None
+            or prefill.seq_lens_cpu is None
+        ):
+            return
+
+        try:
+            paged_kv_indptr = prefill.paged_kv_indptr_cpu.detach().cpu()
+            first_page_pos = int(paged_kv_indptr[0].item())
+            last_page_pos = int(paged_kv_indptr[-1].item())
+            if last_page_pos <= first_page_pos:
+                return
+
+            used_page_ids = (
+                prefill.paged_kv_indices[first_page_pos:last_page_pos].detach().cpu()
+            )
+            if used_page_ids.numel() == 0:
+                return
+
+            unique_pages, remapped_indices = torch.unique(
+                used_page_ids, sorted=True, return_inverse=True
+            )
+            unique_pages_gpu = unique_pages.to(
+                device=prefill.paged_kv_indices.device, dtype=torch.long
+            )
+
+            def slice_pages(
+                tensors: tuple[torch.Tensor, ...],
+            ) -> tuple[torch.Tensor, ...]:
+                return tuple(
+                    tensor.index_select(0, unique_pages_gpu).detach().cpu()
+                    for tensor in tensors
+                )
+
+            local_paged_kv_indptr = paged_kv_indptr - first_page_pos
+            local_paged_kv_indices = remapped_indices.to(dtype=used_page_ids.dtype)
+            page_counts = local_paged_kv_indptr[1:] - local_paged_kv_indptr[:-1]
+            max_pages_per_req = int(page_counts.max().item())
+            kv_layout = get_kv_cache_layout()
+            if kv_layout == "NHD":
+                page_size = int(nvfp4_kv_data[0].shape[1])
+            else:
+                page_size = int(nvfp4_kv_data[0].shape[2])
+            block_tables = torch.zeros(
+                (page_counts.shape[0], max_pages_per_req),
+                dtype=local_paged_kv_indices.dtype,
+            )
+            for req_idx, page_count in enumerate(page_counts.tolist()):
+                start = int(local_paged_kv_indptr[req_idx].item())
+                end = start + int(page_count)
+                block_tables[req_idx, : int(page_count)] = local_paged_kv_indices[
+                    start:end
+                ]
+
+            payload = {
+                "query": _diffusion_nvfp4_dump_value(prefill_query),
+                "raw_key": _diffusion_nvfp4_dump_value(prefill_key),
+                "raw_value": _diffusion_nvfp4_dump_value(prefill_value),
+                "nvfp4_kv_data": slice_pages(nvfp4_kv_data),
+                "nvfp4_kv_block_scales": slice_pages(nvfp4_kv_block_scales),
+                "custom_mask": _diffusion_nvfp4_dump_value(prefill.custom_mask),
+                "qo_indptr": _diffusion_nvfp4_dump_value(prefill.query_start_loc_cpu),
+                "paged_kv_indptr": local_paged_kv_indptr,
+                "paged_kv_indices": local_paged_kv_indices,
+                "paged_kv_last_page_len": _diffusion_nvfp4_dump_value(
+                    prefill.paged_kv_last_page_len_cpu
+                ),
+                "block_tables": block_tables,
+                "seq_lens": _diffusion_nvfp4_dump_value(prefill.seq_lens_cpu),
+                "num_qo_heads": self.num_heads,
+                "num_kv_heads": self.num_kv_heads,
+                "head_size": self.head_size,
+                "head_size_v": self.head_size_v,
+                "page_size": page_size,
+                "kv_layout": kv_layout,
+                "q_data_type": prefill_query.dtype,
+                "kv_data_type": self.kv_cache_dtype,
+                "o_data_type": prefill_query.dtype,
+                "sm_scale": self.scale,
+                "window_left": self.window_left,
+                "logits_soft_cap": self.logits_soft_cap,
+                "wrapper_backend": getattr(prefill_wrapper, "_backend", None),
+                "wrapper_causal": getattr(prefill_wrapper, "_causal", None),
+                "wrapper_window_left": getattr(prefill_wrapper, "_window_left", None),
+                "wrapper_sm_scale": getattr(prefill_wrapper, "_sm_scale", None),
+                "k_scale": _diffusion_nvfp4_dump_value(
+                    getattr(layer, "_k_scale_float", None)
+                ),
+                "v_scale": _diffusion_nvfp4_dump_value(
+                    getattr(layer, "_v_scale_float", None)
+                ),
+                "q_scale": _diffusion_nvfp4_dump_value(
+                    getattr(layer, "_q_scale_float", None)
+                ),
+            }
+
+            path = os.environ.get(
+                _DIFFUSION_NVFP4_REPRO_PATH_ENV,
+                _DIFFUSION_NVFP4_REPRO_DEFAULT_PATH,
+            )
+            torch.save(payload, path)
+            _diffusion_nvfp4_repro_dumped = True
+            logger.warning(
+                "[DiffusionGemma NVFP4 debug] dumped prefill repro to %s "
+                "(unique_pages=%d, tokens=%d)",
+                path,
+                unique_pages.numel(),
+                prefill_query.shape[0],
+            )
+        except Exception:
+            _diffusion_nvfp4_repro_dumped = True
+            logger.exception("[DiffusionGemma NVFP4 debug] failed to dump repro")
+
     def _run_nvfp4_fa2_prefill(
         self,
         layer: torch.nn.Module,
@@ -2699,6 +3311,7 @@ class FlashInferImpl(AttentionImpl):
             or not _is_flash_attn_varlen_func_available()
             or prefill_query.dtype not in (torch.float16, torch.bfloat16)
             or not isinstance(attn_metadata.causal, bool)
+            or attn_metadata.uses_dynamic_causal_mask
             or self.dcp_world_size > 1
             or attn_metadata.use_cascade
             or self._nvfp4_fa2_cu_q is None
@@ -2945,6 +3558,8 @@ class FlashInferImpl(AttentionImpl):
         # Decodes are at the front and prefills are at the back.
         if num_prefill_tokens > 0:
             prefill_query = query[num_decode_tokens:]
+            prefill_key = key[num_decode_tokens:]
+            prefill_value = value[num_decode_tokens:]
             assert prefill_query.shape[0] == num_prefill_tokens
 
             if not prefill_use_trtllm:
@@ -2979,8 +3594,8 @@ class FlashInferImpl(AttentionImpl):
                         layer,
                         prefill_query,
                         kv_cache_permute,
-                        key[num_decode_tokens:],
-                        value[num_decode_tokens:],
+                        prefill_key,
+                        prefill_value,
                         out=output[num_decode_tokens:],
                     )
                 else:
@@ -2988,7 +3603,12 @@ class FlashInferImpl(AttentionImpl):
                         prefill_wrapper, BatchPrefillWithPagedKVCacheWrapper
                     )
                     expected_window_left = (
-                        -1 if use_mm_prefill_wrapper else self.window_left
+                        -1
+                        if (
+                            use_mm_prefill_wrapper
+                            or attn_metadata.uses_dynamic_causal_mask
+                        )
+                        else self.window_left
                     )
                     assert prefill_wrapper._window_left == expected_window_left
                     assert prefill_wrapper._logits_soft_cap == (
@@ -3001,14 +3621,81 @@ class FlashInferImpl(AttentionImpl):
 
                     out_prefill = output[num_decode_tokens:]
                     used_nvfp4_fa2_prefill = False
+                    debug_dynamic_prefill_detail = (
+                        attn_metadata.uses_dynamic_causal_mask
+                        and attn_metadata.num_prefill_tokens >= 64
+                    )
                     if self.is_kvcache_nvfp4:
                         assert nvfp4_kv_data is not None
                         assert nvfp4_kv_block_scales is not None
+                        if debug_dynamic_prefill_detail:
+                            _diffusion_nvfp4_debug_log(
+                                "dynamic native prefill context: layer=%s "
+                                "layer_id=%s heads=%d kv_heads=%d head_size=%d "
+                                "head_size_v=%d window_left=%s soft_cap=%s "
+                                "scale=%s wrapper_backend=%s wrapper_causal=%s "
+                                "wrapper_window=%s wrapper_sm_scale=%s "
+                                "q_dtype=%s kv_dtype=%s out_dtype=%s "
+                                "k_scale=%s v_scale=%s q_scale=%s "
+                                "prefills=%d prefill_tokens=%d decode_tokens=%d",
+                                layer.__class__.__name__,
+                                hex(id(layer)),
+                                self.num_heads,
+                                self.num_kv_heads,
+                                self.head_size,
+                                self.head_size_v,
+                                self.window_left,
+                                self.logits_soft_cap,
+                                self.scale,
+                                getattr(prefill_wrapper, "_backend", None),
+                                getattr(prefill_wrapper, "_causal", None),
+                                getattr(prefill_wrapper, "_window_left", None),
+                                getattr(prefill_wrapper, "_sm_scale", None),
+                                attn_metadata.q_data_type,
+                                self.kv_cache_dtype,
+                                out_prefill.dtype,
+                                getattr(layer, "_k_scale_float", None),
+                                getattr(layer, "_v_scale_float", None),
+                                getattr(layer, "_q_scale_float", None),
+                                attn_metadata.num_prefills,
+                                attn_metadata.num_prefill_tokens,
+                                attn_metadata.num_decode_tokens,
+                            )
+                            _diffusion_nvfp4_tensor_stats(
+                                "dynamic prefill query",
+                                prefill_query,
+                            )
+                            _diffusion_nvfp4_tensor_stats(
+                                "dynamic prefill key",
+                                prefill_key,
+                            )
+                            _diffusion_nvfp4_tensor_stats(
+                                "dynamic prefill value",
+                                prefill_value,
+                            )
+                            self._debug_nvfp4_prefill_cache(
+                                layer,
+                                prefill_key,
+                                prefill_value,
+                                attn_metadata,
+                                nvfp4_kv_data,
+                                nvfp4_kv_block_scales,
+                            )
+                        self._maybe_dump_diffusion_nvfp4_prefill_repro(
+                            layer,
+                            prefill_wrapper,
+                            prefill_query,
+                            prefill_key,
+                            prefill_value,
+                            attn_metadata,
+                            nvfp4_kv_data,
+                            nvfp4_kv_block_scales,
+                        )
                         used_nvfp4_fa2_prefill = self._run_nvfp4_fa2_prefill(
                             layer,
                             prefill_query,
-                            key[num_decode_tokens:],
-                            value[num_decode_tokens:],
+                            prefill_key,
+                            prefill_value,
                             out_prefill,
                             attn_metadata,
                             nvfp4_kv_data,
@@ -3029,6 +3716,11 @@ class FlashInferImpl(AttentionImpl):
                             v_scale=layer._v_scale_float,
                             out=out_prefill,
                             kv_cache_sf=kv_cache_sf,
+                        )
+                    if self.is_kvcache_nvfp4 and debug_dynamic_prefill_detail:
+                        _diffusion_nvfp4_tensor_stats(
+                            "dynamic prefill output",
+                            out_prefill,
                         )
 
             else:

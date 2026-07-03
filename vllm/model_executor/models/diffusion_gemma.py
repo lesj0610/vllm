@@ -16,7 +16,9 @@ via Gemma4MultimodalEmbedder.
 
 from __future__ import annotations
 
+import os
 from collections.abc import Iterable, Mapping
+from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any
 
@@ -52,7 +54,10 @@ from vllm.v1.outputs import LogprobsTensors
 from vllm.v1.worker.gpu.attn_utils import build_attn_metadata
 from vllm.v1.worker.gpu.buffer_utils import UvaBackedTensor, async_copy_to_gpu
 from vllm.v1.worker.gpu.input_batch import InputBatch
-from vllm.v1.worker.gpu.model_states.interface import ModelState
+from vllm.v1.worker.gpu.model_states.interface import (
+    ModelSpecificAttnMetadata,
+    ModelState,
+)
 from vllm.v1.worker.gpu.sample.logprob import compute_topk_logprobs
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
 from vllm.v1.worker.gpu.sample.penalties import use_penalty
@@ -65,6 +70,81 @@ from .interfaces import (
 )
 
 logger = init_logger(__name__)
+
+_DIFFUSION_GEMMA_DEBUG_ENV = "VLLM_DEBUG_DIFFUSION_GEMMA_NVFP4"
+_DIFFUSION_GEMMA_DEBUG_MAX_LOGS = 128
+_diffusion_gemma_debug_logs = 0
+
+
+def _is_diffusion_gemma_debug_enabled() -> bool:
+    return os.environ.get(_DIFFUSION_GEMMA_DEBUG_ENV, "").lower() in {
+        "1",
+        "true",
+        "yes",
+    }
+
+
+def _diffusion_gemma_debug_log(message: str, *args: Any) -> None:
+    global _diffusion_gemma_debug_logs
+    if not _is_diffusion_gemma_debug_enabled():
+        return
+    if _diffusion_gemma_debug_logs >= _DIFFUSION_GEMMA_DEBUG_MAX_LOGS:
+        return
+    _diffusion_gemma_debug_logs += 1
+    if args:
+        message = message % args
+    logger.warning("[DiffusionGemma debug] %s", message)
+
+
+def _diffusion_gemma_tensor_stats(name: str, tensor: torch.Tensor) -> None:
+    if not _is_diffusion_gemma_debug_enabled():
+        return
+    with torch.no_grad():
+        detached = tensor.detach()
+        shape = tuple(detached.shape)
+        dtype = detached.dtype
+        numel = detached.numel()
+        if numel == 0:
+            _diffusion_gemma_debug_log(
+                "%s: shape=%s dtype=%s empty", name, shape, dtype
+            )
+            return
+        if detached.is_floating_point():
+            finite = torch.isfinite(detached)
+            finite_count = int(finite.sum().item())
+            if finite_count == 0:
+                _diffusion_gemma_debug_log(
+                    "%s: shape=%s dtype=%s finite=0/%d",
+                    name,
+                    shape,
+                    dtype,
+                    numel,
+                )
+                return
+            values = detached[finite].float()
+            abs_values = values.abs()
+            zero_ratio = float((values == 0).float().mean().item())
+            _diffusion_gemma_debug_log(
+                "%s: shape=%s dtype=%s finite=%d/%d abs_mean=%.6g "
+                "abs_max=%.6g zero_ratio=%.6g",
+                name,
+                shape,
+                dtype,
+                finite_count,
+                numel,
+                float(abs_values.mean().item()),
+                float(abs_values.max().item()),
+                zero_ratio,
+            )
+            return
+        _diffusion_gemma_debug_log(
+            "%s: shape=%s dtype=%s min=%s max=%s",
+            name,
+            shape,
+            dtype,
+            detached.min().item(),
+            detached.max().item(),
+        )
 
 
 class DiffusionGemmaSelfConditioning(nn.Module):
@@ -785,6 +865,22 @@ class DiffusionGemmaRequestStates:
         self.self_conditioning_embeds[slot_idx] = 0
 
 
+@dataclass
+class DiffusionGemmaAttnMetadata(ModelSpecificAttnMetadata):
+    is_prefilling: torch.Tensor
+    mm_req_doc_ranges: dict[int, list[tuple[int, int]]] | None = None
+
+    def get_extra_common_attn_kwargs(
+        self,
+        kv_cache_group_id: int,
+        num_reqs: int,
+    ) -> dict[str, Any]:
+        return {
+            "is_prefilling": self.is_prefilling[:num_reqs],
+            "mm_req_doc_ranges": self.mm_req_doc_ranges,
+        }
+
+
 class DiffusionGemmaModelState(ModelState):
     """ModelState for DiffusionGemma.
 
@@ -1037,6 +1133,44 @@ class DiffusionGemmaModelState(ModelState):
             self._causal_buf[actual_num_reqs:num_reqs] = False
         causal: bool | torch.Tensor = self._causal_buf[:num_reqs]
 
+        is_prefilling = torch.zeros(num_reqs, dtype=torch.bool, device="cpu")
+        is_prefilling[:actual_num_reqs] = torch.from_numpy(input_batch.is_prefilling_np)
+        _diffusion_gemma_debug_log(
+            "prepare_attn: num_reqs=%d actual=%d num_tokens=%d "
+            "num_draft_tokens=%d causal=%s is_prefilling=%s "
+            "scheduled_tokens=%s",
+            num_reqs,
+            actual_num_reqs,
+            num_tokens,
+            getattr(input_batch, "num_draft_tokens", -1),
+            self._causal_buf[:num_reqs].detach().cpu().tolist(),
+            is_prefilling[:num_reqs].tolist(),
+            input_batch.num_scheduled_tokens[:actual_num_reqs].tolist(),
+        )
+
+        mm_req_doc_ranges: dict[int, list[tuple[int, int]]] | None = None
+        if self.model_config.is_mm_prefix_lm:
+            mm_req_doc_ranges = {}
+            hf_text_config = self.model_config.hf_text_config
+            sliding_window = getattr(hf_text_config, "sliding_window", None)
+            encoder_cache = getattr(self, "encoder_cache", None)
+            mm_features_by_req = (
+                {} if encoder_cache is None else encoder_cache.mm_features
+            )
+            for req_idx, req_id in enumerate(input_batch.req_ids):
+                image_doc_ranges = []
+                for mm_feature in mm_features_by_req.get(req_id, []):
+                    if mm_feature.modality == "audio":
+                        continue
+                    for doc_range in mm_feature.mm_position.extract_embeds_range():
+                        if (
+                            sliding_window is not None
+                            and (doc_range[1] - doc_range[0] + 1) > sliding_window
+                        ):
+                            continue
+                        image_doc_ranges.append(doc_range)
+                mm_req_doc_ranges[req_idx] = image_doc_ranges
+
         return build_attn_metadata(
             attn_groups=attn_groups,
             num_reqs=num_reqs,
@@ -1050,6 +1184,10 @@ class DiffusionGemmaModelState(ModelState):
             slot_mappings=slot_mappings,
             kv_cache_config=kv_cache_config,
             causal=causal,
+            model_specific_attn_metadata=DiffusionGemmaAttnMetadata(
+                is_prefilling=is_prefilling,
+                mm_req_doc_ranges=mm_req_doc_ranges,
+            ),
         )
 
     num_new_sampled_tokens_per_step: int = 0
@@ -1252,6 +1390,15 @@ class DiffusionSampler:
     ) -> SamplerOutput:
         num_reqs = input_batch.num_reqs
         device = logits.device
+        _diffusion_gemma_debug_log(
+            "sampler enter: num_reqs=%d num_draft_tokens=%d "
+            "cu_num_logits=%s query_start=%s",
+            num_reqs,
+            input_batch.num_draft_tokens,
+            input_batch.cu_num_logits_np[: num_reqs + 1].tolist(),
+            input_batch.query_start_loc_np[: num_reqs + 1].tolist(),
+        )
+        _diffusion_gemma_tensor_stats("sampler input logits", logits)
 
         if input_batch.num_draft_tokens == 0:
             return self._handle_prefill(input_batch, device)
@@ -1342,6 +1489,19 @@ class DiffusionSampler:
             sc_vocab_end=self.sc_vocab_end,
             tp_size=self.tp_size,
             tp_group_name=self.tp_group_name,
+        )
+        _diffusion_gemma_tensor_stats("sampler decode scaled logits", scaled)
+        _diffusion_gemma_tensor_stats("sampler sampled ids", sampled[:num_reqs])
+        _diffusion_gemma_debug_log(
+            "sampler decode state: num_decode=%d decode_slots=%s "
+            "decode_idx=%s is_committing=%s is_encoder_phase_after=%s "
+            "num_sampled=%s",
+            num_decode,
+            decode_slots.detach().cpu().tolist(),
+            decode_idx.detach().cpu().tolist(),
+            is_committing.detach().cpu().tolist(),
+            states.is_encoder_phase[decode_slots].detach().cpu().tolist(),
+            num_sampled[:num_reqs].detach().cpu().tolist(),
         )
 
         # --- Logprobs: stash on convergence, return on commit ---

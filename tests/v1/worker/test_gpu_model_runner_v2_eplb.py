@@ -202,3 +202,91 @@ def test_v2_sample_tokens_runs_eplb_on_non_last_pp_rank(monkeypatch):
     output = mrv2.GPUModelRunner.sample_tokens(runner, None)
     assert output in (EMPTY_MODEL_RUNNER_OUTPUT, None)
     assert events == ["receive", "postprocess_num_computed_tokens", "eplb"]
+
+
+def test_v2_dummy_sampler_run_profiles_multi_token_decode(monkeypatch):
+    device = torch.device("cpu")
+    runner = mrv2.GPUModelRunner.__new__(mrv2.GPUModelRunner)
+    runner.device = device
+    runner.input_buffers = mrv2.InputBuffers(4, 16, device)
+    runner.decode_query_len = 4
+    runner.rejection_sampler = None
+    runner.model_state = SimpleNamespace(num_new_sampled_tokens_per_step=0)
+    runner.model = SimpleNamespace(
+        compute_logits=lambda hidden_states: torch.zeros(
+            hidden_states.shape[0], 8, device=hidden_states.device
+        )
+    )
+
+    calls = []
+
+    def fake_sampler(logits, input_batch):
+        calls.append(
+            {
+                "logits_shape": tuple(logits.shape),
+                "num_draft_tokens": input_batch.num_draft_tokens,
+                "num_draft_tokens_per_req": (
+                    None
+                    if input_batch.num_draft_tokens_per_req is None
+                    else input_batch.num_draft_tokens_per_req.copy()
+                ),
+                "cu_num_logits_np": input_batch.cu_num_logits_np.copy(),
+                "expanded_idx_mapping": input_batch.expanded_idx_mapping.clone(),
+                "expanded_local_pos": input_batch.expanded_local_pos.clone(),
+                "logits_indices": input_batch.logits_indices.clone(),
+            }
+        )
+
+    def fake_expand_idx_mapping(
+        idx_mapping, total_num_logits, cu_num_logits, max_expand_len
+    ):
+        return (
+            idx_mapping.repeat_interleave(max_expand_len),
+            torch.arange(max_expand_len, dtype=torch.int32).repeat(
+                idx_mapping.shape[0]
+            ),
+        )
+
+    monkeypatch.setattr(mrv2, "expand_idx_mapping", fake_expand_idx_mapping)
+    runner.sampler = fake_sampler
+
+    mrv2.GPUModelRunner._dummy_sampler_run(runner, torch.zeros(2, 3))
+
+    assert len(calls) == 2
+    assert calls[0]["logits_shape"] == (2, 8)
+    assert calls[0]["num_draft_tokens"] == 0
+
+    assert calls[1]["logits_shape"] == (8, 8)
+    assert calls[1]["num_draft_tokens"] == 8
+    assert calls[1]["num_draft_tokens_per_req"].tolist() == [4, 4]
+    assert calls[1]["cu_num_logits_np"].tolist() == [0, 4, 8]
+    assert calls[1]["expanded_idx_mapping"].tolist() == [0, 0, 0, 0, 1, 1, 1, 1]
+    assert calls[1]["expanded_local_pos"].tolist() == [0, 1, 2, 3, 0, 1, 2, 3]
+    assert calls[1]["logits_indices"].tolist() == list(range(8))
+
+
+def test_v2_dummy_sampler_run_skips_decode_profile_for_existing_paths():
+    device = torch.device("cpu")
+
+    for decode_query_len, rejection_sampler in ((1, None), (4, object())):
+        runner = mrv2.GPUModelRunner.__new__(mrv2.GPUModelRunner)
+        runner.device = device
+        runner.input_buffers = mrv2.InputBuffers(4, 16, device)
+        runner.decode_query_len = decode_query_len
+        runner.rejection_sampler = rejection_sampler
+        runner.model_state = SimpleNamespace(num_new_sampled_tokens_per_step=0)
+        runner.model = SimpleNamespace(
+            compute_logits=lambda hidden_states: torch.zeros(
+                hidden_states.shape[0], 8, device=hidden_states.device
+            )
+        )
+        calls: list[tuple[tuple[int, ...], int]] = []
+
+        def record_sampler(logits, input_batch, calls=calls):
+            calls.append((tuple(logits.shape), input_batch.num_draft_tokens))
+
+        runner.sampler = record_sampler
+
+        mrv2.GPUModelRunner._dummy_sampler_run(runner, torch.zeros(2, 3))
+
+        assert calls == [((2, 8), 0)]

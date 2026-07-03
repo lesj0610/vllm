@@ -643,6 +643,78 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         assert self.sampler is not None
         self.sampler(logits, dummy_input_batch)
 
+        if self.decode_query_len == 1 or self.rejection_sampler is not None:
+            return
+
+        # Some samplers allocate decode-step tensors proportional to the full
+        # multi-token logits shape, which the prefill dummy run above misses.
+        num_logits_per_req = self.decode_query_len
+        num_bonus_tokens = self.model_state.num_new_sampled_tokens_per_step
+        num_draft_tokens = num_logits_per_req - num_bonus_tokens
+        if num_draft_tokens <= 0:
+            return
+
+        max_num_reqs = self.input_buffers.max_num_tokens // num_logits_per_req
+        num_decode_reqs = min(num_reqs, max_num_reqs)
+        if num_decode_reqs == 0:
+            return
+
+        num_draft_tokens_per_req = np.full(
+            num_decode_reqs,
+            num_draft_tokens,
+            dtype=np.int32,
+        )
+
+        total_num_logits = num_decode_reqs * num_logits_per_req
+        decode_hidden_states = hidden_states[:num_decode_reqs].repeat_interleave(
+            num_logits_per_req, dim=0
+        )
+        decode_logits = self.model.compute_logits(decode_hidden_states)
+        decode_input_batch = InputBatch.make_dummy(
+            num_decode_reqs,
+            total_num_logits,
+            self.input_buffers,
+        )
+        decode_input_batch.req_ids = dummy_input_batch.req_ids[:num_decode_reqs]
+        decode_input_batch.idx_mapping = dummy_input_batch.idx_mapping[:num_decode_reqs]
+        decode_input_batch.idx_mapping_np = dummy_input_batch.idx_mapping_np[
+            :num_decode_reqs
+        ]
+
+        total_num_draft_tokens = int(num_draft_tokens_per_req.sum())
+        cu_num_logits_np = np.arange(
+            0,
+            total_num_logits + 1,
+            num_logits_per_req,
+            dtype=np.int32,
+        )
+        cu_num_logits = torch.arange(
+            0,
+            total_num_logits + 1,
+            num_logits_per_req,
+            device=self.device,
+            dtype=torch.int32,
+        )
+        expanded_idx_mapping, expanded_local_pos = expand_idx_mapping(
+            decode_input_batch.idx_mapping,
+            total_num_logits,
+            cu_num_logits,
+            num_logits_per_req,
+        )
+
+        decode_input_batch.num_draft_tokens = total_num_draft_tokens
+        decode_input_batch.num_draft_tokens_per_req = num_draft_tokens_per_req
+        decode_input_batch.cu_num_logits = cu_num_logits
+        decode_input_batch.cu_num_logits_np = cu_num_logits_np
+        decode_input_batch.expanded_idx_mapping = expanded_idx_mapping
+        decode_input_batch.expanded_local_pos = expanded_local_pos
+        decode_input_batch.logits_indices = torch.arange(
+            total_num_logits,
+            device=self.device,
+            dtype=torch.int64,
+        )
+        self.sampler(decode_logits, decode_input_batch)
+
     @torch.inference_mode()
     def _dummy_pooler_run(self, hidden_states: torch.Tensor) -> None:
         assert self.pooling_runner is not None

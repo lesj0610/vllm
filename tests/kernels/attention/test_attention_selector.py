@@ -451,19 +451,24 @@ def test_gemma4_keeps_existing_fa4_selection(monkeypatch: pytest.MonkeyPatch):
     assert vllm_config.attention_config.flash_attn_version == 4
 
 
-def test_diffusion_gemma_keeps_flashinfer_blocker(
+def test_diffusion_gemma_allows_flashinfer_when_requested(
     monkeypatch: pytest.MonkeyPatch,
 ):
     _patch_fa_version_supported(monkeypatch, lambda version: False)
     vllm_config = _make_gemma4_vllm_config(
         backend=AttentionBackendEnum.FLASHINFER,
     )
+    vllm_config.diffusion_config = object()
+    vllm_config.scheduler_config = None
+    vllm_config.model_config.hf_config = SimpleNamespace(canvas_length=256)
+    vllm_config.model_config.override_generation_config = {}
 
-    with pytest.raises(ValueError, match="mixed causal/bidirectional attention"):
-        DiffusionGemmaModelForBlockDiffusionConfig.verify_and_update_config(vllm_config)
+    DiffusionGemmaModelForBlockDiffusionConfig.verify_and_update_config(vllm_config)
+
+    assert vllm_config.attention_config.backend == AttentionBackendEnum.FLASHINFER
 
 
-def test_diffusion_gemma_auto_uses_triton_when_fa4_unavailable(
+def test_diffusion_gemma_auto_keeps_selector_when_fa4_unavailable(
     monkeypatch: pytest.MonkeyPatch,
 ):
     _patch_fa_version_supported(monkeypatch, lambda version: False)
@@ -475,8 +480,9 @@ def test_diffusion_gemma_auto_uses_triton_when_fa4_unavailable(
 
     DiffusionGemmaModelForBlockDiffusionConfig.verify_and_update_config(vllm_config)
 
-    assert vllm_config.attention_config.backend == AttentionBackendEnum.TRITON_ATTN
+    assert vllm_config.attention_config.backend is None
     assert vllm_config.attention_config.flash_attn_version is None
+    assert vllm_config.attention_config.use_non_causal
 
 
 @pytest.mark.skipif(CudaPlatform is None, reason="CudaPlatform not available")
