@@ -121,6 +121,11 @@ from vllm.v1.worker.workspace import lock_workspace
 logger = init_logger(__name__)
 
 
+class CudaGraphMemorySample(NamedTuple):
+    residual: int
+    peak: int
+
+
 class GPUModelRunner(LoRAModelRunnerMixin):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         self.vllm_config = vllm_config
@@ -790,7 +795,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if capture_speculator and self.speculator is not None:
                 self.speculator.capture(attn_states)
 
-    def _measure_cuda_graph_pool_sample(self, capture_fn: Callable[[], None]) -> int:
+    def _measure_cuda_graph_pool_sample(
+        self, capture_fn: Callable[[], None]
+    ) -> CudaGraphMemorySample:
         torch.accelerator.synchronize()
         torch.accelerator.empty_cache()
         free_before = torch.accelerator.get_memory_info()[0]
@@ -801,8 +808,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         capture_fn()
         torch.accelerator.synchronize()
 
-        free_after = torch.accelerator.get_memory_info()[0]
-        residual_delta = max(free_before - free_after, 0)
         peak_reserved_delta = max(
             torch.accelerator.max_memory_reserved(self.device) - reserved_before,
             0,
@@ -811,7 +816,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             torch.accelerator.max_memory_allocated(self.device) - allocated_before,
             0,
         )
-        return max(residual_delta, peak_reserved_delta, peak_allocated_delta)
+        torch.accelerator.empty_cache()
+        free_after = torch.accelerator.get_memory_info()[0]
+        residual_delta = max(free_before - free_after, 0)
+        peak_delta = max(residual_delta, peak_reserved_delta, peak_allocated_delta)
+        return CudaGraphMemorySample(residual=residual_delta, peak=peak_delta)
 
     def _profile_cudagraph_memory_graph_pool(self) -> int:
         assert self.cudagraph_manager is not None
@@ -852,7 +861,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
             for mode, descs in capture_descs:
                 profile_descs = descs[:2]
-                mem_samples: list[int] = []
+                mem_samples: list[CudaGraphMemorySample] = []
 
                 for desc in profile_descs:
                     sample_descs = {mode: [desc]}
@@ -872,8 +881,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         self._measure_cuda_graph_pool_sample(capture_sample)
                     )
 
-                first_capture = mem_samples[0]
-                per_graph = max(mem_samples[1] if len(mem_samples) > 1 else 0, 1 << 20)
+                first_capture = mem_samples[0].peak
+                per_graph = max(
+                    mem_samples[1].residual if len(mem_samples) > 1 else 0,
+                    1 << 20,
+                )
                 shared_memory_estimate[mode] = first_capture
                 per_graph_estimate[mode] = per_graph * (len(descs) - 1)
                 logger.debug(

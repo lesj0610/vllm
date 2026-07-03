@@ -573,7 +573,7 @@ def test_v2_profile_is_noop_on_non_cuda(monkeypatch):
     assert runner.cudagraph_memory_graph_pool_estimate == 0
 
 
-def test_v2_cuda_graph_pool_sample_uses_peak(monkeypatch):
+def test_v2_cuda_graph_pool_sample_separates_residual_and_peak(monkeypatch):
     from vllm.v1.worker.gpu import model_runner as gpu_model_runner_v2
     from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 
@@ -623,16 +623,75 @@ def test_v2_cuda_graph_pool_sample_uses_peak(monkeypatch):
         lambda device: 530,
     )
 
-    assert (
-        runner._measure_cuda_graph_pool_sample(lambda: events.append("capture")) == 120
-    )
+    sample = runner._measure_cuda_graph_pool_sample(lambda: events.append("capture"))
+    assert sample.residual == 50
+    assert sample.peak == 120
     assert events == [
         "sync",
         "empty_cache",
         "reset_peak",
         "capture",
         "sync",
+        "empty_cache",
     ]
+
+
+def test_v2_graph_pool_profile_does_not_multiply_transient_peak(monkeypatch):
+    from vllm.v1.worker.gpu import model_runner as gpu_model_runner_v2
+    from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
+    from vllm.v1.worker.gpu.model_runner import (
+        CudaGraphMemorySample,
+        CUDAGraphMode,
+        GPUModelRunner,
+    )
+
+    descs = [
+        BatchExecutionDescriptor(CUDAGraphMode.PIECEWISE, 128, None),
+        BatchExecutionDescriptor(CUDAGraphMode.PIECEWISE, 64, None),
+        BatchExecutionDescriptor(CUDAGraphMode.PIECEWISE, 32, None),
+    ]
+
+    class FakeCudaGraphManager:
+        pool = "manager-original"
+        graphs = {}
+        _graphs_captured = False
+        hidden_states = None
+        aux_hidden_states = []
+        intermediate_tensors = None
+        use_aux_hidden_state_outputs = False
+        use_breakable_cg = False
+        breakable_cg_runner = None
+
+        def get_capture_descs(self):
+            return [(CUDAGraphMode.PIECEWISE, descs)]
+
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.cudagraph_manager = FakeCudaGraphManager()
+    samples = iter(
+        [
+            CudaGraphMemorySample(residual=10 << 20, peak=200 << 20),
+            CudaGraphMemorySample(residual=2 << 20, peak=180 << 20),
+        ]
+    )
+
+    monkeypatch.setattr(
+        gpu_model_runner_v2.current_platform,
+        "graph_pool_handle",
+        lambda: "profile-pool",
+    )
+    monkeypatch.setattr(
+        gpu_model_runner_v2.torch.accelerator,
+        "empty_cache",
+        lambda: None,
+    )
+    monkeypatch.setattr(
+        runner,
+        "_measure_cuda_graph_pool_sample",
+        lambda capture_fn: capture_fn() or next(samples),
+    )
+    monkeypatch.setattr(runner, "_capture_model_cudagraphs", lambda **kwargs: None)
+
+    assert runner._profile_cudagraph_memory_graph_pool() == 204 << 20
 
 
 def test_v2_graph_pool_profile_restores_capture_state(monkeypatch):
@@ -680,7 +739,16 @@ def test_v2_graph_pool_profile_restores_capture_state(monkeypatch):
     runner = GPUModelRunner.__new__(GPUModelRunner)
     runner.model = "model"
     runner.cudagraph_manager = FakeCudaGraphManager()
-    sample_values = iter([1_000, 2_000_000, 800, 3_000_000])
+    from vllm.v1.worker.gpu.model_runner import CudaGraphMemorySample
+
+    sample_values = iter(
+        [
+            CudaGraphMemorySample(residual=1_000, peak=10_000),
+            CudaGraphMemorySample(residual=2_000_000, peak=200_000_000),
+            CudaGraphMemorySample(residual=800, peak=8_000),
+            CudaGraphMemorySample(residual=3_000_000, peak=300_000_000),
+        ]
+    )
     capture_calls = []
 
     monkeypatch.setattr(
@@ -727,7 +795,7 @@ def test_v2_graph_pool_profile_restores_capture_state(monkeypatch):
 
     estimate = runner._profile_cudagraph_memory_graph_pool()
 
-    assert estimate == 7_001_000
+    assert estimate == 7_010_000
     assert [call["capture_descs"] for call in capture_calls] == [
         {CUDAGraphMode.PIECEWISE: [piecewise_descs[0]]},
         {CUDAGraphMode.PIECEWISE: [piecewise_descs[1]]},
