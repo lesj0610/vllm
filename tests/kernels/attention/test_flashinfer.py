@@ -303,6 +303,68 @@ def test_flashinfer_backend_accepts_nvfp4_kv_cache() -> None:
     assert invalid_reasons == []
 
 
+def _make_flashinfer_q_dtype_builder(
+    *,
+    cache_dtype: str,
+    model_dtype: torch.dtype = torch.bfloat16,
+    disable_q_quantization: bool = False,
+):
+    from vllm.v1.attention.backends.flashinfer import FlashInferMetadataBuilder
+
+    builder = FlashInferMetadataBuilder.__new__(FlashInferMetadataBuilder)
+    builder.cache_dtype = cache_dtype
+    builder.kv_cache_spec = SimpleNamespace(dtype=model_dtype)
+    builder.model_config = SimpleNamespace(dtype=model_dtype)
+    builder.vllm_config = SimpleNamespace(
+        attention_config=SimpleNamespace(
+            disable_flashinfer_q_quantization=disable_q_quantization
+        )
+    )
+    return builder
+
+
+@pytest.mark.parametrize("is_prefill", [True, False])
+def test_flashinfer_nvfp4_native_q_dtype_uses_model_dtype(
+    is_prefill: bool,
+) -> None:
+    builder = _make_flashinfer_q_dtype_builder(cache_dtype="nvfp4")
+
+    q_dtype = builder.get_q_data_type(
+        is_prefill=is_prefill,
+        use_trtllm_gen=False,
+    )
+
+    assert q_dtype == torch.bfloat16
+
+
+@pytest.mark.parametrize("is_prefill", [True, False])
+def test_flashinfer_nvfp4_trtllm_gen_q_dtype_uses_fp8(is_prefill: bool) -> None:
+    from vllm.v1.attention.backends.flashinfer import FP8_DTYPE
+
+    builder = _make_flashinfer_q_dtype_builder(cache_dtype="nvfp4")
+
+    q_dtype = builder.get_q_data_type(
+        is_prefill=is_prefill,
+        use_trtllm_gen=True,
+    )
+
+    assert q_dtype == FP8_DTYPE
+
+
+def test_flashinfer_q_quantization_disable_overrides_nvfp4_trtllm_gen() -> None:
+    builder = _make_flashinfer_q_dtype_builder(
+        cache_dtype="nvfp4",
+        disable_q_quantization=True,
+    )
+
+    q_dtype = builder.get_q_data_type(
+        is_prefill=False,
+        use_trtllm_gen=True,
+    )
+
+    assert q_dtype == torch.bfloat16
+
+
 def test_flashinfer_nvfp4_mixed_head_shape_uses_packed_layout() -> None:
     from vllm.v1.attention.backends.flashinfer import FlashInferBackend
 
@@ -509,7 +571,7 @@ def test_flashinfer_impl_caches_nvfp4_slot_mapping_writer(monkeypatch) -> None:
     monkeypatch.setattr(
         flashinfer_backend,
         "can_use_trtllm_attention",
-        lambda num_heads, num_kv_heads: False,
+        lambda num_heads, num_kv_heads, is_prefill=False: False,
     )
 
     impl = flashinfer_backend.FlashInferImpl(

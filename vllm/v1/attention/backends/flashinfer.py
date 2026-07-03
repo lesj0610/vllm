@@ -982,13 +982,6 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             assert self.kv_cache_spec.dtype == self.model_config.dtype
             self.kv_cache_dtype = self.kv_cache_spec.dtype
 
-        # Compute per-phase Q dtype.  On SM90 (XQA decode), the prefill and
-        # decode phases require different Q dtypes when the KV cache is FP8
-        # (FP8-Q for the FI native prefill, BF16/FP16-Q for XQA decode),
-        # so both values must be tracked independently.
-        self.q_data_type_prefill = self.get_q_data_type(is_prefill=True)
-        self.q_data_type_decode = self.get_q_data_type(is_prefill=False)
-
         # Prefer TRTLLM/XQA for decoding whenever supported. The decode kernel
         # must be selected statically for FULL cudagraph capture.
         can_use_xqa_or_trtllm_gen_decode = can_use_trtllm_attention(
@@ -1016,6 +1009,23 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         )
         can_use_trtllm_prefill_attention = can_use_trtllm_attention(
             self.num_qo_heads, self.num_kv_heads, is_prefill=True
+        )
+        use_trtllm_gen_decode = (
+            self.flashinfer_trtllm_api_decode_kernel
+            == FlashInferDecodeKernel.TRTLLM_GEN
+        )
+
+        # Compute per-phase Q dtype.  On SM90 (XQA decode), the prefill and
+        # decode phases require different Q dtypes when the KV cache is FP8
+        # (FP8-Q for the FI native prefill, BF16/FP16-Q for XQA decode),
+        # so both values must be tracked independently.
+        self.q_data_type_prefill = self.get_q_data_type(
+            is_prefill=True,
+            use_trtllm_gen=can_use_trtllm_prefill_attention,
+        )
+        self.q_data_type_decode = self.get_q_data_type(
+            is_prefill=False,
+            use_trtllm_gen=use_trtllm_gen_decode,
         )
 
         self._cascade_wrapper = None  # Wrapper for cascade attention
@@ -1076,7 +1086,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         self._reserve_nvfp4_fa2_prefill_workspace(can_use_trtllm_prefill_attention)
 
     # Keep SM90 prefill/decode Q dtype selection in one place.
-    def get_q_data_type(self, is_prefill: bool) -> torch.dtype:
+    def get_q_data_type(self, is_prefill: bool, use_trtllm_gen: bool) -> torch.dtype:
         # The user sets --attention-config.disable_flashinfer_q_quantization
         # to 1 explicitly, use model dtype for query.
         if self.vllm_config.attention_config.disable_flashinfer_q_quantization:
@@ -1109,7 +1119,12 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 return FlashInferBackend.get_dtype_for_flashinfer(cache_dtype)
             return self.model_config.dtype
         if cache_dtype == "nvfp4":
-            return FlashInferBackend.get_dtype_for_flashinfer("fp8_e4m3")
+            # NVFP4 KV uses FP8-Q only on the trtllm-gen path. Native FA2
+            # prefill/decode, including SM8x and SM90 fallback, consumes
+            # model-dtype Q.
+            if use_trtllm_gen:
+                return FlashInferBackend.get_dtype_for_flashinfer("fp8_e4m3")
+            return self.model_config.dtype
         return self.kv_cache_spec.dtype
 
     def _make_buffer(
