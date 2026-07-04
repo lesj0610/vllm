@@ -25,6 +25,7 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowMLASpec,
     SlidingWindowSpec,
     TQFullAttentionSpec,
+    TQSlidingWindowSpec,
 )
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 from vllm.v1.request import Request
@@ -1529,12 +1530,21 @@ def register_all_kvcache_specs(vllm_config):
         uniform_type_base_spec=CrossAttentionSpec,
     )
 
-    # FullAttentionSpec subclasses — grouped with FullAttentionSpec
+    # TurboQuant specs subclass native attention specs and share their
+    # scheduling semantics, while preserving per-layer physical layout through
+    # UniformTypeKVCacheSpecs when needed.
     KVCacheSpecRegistry.register(
         TQFullAttentionSpec,
         FullAttentionManager,
         uniform_type_base_spec=FullAttentionSpec,
     )
+    KVCacheSpecRegistry.register(
+        TQSlidingWindowSpec,
+        SlidingWindowManager,
+        uniform_type_base_spec=SlidingWindowSpec,
+    )
+
+    # FullAttentionSpec subclasses that share the native full-attention layout.
     KVCacheSpecRegistry.register(
         MLAAttentionSpec, FullAttentionManager, uniform_type_base_spec=FullAttentionSpec
     )

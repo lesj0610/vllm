@@ -205,9 +205,14 @@ class Gemma4Config(VerifyAndUpdateConfig):
         default FA3 on Hopper cannot handle head_dim > 256, which
         causes mixed backend selection and numerical divergence.
 
-        When FA4 is available we force it for ALL layers, giving a
-        uniform kernel path and avoiding the mixed FA3+FA4 penalty.
-        When FA4 is not available we fall back to Triton.
+        TurboQuant KV cache uses its own backend. For non-TurboQuant KV, when
+        FA4 is available we force it for ALL layers, giving a uniform kernel
+        path and avoiding the mixed FA3+FA4 penalty. When FA4 is not available
+        we fall back to Triton.
+
+        TODO: Heterogeneous head_sizes (head_dim != global_head_dim)
+        require NixlConnector changes to support per-layer KV transfer
+        with different head dimensions for prefill-decode disaggregation.
         """
         hf_text_config = vllm_config.model_config.hf_text_config
         head_dim = getattr(hf_text_config, "head_dim", None)
@@ -216,18 +221,40 @@ class Gemma4Config(VerifyAndUpdateConfig):
         if head_dim is None or global_head_dim is None or head_dim == global_head_dim:
             return
 
-        from vllm.v1.attention.backends.fa_utils import is_fa_version_supported
         from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+        attention_config = vllm_config.attention_config
+        cache_dtype = vllm_config.cache_config.cache_dtype
+
+        if isinstance(cache_dtype, str) and cache_dtype.startswith("turboquant_"):
+            if attention_config.backend is None:
+                attention_config.backend = AttentionBackendEnum.TURBOQUANT
+                logger.info(
+                    "Gemma4 model has heterogeneous head dimensions "
+                    "(head_dim=%d, global_head_dim=%d). Forcing TURBOQUANT "
+                    "backend for TurboQuant KV cache.",
+                    head_dim,
+                    global_head_dim,
+                )
+            return
 
         max_head_dim = max(head_dim, global_head_dim)
 
-        if is_fa_version_supported(4) and max_head_dim <= 512:
-            if (
-                vllm_config.attention_config.flash_attn_version is None
-                and vllm_config.attention_config.backend
-                in (None, AttentionBackendEnum.FLASH_ATTN)
+        try:
+            from vllm.v1.attention.backends.fa_utils import is_fa_version_supported
+
+            fa4_supported = is_fa_version_supported(4)
+        except ImportError:
+            fa4_supported = False
+
+        if fa4_supported and max_head_dim <= 512:
+            if getattr(
+                attention_config, "flash_attn_version", None
+            ) is None and attention_config.backend in (
+                None,
+                AttentionBackendEnum.FLASH_ATTN,
             ):
-                vllm_config.attention_config.flash_attn_version = 4
+                attention_config.flash_attn_version = 4
                 logger.info(
                     "Gemma4 model has heterogeneous head dimensions "
                     "(head_dim=%d, global_head_dim=%d). Using FA4 for "
@@ -235,8 +262,8 @@ class Gemma4Config(VerifyAndUpdateConfig):
                     head_dim,
                     global_head_dim,
                 )
-        elif vllm_config.attention_config.backend is None:
-            vllm_config.attention_config.backend = AttentionBackendEnum.TRITON_ATTN
+        elif attention_config.backend is None:
+            attention_config.backend = AttentionBackendEnum.TRITON_ATTN
             logger.info(
                 "Gemma4 model has heterogeneous head dimensions "
                 "(head_dim=%d, global_head_dim=%d). FA4 not available, "
