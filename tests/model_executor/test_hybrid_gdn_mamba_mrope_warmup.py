@@ -10,6 +10,9 @@ import torch
 
 def _install_flash_attn_stub(monkeypatch) -> None:
     flash_attn_stub = ModuleType("vllm.vllm_flash_attn")
+    flash_attn_stub.__dict__["compile_flash_attn_varlen_func_from_specs"] = (
+        lambda *args, **kwargs: None
+    )
     flash_attn_stub.__dict__["flash_attn_varlen_func"] = lambda *args, **kwargs: None
     flash_attn_stub.__dict__["get_scheduler_metadata"] = lambda *args, **kwargs: None
     monkeypatch.setitem(sys.modules, "vllm.vllm_flash_attn", flash_attn_stub)
@@ -36,11 +39,6 @@ def test_kernel_warmup_runs_hybrid_warmup(monkeypatch) -> None:
         assert args == (model,)
         assert kwargs == {"model_dtype": torch.bfloat16}
         calls.append("hybrid")
-
-    def fake_qwen3_vl_vision_warmup(*args, **kwargs) -> None:
-        assert args == (model,)
-        assert kwargs == {}
-        calls.append("qwen3_vl_vision")
 
     def fake_dummy_run(**kwargs) -> None:
         assert kwargs == {
@@ -78,13 +76,12 @@ def test_kernel_warmup_runs_hybrid_warmup(monkeypatch) -> None:
         ".hybrid_gdn_mamba_mrope_warmup",
         fake_hybrid_warmup,
     )
-    monkeypatch.setattr(
-        "vllm.model_executor.warmup.minimax_m3_msa_warmup.minimax_m3_msa_warmup",
-        lambda worker: None,
-    )
-    monkeypatch.setattr(
-        "vllm.model_executor.warmup.qwen3_vl_vision_warmup.qwen3_vl_vision_warmup",
-        fake_qwen3_vl_vision_warmup,
+    minimax_warmup_stub = ModuleType("vllm.model_executor.warmup.minimax_m3_msa_warmup")
+    minimax_warmup_stub.__dict__["minimax_m3_msa_warmup"] = lambda worker: None
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm.model_executor.warmup.minimax_m3_msa_warmup",
+        minimax_warmup_stub,
     )
 
     worker = SimpleNamespace(
@@ -109,7 +106,7 @@ def test_kernel_warmup_runs_hybrid_warmup(monkeypatch) -> None:
 
     kernel_warmup.kernel_warmup(worker)
 
-    assert calls == ["hybrid", "qwen3_vl_vision"]
+    assert calls == ["hybrid"]
 
 
 def test_qwen_gdn_update_warmup_uses_bound_ssm_cache(monkeypatch) -> None:
