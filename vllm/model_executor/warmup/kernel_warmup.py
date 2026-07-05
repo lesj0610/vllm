@@ -90,6 +90,7 @@ def kernel_warmup(worker: "Worker"):
         deep_gemm_warmup(model, max_tokens)
 
     minimax_m3_msa_warmup(worker)
+    qwen3_vl_vision_warmup(worker.get_model())
 
     hybrid_gdn_mamba_mrope_warmup(
         worker.get_model(),
