@@ -37,6 +37,11 @@ def test_kernel_warmup_runs_hybrid_warmup(monkeypatch) -> None:
         assert kwargs == {"model_dtype": torch.bfloat16}
         calls.append("hybrid")
 
+    def fake_qwen3_vl_vision_warmup(*args, **kwargs) -> None:
+        assert args == (model,)
+        assert kwargs == {}
+        calls.append("qwen3_vl_vision")
+
     def fake_dummy_run(**kwargs) -> None:
         assert kwargs == {
             "num_tokens": 16,
@@ -77,6 +82,10 @@ def test_kernel_warmup_runs_hybrid_warmup(monkeypatch) -> None:
         "vllm.model_executor.warmup.minimax_m3_msa_warmup.minimax_m3_msa_warmup",
         lambda worker: None,
     )
+    monkeypatch.setattr(
+        "vllm.model_executor.warmup.qwen3_vl_vision_warmup.qwen3_vl_vision_warmup",
+        fake_qwen3_vl_vision_warmup,
+    )
 
     worker = SimpleNamespace(
         get_model=lambda: model,
@@ -84,7 +93,10 @@ def test_kernel_warmup_runs_hybrid_warmup(monkeypatch) -> None:
         scheduler_config=SimpleNamespace(max_num_batched_tokens=16),
         vllm_config=SimpleNamespace(
             compilation_config=SimpleNamespace(cudagraph_capture_sizes=[]),
-            kernel_config=SimpleNamespace(enable_flashinfer_autotune=False),
+            kernel_config=SimpleNamespace(
+                enable_cutedsl_warmup=False,
+                enable_flashinfer_autotune=False,
+            ),
             model_config=SimpleNamespace(),
         ),
         model_runner=SimpleNamespace(
@@ -97,7 +109,7 @@ def test_kernel_warmup_runs_hybrid_warmup(monkeypatch) -> None:
 
     kernel_warmup.kernel_warmup(worker)
 
-    assert calls == ["hybrid"]
+    assert calls == ["hybrid", "qwen3_vl_vision"]
 
 
 def test_qwen_gdn_update_warmup_uses_bound_ssm_cache(monkeypatch) -> None:

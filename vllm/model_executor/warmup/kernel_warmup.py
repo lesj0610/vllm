@@ -50,6 +50,9 @@ def kernel_warmup(worker: "Worker"):
     from vllm.model_executor.warmup.minimax_m3_msa_warmup import (
         minimax_m3_msa_warmup,
     )
+    from vllm.model_executor.warmup.qwen3_vl_vision_warmup import (
+        qwen3_vl_vision_warmup,
+    )
 
     # Pooling models do not use the generation slot-mapping path.
     if not worker.use_v2_model_runner and not worker.model_runner.is_pooling_model:
@@ -92,6 +95,7 @@ def kernel_warmup(worker: "Worker"):
         worker.get_model(),
         model_dtype=worker.model_runner.dtype,
     )
+    qwen3_vl_vision_warmup(worker.get_model())
 
     kv_block_zeroer = getattr(worker.model_runner, "_kv_block_zeroer", None)
     if kv_block_zeroer is None:

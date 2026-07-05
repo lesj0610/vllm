@@ -42,7 +42,10 @@ def _make_worker(model_runner):
         scheduler_config=SimpleNamespace(max_num_batched_tokens=1),
         vllm_config=SimpleNamespace(
             compilation_config=SimpleNamespace(cudagraph_capture_sizes=[]),
-            kernel_config=SimpleNamespace(enable_flashinfer_autotune=False),
+            kernel_config=SimpleNamespace(
+                enable_cutedsl_warmup=False,
+                enable_flashinfer_autotune=False,
+            ),
             model_config=SimpleNamespace(),
         ),
     )
