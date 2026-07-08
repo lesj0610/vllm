@@ -102,7 +102,7 @@ def test_mamba_none_allocates_fixed_request_blocks():
         )
         == 0
     )
-    manager.remove_skipped_blocks("req", num_computed_tokens=2048)
+    manager.remove_skipped_blocks("req", 2048)
     assert len(manager.req_to_blocks["req"]) == mamba_spec.blocks_per_request
 
     manager.free("req")
