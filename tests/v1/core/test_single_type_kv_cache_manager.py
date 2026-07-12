@@ -80,6 +80,7 @@ def test_mamba_none_allocates_fixed_request_blocks():
             num_tokens=1024,
             new_computed_blocks=[],
             total_computed_tokens=0,
+            num_local_computed_tokens=0,
             num_tokens_main_model=1024,
         )
         == mamba_spec.blocks_per_request
@@ -98,6 +99,7 @@ def test_mamba_none_allocates_fixed_request_blocks():
             num_tokens=2048,
             new_computed_blocks=[],
             total_computed_tokens=1024,
+            num_local_computed_tokens=1024,
             num_tokens_main_model=2048,
         )
         == 0
