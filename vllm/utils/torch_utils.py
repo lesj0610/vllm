@@ -416,27 +416,25 @@ def nvfp4_kv_cache_full_dim(head_size: int) -> int:
     return head_size // 2 + head_size // 16
 
 
-def _nvfp4_split_data_scale(
+def nvfp4_split_data_scale(
     kv_side: torch.Tensor,
     head_size: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Split a single NVFP4 KV-side buffer into data and scale views.
+    """Split one side (K or V) of an NVFP4 KV cache into data and scale.
 
-    The input is a 4D tensor for one KV side (K or V) whose last
-    dimension is ``full_dim = data_dim + scale_dim``.  The physical
-    layout within each side is [data | scale], both packed contiguously.
+    The input is a 4D uint8 tensor whose last dimension is
+    ``full_dim = data_dim + scale_dim``.  The physical layout within each
+    side is ``[data | scale]``, both packed contiguously.
+
+    The caller is responsible for slicing K and V from the combined cache
+    first (e.g. ``kv_cache.split(num_kv_heads, dim=1)``).
 
     Args:
-        kv_side: 4D uint8 tensor with shape
-            ``(num_pages, dim_1, dim_2, full_dim)``.
-            May be in any permutation order (NHD or HND).
+        kv_side: 4D uint8 tensor ``(B, H, N, full_dim)``.
 
     Returns:
-        ``(data, scale)`` where
-        ``data`` is a uint8 view with shape
-        ``(num_pages, dim_1, dim_2, data_dim)``.
-        ``scale`` is a float8_e4m3fn view with shape
-        ``(num_pages, dim_1, dim_2, scale_dim)``.
+        ``(data, scale)`` where *data* is uint8 and *scale* is
+        float8_e4m3fn, both views of the same storage.
     """
     num_pages = kv_side.shape[0]
     dim_1, dim_2 = kv_side.shape[1], kv_side.shape[2]
@@ -609,11 +607,11 @@ def nvfp4_kv_cache_split_views(
             if kv_cache.shape[-1] == k_full_dim + v_full_dim:
                 return _nvfp4_split_mixed_data_scale(kv_cache, head_size, head_size_v)
 
-        data, scale = _nvfp4_split_data_scale(kv_cache, head_size)
+        data, scale = nvfp4_split_data_scale(kv_cache, head_size)
         return (data,), (scale,)
 
-    k_data, k_scale = _nvfp4_split_data_scale(kv_cache[:, 0], head_size)
-    v_data, v_scale = _nvfp4_split_data_scale(kv_cache[:, 1], head_size_v)
+    k_data, k_scale = nvfp4_split_data_scale(kv_cache[:, 0], head_size)
+    v_data, v_scale = nvfp4_split_data_scale(kv_cache[:, 1], head_size_v)
     return (k_data, v_data), (k_scale, v_scale)
 
 

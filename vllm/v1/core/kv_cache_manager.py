@@ -11,7 +11,7 @@ from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.kv_cache_coordinator import get_kv_cache_coordinator
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
-from vllm.v1.core.kv_cache_utils import KVCacheBlock
+from vllm.v1.core.kv_cache_utils import KVCacheBlock, KVCacheBlockCopy
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     CrossAttentionSpec,
@@ -419,6 +419,7 @@ class KVCacheManager:
                     new_computed_blocks=new_computed_block_list,
                     num_encoder_tokens=num_encoder_tokens,
                     total_computed_tokens=total_computed_tokens,
+                    num_local_computed_tokens=num_local_computed_tokens,
                     num_tokens_main_model=full_num_tokens,
                     apply_admission_cap=True,
                 )
@@ -458,6 +459,7 @@ class KVCacheManager:
                 num_encoder_tokens=num_encoder_tokens,
                 total_computed_tokens=num_local_computed_tokens
                 + num_external_computed_tokens,
+                num_local_computed_tokens=num_local_computed_tokens,
                 num_tokens_main_model=num_tokens_main_model,
             )
         )
@@ -694,6 +696,29 @@ class KVCacheManager:
             ids.extend(mgr.take_new_block_ids())
         return ids
 
+    def take_kv_cache_block_copies(
+        self,
+    ) -> tuple[list[KVCacheBlockCopy], KVCacheBlocks]:
+        """Drain pending copies and return their retained endpoints."""
+        pending_copies: list[tuple[KVCacheBlock, KVCacheBlock]] = []
+        retained_blocks_by_group: list[list[KVCacheBlock]] = []
+        for mgr in self.coordinator.single_type_managers:
+            group_copies = mgr.take_pending_cow_copies()
+            pending_copies.extend(group_copies)
+            # free_popped_blocks reverses each group. Store these in reverse
+            # so CoW endpoints retain their existing source-then-copy order.
+            retained_blocks_by_group.append(
+                [block for pair in reversed(group_copies) for block in reversed(pair)]
+            )
+        copies = [
+            KVCacheBlockCopy(
+                src_block_id=source_block.block_id,
+                dst_block_id=cow_block.block_id,
+            )
+            for source_block, cow_block in pending_copies
+        ]
+        return copies, KVCacheBlocks(tuple(retained_blocks_by_group))
+
     def new_step_starts(self) -> None:
-        """Called when a new step is started."""
+        """Notify the coordinator that a new step is starting."""
         self.coordinator.new_step_starts()
