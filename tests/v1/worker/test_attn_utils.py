@@ -244,7 +244,7 @@ def test_turboquant_spec_preserves_configured_cache_dtype_for_shape():
         kernel_block_size=tq_spec.block_size,
         cache_dtype="turboquant_4bit_nc",
     )
-    assert shape == (1, 16, 8, 134)
+    assert shape == (1, 8, 16, 134)
     assert stride_order == (0, 1, 2, 3)
 
 

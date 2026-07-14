@@ -86,7 +86,6 @@ def test_multi_group_block_table_warmup_compute_slot_mapping(monkeypatch):
 
     block_tables = MultiGroupBlockTable(
         max_num_reqs=4,
-        max_model_len=128,
         max_num_batched_tokens=128,
         pin_memory=False,
         device=torch.device("cpu"),

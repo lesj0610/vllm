@@ -31,8 +31,10 @@ def _make_warmup_model_runner(
         num_speculative_steps=0,
         decode_query_len=1,
         is_pooling_model=False,
+        is_encoder_decoder=False,
         is_last_pp_rank=True,
         max_model_len=max_model_len,
+        model_state=SimpleNamespace(max_encoder_len=0),
         scheduler_config=SimpleNamespace(
             max_num_seqs=max_num_seqs,
             max_num_batched_tokens=max_num_batched_tokens,
