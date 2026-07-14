@@ -1235,6 +1235,7 @@ class MambaManager(SingleTypeKVCacheManager):
         self._fixed_request_blocks = (
             kv_cache_spec.memory_model == MemoryModel.REQUEST_CONSTANT
             and kv_cache_spec.mamba_cache_mode != "align"
+            and not self.enable_caching
         )
         self.num_speculative_blocks: int = kv_cache_spec.num_speculative_blocks
         self.cached_blocks_this_step: set[BlockHashWithGroupId] = set()

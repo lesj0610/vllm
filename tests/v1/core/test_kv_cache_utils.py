@@ -2550,6 +2550,7 @@ def test_auto_fit_max_model_len_with_hybrid():
             max_model_len=model_len,
             scheduler_block_size=block_size,
             hash_block_size=block_size,
+            enable_caching=False,
         )
         request = make_request(
             request_id=f"req_{model_len}",
