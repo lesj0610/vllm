@@ -47,6 +47,7 @@ else:
 from .interfaces import (
     has_inner_state,
     has_noops,
+    has_sequence_bounded_mrope_positions,
     is_attention_free,
     is_hybrid,
     requires_raw_input_tokens,
@@ -778,6 +779,7 @@ class _ModelInfo:
     supports_mamba_prefix_caching: bool
     supports_transcription: bool
     supports_transcription_only: bool
+    mrope_positions_are_sequence_bounded: bool = False
 
     @staticmethod
     def from_model_cls(model: type[nn.Module]) -> "_ModelInfo":
@@ -807,6 +809,9 @@ class _ModelInfo:
                 supports_transcription(model) and model.supports_transcription_only
             ),
             has_noops=has_noops(model),
+            mrope_positions_are_sequence_bounded=(
+                has_sequence_bounded_mrope_positions(model)
+            ),
         )
 
 

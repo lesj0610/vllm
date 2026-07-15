@@ -428,6 +428,7 @@ class ModelConfig:
         # here early.
         if self.multimodal_config:
             factors["language_model_only"] = self.multimodal_config.language_model_only
+        factors["mrope_cache_max_position"] = self.mrope_cache_max_position
         return hash_factors(factors)
 
     def _update_nested(
@@ -1619,6 +1620,13 @@ class ModelConfig:
     @property
     def uses_mrope(self) -> bool:
         return uses_mrope(self.hf_config)
+
+    @property
+    def mrope_cache_max_position(self) -> int | None:
+        """Exclusive M-RoPE cache position bound, if proven by the model."""
+        if self._model_info.mrope_positions_are_sequence_bounded:
+            return self.max_model_len
+        return None
 
     @property
     def uses_xdrope_dim(self) -> int:

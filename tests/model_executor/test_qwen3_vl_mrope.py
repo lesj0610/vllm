@@ -7,6 +7,11 @@ from dataclasses import dataclass
 import pytest
 import torch
 
+from vllm.model_executor.models.qwen2_5_vl import (
+    Qwen2_5_VLForConditionalGeneration,
+)
+from vllm.model_executor.models.qwen2_vl import Qwen2VLForConditionalGeneration
+from vllm.model_executor.models.qwen3_5 import Qwen3_5ForConditionalGeneration
 from vllm.model_executor.models.qwen3_vl import Qwen3VLForConditionalGeneration
 from vllm.multimodal.inputs import (
     MultiModalFeatureSpec,
@@ -35,6 +40,7 @@ VISION_END_TOKEN_ID = 778
 @dataclass
 class DummyVisionConfig:
     spatial_merge_size: int = 1
+    tokens_per_second: float = 1.0
 
 
 @dataclass
@@ -235,3 +241,209 @@ def test_match_qwen3vl_mrope_evs_on(
     )
 
     assert torch.equal(actual_mrope, expected_mrope_masked)
+
+
+def _make_mm_feature(
+    modality: str,
+    grid_thw: tuple[int, int, int],
+    offset: int,
+    length: int,
+) -> MultiModalFeatureSpec:
+    return MultiModalFeatureSpec(
+        data=MultiModalKwargsItem(
+            {
+                f"{modality}_grid_thw": MultiModalFieldElem(
+                    data=torch.tensor(grid_thw),
+                    field=None,
+                ),
+            }
+        ),
+        modality=modality,
+        identifier="DUMMY",
+        mm_position=PlaceholderRange(offset=offset, length=length),
+    )
+
+
+def _make_normal_video_case(
+    grid_thw: tuple[int, int, int],
+    *,
+    spatial_merge_size: int = 1,
+    inter_frame_text_tokens: int = 0,
+) -> tuple[list[int], list[MultiModalFeatureSpec]]:
+    t, h, w = grid_thw
+    tokens_per_frame = (h // spatial_merge_size) * (w // spatial_merge_size)
+    tokens = [11, 12]
+    offset = len(tokens)
+    for frame_idx in range(t):
+        if frame_idx > 0:
+            tokens.extend([100 + frame_idx] * inter_frame_text_tokens)
+        tokens.extend(
+            [VISION_START_TOKEN_ID]
+            + [VIDEO_TOKEN_ID] * tokens_per_frame
+            + [VISION_END_TOKEN_ID]
+        )
+    video_length = len(tokens) - offset
+    tokens.extend([13, 14, 15])
+    return tokens, [_make_mm_feature("video", grid_thw, offset, video_length)]
+
+
+def _make_lumped_video_case(
+    grid_thw: tuple[int, int, int],
+    num_video_tokens: int,
+) -> tuple[list[int], list[MultiModalFeatureSpec]]:
+    t, _, _ = grid_thw
+    tokens = [21, 22, VISION_START_TOKEN_ID]
+    offset = 2
+    tokens.extend([VIDEO_TOKEN_ID] * num_video_tokens)
+    tokens.append(VISION_END_TOKEN_ID)
+    for _ in range(t - 1):
+        tokens.extend([VISION_START_TOKEN_ID, VISION_END_TOKEN_ID])
+    video_length = len(tokens) - offset
+    tokens.extend([23, 24])
+    return tokens, [_make_mm_feature("video", grid_thw, offset, video_length)]
+
+
+def _make_multiple_image_case(
+    grids: list[tuple[int, int, int]],
+) -> tuple[list[int], list[MultiModalFeatureSpec]]:
+    tokens = list(range(30, 94))
+    features = []
+    for index, grid_thw in enumerate(grids):
+        _, h, w = grid_thw
+        tokens.extend([100 + index] * (index + 1))
+        offset = len(tokens)
+        num_image_tokens = h * w
+        tokens.extend([IMAGE_TOKEN_ID] * num_image_tokens)
+        features.append(_make_mm_feature("image", grid_thw, offset, num_image_tokens))
+    tokens.extend(range(200, 264))
+    return tokens, features
+
+
+def test_qwen3_5_mrope_positions_are_sequence_bounded():
+    cases = [
+        ([1, 2, 3, 4, 5], [], DummyConfig()),
+        (*_make_multiple_image_case([(1, 2, 3)]), DummyConfig()),
+        (
+            *_make_multiple_image_case([(1, 1, 7), (1, 3, 4), (1, 5, 2), (1, 4, 4)]),
+            DummyConfig(),
+        ),
+        (*_make_normal_video_case((3, 2, 3)), DummyConfig()),
+        (*_make_normal_video_case((128, 10, 12)), DummyConfig()),
+        (
+            *_make_normal_video_case(
+                (3, 4, 6),
+                spatial_merge_size=2,
+                inter_frame_text_tokens=5,
+            ),
+            DummyConfig(vision_config=DummyVisionConfig(spatial_merge_size=2)),
+        ),
+        # Three complete logical frames are stored in the first placeholder.
+        (*_make_lumped_video_case((3, 2, 2), num_video_tokens=12), DummyConfig()),
+        # Two complete frames and a partial-frame remainder are stored together.
+        (*_make_lumped_video_case((3, 2, 2), num_video_tokens=10), DummyConfig()),
+    ]
+
+    rng = random.Random(0)
+    for _ in range(100):
+        grids = [
+            (1, rng.randint(1, 8), rng.randint(1, 8)) for _ in range(rng.randint(1, 4))
+        ]
+        cases.append((*_make_multiple_image_case(grids), DummyConfig()))
+    for _ in range(50):
+        spatial_merge_size = rng.choice((1, 2))
+        grid_thw = (
+            rng.randint(1, 8),
+            spatial_merge_size * rng.randint(1, 8),
+            spatial_merge_size * rng.randint(1, 8),
+        )
+        cases.append(
+            (
+                *_make_normal_video_case(
+                    grid_thw,
+                    spatial_merge_size=spatial_merge_size,
+                    inter_frame_text_tokens=rng.randint(0, 5),
+                ),
+                DummyConfig(
+                    vision_config=DummyVisionConfig(
+                        spatial_merge_size=spatial_merge_size
+                    )
+                ),
+            )
+        )
+
+    for input_tokens, mm_features, config in cases:
+        positions, mrope_position_delta = (
+            Qwen3_5ForConditionalGeneration._get_mrope_input_positions(
+                input_tokens=input_tokens,
+                mm_features=mm_features,
+                config=config,
+            )
+        )
+
+        assert positions.shape == (3, len(input_tokens))
+        assert positions.min().item() >= 0
+        assert positions.max().item() < len(input_tokens)
+        assert mrope_position_delta <= 0
+
+
+def test_qwen3_vl_pruned_positions_can_exceed_pruned_sequence_length():
+    input_tokens, mm_features = _make_normal_video_case((128, 10, 10))
+    positions, _ = Qwen3VLForConditionalGeneration._get_mrope_input_positions(
+        input_tokens=input_tokens,
+        mm_features=mm_features,
+        config=DummyConfig(),
+    )
+
+    input_tensor = torch.tensor(input_tokens)
+    retention_mask = input_tensor != VIDEO_TOKEN_ID
+    video_indices = torch.where(input_tensor == VIDEO_TOKEN_ID)[0]
+    retention_mask[video_indices[:100]] = True
+
+    retained_positions = positions[:, retention_mask]
+    pruned_len = int(retention_mask.sum())
+
+    assert retained_positions.max().item() >= pruned_len
+    assert retained_positions.max().item() + 1 - pruned_len > 0
+
+
+@pytest.mark.parametrize(
+    "model_cls",
+    [Qwen2VLForConditionalGeneration, Qwen2_5_VLForConditionalGeneration],
+)
+def test_qwen2_vl_video_temporal_positions_require_legacy_capacity(model_cls):
+    config = DummyConfig(
+        vision_config=DummyVisionConfig(
+            spatial_merge_size=1,
+            tokens_per_second=25,
+        )
+    )
+    model = object.__new__(model_cls)
+    torch.nn.Module.__init__(model)
+    model.config = config
+
+    mm_feature = MultiModalFeatureSpec(
+        data=MultiModalKwargsItem(
+            {
+                "video_grid_thw": MultiModalFieldElem(
+                    data=torch.tensor((2, 1, 1)),
+                    field=None,
+                ),
+                "second_per_grid_ts": MultiModalFieldElem(
+                    data=torch.tensor(4.0),
+                    field=None,
+                ),
+            }
+        ),
+        modality="video",
+        identifier="DUMMY",
+        mm_position=PlaceholderRange(offset=0, length=2),
+    )
+    positions, mrope_position_delta = model.get_mrope_input_positions(
+        input_tokens=[VIDEO_TOKEN_ID, VIDEO_TOKEN_ID],
+        mm_features=[mm_feature],
+    )
+
+    assert positions[0].tolist() == [0, 100]
+    assert positions.max().item() == 100
+    assert mrope_position_delta == 99
+    assert positions.max().item() >= 2
