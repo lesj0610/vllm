@@ -28,6 +28,9 @@ from vllm.model_executor.warmup.flashinfer_sparse_mla_warmup import (
     deepseek_v4_sparse_mla_attention_warmup,
     flashinfer_sparse_mla_decode_autotune_warmup,
 )
+from vllm.model_executor.warmup.hybrid_gdn_mamba_mrope_warmup import (
+    hybrid_gdn_mamba_mrope_warmup,
+)
 from vllm.model_executor.warmup.qwen_triton_warmup import qwen_triton_warmup
 from vllm.model_executor.warmup.sparse_mla_triton_warmup import (
     sparse_mla_triton_warmup,
@@ -73,9 +76,6 @@ def _warmup_ll_bf16_router_gemm() -> None:
 
 
 def kernel_warmup(worker: "Worker"):
-    from vllm.model_executor.warmup.hybrid_gdn_mamba_mrope_warmup import (
-        hybrid_gdn_mamba_mrope_warmup,
-    )
     from vllm.model_executor.warmup.minimax_m3_msa_warmup import (
         minimax_m3_msa_warmup,
     )
@@ -115,17 +115,6 @@ def kernel_warmup(worker: "Worker"):
         deep_gemm_warmup(model, max_tokens)
 
     minimax_m3_msa_warmup(worker)
-
-    hybrid_gdn_mamba_mrope_warmup(
-        worker.get_model(),
-        model_dtype=worker.model_runner.dtype,
-    )
-
-    kv_block_zeroer = getattr(worker.model_runner, "_kv_block_zeroer", None)
-    if kv_block_zeroer is None:
-        kv_block_zeroer = getattr(worker.model_runner, "kv_block_zeroer", None)
-    if kv_block_zeroer is not None:
-        kv_block_zeroer.warmup()
 
     enable_flashinfer_autotune = (
         worker.vllm_config.kernel_config.enable_flashinfer_autotune
@@ -179,6 +168,7 @@ def kernel_warmup(worker: "Worker"):
 
     if worker.vllm_config.kernel_config.enable_jit_warmup:
         fa4_cutedsl_warmup(worker)
+        hybrid_gdn_mamba_mrope_warmup(worker)
         sparse_mla_triton_warmup(worker)
 
 
