@@ -85,7 +85,7 @@ from vllm.v1.worker.workspace import (
 )
 
 from ...model_executor.model_loader import TensorizerLoader
-from .gpu.warmup import warmup_kernels, warmup_v1_attention_kernels
+from .gpu.warmup import warmup_kernels
 from .utils import request_memory
 
 logger = init_logger(__name__)
@@ -740,8 +740,6 @@ class Worker(WorkerBase):
         # cuda graph capture.
         kernel_warmup(self)
         _warmup_slot_mapping_kernel(self.model_runner)
-        if not self.use_v2_model_runner:
-            warmup_v1_attention_kernels(self.model_runner)
 
         profile_persistent_workspace = (
             requires_persistent_attention_workspace_profiling(self.vllm_config)
