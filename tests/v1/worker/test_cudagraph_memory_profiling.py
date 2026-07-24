@@ -335,7 +335,7 @@ def test_flashinfer_separate_cudagraph_memory_profile_gate():
     [
         pytest.param(1, False, True, id="single-rank"),
         pytest.param(2, False, False, id="dcp-fallback"),
-        pytest.param(1, True, False, id="mm-prefix-fallback"),
+        pytest.param(1, True, True, id="mm-prefix-profiled"),
     ],
 )
 def test_flashinfer_persistent_workspace_profile_gate(
@@ -508,6 +508,37 @@ def test_flashinfer_workspace_routes_match_reachable_dispatches(
     builder.model_config = SimpleNamespace(is_mm_prefix_lm=is_mm_prefix_lm)
 
     assert builder._get_workspace_routes() == expected
+
+
+def test_flashinfer_mm_prefill_wrapper_uses_native_initial_workspace(monkeypatch):
+    pytest.importorskip("flashinfer")
+    from vllm.v1.attention.backends import flashinfer as flashinfer_backend
+
+    captured_float_workspace_bytes = []
+
+    class Wrapper(_FakeFlashInferWrapper):
+        def __init__(self, float_workspace_buffer, *args, **kwargs):
+            del args, kwargs
+            captured_float_workspace_bytes.append(float_workspace_buffer.numel())
+            super().__init__(float_workspace_buffer)
+
+    builder = _make_flashinfer_builder(flashinfer_backend)
+    builder._mm_prefill_wrapper = None
+    monkeypatch.setattr(builder, "_default_workspace_buffer_size", lambda: 4096)
+    monkeypatch.setattr(
+        flashinfer_backend, "BatchPrefillWithPagedKVCacheWrapper", Wrapper
+    )
+    monkeypatch.setattr(flashinfer_backend, "get_kv_cache_layout", lambda: "NHD")
+
+    reset_workspace_manager()
+    init_workspace_manager(torch.device("cpu"))
+    try:
+        wrapper = builder._get_mm_prefill_wrapper()
+        assert captured_float_workspace_bytes == [1]
+        assert wrapper._float_workspace_buffer.numel() == 1
+        assert current_workspace_manager().workspace_sizes_bytes()[0] < 4096
+    finally:
+        reset_workspace_manager()
 
 
 def test_worker_persistent_workspace_gate_falls_back_for_flashinfer_dcp(
@@ -764,7 +795,11 @@ def test_flashinfer_reserves_prefill_tail_workspace(monkeypatch):
     builder.device = torch.device("cpu")
     builder.use_dcp = False
     builder.use_trtllm_decode_attention = False
-    builder.model_config = SimpleNamespace(max_model_len=1024, dtype=torch.float16)
+    builder.model_config = SimpleNamespace(
+        max_model_len=1024,
+        dtype=torch.float16,
+        is_mm_prefix_lm=False,
+    )
     builder.vllm_config = SimpleNamespace(
         scheduler_config=SimpleNamespace(
             max_num_batched_tokens=8,
@@ -837,6 +872,164 @@ def test_flashinfer_reserves_prefill_tail_workspace(monkeypatch):
     assert ensured == [WorkspaceSizes(4096, 64, True)]
     assert 3 in observed_query_lens
     assert 8 in observed_query_lens
+
+
+@pytest.mark.parametrize(
+    ("helper_available", "memory_profiling", "expected_float_workspace"),
+    [
+        pytest.param(True, False, 256, id="exact-cudagraph-reservation"),
+        pytest.param(False, False, 4096, id="fallback-before-lock"),
+        pytest.param(True, True, 4096, id="persistent-profile"),
+    ],
+)
+def test_flashinfer_mm_prefix_workspace_is_reserved_before_lock(
+    helper_available,
+    memory_profiling,
+    expected_float_workspace,
+    monkeypatch,
+):
+    pytest.importorskip("flashinfer")
+    from vllm.v1.attention.backends import flashinfer as flashinfer_backend
+
+    WorkspaceSizes = flashinfer_backend.WorkspaceSizes
+    builder = flashinfer_backend.FlashInferMetadataBuilder.__new__(
+        flashinfer_backend.FlashInferMetadataBuilder
+    )
+    builder._workspace_buffer = None
+    builder._workspace_state = flashinfer_backend._FlashInferWorkspaceState()
+    builder._last_reserved_workspace_sizes = WorkspaceSizes(0, 0)
+    builder._last_reserved_trtllm_workspace_bytes = 0
+    builder.device = torch.device("cpu")
+    builder.use_dcp = False
+    builder.model_config = SimpleNamespace(
+        max_model_len=1024,
+        dtype=torch.float16,
+        is_mm_prefix_lm=True,
+    )
+    builder.vllm_config = SimpleNamespace(
+        scheduler_config=SimpleNamespace(
+            max_num_batched_tokens=8,
+            max_num_seqs=4,
+        ),
+        speculative_config=None,
+    )
+    builder.q_data_type_prefill = torch.float16
+    builder.kv_cache_dtype = torch.uint8
+    builder.page_size = 16
+    builder.window_left = 11
+    builder.prefill_fixed_split_size = -1
+    builder.disable_split_kv = False
+    builder.enable_cuda_graph = False
+    builder._prefill_wrapper = None
+    builder._mm_prefill_wrapper = None
+    builder._noncausal_prefill_wrapper = None
+    builder._decode_wrapper = None
+    builder._decode_wrappers_cudagraph = {}
+    builder._cascade_wrapper = None
+
+    causal_wrapper = _FakeFlashInferWrapper()
+    mm_wrapper = _FakeFlashInferWrapper()
+    helper_calls = []
+    size_calls = []
+    warnings = []
+
+    def get_prefill_wrapper(causal=True):
+        assert causal
+        if builder._prefill_wrapper is None:
+            builder._prefill_wrapper = causal_wrapper
+            builder._register_workspace_wrapper(causal_wrapper)
+        return builder._prefill_wrapper
+
+    def get_mm_prefill_wrapper():
+        if builder._mm_prefill_wrapper is None:
+            builder._mm_prefill_wrapper = mm_wrapper
+            builder._register_workspace_wrapper(mm_wrapper)
+        return builder._mm_prefill_wrapper
+
+    def get_workspace_size_func(**kwargs):
+        helper_calls.append((kwargs["use_custom_mask"], kwargs["window_left"]))
+        if not helper_available:
+            return None
+        return (
+            "custom-mask" if kwargs["use_custom_mask"] else "causal",
+            object(),
+        )
+
+    def call_workspace_size(**kwargs):
+        size_calls.append(
+            (
+                kwargs["backend"],
+                kwargs["causal"],
+                kwargs["window_left"],
+            )
+        )
+        if kwargs["backend"] == "custom-mask":
+            return WorkspaceSizes(256, 32, True)
+        return WorkspaceSizes(128, 16, True)
+
+    monkeypatch.setattr(
+        builder,
+        "_get_workspace_routes",
+        lambda: flashinfer_backend.FlashInferWorkspaceRoutes(
+            native_prefill=True,
+            trtllm_prefill=False,
+            native_decode=False,
+            trtllm_decode=False,
+        ),
+    )
+    monkeypatch.setattr(builder, "_get_prefill_wrapper", get_prefill_wrapper)
+    monkeypatch.setattr(builder, "_get_mm_prefill_wrapper", get_mm_prefill_wrapper)
+    monkeypatch.setattr(
+        builder, "_get_prefill_workspace_size_func", get_workspace_size_func
+    )
+    monkeypatch.setattr(builder, "_call_prefill_workspace_size", call_workspace_size)
+    monkeypatch.setattr(builder, "_default_workspace_buffer_size", lambda: 4096)
+    monkeypatch.setattr(
+        flashinfer_backend.logger,
+        "warning",
+        lambda message, *args: warnings.append((message, args)),
+    )
+
+    reset_workspace_manager()
+    init_workspace_manager(torch.device("cpu"))
+    try:
+        if memory_profiling:
+            builder.reserve_workspace_for_memory_profiling()
+        else:
+            builder.reserve_workspace_for_cudagraph_capture()
+        builder.rebind_workspace_after_reservation()
+
+        assert current_workspace_manager().workspace_sizes_bytes() == (
+            expected_float_workspace,
+        )
+        assert builder._prefill_wrapper is causal_wrapper
+        assert builder._mm_prefill_wrapper is mm_wrapper
+        assert builder.get_workspace_reserve_debug_info()["mm_prefill_wrappers"] == 1
+        assert helper_calls == [(False, 11), (True, -1)]
+
+        if helper_available:
+            assert size_calls
+            assert all(causal for _, causal, _ in size_calls)
+            assert {
+                (backend, window_left) for backend, _, window_left in size_calls
+            } == {("causal", 11), ("custom-mask", -1)}
+            assert not warnings
+            runtime_workspace = WorkspaceSizes(256, 32, True)
+        else:
+            assert size_calls == []
+            assert len(warnings) == 2
+            runtime_workspace = None
+
+        workspace_sizes_before_lock = (
+            current_workspace_manager().workspace_sizes_bytes()
+        )
+        lock_workspace()
+        builder._ensure_flashinfer_wrapper_workspace(mm_wrapper, runtime_workspace)
+        assert current_workspace_manager().workspace_sizes_bytes() == (
+            workspace_sizes_before_lock
+        )
+    finally:
+        reset_workspace_manager()
 
 
 @pytest.mark.parametrize("helper_available", [False, True])

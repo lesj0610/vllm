@@ -1329,10 +1329,6 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
     ) -> PersistentWorkspaceProfilingSupport:
         if vllm_config.parallel_config.decode_context_parallel_size > 1:
             return PersistentWorkspaceProfilingSupport.UNSUPPORTED
-        # MM-prefix execution owns a lazily-created custom-mask prefill
-        # wrapper that is not covered by the causal reservation contract.
-        if vllm_config.model_config.is_mm_prefix_lm:
-            return PersistentWorkspaceProfilingSupport.UNSUPPORTED
         kv_specs = (
             kv_cache_spec.kv_cache_specs.values()
             if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs)
@@ -1578,6 +1574,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 wrappers.append((kind, wrapper))
 
         add_wrapper("prefill", getattr(self, "_prefill_wrapper", None))
+        add_wrapper("mm_prefill", getattr(self, "_mm_prefill_wrapper", None))
         add_wrapper(
             "noncausal_prefill", getattr(self, "_noncausal_prefill_wrapper", None)
         )
@@ -1635,6 +1632,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         return {
             "workspace_wrapper_count": len(unique_wrappers),
             "prefill_wrappers": kind_counts.get("prefill", 0),
+            "mm_prefill_wrappers": kind_counts.get("mm_prefill", 0),
             "noncausal_prefill_wrappers": kind_counts.get("noncausal_prefill", 0),
             "decode_wrappers": kind_counts.get("decode", 0),
             "decode_cudagraph_wrappers": kind_counts.get("decode_cudagraph", 0),
@@ -1713,7 +1711,9 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             )
         if self._mm_prefill_wrapper is None:
             self._mm_prefill_wrapper = BatchPrefillWithPagedKVCacheWrapper(
-                self._get_workspace_buffer(),
+                self._get_workspace_buffer(
+                    self._native_initial_workspace_buffer_size()
+                ),
                 get_kv_cache_layout(),
                 backend="auto",
             )
@@ -1940,6 +1940,124 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             query_lens.append(max_query_len)
         return query_lens
 
+    @staticmethod
+    def _merge_wrapper_workspace_sizes(
+        current: WorkspaceSizes,
+        additional: WorkspaceSizes,
+    ) -> WorkspaceSizes:
+        return WorkspaceSizes(
+            max(current.float_bytes, additional.float_bytes),
+            current.int_bytes + additional.int_bytes,
+            current.has_int_bytes or additional.has_int_bytes,
+        )
+
+    def _max_prefill_workspace_size(
+        self,
+        *,
+        max_num_batched_tokens: int,
+        max_num_seqs: int,
+        num_pages: int,
+        last_page_len: int,
+        use_custom_mask: bool,
+        window_left: int,
+    ) -> WorkspaceSizes | None:
+        helper = self._get_prefill_workspace_size_func(
+            q_data_type=self.q_data_type_prefill,
+            kv_data_type=self.kv_cache_dtype,
+            paged_kv_indptr_dtype=torch.int32,
+            use_custom_mask=use_custom_mask,
+            window_left=window_left,
+        )
+        if helper is None:
+            return None
+        backend, workspace_size = helper
+        max_workspace_size = WorkspaceSizes(0, 0)
+
+        for batch_size in range(1, max_num_seqs + 1):
+            max_query_len = max_num_batched_tokens // batch_size
+            if max_query_len <= 0:
+                break
+            batch_arange = torch.arange(batch_size + 1, dtype=torch.int32, device="cpu")
+            paged_kv_indptr_cpu = batch_arange * num_pages
+            paged_kv_last_page_len_cpu = torch.full(
+                (batch_size,),
+                last_page_len,
+                dtype=torch.int32,
+                device="cpu",
+            )
+            query_lens = self._get_workspace_query_len_candidates(max_query_len)
+            for query_len in query_lens:
+                qo_indptr_cpu = batch_arange * query_len
+                workspace_sizes = self._call_prefill_workspace_size(
+                    backend=backend,
+                    workspace_size=workspace_size,
+                    qo_indptr_cpu=qo_indptr_cpu,
+                    paged_kv_indptr_cpu=paged_kv_indptr_cpu,
+                    paged_kv_last_page_len_cpu=paged_kv_last_page_len_cpu,
+                    causal=True,
+                    window_left=window_left,
+                    fixed_split_size=self.prefill_fixed_split_size,
+                    disable_split_kv=self.disable_split_kv,
+                )
+                if workspace_sizes is None:
+                    return None
+                max_workspace_size = WorkspaceSizes(
+                    max(
+                        max_workspace_size.float_bytes,
+                        workspace_sizes.float_bytes,
+                    ),
+                    max(
+                        max_workspace_size.int_bytes,
+                        workspace_sizes.int_bytes,
+                    ),
+                    (max_workspace_size.has_int_bytes or workspace_sizes.has_int_bytes),
+                )
+
+        return max_workspace_size
+
+    def _reserve_prefill_wrapper_workspace(
+        self,
+        *,
+        wrapper_getter: Callable[[], object],
+        max_num_batched_tokens: int,
+        max_num_seqs: int,
+        num_pages: int,
+        last_page_len: int,
+        use_custom_mask: bool,
+        window_left: int,
+        description: str,
+    ) -> WorkspaceSizes:
+        workspace_sizes = self._max_prefill_workspace_size(
+            max_num_batched_tokens=max_num_batched_tokens,
+            max_num_seqs=max_num_seqs,
+            num_pages=num_pages,
+            last_page_len=last_page_len,
+            use_custom_mask=use_custom_mask,
+            window_left=window_left,
+        )
+        wrapper = wrapper_getter()
+        if workspace_sizes is None:
+            default_float_bytes = self._default_workspace_buffer_size()
+            logger.warning(
+                "FlashInfer %s workspace sizing helper is unavailable; "
+                "reserving the runtime default %.2f MiB before workspace lock.",
+                description,
+                default_float_bytes / (1 << 20),
+            )
+            self._get_workspace_buffer(default_float_bytes)
+            self._ensure_flashinfer_wrapper_workspace(wrapper, None)
+            int_workspace = getattr(wrapper, "_int_workspace_buffer", None)
+            return WorkspaceSizes(
+                default_float_bytes,
+                _buffer_nbytes(int_workspace)
+                if isinstance(int_workspace, torch.Tensor)
+                else 0,
+                False,
+            )
+
+        self._ensure_flashinfer_wrapper_workspace(wrapper, workspace_sizes)
+        return workspace_sizes
+
     def _make_decode_workspace_inputs(
         self,
         *,
@@ -2007,68 +2125,34 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
 
         workspace_routes = self._get_workspace_routes()
         if workspace_routes.native_prefill:
-            helper = self._get_prefill_workspace_size_func(
-                q_data_type=self.q_data_type_prefill,
-                kv_data_type=self.kv_cache_dtype,
-                paged_kv_indptr_dtype=torch.int32,
+            prefill_sizes = self._reserve_prefill_wrapper_workspace(
+                wrapper_getter=lambda: self._get_prefill_wrapper(causal=True),
+                max_num_batched_tokens=max_num_batched_tokens,
+                max_num_seqs=max_num_seqs,
+                num_pages=num_pages,
+                last_page_len=last_page_len,
                 use_custom_mask=False,
                 window_left=self.window_left,
+                description="causal prefill",
             )
-            if helper is not None:
-                backend, workspace_size = helper
-                max_prefill_workspace_size = WorkspaceSizes(0, 0)
+            reserved_sizes = self._merge_wrapper_workspace_sizes(
+                reserved_sizes, prefill_sizes
+            )
 
-                for batch_size in range(1, max_num_seqs + 1):
-                    max_query_len = max_num_batched_tokens // batch_size
-                    if max_query_len <= 0:
-                        break
-                    batch_arange = torch.arange(
-                        batch_size + 1, dtype=torch.int32, device="cpu"
-                    )
-                    paged_kv_indptr_cpu = batch_arange * num_pages
-                    paged_kv_last_page_len_cpu = torch.full(
-                        (batch_size,),
-                        last_page_len,
-                        dtype=torch.int32,
-                        device="cpu",
-                    )
-                    query_lens = self._get_workspace_query_len_candidates(max_query_len)
-                    for query_len in query_lens:
-                        qo_indptr_cpu = batch_arange * query_len
-                        workspace_sizes = self._call_prefill_workspace_size(
-                            backend=backend,
-                            workspace_size=workspace_size,
-                            qo_indptr_cpu=qo_indptr_cpu,
-                            paged_kv_indptr_cpu=paged_kv_indptr_cpu,
-                            paged_kv_last_page_len_cpu=paged_kv_last_page_len_cpu,
-                            causal=True,
-                            window_left=self.window_left,
-                            fixed_split_size=self.prefill_fixed_split_size,
-                            disable_split_kv=self.disable_split_kv,
-                        )
-                        if workspace_sizes is None:
-                            continue
-                        max_prefill_workspace_size = WorkspaceSizes(
-                            max(
-                                max_prefill_workspace_size.float_bytes,
-                                workspace_sizes.float_bytes,
-                            ),
-                            max(
-                                max_prefill_workspace_size.int_bytes,
-                                workspace_sizes.int_bytes,
-                            ),
-                            (
-                                max_prefill_workspace_size.has_int_bytes
-                                or workspace_sizes.has_int_bytes
-                            ),
-                        )
-
-                reserved_sizes = max_prefill_workspace_size
-                if max_prefill_workspace_size.total_bytes > 0:
-                    prefill_wrapper = self._get_prefill_wrapper(causal=True)
-                    self._ensure_flashinfer_wrapper_workspace(
-                        prefill_wrapper, max_prefill_workspace_size
-                    )
+            if self.model_config.is_mm_prefix_lm:
+                mm_prefill_sizes = self._reserve_prefill_wrapper_workspace(
+                    wrapper_getter=self._get_mm_prefill_wrapper,
+                    max_num_batched_tokens=max_num_batched_tokens,
+                    max_num_seqs=max_num_seqs,
+                    num_pages=num_pages,
+                    last_page_len=last_page_len,
+                    use_custom_mask=True,
+                    window_left=-1,
+                    description="MM-prefix custom-mask prefill",
+                )
+                reserved_sizes = self._merge_wrapper_workspace_sizes(
+                    reserved_sizes, mm_prefill_sizes
+                )
 
         if workspace_routes.native_decode:
             max_decode_tokens = max_num_seqs
@@ -2084,10 +2168,8 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     last_page_len=last_page_len,
                     use_cudagraph=False,
                 )
-                reserved_sizes = WorkspaceSizes(
-                    max(reserved_sizes.float_bytes, decode_sizes.float_bytes),
-                    reserved_sizes.int_bytes + decode_sizes.int_bytes,
-                    reserved_sizes.has_int_bytes or decode_sizes.has_int_bytes,
+                reserved_sizes = self._merge_wrapper_workspace_sizes(
+                    reserved_sizes, decode_sizes
                 )
 
             if self.enable_cuda_graph:
@@ -2100,10 +2182,8 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                         last_page_len=last_page_len,
                         use_cudagraph=True,
                     )
-                    reserved_sizes = WorkspaceSizes(
-                        max(reserved_sizes.float_bytes, decode_sizes.float_bytes),
-                        reserved_sizes.int_bytes + decode_sizes.int_bytes,
-                        reserved_sizes.has_int_bytes or decode_sizes.has_int_bytes,
+                    reserved_sizes = self._merge_wrapper_workspace_sizes(
+                        reserved_sizes, decode_sizes
                     )
 
         trtllm_workspace_bytes = 0
@@ -2142,7 +2222,10 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         # the global allocator twice during one profiling reservation.
         trtllm_workspace_bytes = self._last_reserved_trtllm_workspace_bytes
         if workspace_routes.native_prefill:
-            self._get_prefill_wrapper(causal=True)
+            if self._prefill_wrapper is None:
+                self._get_prefill_wrapper(causal=True)
+            if self.model_config.is_mm_prefix_lm and self._mm_prefill_wrapper is None:
+                self._get_mm_prefill_wrapper()
 
         if workspace_routes.native_decode:
             max_decode_tokens = min(
