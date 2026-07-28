@@ -798,6 +798,7 @@ class _ModelInfo:
     supports_replayssm: bool
     supports_transcription: bool
     supports_transcription_only: bool
+    supported_video_pruning_methods: tuple[str, ...]
     mrope_positions_are_sequence_bounded: bool = False
 
     @staticmethod
@@ -829,6 +830,9 @@ class _ModelInfo:
                 supports_transcription(model) and model.supports_transcription_only
             ),
             has_noops=has_noops(model),
+            supported_video_pruning_methods=getattr(
+                model, "supported_video_pruning_methods", ()
+            ),
             mrope_positions_are_sequence_bounded=(
                 has_sequence_bounded_mrope_positions(model)
             ),
