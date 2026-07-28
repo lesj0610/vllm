@@ -1701,10 +1701,15 @@ class ModelConfig:
 
     @property
     def mrope_cache_max_position(self) -> int | None:
-        """Exclusive M-RoPE cache position bound, if proven by the model."""
-        if self._model_info.mrope_positions_are_sequence_bounded:
-            return self.max_model_len
-        return None
+        """Exclusive M-RoPE cache position bound, if proven by model and config."""
+        if not self._model_info.mrope_positions_are_sequence_bounded:
+            return None
+        if (
+            self.multimodal_config is not None
+            and self.multimodal_config.is_multimodal_pruning_enabled()
+        ):
+            return None
+        return self.max_model_len
 
     @property
     def uses_xdrope_dim(self) -> int:

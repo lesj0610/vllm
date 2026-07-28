@@ -11,6 +11,7 @@ def _make_model_config(
     *,
     sequence_bounded: bool,
     max_model_len: int = 128,
+    pruning_enabled: bool | None = None,
 ) -> ModelConfig:
     model_config = object.__new__(ModelConfig)
     object.__setattr__(
@@ -21,7 +22,15 @@ def _make_model_config(
         ),
     )
     object.__setattr__(model_config, "max_model_len", max_model_len)
-    object.__setattr__(model_config, "multimodal_config", None)
+    multimodal_config = (
+        None
+        if pruning_enabled is None
+        else SimpleNamespace(
+            language_model_only=False,
+            is_multimodal_pruning_enabled=lambda: pruning_enabled,
+        )
+    )
+    object.__setattr__(model_config, "multimodal_config", multimodal_config)
     return model_config
 
 
@@ -31,6 +40,14 @@ def test_mrope_cache_capacity_is_fail_closed():
 
     assert unknown.mrope_cache_max_position is None
     assert bounded.mrope_cache_max_position == 256
+
+
+def test_mrope_cache_capacity_is_fail_closed_for_pruning():
+    unpruned = _make_model_config(sequence_bounded=True, pruning_enabled=False)
+    pruned = _make_model_config(sequence_bounded=True, pruning_enabled=True)
+
+    assert unpruned.mrope_cache_max_position == 128
+    assert pruned.mrope_cache_max_position is None
 
 
 def test_mrope_cache_capacity_affects_model_hash(monkeypatch):
@@ -43,6 +60,8 @@ def test_mrope_cache_capacity_affects_model_hash(monkeypatch):
     unknown = _make_model_config(sequence_bounded=False)
     bounded_128 = _make_model_config(sequence_bounded=True, max_model_len=128)
     bounded_256 = _make_model_config(sequence_bounded=True, max_model_len=256)
+    pruned = _make_model_config(sequence_bounded=True, pruning_enabled=True)
 
     assert unknown.compute_hash() != bounded_128.compute_hash()
     assert bounded_128.compute_hash() != bounded_256.compute_hash()
+    assert bounded_128.compute_hash() != pruned.compute_hash()
