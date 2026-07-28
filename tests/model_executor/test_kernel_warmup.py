@@ -1,81 +1,56 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import sys
 from types import SimpleNamespace
 from unittest.mock import Mock
 
-from vllm.model_executor.warmup import kernel_warmup, minimax_m3_msa_warmup
+import pytest
+
+from vllm.model_executor.warmup import kernel_warmup
 
 
-def _patch_common_warmups(monkeypatch):
+@pytest.mark.parametrize("attribute", ["_kv_block_zeroer", "kv_block_zeroer"])
+def test_warmup_kv_block_zeroer_supports_runner_attribute_names(attribute):
+    zeroer = Mock()
+    model_runner = SimpleNamespace(**{attribute: zeroer})
+    if attribute == "kv_block_zeroer":
+        model_runner._kv_block_zeroer = None
+
+    kernel_warmup._warmup_kv_block_zeroer(model_runner)
+
+    zeroer.warmup.assert_called_once_with()
+
+
+def test_warmup_kv_block_zeroer_ignores_runner_without_zeroer():
+    kernel_warmup._warmup_kv_block_zeroer(SimpleNamespace())
+
+
+def test_kernel_warmup_routes_model_runner_to_kv_block_zeroer(monkeypatch):
     monkeypatch.setattr(kernel_warmup.envs, "VLLM_USE_DEEP_GEMM", False)
-    monkeypatch.setattr(kernel_warmup, "qwen_triton_warmup", Mock())
-    monkeypatch.setattr(kernel_warmup, "deepseek_v4_mhc_warmup", Mock())
-    monkeypatch.setattr(kernel_warmup, "sparse_mla_triton_warmup_if_needed", Mock())
-    monkeypatch.setattr(
-        kernel_warmup,
+    for warmup_name in (
+        "qwen_triton_warmup",
+        "deepseek_v4_mhc_warmup",
         "flashinfer_sparse_mla_decode_autotune_warmup",
-        Mock(),
-    )
-    monkeypatch.setattr(
-        kernel_warmup,
         "deepseek_v4_sparse_mla_attention_warmup",
-        Mock(),
-    )
-    monkeypatch.setattr(minimax_m3_msa_warmup, "minimax_m3_msa_warmup", Mock())
+    ):
+        monkeypatch.setattr(kernel_warmup, warmup_name, Mock())
 
-    monkeypatch.setitem(
-        sys.modules,
-        "vllm.model_executor.warmup.hybrid_gdn_mamba_mrope_warmup",
-        SimpleNamespace(hybrid_gdn_mamba_mrope_warmup=Mock()),
-    )
+    route_warmup = Mock(side_effect=RuntimeError("stop after zeroer routing"))
+    monkeypatch.setattr(kernel_warmup, "_warmup_kv_block_zeroer", route_warmup)
 
-
-def _make_worker(model_runner):
-    if not hasattr(model_runner, "dtype"):
-        model_runner.dtype = None
-    return SimpleNamespace(
-        get_model=lambda: object(),
+    model_runner = SimpleNamespace()
+    worker = SimpleNamespace(
         model_runner=model_runner,
         use_v2_model_runner=True,
         scheduler_config=SimpleNamespace(max_num_batched_tokens=1),
         vllm_config=SimpleNamespace(
-            compilation_config=SimpleNamespace(cudagraph_capture_sizes=[]),
-            kernel_config=SimpleNamespace(
-                enable_cutedsl_warmup=False,
-                enable_flashinfer_autotune=False,
-            ),
             model_config=SimpleNamespace(),
+            compilation_config=SimpleNamespace(cudagraph_capture_sizes=[]),
         ),
+        get_model=Mock(),
     )
 
+    with pytest.raises(RuntimeError, match="stop after zeroer routing"):
+        kernel_warmup.kernel_warmup(worker)
 
-def test_kernel_warmup_invokes_private_kv_block_zeroer(monkeypatch):
-    _patch_common_warmups(monkeypatch)
-
-    zeroer = Mock()
-    model_runner = SimpleNamespace(
-        _kv_block_zeroer=zeroer,
-        is_pooling_model=True,
-        attn_groups=[],
-    )
-
-    kernel_warmup.kernel_warmup(_make_worker(model_runner))
-
-    zeroer.warmup.assert_called_once_with()
-
-
-def test_kernel_warmup_invokes_public_kv_block_zeroer(monkeypatch):
-    _patch_common_warmups(monkeypatch)
-
-    zeroer = Mock()
-    model_runner = SimpleNamespace(
-        kv_block_zeroer=zeroer,
-        is_pooling_model=True,
-        attn_groups=[],
-    )
-
-    kernel_warmup.kernel_warmup(_make_worker(model_runner))
-
-    zeroer.warmup.assert_called_once_with()
+    route_warmup.assert_called_once_with(model_runner)
