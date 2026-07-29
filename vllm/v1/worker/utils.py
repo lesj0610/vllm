@@ -83,7 +83,7 @@ def requires_persistent_attention_workspace_profiling(
     return found_required_builder
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["n_blocks"])
 def _zero_kv_blocks_kernel(
     seg_addrs_ptr,
     seg_page_sizes_ptr,
@@ -249,13 +249,10 @@ class KVBlockZeroer:
             BLOCK_SIZE=blk_size,
         )
 
-    def warmup(self) -> None:
-        """Compile the KV block zeroing kernel before the first request."""
-        self.zero_block_ids([0])
-        # Runtime allocation commonly zeros a non-singleton, non-divisible
-        # number of blocks; Triton specializes that separately from n_blocks=1.
-        self.zero_block_ids([0, 0])
-        torch.accelerator.synchronize()
+    def warmup(self, num_kv_blocks: int) -> None:
+        """JIT-compile the zeroing kernel before the first real request."""
+        if num_kv_blocks > 0:
+            self.zero_block_ids([0])
 
 
 @dataclass
