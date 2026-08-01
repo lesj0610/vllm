@@ -390,7 +390,8 @@ class TQFullAttentionSpec(FullAttentionSpec):
     tq_slot_size: int = 0
 
     def cache_dtype_for_shape(self, configured_cache_dtype: str) -> str:
-        # TQ uses a packed layout even though it does not use KVQuantMode.
+        # Preserve the packed layout for manually constructed TQ specs whose
+        # kv_quant_mode retains the default value.
         return configured_cache_dtype
 
     @property
