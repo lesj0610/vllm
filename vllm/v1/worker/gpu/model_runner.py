@@ -753,6 +753,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     def reset_encoder_cache(self) -> None:
         if self.encoder_cache is not None:
             self.encoder_cache.reset_encoder_cache()
+        if self.pooling_runner is not None:
+            self.pooling_runner.clear()
 
     def _init_minimal_kv_cache_for_profiling(self) -> None:
         from vllm.v1.core.kv_cache_utils import (
@@ -1267,6 +1269,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
     def finish_requests(self, scheduler_output: SchedulerOutput) -> None:
         finished_req_ids = scheduler_output.finished_req_ids
+        if self.pooling_runner is not None:
+            # Preempted docs keep their query-use reservation until rescheduled.
+            self.pooling_runner.on_requests_finished(finished_req_ids)
         preempted_req_ids = scheduler_output.preempted_req_ids
         if preempted_req_ids:
             finished_req_ids = finished_req_ids.union(preempted_req_ids)
@@ -1311,6 +1316,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if self.pooling_runner is not None:
                 assert new_req_data.pooling_params is not None
                 self.pooling_runner.add_request(
+                    req_id,
                     req_index,
                     new_req_data.pooling_params,
                     new_req_data.prompt_token_ids,
