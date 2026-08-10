@@ -623,7 +623,7 @@ _SPECULATIVE_DECODING_MODELS = {
     "DFlashDraftModel": ("qwen3_dflash", "DFlashQwen3ForCausalLM"),
     # Muse Glimmer's DFlash draft head. Same architecture and the same
     # safetensors as DFlashDraftModel — only the name in the checkpoint's
-    # config.json changed, with the Onyx -> Muse Glimmer rename.
+    # config.json differs.
     "MuseGlimmerAssistantModel": ("qwen3_dflash", "DFlashQwen3ForCausalLM"),
     "DSparkDraftModel": ("vllm.models.deepseek_v4", "DSparkDeepseekV4ForCausalLM"),
     "Qwen3DSparkModel": ("qwen3_dspark", "Qwen3DSparkForCausalLM"),

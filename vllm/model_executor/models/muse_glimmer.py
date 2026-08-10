@@ -2,9 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Inference-only MuseGlimmer multimodal model for vLLM.
 
-Native port of HuggingFace's MuseGlimmer text decoder (``MuseGlimmerForCausalLM``), ported
-from the ``huggingface/new-model-addition-onyx`` reference (``modular_muse_glimmer.py``
-/ ``modeling_muse_glimmer.py``). The text stack is a Gemma2 derivative with the
+Native port of the MuseGlimmer text decoder (``MuseGlimmerForCausalLM``). The text
+stack is a Gemma2 derivative with the
 following MuseGlimmer-specific deltas, each of which is handled explicitly here:
 
   * SiLU-gated MLP (``hidden_activation="silu"``), not Gemma's gelu-tanh.
@@ -1355,11 +1354,10 @@ class MuseGlimmerForCausalLM(
     #     named ``input_layernorm`` / ``post_attention_layernorm`` /
     #     ``pre_feedforward_layernorm`` / ``post_feedforward_layernorm``.
     #
-    #   * Legacy guac HF export (``GuacForCausalLM``, the checkpoints the
-    #     reference NLLs were computed on): uses ``model.`` and a different
-    #     sandwich-norm naming where ``post_attn_norm`` is the true
-    #     post-attention norm and ``post_attention_layernorm`` is actually the
-    #     pre-feedforward norm. We remap those to MuseGlimmer's names.
+    #   * Legacy HF export (an earlier checkpoint convention): uses ``model.``
+    #     and a different sandwich-norm naming where ``post_attn_norm`` is the
+    #     true post-attention norm and ``post_attention_layernorm`` is actually
+    #     the pre-feedforward norm. We remap those to MuseGlimmer's names.
     #
     # CONVENTION DISAMBIGUATION (critical): the two checkpoint families use
     # DIFFERENT sandwich-norm names, and they must not be conflated:
@@ -1370,8 +1368,8 @@ class MuseGlimmerForCausalLM(
     #     ``post_attention_layernorm`` / ``pre_feedforward_layernorm`` /
     #     ``post_feedforward_layernorm``. No norm rename needed — pass through.
     #
-    #   * Legacy guac HF export (the checkpoints the reference NLLs were
-    #     computed on): keys are ``model.layers.N.*`` and the sandwich norms are
+    #   * Legacy HF export (an earlier checkpoint convention): keys are
+    #     ``model.layers.N.*`` and the sandwich norms are
     #     named ``input_layernorm`` / ``post_attention_layernorm`` (this one is
     #     actually the PRE-feedforward norm) / ``post_attn_norm`` (the true
     #     post-attention norm) / ``post_ffn_norm``. These must be remapped.
