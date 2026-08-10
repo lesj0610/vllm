@@ -37,6 +37,14 @@ from vllm.v1.attention.backends.registry import AttentionBackendEnum, register_b
 from vllm.v1.attention.selector import _cached_get_attn_backend, get_attn_backend
 
 
+class _FakeModelArchConfig(list):
+    """Stand-in for ModelArchitectureConfig's per-layer indexing."""
+
+    @property
+    def total_num_hidden_layers(self) -> int:
+        return len(self)
+
+
 def _make_gemma4_vllm_config(
     *,
     backend: AttentionBackendEnum | None = None,
@@ -46,8 +54,13 @@ def _make_gemma4_vllm_config(
     return SimpleNamespace(
         model_config=SimpleNamespace(
             hf_text_config=SimpleNamespace(
-                head_dim=head_dim,
-                global_head_dim=global_head_dim,
+                layer_types=["sliding_attention", "full_attention"],
+            ),
+            model_arch_config=_FakeModelArchConfig(
+                [
+                    SimpleNamespace(head_size=head_dim),
+                    SimpleNamespace(head_size=global_head_dim),
+                ]
             ),
         ),
         attention_config=AttentionConfig(backend=backend),

@@ -203,51 +203,54 @@ class Gemma4Config(VerifyAndUpdateConfig):
     ) -> None:
         """Configure attention for heterogeneous head dimensions.
 
-        Gemma4 uses different head dimensions for sliding window
-        (head_dim) vs full attention (global_head_dim) layers. The
-        default FA3 on Hopper cannot handle head_dim > 256, which
-        causes mixed backend selection and numerical divergence.
+        Gemma4 uses different head dimensions for sliding window vs full attention
+        layers. The default FA3 on Hopper cannot handle head_dim > 256, which causes
+        mixed backend selection and numerical divergence.
 
-        When FA4 is available we force it for ALL layers, giving a
-        uniform kernel path and avoiding the mixed FA3+FA4 penalty.
-        Otherwise, leave backend selection to the standard attention
-        selector unless fallback_to_triton is set.
+        When FA4 is available we force it for ALL layers, giving a uniform kernel path
+        and avoiding the mixed FA3+FA4 penalty. Otherwise, leave backend selection to
+        the standard attention selector unless fallback_to_triton is set.
         """
-        hf_text_config = vllm_config.model_config.hf_text_config
-        head_dim = getattr(hf_text_config, "head_dim", None)
-        global_head_dim = getattr(hf_text_config, "global_head_dim", None)
+        model_config = vllm_config.model_config
+        arch_config = model_config.model_arch_config
+        layer_types = getattr(model_config.hf_text_config, "layer_types", None) or []
+        head_dims = {
+            layer_types[i]: arch_config[i].head_size
+            for i in range(min(arch_config.total_num_hidden_layers, len(layer_types)))
+        }
 
-        if head_dim is None or global_head_dim is None or head_dim == global_head_dim:
+        if len(set(head_dims.values())) <= 1:
             return
 
         from vllm.v1.attention.backends.fa_utils import is_fa_version_supported
         from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
-        max_head_dim = max(head_dim, global_head_dim)
+        max_head_dim = max(head_dims.values())
+
+        fa4_supports_dims = is_fa_version_supported(4) and max_head_dim <= 512
 
         if (
-            is_fa_version_supported(4)
-            and max_head_dim <= 512
+            fa4_supports_dims
             and vllm_config.attention_config.flash_attn_version is None
             and vllm_config.attention_config.backend
             in (None, AttentionBackendEnum.FLASH_ATTN)
         ):
             vllm_config.attention_config.flash_attn_version = 4
             logger.info(
-                "Gemma4 model has heterogeneous head dimensions "
-                "(head_dim=%d, global_head_dim=%d). Using FA4 for "
+                "Gemma4 model has heterogeneous head dimensions %s. Using FA4 for "
                 "all layers to avoid mixed FA3/FA4 penalty.",
-                head_dim,
-                global_head_dim,
+                head_dims,
             )
-        elif fallback_to_triton and vllm_config.attention_config.backend is None:
+        elif (
+            fallback_to_triton
+            and not fa4_supports_dims
+            and vllm_config.attention_config.backend is None
+        ):
             vllm_config.attention_config.backend = AttentionBackendEnum.TRITON_ATTN
             logger.info(
                 "Gemma4 model has heterogeneous head dimensions "
-                "(head_dim=%d, global_head_dim=%d). FA4 not available, "
-                "forcing TRITON_ATTN backend.",
-                head_dim,
-                global_head_dim,
+                "%s. FA4 not available, forcing TRITON_ATTN backend.",
+                head_dims,
             )
 
 
