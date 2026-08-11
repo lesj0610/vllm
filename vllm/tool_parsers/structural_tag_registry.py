@@ -70,7 +70,7 @@ XGRAMMAR_BUILTIN_STRUCTURAL_TAG_MODELS = frozenset(
         "deepseek_v4",
     }
 )
-VLLM_BUILTIN_STRUCTURAL_TAG_MODELS = frozenset({"hermes", "kimi_k3"})
+VLLM_BUILTIN_STRUCTURAL_TAG_MODELS = frozenset({"hermes", "kimi_k3", "muse_glimmer"})
 SUPPORTED_STRUCTURAL_TAG_MODELS = (
     XGRAMMAR_BUILTIN_STRUCTURAL_TAG_MODELS | VLLM_BUILTIN_STRUCTURAL_TAG_MODELS
 )
@@ -604,4 +604,267 @@ def get_kimi_k3_structural_tag(
 
     return StructuralTag(
         format=SequenceFormat(elements=[*_k3_response_prefix(), tools_part, trailer])
+    )
+
+
+# --- MuseGlimmer ATEM ------------------------------------------------------
+# MuseGlimmer wraps tool calls in ATEM markup inside a channel-scoped message:
+#
+#     <|start|>assistant to=self<|message|>...reasoning...<|eom|>
+#     <|start|>assistant to=get_weather<|message|><atem:function_calls>
+#     <atem:invoke name="get_weather">
+#     <atem:parameter name="city">Busan</atem:parameter>
+#     </atem:invoke>
+#     </atem:function_calls><|eom|>
+#
+# Parameter values are NOT JSON-quoted: the chat template writes strings raw and
+# only serialises objects/arrays with ``tojson``, mirrored by the parser's
+# ``_decode_value`` (json.loads with a raw-string fallback). So string-typed
+# properties get a raw text channel, everything else an embedded JSON schema --
+# the same split ``kimi_k3`` makes for XTML.
+_ATEM_CALLS_OPEN = "<atem:function_calls>"
+_ATEM_CALLS_CLOSE = "</atem:function_calls>"
+_ATEM_INVOKE_CLOSE = "</atem:invoke>"
+_ATEM_PARAM_CLOSE = "</atem:parameter>"
+_MUSE_MESSAGE = "<|message|>"
+_MUSE_EOM = "<|eom|>"
+_MUSE_START_ASSISTANT = "<|start|>assistant"
+
+
+def _muse_ws() -> RegexFormat:
+    """Structural whitespace. The template emits newlines between ATEM nodes;
+    accept any amount so a differently spaced but valid call is not rejected."""
+    return RegexFormat(pattern=r"[ \t\r\n]*")
+
+
+def _muse_any_text(excludes: list[str]) -> Any:
+    """``AnyTextFormat`` with a single-exclude fallback.
+
+    Older xgrammar builds accept only one exclude string. Collapsing to the
+    common ``"<"`` prefix stays correct -- it is stricter, and no ATEM value
+    legitimately contains a raw ``<``.
+    """
+    try:
+        return AnyTextFormat(excludes=excludes)
+    except (TypeError, ValueError):
+        return AnyTextFormat(excludes=["<"])
+
+
+def _muse_recipient_alternatives(name: str) -> list[str]:
+    """Recipient / invoke-name spellings that the parser accepts for ``name``.
+
+    The shipped chat template renders the valid recipient of a BARE tool as
+    ``"<name>.*"``, so the model routinely emits the doubled ``name.name`` form,
+    which ``MuseGlimmerToolParser._normalize_name`` collapses. Both spellings
+    must be in the grammar or a valid generation gets rejected.
+    """
+    if "." in name:
+        return [name]
+    return [name, f"{name}.{name}"]
+
+
+def _muse_parameter_tag(
+    key: str,
+    schema: dict[str, Any],
+    root_defs: dict[str, Any] | None = None,
+) -> TagFormat:
+    """One ``<atem:parameter name="key">value</atem:parameter>`` node."""
+    prop = schema if isinstance(schema, dict) else {}
+    json_type = prop.get("type")
+    begin = f'<atem:parameter name="{key}">'
+
+    if json_type == "string":
+        enum_values = prop.get("enum")
+        if enum_values is None and isinstance(prop.get("const"), str):
+            enum_values = [prop["const"]]
+        if (
+            isinstance(enum_values, list)
+            and enum_values
+            and len(enum_values) <= 256
+            and all(isinstance(v, str) for v in enum_values)
+            and not any("<" in v for v in enum_values)
+        ):
+            branches = [ConstStringFormat(value=v) for v in enum_values]
+            content: Any = (
+                branches[0] if len(branches) == 1 else OrFormat(elements=branches)
+            )
+        else:
+            content = _muse_any_text([_ATEM_PARAM_CLOSE])
+    elif isinstance(json_type, str):
+        embedded = prop
+        if root_defs:
+            embedded = dict(prop)
+            for defs_key, defs_value in root_defs.items():
+                embedded.setdefault(defs_key, defs_value)
+        content = JSONSchemaFormat(json_schema=embedded)
+    else:
+        # Union / missing type: constrain the key, keep the value permissive.
+        content = _muse_any_text([_ATEM_PARAM_CLOSE])
+
+    return TagFormat(begin=begin, content=content, end=_ATEM_PARAM_CLOSE)
+
+
+def _muse_permissive_parameter_tag() -> TagFormat:
+    """A key-agnostic parameter node, for tools with no declared properties."""
+    return TagFormat(
+        begin='<atem:parameter name="',
+        content=SequenceFormat(
+            elements=[
+                RegexFormat(pattern=r'[^"<]+">'),
+                _muse_any_text([_ATEM_PARAM_CLOSE]),
+            ]
+        ),
+        end=_ATEM_PARAM_CLOSE,
+    )
+
+
+def _muse_parameters_block(parameters: dict[str, Any] | bool) -> Any:
+    """Parameter nodes for a tool's schema, order-agnostic and non-unique.
+
+    Requires at least one node when the schema declares required properties,
+    matching the ``kimi_k3`` treatment: enforcing *which* required keys appear
+    is not expressible here without fixing their order, and over-rejecting a
+    valid call is worse than under-constraining one.
+    """
+    if not isinstance(parameters, dict):
+        return StarFormat(
+            content=SequenceFormat(
+                elements=[_muse_permissive_parameter_tag(), _muse_ws()]
+            )
+        )
+    props = parameters.get("properties")
+    if not isinstance(props, dict) or not props:
+        return StarFormat(
+            content=SequenceFormat(
+                elements=[_muse_permissive_parameter_tag(), _muse_ws()]
+            )
+        )
+    root_defs = {
+        defs_key: parameters[defs_key]
+        for defs_key in ("$defs", "definitions")
+        if isinstance(parameters.get(defs_key), dict)
+    }
+    tags = [_muse_parameter_tag(key, prop, root_defs) for key, prop in props.items()]
+    inner: Any = tags[0] if len(tags) == 1 else OrFormat(elements=list(tags))
+    node = SequenceFormat(elements=[inner, _muse_ws()])
+    required = parameters.get("required")
+    if isinstance(required, list) and required:
+        return PlusFormat(content=node)
+    return StarFormat(content=node)
+
+
+def _muse_invoke_tags(tools: list[FunctionToolParam]) -> list[TagFormat]:
+    """One ``<atem:invoke>`` node per (tool, accepted name spelling)."""
+    tags: list[TagFormat] = []
+    for tool in tools:
+        function = tool.function
+        parameters = get_function_parameters(function)
+        for spelling in _muse_recipient_alternatives(function.name):
+            tags.append(
+                TagFormat(
+                    begin=f'<atem:invoke name="{spelling}">',
+                    content=SequenceFormat(
+                        elements=[_muse_ws(), _muse_parameters_block(parameters)]
+                    ),
+                    end=_ATEM_INVOKE_CLOSE,
+                )
+            )
+    return tags
+
+
+def _muse_tool_message(tools: list[FunctionToolParam]) -> Any:
+    """The tool-channel message: header, then one ATEM ``function_calls`` block.
+
+    The header's ``<|start|>assistant`` is optional because the generation prompt
+    already ends with it -- the first message of a turn starts at ``to=``. The
+    recipient is NOT optional: an ``<atem:invoke>`` in a bare ``<|message|>``
+    channel is deliberately ignored by the parser, so allowing it here would
+    satisfy the grammar while still producing zero tool calls.
+    """
+    recipients = [
+        spelling
+        for tool in tools
+        for spelling in _muse_recipient_alternatives(tool.function.name)
+    ]
+    invoke_tags = _muse_invoke_tags(tools)
+    calls_block = TagFormat(
+        begin=_ATEM_CALLS_OPEN,
+        content=SequenceFormat(
+            elements=[
+                _muse_ws(),
+                PlusFormat(
+                    content=SequenceFormat(
+                        elements=[
+                            invoke_tags[0]
+                            if len(invoke_tags) == 1
+                            else OrFormat(elements=list(invoke_tags)),
+                            _muse_ws(),
+                        ]
+                    )
+                ),
+            ]
+        ),
+        end=_ATEM_CALLS_CLOSE,
+    )
+    return SequenceFormat(
+        elements=[
+            OptionalFormat(content=ConstStringFormat(value=_MUSE_START_ASSISTANT)),
+            RegexFormat(pattern=r"[ \t]*"),
+            ConstStringFormat(value="to="),
+            OrFormat(elements=[ConstStringFormat(value=r) for r in recipients])
+            if len(recipients) > 1
+            else ConstStringFormat(value=recipients[0]),
+            ConstStringFormat(value=_MUSE_MESSAGE),
+            _muse_ws(),
+            calls_block,
+        ]
+    )
+
+
+def _muse_reasoning_prefix() -> Any:
+    """The optional ``to=self`` reasoning message that precedes the tool call."""
+    return OptionalFormat(
+        content=SequenceFormat(
+            elements=[
+                RegexFormat(pattern=r"[ \t]*"),
+                ConstStringFormat(value="to=self" + _MUSE_MESSAGE),
+                _muse_any_text([_MUSE_EOM, "<|eot|>", "<|start|>"]),
+                ConstStringFormat(value=_MUSE_EOM),
+            ]
+        )
+    )
+
+
+@register_vllm_structural_tag("muse_glimmer")
+def get_muse_glimmer_structural_tag(
+    tools: list[FunctionToolParam],
+    builtin_tools: list[BuiltinToolParam],
+    tool_choice: SimplifiedToolChoice,
+    reasoning: bool,
+) -> StructuralTag | None:
+    del builtin_tools, reasoning
+
+    if not tools:
+        return None
+
+    # For "forced", normalize_tool_choice has already narrowed ``tools`` to the
+    # named one; the slice is belt-and-braces against a longer list.
+    selected = tools[:1] if tool_choice == "forced" else tools
+
+    tool_part: Any = _muse_tool_message(selected)
+    if tool_choice == "auto":
+        # "auto" only reaches here when a tool opted into strict mode; the model
+        # must still be free to answer without calling anything.
+        tool_part = OptionalFormat(content=tool_part)
+
+    return StructuralTag(
+        format=SequenceFormat(
+            elements=[
+                _muse_reasoning_prefix(),
+                tool_part,
+                # Whatever closes the turn, plus any following user-channel
+                # message, is unconstrained: the call has already been made.
+                OptionalFormat(content=AnyTextFormat()),
+            ]
+        )
     )
