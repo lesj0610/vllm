@@ -15,10 +15,7 @@ import os
 
 import pytest
 
-CKPT = os.environ.get(
-    "MUSE_GLIMMER_CKPT",
-    "/home/betodepaola/projects/onyx-final-nvidia-repro/ckpt/onyx_final_hf",
-)
+CKPT = os.environ.get("MUSE_GLIMMER_CKPT", "")
 
 pytestmark = pytest.mark.skipif(
     not os.path.isdir(CKPT), reason=f"MuseGlimmer checkpoint not found at {CKPT}"

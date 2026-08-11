@@ -2,8 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """MuseGlimmer model configuration for vLLM.
 
-Native vLLM copy of the HuggingFace MuseGlimmer configs
-(``huggingface/new-model-addition-onyx``: ``configuration_muse_glimmer.py``). MuseGlimmer's
+Native vLLM copy of the MuseGlimmer HuggingFace configs
+(``configuration_muse_glimmer.py``). MuseGlimmer's
 ``model_type`` is not yet registered in released transformers, so vLLM ships
 this config so partners can serve MuseGlimmer checkpoints *without* trust_remote_code.
 
