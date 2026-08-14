@@ -14,6 +14,7 @@ import flashinfer
 import numpy as np
 import torch
 from flashinfer import (
+    BatchAttentionWithAttentionSinkWrapper,
     BatchDecodeWithPagedKVCacheWrapper,
     BatchPrefillWithPagedKVCacheWrapper,
     BatchPrefillWithRaggedKVCacheWrapper,
@@ -689,6 +690,12 @@ class FlashInferBackend(AttentionBackend):
     @classmethod
     def supports_mm_prefix(cls) -> bool:
         return True
+
+    @classmethod
+    def supports_device_cpu_query_lens_mismatch(cls) -> bool:
+        # The wrappers are planned from qo_indptr_cpu, so the CPU query offsets
+        # have to be the ones the kernel runs on.
+        return False
 
     @classmethod
     def supports_combination(
@@ -1812,13 +1819,31 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     "NVFP4 KV cache."
                 )
             if self._noncausal_prefill_wrapper is None:
-                self._noncausal_prefill_wrapper = BatchPrefillWithPagedKVCacheWrapper(
-                    self._get_workspace_buffer(
-                        self._native_initial_workspace_buffer_size()
-                    ),
-                    get_kv_cache_layout(),
-                    backend="auto",
-                )
+                if self.has_sinks and current_platform.is_device_capability_family(120):
+                    self._noncausal_prefill_wrapper = (
+                        BatchAttentionWithAttentionSinkWrapper(
+                            self._get_workspace_buffer(
+                                self._native_initial_workspace_buffer_size()
+                            ),
+                            get_kv_cache_layout(),
+                            backend="auto",
+                            q_data_type=self.q_data_type_prefill,
+                            kv_data_type=self.kv_cache_dtype,
+                            head_dim_qk=self.head_dim,
+                            head_dim_vo=self.head_dim,
+                            window_left=self.window_left,
+                        )
+                    )
+                else:
+                    self._noncausal_prefill_wrapper = (
+                        BatchPrefillWithPagedKVCacheWrapper(
+                            self._get_workspace_buffer(
+                                self._native_initial_workspace_buffer_size()
+                            ),
+                            get_kv_cache_layout(),
+                            backend="auto",
+                        )
+                    )
                 self._register_workspace_wrapper(self._noncausal_prefill_wrapper)
             return self._noncausal_prefill_wrapper
 
@@ -1834,13 +1859,31 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     dcp_a2a=self.dcp_a2a,
                 )
             else:
-                self._prefill_wrapper = BatchPrefillWithPagedKVCacheWrapper(
-                    self._get_workspace_buffer(
-                        self._native_initial_workspace_buffer_size()
-                    ),
-                    get_kv_cache_layout(),
-                    backend="auto",
-                )
+                if self.has_sinks and current_platform.is_device_capability_family(120):
+                    assert not self.is_kvcache_nvfp4
+                    self._prefill_wrapper = BatchAttentionWithAttentionSinkWrapper(
+                        self._get_workspace_buffer(
+                            self._native_initial_workspace_buffer_size()
+                        ),
+                        get_kv_cache_layout(),
+                        backend="auto",
+                        q_data_type=self.q_data_type_prefill,
+                        kv_data_type=self.kv_cache_dtype,
+                        head_dim_qk=self.head_dim,
+                        head_dim_vo=self.head_dim,
+                        window_left=self.window_left,
+                    )
+                else:
+                    # NVFP4 KV planning goes through the native FlashInfer
+                    # wrapper; the backend is resolved per shape rather than
+                    # pinned to trtllm-gen, which is unavailable pre-SM100.
+                    self._prefill_wrapper = BatchPrefillWithPagedKVCacheWrapper(
+                        self._get_workspace_buffer(
+                            self._native_initial_workspace_buffer_size()
+                        ),
+                        get_kv_cache_layout(),
+                        backend="auto",
+                    )
                 self._register_workspace_wrapper(self._prefill_wrapper)
         assert self._prefill_wrapper is not None
         return self._prefill_wrapper
@@ -3810,6 +3853,21 @@ class FlashInferImpl(AttentionImpl):
                                 out_prefill,
                                 nvfp4_kv_data,
                                 nvfp4_kv_block_scales,
+                            )
+                        elif isinstance(
+                            prefill_wrapper, BatchAttentionWithAttentionSinkWrapper
+                        ):
+                            assert self.sinks is not None
+                            assert kv_cache_tuple is not None
+                            prefill_wrapper.run(
+                                prefill_query,
+                                kv_cache_tuple,
+                                self.sinks,
+                                self.scale
+                                * layer._q_scale_float
+                                * layer._k_scale_float,
+                                v_scale=layer._v_scale_float,
+                                out=out_prefill,
                             )
                         else:
                             assert kv_cache_tuple is not None
