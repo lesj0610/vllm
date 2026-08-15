@@ -108,7 +108,8 @@ logger = init_logger(__name__)
 
 def _text_config(config):
     """MuseGlimmer checkpoints may nest the text config under ``text_config``
-    (multimodal ``MuseGlimmerConfig``) or expose it directly (``MuseGlimmerTextConfig``)."""
+    (multimodal ``MuseGlimmerConfig``) or expose it directly
+    (``MuseGlimmerTextConfig``)."""
     return getattr(config, "text_config", config)
 
 
@@ -258,7 +259,20 @@ class MuseGlimmerDummyInputsBuilder(BaseDummyInputsBuilder[MuseGlimmerProcessing
         }
 
 
-class MuseGlimmerMultiModalProcessor(BaseMultiModalProcessor[MuseGlimmerProcessingInfo]):
+class MuseGlimmerMultiModalProcessor(
+    BaseMultiModalProcessor[MuseGlimmerProcessingInfo]
+):
+    def _apply_hf_processor_text_only(
+        self,
+        prompt_text: str,
+        tokenization_kwargs: Mapping[str, object],
+    ) -> list[int]:
+        tokenizer = self.info.get_tokenizer()
+        return tokenizer.encode(
+            prompt_text,
+            **{"add_special_tokens": False, **tokenization_kwargs},
+        )
+
     def _call_hf_processor(
         self,
         prompt: str,
@@ -298,7 +312,9 @@ class MuseGlimmerMultiModalProcessor(BaseMultiModalProcessor[MuseGlimmerProcessi
             if isinstance(pixels, torch.Tensor):
                 pixels = [pixels] if pixels.ndim == 3 else list(pixels)
             if len(pixels) != 1:
-                raise ValueError("MuseGlimmer HF processor must return one tensor per image")
+                raise ValueError(
+                    "MuseGlimmer HF processor must return one tensor per image"
+                )
             image_pixels.append(pixels[0])
             image_sizes.append(block_ids.count(config.image_token_id))
             image_prompt_blocks.append(block_ids)
@@ -407,7 +423,9 @@ class MuseGlimmerMultiModalProcessor(BaseMultiModalProcessor[MuseGlimmerProcessi
             pixel_values = out_item["video_pixel_values"].data
             num_groups = len(pixel_values)
             if num_groups == 0:
-                raise ValueError("MuseGlimmer video must contain at least one frame group")
+                raise ValueError(
+                    "MuseGlimmer video must contain at least one frame group"
+                )
 
             num_tokens = int(out_item["video_feature_sizes"].data)
             tokens_per_group, remainder = divmod(num_tokens, num_groups)
@@ -702,7 +720,9 @@ class MuseGlimmerVisionEncoder(nn.Module):
         self.head_dim = hidden_size // config.num_attention_heads
         self.layer_types = list(config.layer_types)
         if len(self.layer_types) != config.num_hidden_layers:
-            raise ValueError("MuseGlimmer vision layer_types must match num_hidden_layers")
+            raise ValueError(
+                "MuseGlimmer vision layer_types must match num_hidden_layers"
+            )
         if self.head_dim % 4:
             raise ValueError("MuseGlimmer vision head dimension must be divisible by 4")
 
@@ -951,11 +971,14 @@ class MuseGlimmerVisionEncoder(nn.Module):
             if pixels.ndim == 3:
                 pixels = pixels.unsqueeze(0)
             if pixels.ndim != 4 or pixels.shape[0] != 1:
-                raise ValueError("Each MuseGlimmer vision input must have shape [C, H, W]")
+                raise ValueError(
+                    "Each MuseGlimmer vision input must have shape [C, H, W]"
+                )
             spatial_stride = self.patch_size * self.merge_kernel_size
             if pixels.shape[-2] % spatial_stride or pixels.shape[-1] % spatial_stride:
                 raise ValueError(
-                    "MuseGlimmer vision input dimensions must divide the merged patch stride"
+                    "MuseGlimmer vision input dimensions must divide the "
+                    "merged patch stride"
                 )
             grid_height = pixels.shape[-2] // self.patch_size
             grid_width = pixels.shape[-1] // self.patch_size
@@ -1068,7 +1091,8 @@ class MuseGlimmerMLP(nn.Module):
         )
         if hidden_activation != "silu":
             raise ValueError(
-                f"MuseGlimmer uses `silu` as the hidden activation; got `{hidden_activation}`."
+                f"MuseGlimmer uses `silu` as the hidden activation; "
+                f"got `{hidden_activation}`."
             )
         self.act_fn = SiluAndMul()
 
@@ -1348,8 +1372,8 @@ class MuseGlimmerForCausalLM(
 ):
     # Weight-name normalization. Two checkpoint conventions are supported:
     #
-    #   * HF MuseGlimmer export (``convert_muse_glimmer_weights_to_hf.py``): the multimodal
-    #     ``MuseGlimmerConfig`` prefixes the language model with
+    #   * HF MuseGlimmer export (``convert_muse_glimmer_weights_to_hf.py``): the
+    #     multimodal ``MuseGlimmerConfig`` prefixes the language model with
     #     ``model.language_model.``; the per-layer sandwich norms are already
     #     named ``input_layernorm`` / ``post_attention_layernorm`` /
     #     ``pre_feedforward_layernorm`` / ``post_feedforward_layernorm``.
@@ -1362,8 +1386,9 @@ class MuseGlimmerForCausalLM(
     # CONVENTION DISAMBIGUATION (critical): the two checkpoint families use
     # DIFFERENT sandwich-norm names, and they must not be conflated:
     #
-    #   * Canonical MuseGlimmer export (current ``convert_muse_glimmer_weights_to_hf.py`` —
-    #     what partners ship): keys are ``model.language_model.layers.N.*`` and
+    #   * Canonical MuseGlimmer export (current
+    #     ``convert_muse_glimmer_weights_to_hf.py`` — what partners ship):
+    #     keys are ``model.language_model.layers.N.*`` and
     #     the norms are ALREADY named ``input_layernorm`` /
     #     ``post_attention_layernorm`` / ``pre_feedforward_layernorm`` /
     #     ``post_feedforward_layernorm``. No norm rename needed — pass through.
@@ -1505,8 +1530,8 @@ class MuseGlimmerForCausalLM(
             return None
         if pixel_values is None or feature_sizes is None:
             raise ValueError(
-                "MuseGlimmer image_pixel_values and image_feature_sizes must be provided "
-                "together"
+                "MuseGlimmer image_pixel_values and image_feature_sizes "
+                "must be provided together"
             )
         if not isinstance(feature_sizes, torch.Tensor):
             raise ValueError("MuseGlimmer image_feature_sizes must be a tensor")
@@ -1528,8 +1553,8 @@ class MuseGlimmerForCausalLM(
             return None
         if pixel_values is None or feature_sizes is None:
             raise ValueError(
-                "MuseGlimmer video_pixel_values and video_feature_sizes must be provided "
-                "together"
+                "MuseGlimmer video_pixel_values and video_feature_sizes "
+                "must be provided together"
             )
         if not isinstance(feature_sizes, torch.Tensor):
             raise ValueError("MuseGlimmer video_feature_sizes must be a tensor")

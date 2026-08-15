@@ -12,16 +12,18 @@ to be single vocab tokens across every checkpoint's tokenizer, this parser works
 on the decoded text with regexes rather than the single start/end-token base class.
 Usage: ``--reasoning-parser muse_glimmer``
 """
+
 from __future__ import annotations
+
 from collections.abc import Iterable, Sequence
+
 import regex as re
+
 from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
 from vllm.entrypoints.openai.engine.protocol import DeltaMessage
 from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
-from vllm.reasoning.abs_reasoning_parsers import (
-    ReasoningParser,
-    ReasoningParserManager,
-)
+from vllm.reasoning.abs_reasoning_parsers import ReasoningParser
+
 _EOM = "<|eom|>"
 _EOT = "<|eot|>"
 _FUNCTION_CALLS_OPEN = "<atem:function_calls>"
@@ -71,6 +73,8 @@ _HOLDBACK_MARKERS = (_EOM, _EOT, "<|start|>", "<|message|>")
 # " to=", " to=skill"). Without this the recipient name leaks into reasoning and
 # then has to be un-emitted once ``<|message|>`` arrives.
 _OPEN_TAIL_HEADER_RE = re.compile(r"[\s](?:t|to|to=[^\s<]*)$")
+
+
 def _current_assistant_turn(text: str) -> str:
     """Return only the text generated in the current assistant turn.
     ``is_reasoning_end`` is evaluated on the PROMPT token-ids at stream start,
@@ -81,6 +85,8 @@ def _current_assistant_turn(text: str) -> str:
     """
     idx = text.rfind(_ASSISTANT_TURN_OPEN)
     return text[idx + len(_ASSISTANT_TURN_OPEN) :] if idx != -1 else text
+
+
 def _trim_open_body(body: str) -> str:
     """Hold back any tail of a still-growing body that could still be framing.
     Iterated to a fixpoint because the two cases compose: `" to=skill<"` needs
@@ -103,7 +109,8 @@ def _trim_open_body(body: str) -> str:
         if trimmed == body:
             return body
         body = trimmed
-@ReasoningParserManager.register_module("muse_glimmer")
+
+
 class MuseGlimmerReasoningParser(ReasoningParser):
     def __init__(self, tokenizer, *args, **kwargs) -> None:
         super().__init__(tokenizer, *args, **kwargs)
@@ -114,9 +121,10 @@ class MuseGlimmerReasoningParser(ReasoningParser):
         self._emitted_reasoning: str = ""
         self._emitted_content: str = ""
         self._tool_handoff_done: bool = False
+
     def adjust_request(
-        self, request: "ChatCompletionRequest | ResponsesRequest"
-    ) -> "ChatCompletionRequest | ResponsesRequest":
+        self, request: ChatCompletionRequest | ResponsesRequest
+    ) -> ChatCompletionRequest | ResponsesRequest:
         """Preserve MuseGlimmer's ATEM framing tokens in the decoded output.
         vLLM's serving default is ``skip_special_tokens=True``, which strips
         ``<|start|>`` / ``<|message|>`` / ``<|eom|>`` / ``<|eot|>`` before the
@@ -126,6 +134,7 @@ class MuseGlimmerReasoningParser(ReasoningParser):
         """
         request.skip_special_tokens = False
         return request
+
     def is_reasoning_end(self, input_ids: Sequence[int]) -> bool:
         """Whether the model has left reasoning and opened a TOOL channel.
         A ``to=user`` answer is NOT a reason to leave the reasoning phase -- this
@@ -141,20 +150,24 @@ class MuseGlimmerReasoningParser(ReasoningParser):
             return False
         remainder = self._tool_channel_remainder(text)
         return _FUNCTION_CALLS_OPEN in remainder or "<atem:invoke" in remainder
+
     def is_reasoning_end_streaming(
         self, input_ids: Sequence[int], delta_ids: Iterable[int]
     ) -> bool:
         return self.is_reasoning_end(list(input_ids))
+
     def extract_content_ids(self, input_ids: list[int]) -> list[int]:
         # Content-id slicing is unreliable for multi-token markers; the serving
         # path uses extract_reasoning() for the final split.
         return []
+
     @classmethod
     def _scoped_turn(cls, text: str) -> str:
         """Current assistant turn with reasoning spans removed."""
         scoped = _current_assistant_turn(text)
         scoped = _STRIP_REASONING_RE.sub("", scoped)
         return _STRIP_OPEN_REASONING_RE.sub("", scoped)
+
     @classmethod
     def _tool_channel_remainder(cls, text: str) -> str:
         """Text from the first tool-channel header onward, framing INCLUDED.
@@ -170,6 +183,7 @@ class MuseGlimmerReasoningParser(ReasoningParser):
             if match.group("recipient") not in ("self", "user"):
                 return scoped[match.start() :]
         return ""
+
     @staticmethod
     def _classify_bodies(text: str) -> tuple[str, str]:
         """Split ``text`` into (reasoning_body, content_body), channel-aware.
@@ -199,19 +213,23 @@ class MuseGlimmerReasoningParser(ReasoningParser):
                 body = _trim_open_body(body)
             if recipient == "self":
                 reasoning_parts.append(body)
-            elif recipient == "user":
+            elif (
                 # Never surface tool XML echoed into a user channel.
-                if _FUNCTION_CALLS_OPEN not in body and "<atem:invoke" not in body:
-                    content_parts.append(body)
+                recipient == "user"
+                and _FUNCTION_CALLS_OPEN not in body
+                and "<atem:invoke" not in body
+            ):
+                content_parts.append(body)
             if terminators and body_end in (eom, eot):
                 pos = body_end + len(_EOM if body_end == eom else _EOT)
             else:
                 pos = body_end
         return "".join(reasoning_parts), "".join(content_parts)
+
     def get_streaming_fallback_content(
         self,
         previous_text: str,
-        request: "ChatCompletionRequest | ResponsesRequest",
+        request: ChatCompletionRequest | ResponsesRequest,
     ) -> str | None:
         """Promote un-surfaced content when the stream ends mid-reasoning.
         ``DelegatingParser.finalize_generation`` calls this when
@@ -221,10 +239,11 @@ class MuseGlimmerReasoningParser(ReasoningParser):
         _, content_body = self._classify_bodies(previous_text)
         remainder = content_body[len(self._emitted_content) :]
         return remainder or None
+
     def extract_reasoning(
         self,
         model_output: str,
-        request: "ChatCompletionRequest | ResponsesRequest",
+        request: ChatCompletionRequest | ResponsesRequest,
     ) -> tuple[str | None, str | None]:
         collapsed = _COLLAPSE_RE.sub("\n", model_output)
         matches = _REASONING_RE.findall(collapsed)
@@ -254,6 +273,7 @@ class MuseGlimmerReasoningParser(ReasoningParser):
             content = model_output or None
             reasoning = None
         return reasoning, content
+
     def extract_reasoning_streaming(
         self,
         previous_text: str,
@@ -270,15 +290,15 @@ class MuseGlimmerReasoningParser(ReasoningParser):
         """
         curr_reason, curr_content = self._classify_bodies(current_text)
         reasoning_delta = ""
-        if curr_reason.startswith(self._emitted_reasoning) and len(
-            curr_reason
-        ) > len(self._emitted_reasoning):
+        if curr_reason.startswith(self._emitted_reasoning) and len(curr_reason) > len(
+            self._emitted_reasoning
+        ):
             reasoning_delta = curr_reason[len(self._emitted_reasoning) :]
             self._emitted_reasoning = curr_reason
         content_delta = ""
-        if curr_content.startswith(self._emitted_content) and len(
-            curr_content
-        ) > len(self._emitted_content):
+        if curr_content.startswith(self._emitted_content) and len(curr_content) > len(
+            self._emitted_content
+        ):
             content_delta = curr_content[len(self._emitted_content) :]
             self._emitted_content = curr_content
         # Hand the tool channel to the tool parser exactly once, starting at its

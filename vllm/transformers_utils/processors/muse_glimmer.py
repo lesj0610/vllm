@@ -16,8 +16,10 @@ HF way, so you can do:
 
 It reproduces the exact token layout the model expects:
 
-  image -> <|image_start|> + <|patch|> * N        + <|image_end|>
-  video -> <|vid_start|> ( "Time: X.Xs" + <|video|> * P [+ <|vid_frame_separator|>] )* + <|vid_end|>
+  image -> <|image_start|> + <|patch|> * N + <|image_end|>
+  video -> <|vid_start|>
+           ( "Time: X.Xs" + <|video|> * P [+ <|vid_frame_separator|>] )*
+           + <|vid_end|>
 
 where N = floor(H/(patch*ds)) * floor(W/(patch*ds)) (<= 4096) for images and
 P = the same grid count per temporal frame-group (<= 144) for video, with the
@@ -72,7 +74,9 @@ MUSE_GLIMMER_MM_CHAT_TEMPLATE = (
     # the caller supplied none. Full-transcript rendering
     # (add_generation_prompt=False) is left unchanged.
     "{%- set ns = namespace(has_system=false) -%}"
-    "{%- for m in messages -%}{%- if m['role'] == 'system' -%}{%- set ns.has_system = true -%}{%- endif -%}{%- endfor -%}"
+    "{%- for m in messages -%}"
+    "{%- if m['role'] == 'system' -%}{%- set ns.has_system = true -%}{%- endif -%}"
+    "{%- endfor -%}"
     "{%- if add_generation_prompt and not ns.has_system -%}"
     "{{- '<|start|>system<|message|>You are a helpful assistant.<|eot|>' -}}"
     "{%- endif -%}"
@@ -93,12 +97,16 @@ MUSE_GLIMMER_MM_CHAT_TEMPLATE = (
     # Tool content is emitted as-is (string body or interleaved image/text parts).
     # Any <tool_output ...> wrapper is baked into the SFT data content; the
     # tokenizer does not add it, so the template must not either.
-    "{{- '<|start|>tool ' + name + '<|message|>' -}}{{- render_parts(message['content']) -}}"
+    "{{- '<|start|>tool ' + name + '<|message|>' -}}"
+    "{{- render_parts(message['content']) -}}"
     "{{- '<|eot|>' -}}"
     "{%- else -%}"
     "{%- set header = role -%}"
-    "{%- if message.get('name') -%}{%- set header = role + ' ' + message['name'] -%}{%- endif -%}"
-    "{{- '<|start|>' + header + '<|message|>' -}}{{- render_parts(message['content']) -}}"
+    "{%- if message.get('name') -%}"
+    "{%- set header = role + ' ' + message['name'] -%}"
+    "{%- endif -%}"
+    "{{- '<|start|>' + header + '<|message|>' -}}"
+    "{{- render_parts(message['content']) -}}"
     "{{- '<|eot|>' -}}"
     "{%- endif -%}"
     "{%- endfor -%}"
@@ -111,8 +119,9 @@ def _grid_size(
 ) -> tuple[int, int, int]:
     """Pick the integer (H, W) grid closest to the aspect ratio under the token cap.
 
-    Replicates MuseGlimmerVisionEncoder._compute_grid_size (modeling_muse_glimmer.py) so the
-    processor needs no torch model import. Returns (target_h, target_w, n_tokens).
+    Replicates MuseGlimmerVisionEncoder._compute_grid_size
+    (modeling_muse_glimmer.py) so the processor needs no torch model import.
+    Returns (target_h, target_w, n_tokens).
     """
     i_nph = img_h / patch_hw
     i_npw = img_w / patch_hw
@@ -175,7 +184,7 @@ class MuseGlimmerImageProcessor(BaseImageProcessor):
             [self.image_std] * 3,
         )
 
-    # -- size computation (mirrors modeling_muse_glimmer.MuseGlimmerVisionEncoder) -------------
+    # -- size computation (mirrors modeling_muse_glimmer.MuseGlimmerVisionEncoder) --
     def compute_image_size(self, img_w: int, img_h: int) -> tuple[int, int, int]:
         ph = self.patch_size * self.downsample_factor
         return _grid_size(img_w, img_h, ph, self.max_image_tokens)
@@ -201,7 +210,8 @@ except Exception:
 
 
 class MuseGlimmerVideoProcessor(BaseVideoProcessor):
-    """MuseGlimmer video preprocessing behind the standard HF ``AutoVideoProcessor`` API.
+    """MuseGlimmer video preprocessing behind the standard HF
+    ``AutoVideoProcessor`` API.
 
     Exposes MuseGlimmer's training-faithful video handling as a first-class video
     processor so you can call ``processor(videos="clip.mp4")`` and downstream
@@ -210,7 +220,8 @@ class MuseGlimmerVideoProcessor(BaseVideoProcessor):
 
       * torchcodec decode (matches training; other decoders diverge),
       * uniform frame sampling to a whole multiple of ``patch_temporal``,
-      * real per-group PTS timestamps (rendered as ``Time: X.Xs`` by MuseGlimmerProcessor),
+      * real per-group PTS timestamps (rendered as ``Time: X.Xs`` by
+        MuseGlimmerProcessor),
       * ``patch_temporal`` frame-grouping (frames cat on the channel axis ->
         ``[patch_temporal * 3, H, W]``; the encoder detects video by channel count).
 
@@ -313,11 +324,12 @@ class MuseGlimmerVideoProcessor(BaseVideoProcessor):
         Returns (group_tensors, n_groups, tokens_per_group).
         """
         pt = self.patch_temporal
-        if len(frames) < pt or len(frames) % pt != 0:
-            raise ValueError(
-                f"video frame count {len(frames)} must be a positive multiple of "
-                f"patch_temporal={pt}"
-            )
+        if pt <= 0:
+            raise ValueError(f"patch_temporal must be positive, got {pt}")
+        if not frames:
+            raise ValueError("video must contain at least one frame")
+        if padding := (-len(frames)) % pt:
+            frames = [*frames, *([frames[-1]] * padding)]
         first = frames[0].convert("RGB")
         target_h, target_w, n_tokens = self.compute_video_frame_size(
             first.width, first.height
@@ -414,8 +426,8 @@ class MuseGlimmerVideoProcessor(BaseVideoProcessor):
 
 
 class MuseGlimmerProcessor(ProcessorMixin):
-    """Bundle MuseGlimmerImageProcessor + MuseGlimmerVideoProcessor + tokenizer; expand media
-    sentinels into spans.
+    """Bundle MuseGlimmerImageProcessor + MuseGlimmerVideoProcessor + tokenizer;
+    expand media sentinels into spans.
 
     Images go through ``image_processor`` (MuseGlimmerImageProcessor) and videos through
     ``video_processor`` (MuseGlimmerVideoProcessor) -- one preprocessing implementation
@@ -524,11 +536,13 @@ class MuseGlimmerProcessor(ProcessorMixin):
         n_vid = sum(1 for t in ids if t == video_sentinel)
         if n_img != len(prepped_images):
             raise ValueError(
-                f"{n_img} image sentinel(s) in text but {len(prepped_images)} image(s) given."
+                f"{n_img} image sentinel(s) in text but "
+                f"{len(prepped_images)} image(s) given."
             )
         if n_vid != len(prepped_videos):
             raise ValueError(
-                f"{n_vid} video sentinel(s) in text but {len(prepped_videos)} video(s) given."
+                f"{n_vid} video sentinel(s) in text but "
+                f"{len(prepped_videos)} video(s) given."
             )
 
         out_ids: list[int] = []
@@ -553,8 +567,8 @@ class MuseGlimmerProcessor(ProcessorMixin):
             "attention_mask": [[1] * len(out_ids)],
         }
         batch = BatchFeature(data=data, tensor_type=return_tensors)
-        # Keep pixel_values as a list of variable-size tensors (MuseGlimmerModel consumes
-        # a list); BatchFeature would fail to stack them into one tensor.
+        # Keep pixel_values as a list of variable-size tensors (MuseGlimmerModel
+        # consumes a list); BatchFeature would fail to stack them into one tensor.
         if pixel_values:
             batch["pixel_values"] = pixel_values
         return batch

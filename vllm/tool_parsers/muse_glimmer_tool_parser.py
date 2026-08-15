@@ -59,7 +59,6 @@ from vllm.logger import init_logger
 from vllm.tool_parsers.abstract_tool_parser import (
     Tool,
     ToolParser,
-    ToolParserManager,
 )
 
 logger = init_logger(__name__)
@@ -180,7 +179,6 @@ def _safe_open_body(body: str) -> str:
     return body[: len(body) - partial] if partial else body
 
 
-@ToolParserManager.register_module("muse_glimmer")
 class MuseGlimmerToolParser(ToolParser):
     # MuseGlimmer emits ATEM markup around tool-call arguments. The generic
     # named/required tool_choice path in vllm/parser/abstract_parser.py assigns
@@ -189,18 +187,7 @@ class MuseGlimmerToolParser(ToolParser):
     # swallows the ValidationError and returns tool_calls=null. Opting out
     # routes named/required through extract_tool_calls /
     # extract_tool_calls_streaming -- the same path "auto" already uses.
-    #
-    # Opting out alone removes the JSON constraint without replacing it, so
-    # required/named degrade to "auto" *decoding* as well as auto parsing: the
-    # model is free to answer in the user channel and emit no call at all, while
-    # the serving layer still reports finish_reason="tool_calls". The ATEM
-    # structural tag below restores the constraint in the model's own syntax, so
-    # required/named are enforced during decoding and parsed natively here.
-    # ``__init_subclass__`` flips supports_required_and_named to False for any
-    # parser that declares one; it stays declared here so the intent survives a
-    # change to that default.
     supports_required_and_named = False
-    structural_tag_model = "muse_glimmer"
 
     def __init__(
         self,
@@ -234,12 +221,6 @@ class MuseGlimmerToolParser(ToolParser):
         the tool channel -- ``<atem:function_calls>[{"name": ...``  -- with no
         ``<atem:invoke>`` for this parser to find. Skip the base hook so those
         choices decode natively, the same as "auto".
-
-        The constraint those choices actually get is the ATEM structural tag,
-        attached by DelegatingParser._apply_structural_tag before this hook runs
-        (``structural_tag_model = "muse_glimmer"``). The base hook would return
-        early on seeing it anyway; skipping explicitly keeps that independent of
-        the base implementation.
         """
         request.skip_special_tokens = False
 

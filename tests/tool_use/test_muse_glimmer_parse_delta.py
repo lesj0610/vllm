@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 """parse_delta-level regression tests for the MuseGlimmer parsers.
 
 These drive the UNIFIED parser-engine streaming API the serving layer actually
@@ -10,6 +13,7 @@ phase for the whole generation.
 
 Requires a real MuseGlimmer tokenizer; skipped if the checkpoint is unavailable.
 """
+
 import json
 import os
 
@@ -22,8 +26,13 @@ pytestmark = pytest.mark.skipif(
 )
 
 _FRAMING = [
-    "<|start|>", "<|message|>", "<|eom|>", "<|eot|>",
-    "to=self", "to=user", "<atem:",
+    "<|start|>",
+    "<|message|>",
+    "<|eom|>",
+    "<|eot|>",
+    "to=self",
+    "to=user",
+    "<atem:",
 ]
 
 PROMPT = "<|start|>user<|message|>hi<|eom|><|start|>assistant"
@@ -38,12 +47,14 @@ class _Req:
 @pytest.fixture(scope="module")
 def tok():
     from transformers import AutoTokenizer
+
     return AutoTokenizer.from_pretrained(CKPT, trust_remote_code=True)
 
 
 @pytest.fixture(scope="module")
 def parser_cls():
     from vllm.parser import ParserManager
+
     return ParserManager.get_parser(
         tool_parser_name="muse_glimmer",
         reasoning_parser_name="muse_glimmer",
@@ -54,6 +65,7 @@ def parser_cls():
 def _drive(parser_cls, tok, gen_text, req=None):
     """Feed gen_text token-by-token through parse_delta (as serving does)."""
     from vllm.parser.abstract_parser import StreamState
+
     if req is None:
         req = _Req()
     parser = parser_cls(tok)
@@ -63,7 +75,9 @@ def _drive(parser_cls, tok, gen_text, req=None):
     reasoning, content, tools = [], [], []
     for i, tid in enumerate(gen_ids):
         dm = parser.parse_delta(
-            tok.decode([tid]), [tid], req,
+            tok.decode([tid]),
+            [tid],
+            req,
             prompt_token_ids=prompt_ids if i == 0 else None,
             finished=(i == len(gen_ids) - 1),
         )
@@ -76,7 +90,11 @@ def _drive(parser_cls, tok, gen_text, req=None):
         for tc in getattr(dm, "tool_calls", None) or []:
             fn = tc.function
             name = fn.get("name") if isinstance(fn, dict) else getattr(fn, "name", None)
-            args = fn.get("arguments") if isinstance(fn, dict) else getattr(fn, "arguments", None)
+            args = (
+                fn.get("arguments")
+                if isinstance(fn, dict)
+                else getattr(fn, "arguments", None)
+            )
             tools.append((tc.index, name, args))
     return "".join(reasoning), "".join(content), tools
 
@@ -89,7 +107,8 @@ def _assert_no_framing(text):
 def test_parse_delta_no_tools_reasoning_then_answer(parser_cls, tok):
     # The core regression: reasoning phase must stay active for a no-tools turn.
     reasoning, content, tools = _drive(
-        parser_cls, tok,
+        parser_cls,
+        tok,
         " to=self<|message|>Let me think step by step about the sum.<|eom|>"
         "<|start|>assistant to=user<|message|>The answer is 42.<|eot|>",
     )
@@ -101,7 +120,9 @@ def test_parse_delta_no_tools_reasoning_then_answer(parser_cls, tok):
 
 def test_parse_delta_content_only(parser_cls, tok):
     reasoning, content, tools = _drive(
-        parser_cls, tok, " to=user<|message|>Just a direct answer.<|eot|>",
+        parser_cls,
+        tok,
+        " to=user<|message|>Just a direct answer.<|eot|>",
     )
     _assert_no_framing(content)
     assert content == "Just a direct answer.", repr(content)
@@ -110,7 +131,8 @@ def test_parse_delta_content_only(parser_cls, tok):
 
 def test_parse_delta_tool_call(parser_cls, tok):
     reasoning, content, tools = _drive(
-        parser_cls, tok,
+        parser_cls,
+        tok,
         " to=self<|message|>I should read the hostname.<|eom|>"
         "<|start|>assistant to=read.read<|message|>"
         '<atem:function_calls>\n<atem:invoke name="read.read">\n'
@@ -129,7 +151,8 @@ def test_parse_delta_truncated_cot_no_toolcall(parser_cls, tok):
     # Contemplated invoke inside an unterminated to=self block: no tool call,
     # no framing leak into content, partial reasoning recovered.
     reasoning, content, tools = _drive(
-        parser_cls, tok,
+        parser_cls,
+        tok,
         " to=self<|message|>Maybe I should call "
         '<atem:function_calls>\n<atem:invoke name="read.read">\n'
         '<atem:parameter name="path">/etc/hostname</atem:parameter>\n'
@@ -147,7 +170,8 @@ def test_parse_delta_reasoning_suppressed_when_not_requested(parser_cls, tok):
         include_reasoning = False
 
     reasoning, content, tools = _drive(
-        parser_cls, tok,
+        parser_cls,
+        tok,
         " to=self<|message|>secret thoughts<|eom|>"
         "<|start|>assistant to=user<|message|>Public answer.<|eot|>",
         req=_NoReasonReq(),
@@ -159,4 +183,5 @@ def test_parse_delta_reasoning_suppressed_when_not_requested(parser_cls, tok):
 
 if __name__ == "__main__":
     import sys
+
     sys.exit(pytest.main([__file__, "-v"]))
