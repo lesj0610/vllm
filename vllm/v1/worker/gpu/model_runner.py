@@ -66,6 +66,7 @@ from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 from vllm.v1.outputs import (
     DraftTokenIds,
+    ECConnectorOutput,
     ModelRunnerOutput,
     RoutedExpertsTensors,
     make_empty_encoder_model_runner_output,
@@ -1847,6 +1848,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             idx_mapping, num_sampled, self.req_states.num_computed_tokens.gpu
         )
 
+    def _merge_ec_connector_no_forward(
+        self, scheduler_output: SchedulerOutput, output: ModelRunnerOutput
+    ) -> ModelRunnerOutput:
+        """Let the EC connector send/recv on a step with no work to run."""
+        return ModelRunnerOutput.with_ec_conn_output(
+            output,
+            self.ec_connector.no_forward(scheduler_output).ec_connector_output,
+        )
+
     @torch.inference_mode()
     def execute_model(
         self,
@@ -1868,7 +1878,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if scheduler_output.total_num_scheduled_tokens == 0:
                 # No need to run the model.
                 empty_output = self.kv_connector.no_forward(scheduler_output)
-                return empty_output
+                return self._merge_ec_connector_no_forward(
+                    scheduler_output, empty_output
+                )
 
         # Get batch descriptor and sync across DP ranks.
         num_reqs = len(scheduler_output.num_scheduled_tokens)
@@ -1909,7 +1921,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if batch_desc.num_tokens == 0:
             # All DP ranks have zero tokens to run.
             empty_output = self.kv_connector.no_forward(scheduler_output)
-            return empty_output
+            return self._merge_ec_connector_no_forward(scheduler_output, empty_output)
 
         if not dummy_run:
             # Common case.
@@ -2026,9 +2038,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 input_ids = None
 
         if self.is_encoder_only:
-            output = make_empty_encoder_model_runner_output(scheduler_output)
-            output.ec_connector_output = ec_connector_output
-            return output
+            return ModelRunnerOutput.with_ec_conn_output(
+                make_empty_encoder_model_runner_output(scheduler_output),
+                ec_connector_output,
+            )
 
         model_inputs = {
             "input_ids": input_ids,
@@ -2133,6 +2146,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             hidden_states=hidden_states,
             aux_hidden_states=aux_hidden_states,
             finished_req_ids=finished_req_ids,
+            ec_connector_output=ec_connector_output,
             routed_experts=routed_experts,
         )
 
@@ -2156,6 +2170,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         hidden_states = self.execute_model_state.hidden_states
         aux_hidden_states = self.execute_model_state.aux_hidden_states
         finished_req_ids = self.execute_model_state.finished_req_ids
+        ec_connector_output = self.execute_model_state.ec_connector_output
         routed_experts = self.execute_model_state.routed_experts
         self.execute_model_state = None
 
@@ -2175,7 +2190,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
             # Post-step KV connector related operations.
             kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
-            return ModelRunnerOutput.with_kv_conn_output_only(kv_connector_output)
+            # The first PP rank holds the encoder cache, so pass its EC output on.
+            output = ModelRunnerOutput.with_kv_conn_output_only(kv_connector_output)
+            return ModelRunnerOutput.with_ec_conn_output(output, ec_connector_output)
 
         # Last rank: sample tokens
         hidden_states, input_batch = pcp.maybe_restore_pcp_for_sampling(
@@ -2292,6 +2309,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Post-step KV connector related operations.
         kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
         model_runner_output.kv_connector_output = kv_connector_output
+        model_runner_output.ec_connector_output = ec_connector_output
 
         return async_output
 
@@ -2308,6 +2326,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         input_batch = self.execute_model_state.input_batch
         hidden_states = self.execute_model_state.hidden_states
         finished_req_ids = self.execute_model_state.finished_req_ids
+        ec_connector_output = self.execute_model_state.ec_connector_output
         self.execute_model_state = None
 
         # Post-step KV connector related operations.
@@ -2315,7 +2334,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         if not self.is_last_pp_rank:
             self.postprocess_num_computed_tokens(input_batch)
-            return ModelRunnerOutput.with_kv_conn_output_only(kv_connector_output)
+            output = ModelRunnerOutput.with_kv_conn_output_only(kv_connector_output)
+            return ModelRunnerOutput.with_ec_conn_output(output, ec_connector_output)
 
         assert self.pooling_runner is not None
         pooler_output, finished_mask = self.pooling_runner.pool(
@@ -2327,6 +2347,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             req_ids=input_batch.req_ids,
             req_id_to_index={req_id: i for i, req_id in enumerate(input_batch.req_ids)},
             kv_connector_output=kv_connector_output,
+            ec_connector_output=ec_connector_output,
         )
         async_output = AsyncPoolingOutput(
             model_runner_output=model_runner_output,
@@ -2416,6 +2437,7 @@ class ExecuteModelState(NamedTuple):
     hidden_states: torch.Tensor | None
     aux_hidden_states: list[torch.Tensor] | None
     finished_req_ids: set[str]
+    ec_connector_output: ECConnectorOutput | None
     routed_experts: RoutedExpertsTensors | None
 
 
