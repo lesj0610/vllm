@@ -1050,6 +1050,8 @@ class KVCacheConfig:
     For models with multiple types of attention, there will be multiple groups,
     see `_get_kv_cache_config_uniform_page_size` for more details.
     """
+    prefix_cache_retention_interval: int | None = None
+    """Resolved retention policy for local prefix-cache checkpoints."""
 
     pool_configs: list[KVCachePoolConfig] = field(default_factory=list)
     """KV cache block pools used by the scheduler and per-type managers."""

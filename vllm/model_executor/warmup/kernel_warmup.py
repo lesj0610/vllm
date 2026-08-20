@@ -6,6 +6,7 @@ This is useful specifically for JIT'ed kernels as we don't want JIT'ing to
 happen during model execution.
 """
 
+import time
 from typing import TYPE_CHECKING
 
 import torch
@@ -117,6 +118,22 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
         zeroer = getattr(worker.model_runner, "_kv_block_zeroer", None)
         if zeroer is not None:
             zeroer.warmup(worker.model_runner.kv_cache_config.num_blocks)
+
+    if worker.vllm_config.kernel_config.enable_jit_warmup:
+        logger.info("JIT kernel warmup starting.")
+        jit_warmup_start = time.perf_counter()
+        try:
+            worker.model_runner.jit_warmup_registry.warmup()
+        except Exception:
+            logger.exception(
+                "JIT kernel warmup failed after %.2fs.",
+                time.perf_counter() - jit_warmup_start,
+            )
+            raise
+        logger.info(
+            "JIT kernel warmup finished in %.2fs.",
+            time.perf_counter() - jit_warmup_start,
+        )
 
     qwen_triton_warmup(worker.model_runner, worker.vllm_config.model_config)
 
