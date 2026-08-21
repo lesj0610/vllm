@@ -1527,7 +1527,6 @@ _SPECULATIVE_DECODING_EXAMPLE_MODELS = {
     "MuseGlimmerAssistantModel": _HfExamplesInfo(
         "meta-models/Muse-Glimmer-30B",
         speculative_model="meta-models/Muse-Glimmer-30B-assistant",
-        use_original_num_layers=True,  # Draft head reads 5 target residual layers
         max_model_len=8192,  # Reduce max len to ensure test runs in low-VRAM CI env
         max_num_seqs=32,
     ),
