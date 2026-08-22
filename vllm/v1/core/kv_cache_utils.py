@@ -898,11 +898,7 @@ def check_enough_kv_cache_memory(
         # plans against usable blocks, as in get_kv_cache_configs. Group a copy
         # of the specs since grouping may unify them in-place.
         groups = get_kv_cache_groups(vllm_config, dict(kv_cache_spec))
-        check_memory = (
-            available_memory - _pool_bytes_per_block(groups)
-            if groups
-            else available_memory
-        )
+        check_memory = _get_fit_available_memory(groups, available_memory)
         _check_enough_kv_cache_memory(
             check_memory,
             lambda: max_memory_usage_bytes(vllm_config, kv_cache_spec.values()),
@@ -966,6 +962,39 @@ def is_kv_cache_spec_uniform(kv_cache_spec: dict[str, KVCacheSpec]) -> bool:
     return True
 
 
+def _kv_transfer_config_uses_simple_cpu_offload(
+    kv_connector: str | None,
+    extra_config: dict[str, Any] | None,
+) -> bool:
+    if kv_connector == "SimpleCPUOffloadConnector":
+        return True
+    if kv_connector != "MultiConnector" or not extra_config:
+        return False
+
+    connectors = extra_config.get("connectors")
+    if not isinstance(connectors, list):
+        return False
+    for connector_config in connectors:
+        if not isinstance(connector_config, dict):
+            continue
+        if _kv_transfer_config_uses_simple_cpu_offload(
+            connector_config.get("kv_connector"),
+            connector_config.get("kv_connector_extra_config"),
+        ):
+            return True
+    return False
+
+
+def _uses_simple_cpu_offload(vllm_config: VllmConfig) -> bool:
+    kv_transfer_config = vllm_config.kv_transfer_config
+    if kv_transfer_config is None:
+        return False
+    return _kv_transfer_config_uses_simple_cpu_offload(
+        kv_transfer_config.kv_connector,
+        kv_transfer_config.kv_connector_extra_config,
+    )
+
+
 def get_max_concurrency_for_kv_cache_config(
     vllm_config: VllmConfig, kv_cache_config: KVCacheConfig
 ) -> float:
@@ -978,7 +1007,7 @@ def get_max_concurrency_for_kv_cache_config(
     total is the sum over groups. The memory/page ratio is identical whether
     a group carries an aggregated UniformTypeKVCacheSpecs (worker config) or
     a representative per-layer spec (scheduler config), so both capacity
-    call sites agree.
+    call sites agree. One pool block is reserved for BlockPool's null block.
     """
     num_blocks_per_request = sum(
         cdiv(
@@ -987,7 +1016,7 @@ def get_max_concurrency_for_kv_cache_config(
         )
         for group in kv_cache_config.kv_cache_groups
     )
-    max_concurrency = kv_cache_config.num_blocks / num_blocks_per_request
+    max_concurrency = max(kv_cache_config.num_blocks - 1, 0) / num_blocks_per_request
     return max_concurrency
 
 
@@ -1326,7 +1355,7 @@ def validate_kv_cache_layout(
         )
 
 
-def get_kv_cache_config_from_groups(
+def _get_token_proportional_kv_cache_config_from_groups(
     vllm_config: VllmConfig,
     kv_cache_groups: list[KVCacheGroupSpec],
     available_memory: int,
@@ -1416,6 +1445,21 @@ def get_kv_cache_config_from_groups(
         prefix_cache_retention_interval=(
             vllm_config.cache_config.prefix_cache_retention_interval
         ),
+    )
+
+
+def get_kv_cache_config_from_groups(
+    vllm_config: VllmConfig,
+    kv_cache_groups: list[KVCacheGroupSpec],
+    available_memory: int,
+    check_available_memory: bool = True,
+) -> KVCacheConfig:
+    # Kept for the profiling path that builds a minimal override config with
+    # zero profiled memory. The shared-pool builder below handles override
+    # sizing directly and does not need a separate availability check switch.
+    del check_available_memory
+    return _get_token_proportional_kv_cache_config_from_groups(
+        vllm_config, kv_cache_groups, available_memory
     )
 
 
@@ -1952,6 +1996,17 @@ def _estimate_max_model_len_from_groups(
         vllm_config.model_config.max_model_len = original_max
 
 
+def _get_fit_available_memory(
+    kv_cache_groups: list[KVCacheGroupSpec],
+    available_memory: int,
+) -> int:
+    """Available memory for per-request fit checks, excluding null blocks."""
+    if not kv_cache_groups:
+        return available_memory
+
+    return max(available_memory - _pool_bytes_per_block(kv_cache_groups), 0)
+
+
 def _auto_fit_max_model_len(
     vllm_config: VllmConfig,
     projected_groups_per_worker: list[list[KVCacheGroupSpec]],
@@ -2163,23 +2218,41 @@ def get_kv_cache_configs(
     # Reserve the null block BlockPool permanently holds back, so auto-fit and
     # the capacity check both plan against usable blocks. Allocation below
     # still uses the full memory.
-    check_memory = [
-        avail_mem - _pool_bytes_per_block(groups) if groups else avail_mem
-        for groups, avail_mem in zip(projected_groups_per_worker, available_memory)
+    fit_available_memory = [
+        _get_fit_available_memory(groups, avail_mem)
+        for groups, avail_mem in zip(
+            projected_groups_per_worker,
+            available_memory,
+        )
     ]
 
     if vllm_config.model_config.original_max_model_len == -1:
-        _auto_fit_max_model_len(vllm_config, projected_groups_per_worker, check_memory)
+        _auto_fit_max_model_len(
+            vllm_config,
+            projected_groups_per_worker,
+            fit_available_memory,
+        )
 
     # Check if the available memory is enough per worker.
-    for groups, avail_mem in zip(projected_groups_per_worker, check_memory):
+    for groups, avail_mem in zip(
+        projected_groups_per_worker,
+        fit_available_memory,
+    ):
         if not groups:
             continue
         _check_enough_kv_cache_memory(
             avail_mem,
-            partial(_max_memory_usage_bytes_from_groups, vllm_config, groups),
+            partial(
+                _max_memory_usage_bytes_from_groups,
+                vllm_config,
+                groups,
+            ),
             vllm_config.model_config.max_model_len,
-            partial(_estimate_max_model_len_from_groups, vllm_config, groups),
+            partial(
+                _estimate_max_model_len_from_groups,
+                vllm_config,
+                groups,
+            ),
         )
 
     kv_cache_configs: list[KVCacheConfig] = []

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import math
 
 import numpy as np
 import torch
@@ -249,8 +250,9 @@ class MRotaryEmbedding(RotaryEmbeddingBase):
         dtype: torch.dtype,
         mrope_section: list[int] | None = None,
         mrope_interleaved: bool = False,
-        # YaRN parameters.
         *,
+        mrope_cache_max_position: int | None = None,
+        # YaRN parameters.
         scaling_factor: float | None = None,
         extrapolation_factor: float = 1,
         attn_factor: float = 1,
@@ -270,14 +272,24 @@ class MRotaryEmbedding(RotaryEmbeddingBase):
         else:
             self.mscale = 1.0
 
-        # In Qwen2.5-VL, the maximum index value is related to the duration of
-        # the input video. We enlarge max_position_embeddings to 4 times to get
-        # a larger the cos and sin cache.
-        self.cache_max_position_num = max_position_embeddings * 4
+        # Preserve the legacy semantic maximum used by YaRN frequency math.
+        # Models with a proven position bound may independently reduce only the
+        # physical cache rows.
+        semantic_max_position_embeddings = max_position_embeddings * 4
+        if mrope_cache_max_position is not None:
+            if mrope_cache_max_position <= 0:
+                raise ValueError("mrope_cache_max_position must be positive")
+            self.cache_max_position_num = mrope_cache_max_position
+        elif self.scaling_factor is None:
+            self.cache_max_position_num = semantic_max_position_embeddings
+        else:
+            self.cache_max_position_num = math.ceil(
+                semantic_max_position_embeddings * self.scaling_factor
+            )
         super().__init__(
             head_size,
             rotary_dim,
-            self.cache_max_position_num,
+            semantic_max_position_embeddings,
             base,
             is_neox_style,
             dtype,
@@ -295,8 +307,18 @@ class MRotaryEmbedding(RotaryEmbeddingBase):
 
     def _compute_cos_sin_cache(self) -> torch.Tensor:
         if self.scaling_factor is None:
-            return super()._compute_cos_sin_cache()
-        return YaRNScalingRotaryEmbedding._compute_cos_sin_cache(self)
+            inv_freq = self._compute_inv_freq(self.base)
+        else:
+            inv_freq = self._compute_inv_freq(self.scaling_factor)
+        t = torch.arange(self.cache_max_position_num, dtype=torch.float32)
+        freqs = torch.einsum("i,j -> ij", t, inv_freq)
+        if self.scaling_factor is None:
+            cos = freqs.cos()
+            sin = freqs.sin()
+        else:
+            cos = freqs.cos() * self.mscale
+            sin = freqs.sin() * self.mscale
+        return torch.cat((cos, sin), dim=-1)
 
     def forward_native(
         self,

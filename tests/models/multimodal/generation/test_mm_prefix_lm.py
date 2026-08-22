@@ -120,3 +120,36 @@ def test_mm_prefix_lm_e2e(
         "Gemma3 mm-prefix-LM image prefill hidden states should be close to HF; "
         f"got {image_cos=}"
     )
+
+
+@pytest.mark.core_model
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="Requires CUDA")
+def test_mm_prefix_lm_first_image_after_cudagraph_workspace_lock(
+    vllm_runner: type[VllmRunner],
+    image_assets: ImageTestAssets,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Regression: the first MM-prefix plan must not grow a locked workspace."""
+    monkeypatch.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "0")
+
+    with vllm_runner(
+        MODEL,
+        max_model_len=4096,
+        max_num_seqs=2,
+        limit_mm_per_prompt={"image": 1},
+        attention_backend="FLASHINFER",
+        compilation_config={"cudagraph_capture_sizes": [1, 2]},
+        mm_processor_cache_gb=0,
+        mm_processor_kwargs={"do_pan_and_scan": True},
+    ) as vllm_model:
+        outputs = vllm_model.generate_greedy(
+            [PROMPT],
+            max_tokens=1,
+            images=[image_assets[0].pil_image],
+        )
+
+    assert len(outputs) == 1
+    output_ids, output_text = outputs[0]
+    assert output_ids
+    assert isinstance(output_text, str)

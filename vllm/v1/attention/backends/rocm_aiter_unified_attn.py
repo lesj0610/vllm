@@ -157,8 +157,10 @@ class RocmAiterUnifiedAttentionImpl(RocmAttentionImpl):
     def _split_kv_cache(
         self, kv_cache: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        # (B, H, N, 2*hs) -> ((B, N, H, hs), (B, N, H, hs))
-        return kv_cache.transpose(1, 2).split(self.head_size, dim=-1)
+        # Blocks-first ``(num_blocks, 2, ...)``. The model runner normalizes any
+        # shared decoder/cross-attention allocation to this layout, so no
+        # per-backend restriding is needed here.
+        return kv_cache.unbind(1)
 
     def forward(
         self,

@@ -6,7 +6,7 @@ from __future__ import annotations
 import copy
 from collections import Counter
 from collections.abc import Collection
-from dataclasses import dataclass, fields, replace
+from dataclasses import dataclass, field, fields, replace
 from enum import Enum, IntEnum
 from fractions import Fraction
 from math import prod
@@ -140,6 +140,11 @@ class KVCacheSpecKind(str, Enum):
     UNKNOWN = "unknown"
 
 
+class MemoryModel(str, Enum):
+    TOKEN_PROPORTIONAL = "token_proportional"
+    REQUEST_CONSTANT = "request_constant"
+
+
 @dataclass(frozen=True)
 class KVCacheSpec:
     """
@@ -178,6 +183,14 @@ class KVCacheSpec:
     def get_num_kernel_states(self, kernel_block_size: int) -> int:
         if self.tokens_per_state > 0:
             return kernel_block_size // self.tokens_per_state
+        return 1
+
+    @property
+    def memory_model(self) -> MemoryModel:
+        return MemoryModel.TOKEN_PROPORTIONAL
+
+    @property
+    def blocks_per_request(self) -> int:
         return 1
 
     def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
@@ -406,6 +419,12 @@ class AttentionSpec(KVCacheSpec):
             return self.state_content_bytes
         return (self.head_size + self.head_size_v) * get_dtype_size(self.dtype)
 
+    def cache_dtype_for_shape(self, configured_cache_dtype: str) -> str:
+        """Return the cache dtype string used for backend layout calculation."""
+        if self.kv_quant_mode == KVQuantMode.NONE:
+            return "auto"
+        return configured_cache_dtype
+
     @property
     def unpadded_page_size_bytes(self) -> int:
         return self.num_heads * self.num_states * self.state_content_size_bytes
@@ -535,6 +554,37 @@ def _apply_alignment_padding(spec: MLAAttentionSpec | SlidingWindowMLASpec):
     padded_page_size = round_up(actual_page_size, spec.alignment)
     if padded_page_size != actual_page_size:
         object.__setattr__(spec, "page_size_padded", padded_page_size)
+
+
+@dataclass(frozen=True, kw_only=True)
+class TQFullAttentionSpec(FullAttentionSpec):
+    """FullAttentionSpec with TQ-aware page size.
+
+    Python equivalent of the C++ TQ4FullAttentionSpec. Overrides
+    real_page_size_bytes to use TQ slot bytes instead of the raw
+    head_size * dtype formula.
+    """
+
+    tq_slot_size: int = 0
+
+    def cache_dtype_for_shape(self, configured_cache_dtype: str) -> str:
+        # Preserve the packed layout for manually constructed TQ specs whose
+        # kv_quant_mode retains the default value.
+        return configured_cache_dtype
+
+    @property
+    def real_page_size_bytes(self) -> int:
+        if self.tq_slot_size > 0:
+            return self.block_size * self.num_kv_heads * self.tq_slot_size
+        return super().real_page_size_bytes
+
+    @classmethod
+    def merge(cls, specs: list[Self]) -> Self:
+        merged = super().merge(specs)
+        assert all(s.tq_slot_size == specs[0].tq_slot_size for s in specs), (
+            "All TQ layers in the same KV cache group must use the same tq_slot_size."
+        )
+        return replace(merged, tq_slot_size=specs[0].tq_slot_size)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -836,6 +886,18 @@ class MambaSpec(KVCacheSpec):
             return self.page_size_padded
         return page_size
 
+    @property
+    def memory_model(self) -> MemoryModel:
+        if self.mamba_cache_mode == "all":
+            return MemoryModel.TOKEN_PROPORTIONAL
+        return MemoryModel.REQUEST_CONSTANT
+
+    @property
+    def blocks_per_request(self) -> int:
+        if self.mamba_cache_mode == "align":
+            return 2 + self.num_speculative_blocks
+        return 1 + self.num_speculative_blocks
+
     def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
         if vllm_config.cache_config.mamba_cache_mode == "all":
             max_model_len = vllm_config.model_config.max_model_len
@@ -958,6 +1020,16 @@ class UniformTypeKVCacheSpecs(KVCacheSpec):
     @property
     def page_size_bytes(self) -> int:
         return sum(spec.page_size_bytes for spec in self.kv_cache_specs.values())
+
+    @property
+    def memory_model(self) -> MemoryModel:
+        memory_models = {spec.memory_model for spec in self.kv_cache_specs.values()}
+        assert len(memory_models) == 1
+        return memory_models.pop()
+
+    @property
+    def blocks_per_request(self) -> int:
+        return max(spec.blocks_per_request for spec in self.kv_cache_specs.values())
 
     def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
         max_num_pages = max(
@@ -1142,6 +1214,14 @@ class KVCacheGroupSpec:
 
 
 @dataclass
+class KVCachePoolConfig:
+    pool_id: int
+    memory_model: MemoryModel
+    group_ids: list[int]
+    num_blocks: int
+
+
+@dataclass
 class KVCacheConfig:
     """
     The KV cache configuration of a model.
@@ -1163,6 +1243,39 @@ class KVCacheConfig:
     """Resolved retention policy for local prefix-cache checkpoints."""
     kv_cache_layout: str | None = None
     """The KV cache layout resolved by the engine core, adopted by all workers."""
+
+    pool_configs: list[KVCachePoolConfig] = field(default_factory=list)
+    """KV cache block pools used by the scheduler and per-type managers."""
+
+    group_to_pool_id: list[int] = field(default_factory=list)
+    """Map each KV cache group index to the pool that owns its block IDs."""
+
+    def __post_init__(self) -> None:
+        if not self.pool_configs:
+            self.pool_configs = [
+                KVCachePoolConfig(
+                    pool_id=0,
+                    memory_model=MemoryModel.TOKEN_PROPORTIONAL,
+                    group_ids=list(range(len(self.kv_cache_groups))),
+                    num_blocks=self.num_blocks,
+                )
+            ]
+
+        if not self.group_to_pool_id:
+            self.group_to_pool_id = [-1] * len(self.kv_cache_groups)
+            for pool_config in self.pool_configs:
+                for group_id in pool_config.group_ids:
+                    self.group_to_pool_id[group_id] = pool_config.pool_id
+
+        assert len(self.group_to_pool_id) == len(self.kv_cache_groups)
+        assert all(pool_id >= 0 for pool_id in self.group_to_pool_id)
+        assert all(
+            pool_config.pool_id == i for i, pool_config in enumerate(self.pool_configs)
+        )
+
+    def get_pool_config_for_group(self, group_id: int) -> KVCachePoolConfig:
+        pool_id = self.group_to_pool_id[group_id]
+        return self.pool_configs[pool_id]
 
     @property
     def has_mamba_layers(self) -> bool:

@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import warnings
+from dataclasses import asdict
 
 import pytest
 import torch.cuda
@@ -15,12 +16,16 @@ from vllm.model_executor.models.adapters import (
     as_embedding_model,
     as_seq_cls_model,
 )
+from vllm.model_executor.models.interfaces import (
+    has_sequence_bounded_mrope_positions,
+)
 from vllm.model_executor.models.registry import (
     _MULTIMODAL_MODELS,
     _SPECULATIVE_DECODING_MODELS,
     _TEXT_GENERATION_MODELS,
     ModelRegistry,
     _LazyRegisteredModel,
+    _ModelInfo,
 )
 from vllm.platforms import current_platform
 
@@ -137,6 +142,55 @@ def test_registry_is_pp(model_arch, is_pp, init_cuda):
                 "Please test using a different one.",
                 stacklevel=2,
             )
+
+
+@pytest.mark.parametrize(
+    "model_arch,expected",
+    [
+        ("Qwen3_5ForConditionalGeneration", True),
+        ("Qwen3_5MoeForConditionalGeneration", False),
+        ("Qwen3VLForConditionalGeneration", False),
+        ("Qwen2VLForConditionalGeneration", False),
+        ("Qwen2_5_VLForConditionalGeneration", False),
+        ("Qwen2_5OmniForConditionalGeneration", False),
+        ("Qwen3OmniMoeForConditionalGeneration", False),
+        ("TransformersMultiModalForCausalLM", False),
+    ],
+)
+def test_registry_mrope_position_bound_capability(model_arch, expected):
+    model_info = ModelRegistry._try_inspect_model_cls(model_arch)
+    assert model_info is not None
+    assert model_info.mrope_positions_are_sequence_bounded is expected
+
+
+def test_mrope_position_bound_capability_requires_concrete_opt_in():
+    class CertifiedModel(torch.nn.Module):
+        mrope_positions_are_sequence_bounded = True
+
+    class UncertifiedDerivedModel(CertifiedModel):
+        pass
+
+    class ExplicitlyCertifiedDerivedModel(CertifiedModel):
+        mrope_positions_are_sequence_bounded = True
+
+    class OutOfTreeModel(torch.nn.Module):
+        pass
+
+    assert has_sequence_bounded_mrope_positions(CertifiedModel)
+    assert not has_sequence_bounded_mrope_positions(UncertifiedDerivedModel)
+    assert has_sequence_bounded_mrope_positions(ExplicitlyCertifiedDerivedModel)
+    assert not has_sequence_bounded_mrope_positions(OutOfTreeModel)
+
+
+def test_old_registry_cache_defaults_mrope_position_bound_to_false():
+    model_info = ModelRegistry._try_inspect_model_cls("Qwen3VLForConditionalGeneration")
+    assert model_info is not None
+    serialized = asdict(model_info)
+    serialized.pop("mrope_positions_are_sequence_bounded")
+
+    restored = _ModelInfo(**serialized)
+
+    assert not restored.mrope_positions_are_sequence_bounded
 
 
 @create_new_process_for_each_test()
