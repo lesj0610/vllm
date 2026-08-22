@@ -31,18 +31,12 @@ from vllm.model_executor.warmup.flashinfer_sparse_mla_warmup import (
     deepseek_v4_sparse_mla_attention_warmup,
     flashinfer_sparse_mla_decode_autotune_warmup,
 )
-from vllm.model_executor.warmup.hybrid_gdn_mamba_mrope_warmup import (
-    hybrid_gdn_mamba_mrope_warmup,
-)
 from vllm.model_executor.warmup.kimi_k3_triton_warmup import (
     kimi_k3_triton_warmup,
 )
 from vllm.model_executor.warmup.qwen_triton_warmup import qwen_triton_warmup
 from vllm.model_executor.warmup.sparse_mla_triton_warmup import (
     sparse_mla_triton_warmup,
-)
-from vllm.model_executor.warmup.turboquant_triton_warmup import (
-    turboquant_triton_warmup,
 )
 from vllm.platforms import current_platform
 from vllm.utils.deep_gemm import is_deep_gemm_supported
@@ -120,8 +114,6 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
     )
 
     if not worker.use_v2_model_runner:
-        # The slot-mapping kernel is warmed through the JIT warmup registry
-        # (BlockTable registers it), so no explicit call is needed here.
         # The KV-block zeroing kernel is driven by the scheduler's
         # `new_block_ids_to_zero`, so no dummy run ever reaches it.
         zeroer = getattr(worker.model_runner, "_kv_block_zeroer", None)
@@ -162,9 +154,7 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
     if worker.vllm_config.kernel_config.enable_jit_warmup:
         kimi_k3_triton_warmup(worker)
         fa4_cutedsl_warmup(worker)
-        hybrid_gdn_mamba_mrope_warmup(worker)
         sparse_mla_triton_warmup(worker)
-        turboquant_triton_warmup(worker)
 
     if current_platform.has_device_capability(90):
         _warmup_ll_bf16_router_gemm(worker.get_model())
