@@ -735,49 +735,51 @@ def profile_cudagraph_memory(
     gc.collect()
     torch.accelerator.empty_cache()
 
-    arena_before_init = current_workspace_manager().workspace_sizes_bytes()
-    with set_current_vllm_config(runner.vllm_config):
-        _init_minimal_kv_cache_for_profiling(runner)
-    arena_after_init = current_workspace_manager().workspace_sizes_bytes()
-    if persistent_workspace_profiled and runner._workspace_sizes_exceed(
-        arena_before_init, arena_after_init
-    ):
-        raise AssertionError(
-            "Attention workspace arena grew while rebuilding CUDA graph "
-            "profiling metadata after persistent workspace profiling: "
-            f"{arena_before_init} -> {arena_after_init}."
-        )
-
-    # Reserve the attention workspace the capture below will run against and
-    # account for it separately from the graph memory: without a persistent
-    # workspace profile it becomes the persistent estimate, with one it must
-    # already be inside the activation peak and adds nothing.
-    persistent_estimate = runner._reserve_attention_workspace_for_cudagraph_capture()
-    arena_after_reserve = current_workspace_manager().workspace_sizes_bytes()
-    if persistent_workspace_profiled:
-        if runner._workspace_sizes_exceed(arena_before_init, arena_after_reserve):
-            raise AssertionError(
-                "Attention workspace arena grew during CUDA graph profiling "
-                "after persistent workspace profiling: "
-                f"{arena_before_init} -> {arena_after_reserve}."
-            )
-        persistent_estimate = 0
-    else:
-        logger.info(
-            "Estimated CUDA graph persistent workspace memory: %.2f GiB",
-            persistent_estimate / (1 << 30),
-        )
-    runner.cudagraph_memory_persistent_estimate = int(persistent_estimate)
-
-    manager = runner.cudagraph_manager
-    assert manager is not None
-
     # Don't count profiling captures; the real capture_model() runs later.
     saved_num_cudagraph_captured = compilation_counter.num_cudagraph_captured
     saved_capture_triggers = compilation_counter.num_gpu_runner_capture_triggers
     all_wrappers: list[Any] = []
     original_pools: dict[int, Any] = {}
+    arena_before_init = current_workspace_manager().workspace_sizes_bytes()
     try:
+        with set_current_vllm_config(runner.vllm_config):
+            runner._init_minimal_kv_cache_for_profiling()
+        arena_after_init = current_workspace_manager().workspace_sizes_bytes()
+        if persistent_workspace_profiled and runner._workspace_sizes_exceed(
+            arena_before_init, arena_after_init
+        ):
+            raise AssertionError(
+                "Attention workspace arena grew while rebuilding CUDA graph "
+                "profiling metadata after persistent workspace profiling: "
+                f"{arena_before_init} -> {arena_after_init}."
+            )
+
+        # Reserve the attention workspace the capture below will run against
+        # and account for it separately from the graph memory: without a
+        # persistent workspace profile it becomes the persistent estimate,
+        # with one it must already be inside the activation peak and adds
+        # nothing.
+        persistent_estimate = (
+            runner._reserve_attention_workspace_for_cudagraph_capture()
+        )
+        arena_after_reserve = current_workspace_manager().workspace_sizes_bytes()
+        if persistent_workspace_profiled:
+            if runner._workspace_sizes_exceed(arena_before_init, arena_after_reserve):
+                raise AssertionError(
+                    "Attention workspace arena grew during CUDA graph profiling "
+                    "after persistent workspace profiling: "
+                    f"{arena_before_init} -> {arena_after_reserve}."
+                )
+            persistent_estimate = 0
+        else:
+            logger.info(
+                "Estimated CUDA graph persistent workspace memory: %.2f GiB",
+                persistent_estimate / (1 << 30),
+            )
+        runner.cudagraph_memory_persistent_estimate = int(persistent_estimate)
+
+        manager = runner.cudagraph_manager
+        assert manager is not None
         if not manager.needs_capture():
             return 0
         # Capture all profiling graphs into a throwaway pool so their memory
@@ -821,7 +823,7 @@ def profile_cudagraph_memory(
         for wrapper in all_wrappers:
             if id(wrapper) in original_pools:
                 wrapper.graph_pool = original_pools[id(wrapper)]
-        _teardown_profiling_state(runner)
+        runner._cleanup_profiling_kv_cache()
 
 
 def _extrapolate_full_graph_memory(mem_samples: list[int], total_graphs: int) -> int:

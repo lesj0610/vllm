@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from vllm.config.compilation import CUDAGraphMode
 from vllm.v1.attention.backend import PersistentWorkspaceProfilingSupport
 from vllm.v1.kv_cache_interface import FullAttentionSpec, UniformTypeKVCacheSpecs
 from vllm.v1.worker.workspace import (
@@ -612,6 +613,7 @@ def test_flashinfer_workspace_routes_match_reachable_dispatches(
     builder = FlashInferMetadataBuilder.__new__(FlashInferMetadataBuilder)
     builder.use_trtllm_prefill_attention = trtllm_prefill
     builder.use_trtllm_decode_attention = trtllm_decode
+    builder.use_dedicated_xqa = False
     builder.kv_cache_spec = SimpleNamespace(non_causal=non_causal)
     builder.model_config = SimpleNamespace(is_mm_prefix_lm=is_mm_prefix_lm)
 
@@ -1441,12 +1443,17 @@ def test_cudagraph_profile_rejects_builder_init_workspace_growth(monkeypatch, ve
 
     runner = GPUModelRunner.__new__(GPUModelRunner)
     runner.vllm_config = object()
+    runner.compilation_config = SimpleNamespace(cudagraph_mode=CUDAGraphMode.PIECEWISE)
     cleanup_calls = []
     runner._init_minimal_kv_cache_for_profiling = lambda: (
         current_workspace_manager().get_simultaneous(((2048,), torch.uint8))
     )
     runner._cleanup_profiling_kv_cache = lambda: cleanup_calls.append("cleanup")
     monkeypatch.setattr(module, "set_current_vllm_config", null_context)
+    if version == "v2":
+        from vllm.v1.worker.gpu import cudagraph_utils as cudagraph_utils_v2
+
+        monkeypatch.setattr(cudagraph_utils_v2, "set_current_vllm_config", null_context)
 
     reset_workspace_manager()
     init_workspace_manager(torch.device("cpu"))
@@ -1633,6 +1640,7 @@ def test_separate_profile_accounts_persistent_and_graph_pool(
 def test_v2_profile_attention_workspace_accounting(
     monkeypatch, persistent_workspace_profiled, expected_estimate
 ):
+    from vllm.v1.worker.gpu import cudagraph_utils as cudagraph_utils_v2
     from vllm.v1.worker.gpu import model_runner as gpu_model_runner_v2
     from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 
@@ -1642,11 +1650,18 @@ def test_v2_profile_attention_workspace_accounting(
 
     runner = GPUModelRunner.__new__(GPUModelRunner)
     runner.vllm_config = object()
+    runner.compilation_config = SimpleNamespace(cudagraph_mode=CUDAGraphMode.PIECEWISE)
+    runner.cudagraph_manager = SimpleNamespace(needs_capture=lambda: False)
 
     events = []
 
     monkeypatch.setattr(
         gpu_model_runner_v2,
+        "set_current_vllm_config",
+        lambda *args, **kwargs: null_context(),
+    )
+    monkeypatch.setattr(
+        cudagraph_utils_v2,
         "set_current_vllm_config",
         lambda *args, **kwargs: null_context(),
     )
@@ -1668,7 +1683,10 @@ def test_v2_profile_attention_workspace_accounting(
             persistent_workspace_profiled=persistent_workspace_profiled
         )
 
-        assert estimate == expected_estimate
+        # The return value is the graph-capture memory estimate (zero here:
+        # nothing needs capture); the workspace reservation is accounted on
+        # the attribute the worker reads separately.
+        assert estimate == 0
         assert runner.cudagraph_memory_persistent_estimate == expected_estimate
         assert runner.cudagraph_memory_graph_pool_estimate == 0
         assert events == ["init", "reserve", "cleanup"]
@@ -1772,7 +1790,7 @@ def test_v2_capture_reserves_workspace_before_measurement_and_locks(monkeypatch)
     runner.lora_config = None
     runner.maybe_setup_dummy_loras = lambda lora_config: null_context()
     runner.model = object()
-    runner.model_state = object()
+    runner.model_state = SimpleNamespace(supports_mm_inputs=False)
     runner.input_buffers = object()
     runner.intermediate_tensors = None
     runner.block_tables = object()
@@ -1780,6 +1798,7 @@ def test_v2_capture_reserves_workspace_before_measurement_and_locks(monkeypatch)
     runner.kv_cache_config = object()
     runner.use_aux_hidden_state_outputs = False
     runner.speculator = None
+    runner.adaptive_verification = None
 
     memory_reserved_values = iter([1_000, 1_000, 1_128, 1_128])
     memory_allocated_values = iter([500, 500, 628, 628])

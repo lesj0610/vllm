@@ -93,8 +93,9 @@ from vllm.v1.worker.gpu.cp_utils import prepare_dcp_local_seq_lens
 from vllm.v1.worker.gpu.cudagraph_utils import (
     BatchExecutionDescriptor,
     ModelCudaGraphManager,
-    _init_minimal_kv_cache_for_profiling,
-    _teardown_profiling_state,
+)
+from vllm.v1.worker.gpu.cudagraph_utils import (
+    _init_minimal_kv_cache_for_profiling as _init_minimal_kv_cache_for_profiling_impl,
 )
 from vllm.v1.worker.gpu.cudagraph_utils import (
     profile_cudagraph_memory as _profile_cudagraph_memory,
@@ -851,6 +852,48 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if self.pooling_runner is not None:
             self.pooling_runner.clear()
 
+    def _init_minimal_kv_cache_for_profiling(self) -> None:
+        _init_minimal_kv_cache_for_profiling_impl(self)
+
+    def _cleanup_profiling_kv_cache(self) -> None:
+        torch.accelerator.synchronize()
+
+        if hasattr(self, "kv_caches") and self.kv_caches:
+            for i in range(len(self.kv_caches)):
+                self.kv_caches[i] = None  # type: ignore[assignment]
+            self.kv_caches.clear()
+        if hasattr(self, "attn_groups"):
+            self.attn_groups.clear()
+        for attr in (
+            "attn_groups",
+            "kv_cache_config",
+            "block_tables",
+            "kernel_block_sizes",
+        ):
+            if hasattr(self, attr):
+                delattr(self, attr)
+        # Profile runs dispatch eagerly but still read this attribute.
+        self.cudagraph_manager = None
+        self.cache_config.num_gpu_blocks = None
+
+        for layer in self.compilation_config.static_forward_context.values():
+            if hasattr(layer, "kv_cache"):
+                kv_cache = layer.kv_cache
+                layer.kv_cache = (
+                    torch.tensor([]) if isinstance(kv_cache, torch.Tensor) else []
+                )
+            # Clean up quantized KV cache scale views
+            # (int8_per_token_head, fp8_per_token_head).
+            if hasattr(layer, "impl"):
+                if hasattr(layer.impl, "_k_scale_cache"):
+                    layer.impl._k_scale_cache = None
+                if hasattr(layer.impl, "_v_scale_cache"):
+                    layer.impl._v_scale_cache = None
+
+        gc.collect()
+        torch.accelerator.empty_cache()
+        logger.debug("Cleaned up profiling KV cache and CUDA graphs")
+
     def _reserve_attention_workspace(self, *, memory_profiling: bool) -> int:
         if not getattr(self, "attn_groups", None):
             return 0
@@ -1113,7 +1156,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         lease: PersistentWorkspaceLease | None = None
         try:
             with set_current_vllm_config(self.vllm_config):
-                _init_minimal_kv_cache_for_profiling(self)
+                self._init_minimal_kv_cache_for_profiling()
 
             arena_after_init = manager.workspace_sizes_bytes()
             allocated_after_init = torch.accelerator.memory_allocated(self.device)
@@ -1130,12 +1173,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 for builder in attn_group.metadata_builders
             ]
             lease = PersistentWorkspaceLease(owners)
-            _teardown_profiling_state(self)
+            self._cleanup_profiling_kv_cache()
         except Exception:
             if lease is not None:
                 lease.release()
             try:
-                _teardown_profiling_state(self)
+                self._cleanup_profiling_kv_cache()
             except Exception:
                 logger.exception(
                     "Failed to clean up profiling KV cache after persistent "
