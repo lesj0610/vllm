@@ -38,7 +38,6 @@ from vllm.v1.worker.gpu.cp_utils import prepare_dcp_local_seq_lens
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.utils import AttentionGroup
-from vllm.v1.worker.workspace import current_workspace_manager
 
 if TYPE_CHECKING:
     from vllm.v1.worker.gpu.model_runner import GPUModelRunner
@@ -709,9 +708,7 @@ _MIN_PER_GRAPH_BYTES = 1 << 20
 
 
 @torch.inference_mode()
-def profile_cudagraph_memory(
-    runner: "GPUModelRunner", *, persistent_workspace_profiled: bool = False
-) -> int:
+def profile_cudagraph_memory(runner: "GPUModelRunner") -> int:
     """Estimate the GPU memory needed for CUDA graph capture.
 
     Called during memory profiling, *before* the real KV cache is allocated,
@@ -727,59 +724,24 @@ def profile_cudagraph_memory(
     partition reclaims the storages of earlier cudagraph recordings once the
     real capture records new ones, leading to use-after-free crashes).
     """
-    runner.cudagraph_memory_persistent_estimate = 0
-    runner.cudagraph_memory_graph_pool_estimate = 0
     if runner.compilation_config.cudagraph_mode == CUDAGraphMode.NONE:
         return 0
 
     gc.collect()
     torch.accelerator.empty_cache()
 
+    with set_current_vllm_config(runner.vllm_config):
+        _init_minimal_kv_cache_for_profiling(runner)
+
+    manager = runner.cudagraph_manager
+    assert manager is not None
+
     # Don't count profiling captures; the real capture_model() runs later.
     saved_num_cudagraph_captured = compilation_counter.num_cudagraph_captured
     saved_capture_triggers = compilation_counter.num_gpu_runner_capture_triggers
     all_wrappers: list[Any] = []
     original_pools: dict[int, Any] = {}
-    arena_before_init = current_workspace_manager().workspace_sizes_bytes()
     try:
-        with set_current_vllm_config(runner.vllm_config):
-            runner._init_minimal_kv_cache_for_profiling()
-        arena_after_init = current_workspace_manager().workspace_sizes_bytes()
-        if persistent_workspace_profiled and runner._workspace_sizes_exceed(
-            arena_before_init, arena_after_init
-        ):
-            raise AssertionError(
-                "Attention workspace arena grew while rebuilding CUDA graph "
-                "profiling metadata after persistent workspace profiling: "
-                f"{arena_before_init} -> {arena_after_init}."
-            )
-
-        # Reserve the attention workspace the capture below will run against
-        # and account for it separately from the graph memory: without a
-        # persistent workspace profile it becomes the persistent estimate,
-        # with one it must already be inside the activation peak and adds
-        # nothing.
-        persistent_estimate = (
-            runner._reserve_attention_workspace_for_cudagraph_capture()
-        )
-        arena_after_reserve = current_workspace_manager().workspace_sizes_bytes()
-        if persistent_workspace_profiled:
-            if runner._workspace_sizes_exceed(arena_before_init, arena_after_reserve):
-                raise AssertionError(
-                    "Attention workspace arena grew during CUDA graph profiling "
-                    "after persistent workspace profiling: "
-                    f"{arena_before_init} -> {arena_after_reserve}."
-                )
-            persistent_estimate = 0
-        else:
-            logger.info(
-                "Estimated CUDA graph persistent workspace memory: %.2f GiB",
-                persistent_estimate / (1 << 30),
-            )
-        runner.cudagraph_memory_persistent_estimate = int(persistent_estimate)
-
-        manager = runner.cudagraph_manager
-        assert manager is not None
         if not manager.needs_capture():
             return 0
         # Capture all profiling graphs into a throwaway pool so their memory
@@ -823,7 +785,7 @@ def profile_cudagraph_memory(
         for wrapper in all_wrappers:
             if id(wrapper) in original_pools:
                 wrapper.graph_pool = original_pools[id(wrapper)]
-        runner._cleanup_profiling_kv_cache()
+        _teardown_profiling_state(runner)
 
 
 def _extrapolate_full_graph_memory(mem_samples: list[int], total_graphs: int) -> int:
@@ -887,6 +849,15 @@ def _teardown_profiling_state(runner: "GPUModelRunner") -> None:
             layer.kv_cache = (
                 torch.tensor([]) if isinstance(kv_cache, torch.Tensor) else []
             )
+        # Quantized KV cache scale views (int8/fp8 per-token-head) are strided
+        # views into the profiling KV cache, so they keep it alive unless the
+        # impl drops them too.
+        impl = getattr(layer, "impl", None)
+        if impl is not None:
+            if hasattr(impl, "_k_scale_cache"):
+                impl._k_scale_cache = None
+            if hasattr(impl, "_v_scale_cache"):
+                impl._v_scale_cache = None
     runner.cache_config.num_gpu_blocks = None
     runner.maybe_remove_all_loras(runner.lora_config)
     gc.collect()
