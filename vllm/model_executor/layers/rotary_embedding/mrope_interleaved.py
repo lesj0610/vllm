@@ -38,16 +38,17 @@ class MRotaryEmbeddingInterleaved(MRotaryEmbedding):
         dtype: torch.dtype,
         mrope_section: list[int],
         mrope_interleaved: bool = True,
+        *,
+        mrope_cache_max_position: int | None = None,
     ) -> None:
-        # Enlarge max_position_embeddings for video inputs
-        self.cache_max_position_num = max_position_embeddings
         super().__init__(
             head_size,
             rotary_dim,
-            self.cache_max_position_num,
+            max_position_embeddings,
             base,
             is_neox_style,
             dtype,
+            mrope_cache_max_position=mrope_cache_max_position,
         )
 
         self.mrope_section = mrope_section

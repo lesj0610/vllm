@@ -466,6 +466,10 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLMBase, QwenNextMixtureOfExperts):
 )
 class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid):
     supports_multimodal_pruning = True
+    # Unpruned M-RoPE positions of this dense implementation stay within the
+    # sequence length, so the physical cos/sin cache does not need the legacy
+    # 4x video headroom. Declared on the concrete class only.
+    mrope_positions_are_sequence_bounded = True
 
     hf_to_vllm_mapper = (
         Qwen3VLForConditionalGeneration.hf_to_vllm_mapper
