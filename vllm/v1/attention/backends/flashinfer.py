@@ -2209,11 +2209,9 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 if use_custom_mask
                 else None
             )
-            o_data_type = (
-                FP8_DTYPE
-                if getattr(self, "is_kvcache_nvfp4", False)
-                else self.model_config.dtype
-            )
+            # Native FlashInfer wrappers (fa2/fa3) reject FP8 output; only the
+            # trtllm-gen kernels require it, and those bypass wrapper planning.
+            o_data_type = self.model_config.dtype
             return _parse_workspace_sizes(
                 workspace_size(
                     qo_indptr=qo_indptr_cpu,
@@ -2522,11 +2520,9 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         if workspace_size is None:
             return None
         try:
-            o_data_type = (
-                FP8_DTYPE
-                if getattr(self, "is_kvcache_nvfp4", False)
-                else self.model_config.dtype
-            )
+            # Native FlashInfer wrappers (fa2/fa3) reject FP8 output; only the
+            # trtllm-gen kernels require it, and those bypass wrapper planning.
+            o_data_type = self.model_config.dtype
             return _parse_workspace_sizes(
                 workspace_size(
                     indptr=indptr_cpu,
@@ -2960,12 +2956,9 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                         prefill_wrapper,
                         BatchPrefillWithPagedKVCacheWrapper,
                     )
-                    # NVFP4 trtllm kernel only supports FP8 output;
-                    # use FP8 o_data_type so the wrapper matches the
-                    # FP8 output buffer allocated in forward().
-                    o_dtype = (
-                        FP8_DTYPE if self.is_kvcache_nvfp4 else self.model_config.dtype
-                    )
+                    # Native FlashInfer wrappers (fa2/fa3) reject FP8 output; only the
+                    # trtllm-gen kernels require it, and those bypass wrapper planning.
+                    o_dtype = self.model_config.dtype
                     self._ensure_flashinfer_wrapper_workspace(
                         prefill_wrapper,
                         self._get_prefill_workspace_size(
