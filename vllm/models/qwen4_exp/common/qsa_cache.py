@@ -578,10 +578,11 @@ class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
         self.is_circular_buffer = isinstance(kv_cache_spec, CircularBufferSpec)
         if isinstance(kv_cache_spec, MLAAttentionSpec):
-            self.compress_ratio = kv_cache_spec.compress_ratio
+            self.compress_ratio = int(kv_cache_spec.tokens_per_state)
         else:
             self.compress_ratio = 1
-        self.storage_block_size = kv_cache_spec.storage_block_size
+        # Stored states per manager block (the pre-refactor storage_block_size).
+        self.storage_block_size = kv_cache_spec.block_size // self.compress_ratio
         max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
         self.token_to_req_buffer = torch.empty(
             max_tokens, dtype=torch.int32, device=device
@@ -630,7 +631,7 @@ class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
             self.logical_positions_buffer,
             self.slot_mapping_buffer,
             storage_block_size=self.storage_block_size,
-            tokens_per_state=self.compress_ratio,
+            compress_ratio=self.compress_ratio,
             circular_buffer_size=(
                 self.kv_cache_spec.block_size if self.is_circular_buffer else 0
             ),
@@ -647,7 +648,7 @@ class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
             k_work_metadata=k_work_metadata,
             num_actual_tokens=num_tokens,
             storage_block_size=self.storage_block_size,
-            tokens_per_state=self.compress_ratio,
+            compress_ratio=self.compress_ratio,
         )
 
 
@@ -758,6 +759,11 @@ class QSAKeyStateCache(_QSAStateCache):
         super().__init__(head_size=storage_head_size, **kwargs)
 
     def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
+        if kv_cache.ndim == 4 and kv_cache.shape[1] == 1 and kv_cache.shape[2] != 1:
+            # The unified allocator hands out canonical [blocks, heads,
+            # block_size, width] views; QSA caches address [blocks,
+            # block_size, 1, width]. One KV head makes the swap a free view.
+            kv_cache = kv_cache.transpose(1, 2)
         if kv_cache.ndim != 4 or kv_cache.shape[2] != 1:
             raise ValueError("QSA raw cache must be [blocks, block_size, 1, width]")
         if kv_cache.dtype != torch.bfloat16 or kv_cache.shape[3] != self.head_size:
