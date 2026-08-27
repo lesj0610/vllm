@@ -68,6 +68,32 @@ def _make_fp8_ngram_embedding_for_load_test() -> Qwen4ExpNGramEmbedding:
     return module
 
 
+def _make_runtime_fp8_ngram_embedding_for_load_test() -> Qwen4ExpNGramEmbedding:
+    module = _make_ngram_embedding_for_load_test()
+    embedding = nn.Module()
+    embedding.org_vocab_size = 8
+    embedding.embedding_dim = 2
+    embedding.shard_indices = SimpleNamespace(
+        org_vocab_start_index=0,
+        org_vocab_end_index=8,
+    )
+    embedding.register_parameter(
+        "weight",
+        nn.Parameter(
+            torch.zeros(8, 2).to(torch.float8_e4m3fn),
+            requires_grad=False,
+        ),
+    )
+    module.ngram_embedding = embedding
+    module.runtime_fp8_table = True
+    module.register_buffer(
+        "runtime_fp8_scales",
+        torch.ones(2, dtype=torch.float32),
+        persistent=False,
+    )
+    return module
+
+
 def test_ple_shard_overlap_and_copy() -> None:
     overlap = compute_ple_shard_overlap(
         checkpoint_start=2, checkpoint_rows=5, tp_start=4, tp_end=8
@@ -157,6 +183,152 @@ def test_ngram_embedding_loads_fp8_shards_and_global_scale() -> None:
     )
     assert torch.equal(module.ngram_embedding.weight_scale, weight_scale)
     assert module.get_offload_output_dtype(torch.bfloat16) == torch.float8_e4m3fn
+
+
+def test_ngram_embedding_loads_unsharded_padded_table() -> None:
+    module = _make_ngram_embedding_for_load_test()
+    # 10 rows = original vocabulary (8) plus divisor padding.
+    table = torch.arange(20, dtype=torch.float32).reshape(10, 2)
+
+    loaded = module.load_weights([("ngram_embedding.weight", table)])
+
+    assert loaded == {"ngram_embedding.weight"}
+    torch.testing.assert_close(module.ngram_embedding.weight, table[2:6])
+
+
+def test_ngram_embedding_rejects_truncated_unsharded_table() -> None:
+    module = _make_ngram_embedding_for_load_test()
+
+    with pytest.raises(ValueError, match="Unsharded PLE embedding table"):
+        module.load_weights([("ngram_embedding.weight", torch.zeros(6, 2))])
+
+
+def test_ngram_embedding_runtime_fp8_quantizes_bf16_shards() -> None:
+    module = _make_runtime_fp8_ngram_embedding_for_load_test()
+    shard_0 = torch.arange(8, dtype=torch.bfloat16).reshape(4, 2)
+    shard_1 = torch.arange(8, 16, dtype=torch.bfloat16).reshape(4, 2)
+
+    loaded = module.load_weights(
+        [
+            ("ngram_embedding.shard_0.weight", shard_0),
+            ("ngram_embedding.shard_1.weight", shard_1),
+        ]
+    )
+
+    assert loaded == {"ngram_embedding.weight"}
+    assert module.ngram_embedding.weight.dtype == torch.float8_e4m3fn
+    fp8_max = torch.finfo(torch.float8_e4m3fn).max
+    torch.testing.assert_close(
+        module.runtime_fp8_scales,
+        torch.tensor([7.0, 15.0]) / fp8_max,
+    )
+    dequantized = (
+        module.ngram_embedding.weight.float()
+        * module._runtime_fp8_row_scales(torch.arange(8)).unsqueeze(-1)
+    )
+    torch.testing.assert_close(
+        dequantized,
+        torch.arange(16, dtype=torch.float32).reshape(8, 2),
+        rtol=0.08,
+        atol=0.0,
+    )
+    assert module.get_offload_output_dtype(torch.bfloat16) == torch.bfloat16
+
+
+def test_ngram_embedding_runtime_fp8_quantizes_unsharded_bf16_table() -> None:
+    module = _make_runtime_fp8_ngram_embedding_for_load_test()
+    table = torch.arange(16, dtype=torch.bfloat16).reshape(8, 2)
+
+    loaded = module.load_weights([("ngram_embedding.weight", table)])
+
+    assert loaded == {"ngram_embedding.weight"}
+    assert module.ngram_embedding.weight.dtype == torch.float8_e4m3fn
+    fp8_max = torch.finfo(torch.float8_e4m3fn).max
+    torch.testing.assert_close(
+        module.runtime_fp8_scales,
+        torch.tensor([7.0, 15.0]) / fp8_max,
+    )
+    dequantized = (
+        module.ngram_embedding.weight.float()
+        * module._runtime_fp8_row_scales(torch.arange(8)).unsqueeze(-1)
+    )
+    torch.testing.assert_close(
+        dequantized,
+        torch.arange(16, dtype=torch.float32).reshape(8, 2),
+        rtol=0.08,
+        atol=0.0,
+    )
+
+
+def _make_runtime_fp8_forward_module(
+    weight: torch.Tensor,
+    scales: torch.Tensor,
+) -> Qwen4ExpNGramEmbedding:
+    module = Qwen4ExpNGramEmbedding.__new__(Qwen4ExpNGramEmbedding)
+    nn.Module.__init__(module)
+    module.embedding_dim = 2
+    module.head_dim = 2
+    module.ngram_size = 2
+    module.heads_per_ngram = 1
+    module.eos_token_id = 99
+    module.split_ngram_parts = 1
+    module.register_buffer("positions_buffer", torch.arange(2))
+    module.register_buffer("padded_buffer", torch.empty(1, 2, dtype=torch.long))
+    module.register_buffer("layer_multipliers", torch.tensor([1, 1]))
+    module.register_buffer("ngram_heads_vocab_sizes", torch.tensor([3]))
+    module.register_buffer("ngram_heads_offsets", torch.tensor([0]))
+    module.ngram_embedding = SimpleNamespace(
+        org_vocab_size=3,
+        embedding_dim=2,
+        weight=weight,
+    )
+    module.runtime_fp8_table = True
+    module.register_buffer("runtime_fp8_scales", scales, persistent=False)
+    return module
+
+
+def test_ngram_runtime_fp8_cpu_offload_dequantizes_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reference = torch.tensor([[1.0, 2.0], [4.0, 8.0], [16.0, 32.0]])
+    fp8_max = torch.finfo(torch.float8_e4m3fn).max
+    scale = reference.abs().max() / fp8_max
+    quantized_weight = (reference / scale).to(torch.float8_e4m3fn)
+    module = _make_runtime_fp8_forward_module(
+        quantized_weight,
+        torch.tensor([scale], dtype=torch.float32),
+    )
+
+    monkeypatch.setattr(ple_layer_module, "is_offload_process", lambda: True)
+    hidden_states = torch.empty(2, 0)
+    input_ids = torch.tensor([0, 1])
+    query_start_loc = torch.tensor([0, 2])
+    ngram_context = torch.tensor([[99]])
+    output_buffer = torch.empty(2, 2, dtype=torch.bfloat16)
+
+    output = module.forward_impl(
+        hidden_states,
+        input_ids,
+        query_start_loc,
+        ngram_context,
+        output_buffer=output_buffer,
+    )
+
+    assert output.data_ptr() == output_buffer.data_ptr()
+    assert output.dtype == torch.bfloat16
+    expected = quantized_weight.float() * scale
+    lookup = module.forward_impl(
+        hidden_states,
+        input_ids,
+        query_start_loc,
+        ngram_context,
+        output_buffer=torch.empty(2, 2, dtype=torch.float32),
+    )
+    torch.testing.assert_close(output.float(), lookup)
+    # Every dequantized row must come from the expected table.
+    for row in output.float():
+        assert any(torch.allclose(row, exp, rtol=0.08) for exp in expected)
+    assert module.get_offload_output_dtype(torch.bfloat16) == torch.bfloat16
 
 
 def test_ngram_gpu_offload_retains_only_fp8_global_scale(monkeypatch) -> None:
