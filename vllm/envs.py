@@ -299,6 +299,7 @@ if TYPE_CHECKING:
     VLLM_USE_V2_MODEL_RUNNER: bool | None = None
     VLLM_PLE_CPU_OFFLOAD: bool = False
     VLLM_PLE_OFFLOAD_READY_TIMEOUT: float = 600.0
+    VLLM_PLE_OFFLOAD_FP8_TABLE: bool = False
     VLLM_LOG_MODEL_INSPECTION: bool = False
     VLLM_DEBUG_MFU_METRICS: bool = False
     VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY: bool = False
@@ -2049,6 +2050,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Timeout for PLE weight loading and TP worker registration.
     "VLLM_PLE_OFFLOAD_READY_TIMEOUT": lambda: float(
         os.getenv("VLLM_PLE_OFFLOAD_READY_TIMEOUT", "600")
+    ),
+    # Quantize PLE tables that are not FP8-serialized (e.g. ModelOpt NVFP4
+    # checkpoints keep the n-gram table in BF16) to FP8 inside the CPU
+    # offload worker, with one scale per checkpoint row group. This halves
+    # the host memory for the table. Lookup results are dequantized on CPU
+    # before the H2D copy, so GPU workers and CUDA graphs are unaffected.
+    "VLLM_PLE_OFFLOAD_FP8_TABLE": lambda: (
+        os.getenv("VLLM_PLE_OFFLOAD_FP8_TABLE", "False").lower() in ("true", "1")
     ),
     # Log model inspection after loading.
     # If enabled, logs a transformers-style hierarchical view of the model

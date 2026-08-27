@@ -184,6 +184,45 @@ class Qwen4ExpPLEFp8EmbeddingMethod(QuantizeMethodBase):
         return F.embedding(input_, layer.weight)
 
 
+class Qwen4ExpPLERuntimeFp8EmbeddingMethod(QuantizeMethodBase):
+    """FP8 PLE table quantized at load time from higher-precision shards.
+
+    Used by the CPU offload worker for checkpoints whose PLE table is not
+    FP8-serialized (e.g. ModelOpt NVFP4 excludes the n-gram table and keeps
+    it in BF16). One scale is kept per checkpoint row group and lookup
+    results are dequantized on CPU, so cross-process output buffers keep the
+    model dtype and GPU workers need no scale.
+    """
+
+    def create_weights(
+        self,
+        layer: nn.Module,
+        input_size_per_partition: int,
+        output_partition_sizes: list[int],
+        input_size: int,
+        output_size: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ) -> None:
+        del input_size, output_size, params_dtype
+        weight_loader = extra_weight_attrs.get("weight_loader")
+        weight = create_fp8_weight_parameter(
+            sum(output_partition_sizes), input_size_per_partition, weight_loader
+        )
+        layer.register_parameter("weight", weight)
+
+    def apply(
+        self,
+        layer: nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        raise NotImplementedError("PLE FP8 weights only support embedding lookup")
+
+    def embedding(self, layer: nn.Module, input_: torch.Tensor) -> torch.Tensor:
+        return F.embedding(input_, layer.weight)
+
+
 def _get_ple_embedding_quant_method(
     quant_config: QuantizationConfig | None,
     prefix: str,
@@ -279,16 +318,36 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
         )
         divisor = int(config.make_ngram_vocab_size_divisible_by)
         padded_vocab_size = ((offset + divisor - 1) // divisor) * divisor
+        quant_method = _get_ple_embedding_quant_method(
+            quant_config, f"{prefix}.ngram_embedding"
+        )
+        # Checkpoints without an FP8-serialized PLE table (e.g. ModelOpt
+        # NVFP4) can be requantized to FP8 while the CPU offload worker
+        # loads them, halving the table's host memory.
+        self.runtime_fp8_table = (
+            quant_method is None
+            and envs.VLLM_PLE_CPU_OFFLOAD
+            and envs.VLLM_PLE_OFFLOAD_FP8_TABLE
+        )
+        if self.runtime_fp8_table:
+            quant_method = Qwen4ExpPLERuntimeFp8EmbeddingMethod()
         self.ngram_embedding = VocabParallelEmbedding(
             padded_vocab_size,
             self.head_dim,
             params_dtype=params_dtype,
             padding_size=divisor,
             prefix=f"{prefix}.ngram_embedding",
-            quant_method=_get_ple_embedding_quant_method(
-                quant_config, f"{prefix}.ngram_embedding"
-            ),
+            quant_method=quant_method,
         )
+        if self.runtime_fp8_table:
+            self._runtime_output_dtype = (
+                params_dtype if params_dtype is not None else torch.get_default_dtype()
+            )
+            self.register_buffer(
+                "runtime_fp8_scales",
+                torch.ones(self.split_ngram_parts, dtype=torch.float32),
+                persistent=False,
+            )
         self.register_buffer(
             "positions_buffer",
             torch.arange(max_total_tokens, dtype=torch.int64),
@@ -428,17 +487,40 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
         ngram_ids = torch.cat(id_blocks, dim=-1)
         if output_buffer is not None:
             output = output_buffer[:num_tokens, : self.embedding_dim]
+            flat_ids = ngram_ids.reshape(-1)
+            if getattr(self, "runtime_fp8_table", False):
+                rows = self.ngram_embedding.weight.index_select(0, flat_ids)
+                scales = self._runtime_fp8_row_scales(flat_ids)
+                out_rows = output.reshape(-1, self.head_dim)
+                torch.mul(
+                    rows.to(out_rows.dtype),
+                    scales.to(out_rows.dtype).unsqueeze(-1),
+                    out=out_rows,
+                )
+                return output
             torch.index_select(
                 self.ngram_embedding.weight,
                 0,
-                ngram_ids.reshape(-1),
+                flat_ids,
                 out=output.reshape(-1, self.head_dim),
             )
             return output
-        return self.ngram_embedding(ngram_ids).flatten(-2)
+        embeddings = self.ngram_embedding(ngram_ids)
+        if getattr(self, "runtime_fp8_table", False):
+            scales = self._runtime_fp8_row_scales(ngram_ids.reshape(-1)).reshape(
+                ngram_ids.shape
+            )
+            embeddings = embeddings.to(self._runtime_output_dtype) * scales.to(
+                self._runtime_output_dtype
+            ).unsqueeze(-1)
+        return embeddings.flatten(-2)
 
     def get_offload_output_dtype(self, default_dtype: torch.dtype) -> torch.dtype:
         """Keep quantized lookup results in their embedding storage dtype."""
+        # Runtime-quantized FP8 tables are dequantized on CPU, so the
+        # cross-process buffers keep the model dtype on both sides.
+        if getattr(self, "runtime_fp8_table", False):
+            return default_dtype
         embedding = getattr(self, "ngram_embedding", None)
         weight = getattr(embedding, "weight", None)
         if weight is not None:
@@ -488,6 +570,32 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
                 buffer.copy_(loaded_weight.to(device=buffer.device, dtype=buffer.dtype))
                 loaded.add(name)
                 continue
+            if name == "ngram_embedding.weight":
+                # Some exporters serialize the PLE table as one unsharded
+                # tensor with either the original or the padded vocabulary
+                # rows. The default embedding loader rejects padded rows, so
+                # copy the TP-relevant range here, mirroring the shard path.
+                embedding = self.ngram_embedding
+                if loaded_weight.shape[0] < embedding.org_vocab_size:
+                    raise ValueError(
+                        "Unsharded PLE embedding table has "
+                        f"{loaded_weight.shape[0]} rows, expected at least "
+                        f"{embedding.org_vocab_size}"
+                    )
+                if getattr(self, "runtime_fp8_table", False):
+                    # Requantize group by group so peak memory stays
+                    # bounded by one row group.
+                    self._quantize_runtime_fp8_rows(loaded_weight, checkpoint_start=0)
+                else:
+                    copy_ple_embedding_shard_(
+                        embedding.weight.data,
+                        loaded_weight,
+                        checkpoint_start=0,
+                        tp_start=embedding.shard_indices.org_vocab_start_index,
+                        tp_end=embedding.shard_indices.org_vocab_end_index,
+                    )
+                loaded.add("ngram_embedding.weight")
+                continue
             if name.startswith(shard_prefix) and name.endswith(".weight"):
                 shard_text = name[len(shard_prefix) : -len(".weight")]
                 if not shard_text.isdigit():
@@ -515,13 +623,20 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
                         f"expected {expected_shape}, got "
                         f"{tuple(loaded_weight.shape)}"
                     )
-                copy_ple_embedding_shard_(
-                    embedding.weight.data,
-                    loaded_weight,
-                    checkpoint_start=checkpoint_start,
-                    tp_start=embedding.shard_indices.org_vocab_start_index,
-                    tp_end=embedding.shard_indices.org_vocab_end_index,
-                )
+                if getattr(self, "runtime_fp8_table", False):
+                    # Checkpoint shards line up with the runtime scale
+                    # groups: both use ceil(org_vocab / split_ngram_parts).
+                    self._quantize_runtime_fp8_rows(
+                        loaded_weight, checkpoint_start=checkpoint_start
+                    )
+                else:
+                    copy_ple_embedding_shard_(
+                        embedding.weight.data,
+                        loaded_weight,
+                        checkpoint_start=checkpoint_start,
+                        tp_start=embedding.shard_indices.org_vocab_start_index,
+                        tp_end=embedding.shard_indices.org_vocab_end_index,
+                    )
                 loaded.add("ngram_embedding.weight")
                 continue
             regular_weights.append((name, loaded_weight))
@@ -529,6 +644,53 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
         if regular_weights:
             loaded.update(AutoWeightsLoader(self).load_weights(regular_weights))
         return loaded
+
+    @property
+    def _runtime_fp8_group_rows(self) -> int:
+        """Rows per runtime-FP8 scale group; equals the checkpoint shard size."""
+        embedding = self.ngram_embedding
+        return (
+            embedding.org_vocab_size + self.split_ngram_parts - 1
+        ) // self.split_ngram_parts
+
+    def _runtime_fp8_row_scales(self, row_ids: torch.Tensor) -> torch.Tensor:
+        group_ids = torch.div(
+            row_ids, self._runtime_fp8_group_rows, rounding_mode="floor"
+        ).clamp_(max=self.split_ngram_parts - 1)
+        return self.runtime_fp8_scales[group_ids]
+
+    def _quantize_runtime_fp8_rows(
+        self,
+        loaded_weight: torch.Tensor,
+        checkpoint_start: int,
+    ) -> None:
+        """Quantize checkpoint rows to FP8 with one scale per row group."""
+        embedding = self.ngram_embedding
+        group_rows = self._runtime_fp8_group_rows
+        fp8_max = torch.finfo(torch.float8_e4m3fn).max
+        row_count = loaded_weight.shape[0]
+        first_group = checkpoint_start // group_rows
+        for group in range(first_group, self.split_ngram_parts):
+            group_start = group * group_rows
+            start = max(group_start, checkpoint_start)
+            end = min(group_start + group_rows, checkpoint_start + row_count)
+            if start >= end:
+                break
+            rows = loaded_weight[start - checkpoint_start : end - checkpoint_start].to(
+                torch.float32
+            )
+            scale = (rows.abs().max() / fp8_max).clamp(
+                min=torch.finfo(torch.float32).tiny
+            )
+            self.runtime_fp8_scales[group] = scale
+            quantized = (rows / scale).clamp_(-fp8_max, fp8_max).to(torch.float8_e4m3fn)
+            copy_ple_embedding_shard_(
+                embedding.weight.data,
+                quantized,
+                checkpoint_start=start,
+                tp_start=embedding.shard_indices.org_vocab_start_index,
+                tp_end=embedding.shard_indices.org_vocab_end_index,
+            )
 
 
 class Qwen4ExpPLELayer(nn.Module, MambaBase):
