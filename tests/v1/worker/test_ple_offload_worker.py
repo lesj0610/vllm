@@ -15,6 +15,7 @@ from vllm.model_executor.layers import ple_offload_layer
 from vllm.model_executor.layers.ple_offload_layer import PleOffloadLayer
 from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
 from vllm.v1.ple_offload import worker as ple_offload_worker
+from vllm.v1.ple_offload.connector import PleOffloadConnector
 from vllm.v1.worker.gpu_worker import Worker
 
 
@@ -35,6 +36,15 @@ class _WeightLoadingPleLayer(_TestPleOffloadLayer):
         super().__init__()
         self.weight = torch.nn.Parameter(torch.zeros(2))
         self.bias = torch.nn.Parameter(torch.zeros(2))
+
+
+class _DummyMetadataPleLayer(_TestPleOffloadLayer):
+    def __init__(self) -> None:
+        super().__init__()
+        self.dummy_metadata_device: torch.device | None = None
+
+    def initialize_dummy_offload_metadata(self, device: torch.device) -> None:
+        self.dummy_metadata_device = device
 
 
 class _WeightLoadingModel(torch.nn.Module):
@@ -101,8 +111,6 @@ def _load_test_ple_weights(
         load_config=SimpleNamespace(),
     )
     runner._layers = {}
-    # _load_weights records the shards it read so they can be released later.
-    runner.checkpoint_shards = []
     runner._load_weights()
     return runner, model
 
@@ -147,6 +155,30 @@ def test_ple_offload_rejects_missing_materialized_parameters(
             monkeypatch,
             ["checkpoint.ple.weight"],
         )
+
+
+@pytest.mark.parametrize("load_format", ["dummy", "auto"])
+def test_ple_connector_initializes_metadata_only_for_dummy_load(
+    load_format: str,
+) -> None:
+    connector = PleOffloadConnector.__new__(PleOffloadConnector)
+    connector.device = torch.device("cpu")
+    model = torch.nn.Module()
+    model.ple = _DummyMetadataPleLayer()
+    vllm_config = SimpleNamespace(
+        load_config=SimpleNamespace(load_format=load_format),
+        model_config=SimpleNamespace(
+            dtype=torch.float32,
+            hf_text_config=SimpleNamespace(ple_embed_dim=2),
+        ),
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=4),
+    )
+
+    layers = connector._setup_layers(vllm_config, model)
+
+    expected_device = connector.device if load_format == "dummy" else None
+    assert model.ple.dummy_metadata_device == expected_device
+    assert list(layers) == ["ple"]
 
 
 def test_ple_offload_wait_only_waits_for_done(
@@ -459,7 +491,10 @@ def test_ple_offload_runner_groups_registrations_by_dp_rank(
         ),
     )
     runner._layers = {
-        "ple": SimpleNamespace(get_offload_output_dtype=lambda default: default)
+        "ple": SimpleNamespace(
+            get_offload_output_dtype=lambda default: default,
+            get_offload_output_dim=lambda default: default + 1,
+        )
     }
     runner._worker_targets = {}
     runner._pinned_bufs = {}
@@ -509,6 +544,8 @@ def test_ple_offload_runner_groups_registrations_by_dp_rank(
     assert runner._input_bufs[0].input_ids_buf[0].item() == 0
     assert runner._input_bufs[1].input_ids_buf[0].item() == 1
     assert set(runner._pinned_bufs) == {0, 1}
+    assert runner._pinned_bufs[0]["ple"].shape == (8, 3)
+    assert runner._pinned_bufs[1]["ple"].shape == (8, 3)
 
 
 def test_ple_offload_runner_routes_requests_layer_first(
@@ -1106,117 +1143,3 @@ def test_poll_semaphores_gives_up_instead_of_spinning_forever(monkeypatch):
 
     with pytest.raises(RuntimeError, match="did not answer for layers.1.ple"):
         connector._poll_semaphores()
-
-
-def _write_table_shard(tmp_path, rows: int, cols: int, name: str) -> str:
-    """Write a one-tensor safetensors shard holding a BF16 PLE table."""
-    import json
-    import struct
-
-    table = (torch.randn(rows, cols) * 0.05).to(torch.bfloat16)
-    blob = table.contiguous().view(torch.uint8).numpy().tobytes()
-    header = json.dumps(
-        {name: {"dtype": "BF16", "shape": [rows, cols], "data_offsets": [0, len(blob)]}}
-    ).encode()
-    shard = tmp_path / "model-00001-of-00001.safetensors"
-    with open(shard, "wb") as handle:
-        handle.write(struct.pack("<Q", len(header)))
-        handle.write(header)
-        handle.write(blob)
-    return str(shard)
-
-
-def _runner_with_streaming(monkeypatch, shard: str, strategy=None):
-    """A runner whose loader resolves to one shard, like the real one does."""
-    runner = ple_offload_worker.PleOffloadRunner.__new__(
-        ple_offload_worker.PleOffloadRunner
-    )
-    runner.checkpoint_shards = []
-    runner.vllm_config = SimpleNamespace(
-        model_config=SimpleNamespace(model="/models/demo", revision=None),
-        load_config=SimpleNamespace(safetensors_load_strategy=strategy),
-    )
-
-    class Loader:
-        def _prepare_weights(self, *args, **kwargs):
-            return "/models/demo", [shard], True
-
-    runner._resolve_checkpoint_shards(
-        Loader(), runner.vllm_config.model_config, SimpleNamespace()
-    )
-    return runner
-
-
-def test_streaming_reaches_the_table_before_any_weight_is_read(monkeypatch, tmp_path):
-    """The shard list must be known before the streaming decision is made.
-
-    get_all_weights() is a generator, so the loader resolves its files only
-    while it is consumed. Deciding earlier than that used to see an empty
-    list and silently skip streaming, leaving the high-memory path in place.
-    """
-    name = "model.language_model.layers.1.ple.ple_embedding.ngram_embedding.weight"
-    shard = _write_table_shard(tmp_path, 64, 8, name)
-    runner = _runner_with_streaming(monkeypatch, shard)
-
-    assert runner.checkpoint_shards == [shard], "shards must resolve up front"
-
-    streamed_from = []
-
-    class Layer:
-        runtime_fp8_table = True
-        ngram_embedding = object()
-
-        def quantize_runtime_fp8_from_file(self, path, tensor_name, checkpoint_start):
-            streamed_from.append((path, tensor_name, checkpoint_start))
-
-    consumed = runner._stream_runtime_fp8_tables(
-        {"layers.1.ple.ple_embedding": Layer()}, runner.vllm_config.load_config
-    )
-
-    assert streamed_from == [(shard, name, 0)]
-    assert consumed == {name}
-
-
-@pytest.mark.parametrize("strategy", ["eager", "prefetch"])
-def test_streaming_refuses_whole_shard_load_strategies(monkeypatch, tmp_path, strategy):
-    """Both strategies read whole shards, which reinstates the peak."""
-    name = "model.language_model.layers.1.ple.ple_embedding.ngram_embedding.weight"
-    shard = _write_table_shard(tmp_path, 64, 8, name)
-    runner = _runner_with_streaming(monkeypatch, shard, strategy=strategy)
-
-    class Layer:
-        runtime_fp8_table = True
-        ngram_embedding = object()
-
-        def quantize_runtime_fp8_from_file(self, *args, **kwargs):
-            pytest.fail("streaming must not run under a whole-shard strategy")
-
-    assert (
-        runner._stream_runtime_fp8_tables(
-            {"layers.1.ple.ple_embedding": Layer()},
-            runner.vllm_config.load_config,
-        )
-        == set()
-    )
-
-
-def test_streaming_leaves_quantized_tables_alone(monkeypatch, tmp_path):
-    """An FP8 or NVFP4 table is already packed; it must not be requantized."""
-    name = "model.language_model.layers.1.ple.ple_embedding.ngram_embedding.weight"
-    shard = _write_table_shard(tmp_path, 64, 8, name)
-    runner = _runner_with_streaming(monkeypatch, shard)
-
-    class PackedLayer:
-        runtime_fp8_table = False  # set when a quant method owns the table
-        ngram_embedding = object()
-
-        def quantize_runtime_fp8_from_file(self, *args, **kwargs):
-            pytest.fail("a packed table must not go through runtime conversion")
-
-    assert (
-        runner._stream_runtime_fp8_tables(
-            {"layers.1.ple.ple_embedding": PackedLayer()},
-            runner.vllm_config.load_config,
-        )
-        == set()
-    )
