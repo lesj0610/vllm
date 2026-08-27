@@ -49,6 +49,19 @@ class Qwen4ExpTextConfig(Qwen3NextConfig):
         if hc_count <= 1:
             raise ValueError(f"Qwen4Exp requires hc_count > 1, got {hc_count}.")
 
+        if layer_types is not None:
+            # Transformers' Qwen4Exp config canonicalizes "full_attention"
+            # entries to "qwen_sparse_attention" in memory, so checkpoints
+            # re-exported through it (e.g. quantized exports) serialize that
+            # name. vLLM keys QSA off "full_attention" plus indexer_n_heads,
+            # so map the transformers spelling back.
+            layer_types = [
+                "full_attention"
+                if layer_type == "qwen_sparse_attention"
+                else layer_type
+                for layer_type in layer_types
+            ]
+
         if rope_parameters is not None:
             if kwargs.get("rope_scaling") is None:
                 kwargs["rope_scaling"] = rope_parameters

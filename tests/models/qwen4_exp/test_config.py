@@ -491,3 +491,17 @@ def test_qwen4_exp_ple_builder_receives_spec_decode_metadata() -> None:
     torch.testing.assert_close(
         kwargs["num_decode_draft_tokens_cpu"], num_decode_draft_tokens_cpu
     )
+
+
+def test_text_config_normalizes_transformers_sparse_attention_spelling():
+    """Checkpoints re-exported through transformers' Qwen4Exp config class
+    serialize "qwen_sparse_attention"; vLLM keys QSA off "full_attention"."""
+    from vllm.models.qwen4_exp.config import Qwen4ExpTextConfig
+
+    config = Qwen4ExpTextConfig(
+        hc_count=4,
+        layer_types=["linear_attention", "qwen_sparse_attention"],
+        num_hidden_layers=2,
+    )
+
+    assert config.layer_types == ["linear_attention", "full_attention"]
