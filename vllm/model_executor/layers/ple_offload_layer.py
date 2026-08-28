@@ -78,6 +78,25 @@ def _cuda_check(result: Any, operation: str) -> Any:
 _LIVE_SEMAPHORES: "weakref.WeakSet[CpuGpuSemaphore]" = weakref.WeakSet()
 
 
+def _bind_primary_context(device_index: int) -> None:
+    """Make the device's primary context current on the calling thread.
+
+    A CUDA context is current per host thread, and the watchdog runs on a
+    thread that never touched CUDA, so every context-dependent driver call
+    would fail with CUDA_ERROR_INVALID_CONTEXT. The primary context is the
+    one PyTorch already uses for this device.
+    """
+    cuda_driver, _ = _stream_mem_ops()
+    _, device = _cuda_check(
+        cuda_driver.cuDeviceGet(device_index), "cuDeviceGet(recovery)"
+    )
+    _, context = _cuda_check(
+        cuda_driver.cuDevicePrimaryCtxRetain(device),
+        "cuDevicePrimaryCtxRetain(recovery)",
+    )
+    _cuda_check(cuda_driver.cuCtxSetCurrent(context), "cuCtxSetCurrent(recovery)")
+
+
 @functools.cache
 def _recovery_stream(device_index: int) -> Any:
     """Create the non-blocking stream used to break a stalled wait.
@@ -88,8 +107,8 @@ def _recovery_stream(device_index: int) -> Any:
     against nothing, so the write runs even while another stream is parked in
     ``cuStreamWaitValue32``.
     """
-    del device_index  # One CUDA context per worker process.
     cuda_driver, _ = _stream_mem_ops()
+    _bind_primary_context(device_index)
     _, stream = _cuda_check(
         cuda_driver.cuStreamCreate(
             cuda_driver.CUstream_flags.CU_STREAM_NON_BLOCKING.value
@@ -109,10 +128,16 @@ def release_all_semaphores() -> int:
     cuda_driver, _ = _stream_mem_ops()
     released = 0
     streams = set()
+    bound: set[int] = set()
     for semaphore in list(_LIVE_SEMAPHORES):
         try:
             flag = semaphore.flag_tensor
-            stream = _recovery_stream(flag.device.index or 0)
+            device_index = flag.device.index or 0
+            if device_index not in bound:
+                # Cheap, and required on every thread that reaches this.
+                _bind_primary_context(device_index)
+                bound.add(device_index)
+            stream = _recovery_stream(device_index)
             _cuda_check(
                 cuda_driver.cuStreamWriteValue32(
                     cuda_driver.CUstream(stream),
