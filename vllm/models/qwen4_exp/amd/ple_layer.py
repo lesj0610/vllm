@@ -1030,7 +1030,7 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         gated_value = gate * value.unsqueeze(-2)
         normalized = self._apply_norm(self.norm_conv, gated_value).flatten(-2)
         conv_output = torch.zeros_like(normalized)
-        torch.ops.vllm.qwen4_exp_ple_short_conv(
+        torch.ops.vllm.qwen4_exp_ple_short_conv_rocm(
             normalized,
             conv_output,
             self.prefix,
@@ -1090,7 +1090,7 @@ direct_register_custom_op(
 
 
 direct_register_custom_op(
-    op_name="qwen4_exp_ple_short_conv",
+    op_name="qwen4_exp_ple_short_conv_rocm",
     op_func=qwen4_exp_ple_short_conv,
     mutates_args=["output"],
     fake_impl=qwen4_exp_ple_short_conv_fake,
