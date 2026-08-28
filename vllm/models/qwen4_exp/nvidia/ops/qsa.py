@@ -984,9 +984,12 @@ def qsa_sparse_paged_attention(
         assert k_scale.numel() == 1 and v_scale.numel() == 1
     else:
         # The kernel still materializes the scale pointers; feed a constant.
-        k_scale = _QSA_UNIT_SCALE_BY_DEVICE.setdefault(
-            q.device, torch.ones(1, dtype=torch.float32, device=q.device)
-        )
+        # setdefault would build a fresh tensor on every unquantized call, so
+        # look the cached one up first.
+        k_scale = _QSA_UNIT_SCALE_BY_DEVICE.get(q.device)
+        if k_scale is None:
+            k_scale = torch.ones(1, dtype=torch.float32, device=q.device)
+            _QSA_UNIT_SCALE_BY_DEVICE[q.device] = k_scale
         v_scale = k_scale
     assert logical_indices.dtype == block_table.dtype == torch.int32
     assert token_to_req.dtype == torch.int32
