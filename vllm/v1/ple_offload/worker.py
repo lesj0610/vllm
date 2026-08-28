@@ -111,8 +111,11 @@ def drop_page_cache_for(paths: "Iterable[str]") -> int:
         except OSError:
             continue
         try:
-            advised += os.fstat(fd).st_size
+            size = os.fstat(fd).st_size
             advise(fd, 0, 0, dontneed)
+            # Only count a shard the kernel accepted: a positive return value
+            # tells the caller no directory fallback is needed.
+            advised += size
         except OSError:
             logger.debug("Could not drop page cache for %s", path)
         finally:
