@@ -1899,12 +1899,19 @@ def _get_kv_cache_groups_csa_linear(
             raise ValueError(
                 f"CSA+linear {policy} mamba cache owners must use one spec."
             )
+        # The legacy shared-tensor layout required every mamba page to fit
+        # inside a main_kv tensor page. The unified overlay layout sizes the
+        # shared pool by the largest group instead, so a larger mamba page
+        # (e.g. with a quantized main KV cache) only grows bytes_per_block.
         unpadded_page = replace(representative, page_size_padded=None).page_size_bytes
         if unpadded_page > main_kv_page:
-            raise ValueError(
-                f"CSA+linear mamba cache owner {names[0]!r} needs "
-                f"{unpadded_page} bytes, but a main_kv tensor page has "
-                f"{main_kv_page} bytes."
+            logger.debug_once(
+                "CSA+linear mamba cache owner %r page (%d bytes) exceeds a "
+                "main_kv tensor page (%d bytes); the shared pool block is "
+                "sized by the larger group.",
+                names[0],
+                unpadded_page,
+                main_kv_page,
             )
         num_groups = _get_csa_linear_mamba_group_count(
             vllm_config, names, main_kv_names
@@ -1914,7 +1921,13 @@ def _get_kv_cache_groups_csa_linear(
                 "CSA+linear pipeline stage has mamba cache owners but no "
                 "main_kv tensor slots; realign the pipeline partition."
             )
-        padded_spec = replace(representative, page_size_padded=main_kv_page)
+        # Pad each mamba page up to a main_kv tensor page for slot alignment;
+        # when the mamba state is larger (e.g. quantized main KV), keep its
+        # natural page and let the shared pool block absorb the difference.
+        padded_spec = replace(
+            representative,
+            page_size_padded=max(main_kv_page, unpadded_page),
+        )
         grouped_names: list[list[str]] = [[] for _ in range(num_groups)]
         for index, name in enumerate(names):
             grouped_names[index % num_groups].append(name)

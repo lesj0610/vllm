@@ -9,6 +9,7 @@ block dim (a contiguous region per layer) or inside it (all layers' pages within
 block); the allocation is the same either way.
 """
 
+from dataclasses import replace
 from unittest.mock import MagicMock
 
 import pytest
@@ -17,14 +18,21 @@ import torch
 from vllm.config import CacheConfig
 from vllm.v1.core.kv_cache_utils import (
     _get_kv_cache_bytes_per_block,
+    _max_memory_usage_bytes_from_groups,
     _pool_bytes_per_block,
     get_kv_cache_config_from_groups,
+    get_kv_cache_groups,
+    resolve_kv_cache_block_sizes,
 )
 from vllm.v1.kv_cache_interface import (
+    CircularBufferSpec,
     FullAttentionSpec,
     KVCacheGroupSpec,
     KVCacheLayout,
+    KVCacheSpec,
+    MambaSpec,
     MLAAttentionSpec,
+    SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.worker.utils import allocate_kv_cache
@@ -243,20 +251,6 @@ if __name__ == "__main__":
 # layout: groups share one backing allocation and alias from byte zero).
 # ---------------------------------------------------------------------------
 
-from dataclasses import replace
-
-from vllm.v1.core.kv_cache_utils import (
-    _max_memory_usage_bytes_from_groups,
-    get_kv_cache_groups,
-    resolve_kv_cache_block_sizes,
-)
-from vllm.v1.kv_cache_interface import (
-    CircularBufferSpec,
-    KVCacheSpec,
-    MambaSpec,
-    SlidingWindowSpec,
-)
-
 MAIN_KV_PAGE_BYTES = 2_048
 COMPRESSED_PAGE_BYTES = 128
 NUM_CACHE_TUPLES = 3
@@ -432,7 +426,7 @@ class TestInterleavedPacking:
         with pytest.raises(ValueError, match="TP-local KV-head geometry"):
             get_kv_cache_groups(_shared_layout_config(), specs)
 
-    def test_compressor_state_and_mamba_pages_must_fit_their_owners(self):
+    def test_compressor_state_must_fit_and_large_mamba_pages_are_kept(self):
         compressor_state_too_large = _make_csa_linear_specs(num_tuples=1)
         compressor_state = compressor_state_too_large[_compressor_state_name(0)]
         assert isinstance(compressor_state, CircularBufferSpec)
@@ -442,15 +436,22 @@ class TestInterleavedPacking:
         with pytest.raises(ValueError, match="violate CSA geometry"):
             get_kv_cache_groups(_shared_layout_config(), compressor_state_too_large)
 
-        state_too_large = _make_csa_linear_specs(num_mamba=1, num_tuples=1)
+        # A mamba state larger than a main_kv page is allowed: the unified
+        # overlay layout sizes the shared pool block by the largest group,
+        # so the oversized state keeps its natural page instead of padding
+        # down to the main_kv page.
+        state_larger = _make_csa_linear_specs(num_mamba=1, num_tuples=1)
         state_name = "model.layers.0.linear_attn"
-        state = state_too_large[state_name]
+        state = state_larger[state_name]
         assert isinstance(state, MambaSpec)
-        state_too_large[state_name] = replace(
+        state_larger[state_name] = replace(
             state, shapes=((MAIN_KV_PAGE_BYTES + 1,),), dtypes=(torch.uint8,)
         )
-        with pytest.raises(ValueError, match="main_kv tensor page"):
-            get_kv_cache_groups(_shared_layout_config(), state_too_large)
+        groups = get_kv_cache_groups(_shared_layout_config(), state_larger)
+        sharded_mamba = next(
+            group for group in groups if group.layer_names == [state_name]
+        )
+        assert sharded_mamba.kv_cache_spec.page_size_bytes == MAIN_KV_PAGE_BYTES + 1
 
     def test_pipeline_partitions_balance_mamba_owners(self):
         specs = _make_csa_linear_specs(
