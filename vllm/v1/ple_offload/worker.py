@@ -21,6 +21,7 @@ Class structure mirrors the GPU worker pattern in multiproc_executor.py:
 
 import contextlib
 import multiprocessing.process
+import os
 import pickle
 import signal
 import tempfile
@@ -28,6 +29,7 @@ import threading
 from collections.abc import Iterable
 from dataclasses import dataclass
 from multiprocessing.connection import Connection
+from pathlib import Path
 from typing import Any, cast
 
 import msgspec
@@ -76,6 +78,39 @@ class PleOffloadOutputTarget:
     copy_stream: torch.cuda.Stream
 
 
+def drop_checkpoint_page_cache(model_path: str) -> int:
+    """Ask the kernel to drop the checkpoint's cached pages, in bytes advised.
+
+    The offload worker streams the whole checkpoint to build its table, and
+    on this model the table's shard alone is tens of gigabytes. Those pages
+    stay in the page cache long after the table is resident, so the next
+    engine start competes with them for the same host memory. The table lives
+    in this process's own memory by then, so the file pages are dead weight.
+    """
+    advise = getattr(os, "posix_fadvise", None)
+    dontneed = getattr(os, "POSIX_FADV_DONTNEED", None)
+    if advise is None or dontneed is None:
+        return 0
+    root = Path(model_path)
+    if not root.is_dir():
+        return 0
+    advised = 0
+    for shard in sorted(root.glob("*.safetensors")):
+        try:
+            fd = os.open(shard, os.O_RDONLY)
+        except OSError:
+            continue
+        try:
+            size = os.fstat(fd).st_size
+            advise(fd, 0, 0, dontneed)
+            advised += size
+        except OSError:
+            logger.debug("Could not drop page cache for %s", shard)
+        finally:
+            os.close(fd)
+    return advised
+
+
 @dataclass
 class PleOffloadInputBuffers:
     """Shared-memory input buffers registered for one DP rank."""
@@ -92,9 +127,13 @@ class PleOffloadWorkerHandle:
     proc: Any
     death_writer: Connection | None
     ready_pipe_reader: Connection | None
+    watchdog: "threading.Thread | None" = None
+    shutting_down: bool = False
 
     def close(self) -> None:
         """Release all process resources. Safe to call more than once."""
+        # Tell the watchdog this exit is expected before the child goes away.
+        self.shutting_down = True
         if self.ready_pipe_reader is not None:
             self.ready_pipe_reader.close()
             self.ready_pipe_reader = None
@@ -234,6 +273,50 @@ class PleOffloadWorker:
             len(layer_names),
             layer_names,
         )
+        # From here on the GPU side waits on the offload process every step,
+        # so its death has to become a failure rather than a stalled stream.
+        PleOffloadWorker.start_watchdog(handle)
+
+    @staticmethod
+    def start_watchdog(handle: PleOffloadWorkerHandle) -> None:
+        """Turn a dead offload process into a worker failure, not a hang.
+
+        The GPU side waits for results with ``cuStreamWaitValue32``. Nothing
+        in the driver times that wait out, so if the offload process dies the
+        stream waits forever and the worker never reports anything. Watch the
+        child, and when it exits unexpectedly release the waits and take this
+        worker down so the executor surfaces the failure.
+        """
+        if handle.watchdog is not None:
+            return
+
+        def _watch() -> None:
+            handle.proc.join()
+            if handle.shutting_down:
+                return
+            exitcode = handle.proc.exitcode
+            logger.error(
+                "PLE offload process exited unexpectedly with code %s. "
+                "Releasing GPU waits and stopping this worker.",
+                exitcode,
+            )
+            try:
+                from vllm.model_executor.layers.ple_offload_layer import (
+                    release_all_semaphores,
+                )
+
+                released = release_all_semaphores()
+                logger.error("Released %d PLE offload semaphore(s).", released)
+            except Exception:
+                logger.exception("Failed to release PLE offload semaphores")
+            # The executor treats a worker that dies as a fatal engine error.
+            os.kill(os.getpid(), signal.SIGTERM)
+
+        thread = threading.Thread(
+            target=_watch, name="ple-offload-watchdog", daemon=True
+        )
+        handle.watchdog = thread
+        thread.start()
 
     @staticmethod
     def proc_main(
@@ -319,6 +402,12 @@ class PleOffloadWorker:
             if ready_writer is not None:
                 ready_writer.close()
             death_pipe.close()
+            advised = drop_checkpoint_page_cache(vllm_config.model_config.model)
+            if advised:
+                logger.info(
+                    "Dropped the page cache for %.1f GiB of checkpoint shards.",
+                    advised / (1 << 30),
+                )
 
 
 class PleOffloadRunner:

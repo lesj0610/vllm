@@ -635,3 +635,120 @@ def test_wait_for_ready_closes_pipe() -> None:
     ple_offload_worker.PleOffloadWorker.wait_for_ready(handle)
 
     assert handle.ready_pipe_reader is None
+
+
+def test_ple_offload_watchdog_releases_waits_and_stops_the_worker(monkeypatch):
+    """A dead offload process must break the GPU wait, not stall it."""
+    import signal as signal_module
+    import threading
+
+    from vllm.v1.ple_offload.worker import (
+        PleOffloadWorker,
+        PleOffloadWorkerHandle,
+    )
+
+    exited = threading.Event()
+
+    class DeadChild:
+        exitcode = -9
+
+        def join(self, timeout=None):
+            exited.wait(5)
+
+        def is_alive(self):
+            return not exited.is_set()
+
+    released = []
+    signals = []
+
+    def fake_release() -> int:
+        released.append(1)
+        return 3
+
+    monkeypatch.setattr(ple_offload_layer, "release_all_semaphores", fake_release)
+    monkeypatch.setattr(
+        ple_offload_worker.os, "kill", lambda pid, sig: signals.append((pid, sig))
+    )
+
+    handle = PleOffloadWorkerHandle(
+        proc=DeadChild(), death_writer=None, ready_pipe_reader=None
+    )
+    PleOffloadWorker.start_watchdog(handle)
+    exited.set()
+    handle.watchdog.join(timeout=5)
+
+    assert not handle.watchdog.is_alive()
+    assert released == [1], "the watchdog must release the pending GPU waits"
+    assert signals and signals[0][1] == signal_module.SIGTERM
+
+
+def test_ple_offload_watchdog_stays_quiet_on_a_planned_shutdown(monkeypatch):
+    """close() marks the exit as expected, so the watchdog must do nothing."""
+    import threading
+
+    from vllm.v1.ple_offload.worker import (
+        PleOffloadWorker,
+        PleOffloadWorkerHandle,
+    )
+
+    exited = threading.Event()
+
+    class ClosingChild:
+        exitcode = 0
+
+        def join(self, timeout=None):
+            exited.wait(5)
+
+        def is_alive(self):
+            return not exited.is_set()
+
+    signals = []
+    monkeypatch.setattr(
+        ple_offload_worker.os, "kill", lambda pid, sig: signals.append((pid, sig))
+    )
+
+    handle = PleOffloadWorkerHandle(
+        proc=ClosingChild(), death_writer=None, ready_pipe_reader=None
+    )
+    PleOffloadWorker.start_watchdog(handle)
+    handle.shutting_down = True
+    exited.set()
+    handle.watchdog.join(timeout=5)
+
+    assert not signals, "a planned shutdown must not signal the worker"
+
+
+def test_drop_checkpoint_page_cache_advises_every_shard(tmp_path, monkeypatch):
+    """Shutdown must hand the checkpoint's cached pages back to the kernel."""
+    from vllm.v1.ple_offload.worker import drop_checkpoint_page_cache
+
+    sizes = {
+        "model-00001-of-00002.safetensors": 4096,
+        "model-00002-of-00002.safetensors": 8192,
+    }
+    for name, size in sizes.items():
+        (tmp_path / name).write_bytes(b"\0" * size)
+    (tmp_path / "config.json").write_text("{}")
+
+    advised = []
+    real_fadvise = ple_offload_worker.os.posix_fadvise
+
+    def record(fd, offset, length, advice):
+        advised.append((offset, length, advice))
+        return real_fadvise(fd, offset, length, advice)
+
+    monkeypatch.setattr(ple_offload_worker.os, "posix_fadvise", record)
+    total = drop_checkpoint_page_cache(str(tmp_path))
+
+    assert total == sum(sizes.values())
+    assert len(advised) == len(sizes), "config.json must not be touched"
+    assert all(
+        entry == (0, 0, ple_offload_worker.os.POSIX_FADV_DONTNEED) for entry in advised
+    )
+
+
+def test_drop_checkpoint_page_cache_ignores_a_missing_directory():
+    """A dummy-weight run has no checkpoint directory to release."""
+    from vllm.v1.ple_offload.worker import drop_checkpoint_page_cache
+
+    assert drop_checkpoint_page_cache("/nonexistent/checkpoint/path") == 0

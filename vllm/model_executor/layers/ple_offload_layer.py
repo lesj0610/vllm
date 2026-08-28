@@ -18,6 +18,7 @@ WriteValue32(flag=1, copy_stream)       return _gpu_output_buffer[:n]
 """
 
 import functools
+import weakref
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from typing import Any, cast
@@ -26,6 +27,7 @@ import torch
 from torch import nn
 
 import vllm.envs as envs
+from vllm.logger import init_logger
 from vllm.utils.torch_utils import direct_register_custom_op
 
 
@@ -46,6 +48,8 @@ def _stream_mem_ops() -> tuple[Any, Any]:
 # Because the offload process and GPU worker processes are separate OS
 # processes (spawned via multiprocessing), each has its own memory space.
 # A plain module-level bool is sufficient -- no thread-local storage needed.
+logger = init_logger(__name__)
+
 _offload_worker_flag = False
 
 
@@ -68,6 +72,31 @@ def _cuda_check(result: Any, operation: str) -> Any:
     return result
 
 
+# Semaphores the GPU worker is waiting on. A stream-memory wait can only be
+# broken by writing the value it waits for, so the offload watchdog needs to
+# reach every live semaphore when the offload process dies.
+_LIVE_SEMAPHORES: "weakref.WeakSet[CpuGpuSemaphore]" = weakref.WeakSet()
+
+
+def release_all_semaphores() -> int:
+    """Write DONE to every live semaphore and return how many were released.
+
+    Called when the offload process is gone: the results are worthless, but
+    the streams waiting for them have to make progress so the worker can shut
+    down instead of hanging in the driver.
+    """
+    released = 0
+    for semaphore in list(_LIVE_SEMAPHORES):
+        try:
+            semaphore.signal()
+            released += 1
+        except Exception:
+            logger.exception("Failed to release a PLE offload semaphore")
+    if released:
+        torch.accelerator.synchronize()
+    return released
+
+
 class CpuGpuSemaphore:
     """Cross-process semaphore backed by a one-element int32 CUDA tensor.
 
@@ -82,12 +111,14 @@ class CpuGpuSemaphore:
 
     def __init__(self, device: torch.device) -> None:
         self._flag_tensor = torch.zeros(1, dtype=torch.int32, device=device)
+        _LIVE_SEMAPHORES.add(self)
 
     @classmethod
     def from_ipc_tensor(cls, flag_tensor: torch.Tensor) -> "CpuGpuSemaphore":
         """Construct a semaphore from a CUDA tensor received through IPC."""
         semaphore = cls.__new__(cls)
         semaphore._flag_tensor = flag_tensor
+        _LIVE_SEMAPHORES.add(semaphore)
         return semaphore
 
     @property
