@@ -529,6 +529,27 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
             return torch.float8_e4m3fn
         return default_dtype
 
+    def _match_table_dtype_(self, loaded_weight: torch.Tensor) -> None:
+        """Keep an FP8-serialized table in FP8 instead of widening it.
+
+        A checkpoint can store the PLE table in FP8 while the rest of the
+        model uses another format, in which case the outer quantization
+        config never selects the FP8 embedding method and the table is built
+        at the model dtype. Copying FP8 rows into it would double the host
+        memory the offload worker holds, so retype the table before the copy.
+        The scale arrives separately and the lookup dequantizes with it.
+        """
+        embedding = self.ngram_embedding
+        weight = embedding.weight
+        if loaded_weight.dtype == weight.dtype:
+            return
+        if loaded_weight.dtype not in (torch.float8_e4m3fn, torch.float8_e5m2):
+            return
+        retyped = torch.empty(
+            weight.shape, dtype=loaded_weight.dtype, device=weight.device
+        )
+        embedding.weight = torch.nn.Parameter(retyped, requires_grad=False)
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load hash buffers and checkpoint-split embedding rows."""
 
@@ -590,6 +611,7 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
                 # tensor with either the original or the padded vocabulary
                 # rows. The default embedding loader rejects padded rows, so
                 # copy the TP-relevant range here, mirroring the shard path.
+                self._match_table_dtype_(loaded_weight)
                 embedding = self.ngram_embedding
                 if loaded_weight.shape[0] < embedding.org_vocab_size:
                     raise ValueError(
@@ -622,6 +644,7 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
                         f"PLE embedding shard index {shard_index} exceeds "
                         f"split_ngram_parts={self.split_ngram_parts}"
                     )
+                self._match_table_dtype_(loaded_weight)
                 embedding = self.ngram_embedding
                 shard_size = (
                     embedding.org_vocab_size + self.split_ngram_parts - 1
