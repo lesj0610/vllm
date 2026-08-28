@@ -616,7 +616,13 @@ def test_ple_offload_runner_routes_requests_layer_first(
     )
 
 
-def test_wait_for_ready_closes_pipe() -> None:
+def test_wait_for_ready_closes_pipe(monkeypatch: pytest.MonkeyPatch) -> None:
+    started: list[object] = []
+    monkeypatch.setattr(
+        ple_offload_worker.PleOffloadWorker,
+        "start_watchdog",
+        staticmethod(started.append),
+    )
     context = ple_offload_worker.get_mp_context()
     ready_reader, ready_writer = context.Pipe(duplex=False)
     ready_writer.send(
@@ -635,6 +641,7 @@ def test_wait_for_ready_closes_pipe() -> None:
     ple_offload_worker.PleOffloadWorker.wait_for_ready(handle)
 
     assert handle.ready_pipe_reader is None
+    assert started == [handle], "readiness must arm the watchdog"
 
 
 def test_ple_offload_watchdog_releases_waits_and_stops_the_worker(monkeypatch):
@@ -939,13 +946,19 @@ def test_drop_page_cache_for_reports_only_what_the_kernel_accepted(
     assert drop_page_cache_for([str(shard)]) == 0
 
 
-def test_wait_for_ready_keeps_the_shards_the_child_reported():
+def test_wait_for_ready_keeps_the_shards_the_child_reported(monkeypatch):
     """The parent needs the child's shard list to clean up after a kill."""
     from multiprocessing import Pipe
 
     from vllm.v1.ple_offload.worker import (
         PleOffloadWorker,
         PleOffloadWorkerHandle,
+    )
+
+    # Readiness arms the watchdog, which would join a process this test does
+    # not have; the watchdog itself is covered separately.
+    monkeypatch.setattr(
+        PleOffloadWorker, "start_watchdog", staticmethod(lambda handle: None)
     )
 
     reader, writer = Pipe(duplex=False)
