@@ -78,6 +78,26 @@ class PleOffloadOutputTarget:
     copy_stream: torch.cuda.Stream
 
 
+def _resolve_local_checkpoint(model_path: str) -> "Path | None":
+    """Return the directory the shards were read from, or None.
+
+    ``model_config.model`` is whatever the user passed, so it is a directory
+    for a local checkpoint and a repository id otherwise. In the second case
+    the shards sit in the hub cache, which is what has to be released.
+    """
+    root = Path(model_path)
+    if root.is_dir():
+        return root
+    try:
+        from vllm.transformers_utils.repo_utils import get_model_path
+
+        resolved = Path(get_model_path(model_path))
+    except Exception:
+        logger.debug("No local checkpoint directory for %s", model_path)
+        return None
+    return resolved if resolved.is_dir() else None
+
+
 def drop_checkpoint_page_cache(model_path: str) -> int:
     """Ask the kernel to drop the checkpoint's cached pages, in bytes advised.
 
@@ -91,8 +111,8 @@ def drop_checkpoint_page_cache(model_path: str) -> int:
     dontneed = getattr(os, "POSIX_FADV_DONTNEED", None)
     if advise is None or dontneed is None:
         return 0
-    root = Path(model_path)
-    if not root.is_dir():
+    root = _resolve_local_checkpoint(model_path)
+    if root is None:
         return 0
     advised = 0
     for shard in sorted(root.glob("*.safetensors")):
@@ -129,6 +149,7 @@ class PleOffloadWorkerHandle:
     ready_pipe_reader: Connection | None
     watchdog: "threading.Thread | None" = None
     shutting_down: bool = False
+    model_path: str = ""
 
     def close(self) -> None:
         """Release all process resources. Safe to call more than once."""
@@ -242,6 +263,7 @@ class PleOffloadWorker:
             proc=proc,
             death_writer=death_writer,
             ready_pipe_reader=ready_reader,
+            model_path=vllm_config.model_config.model,
         )
 
     @staticmethod
@@ -309,6 +331,16 @@ class PleOffloadWorker:
                 logger.error("Released %d PLE offload semaphore(s).", released)
             except Exception:
                 logger.exception("Failed to release PLE offload semaphores")
+            # A killed child skips its own cleanup, so release the shards here.
+            try:
+                advised = drop_checkpoint_page_cache(handle.model_path)
+                if advised:
+                    logger.info(
+                        "Dropped the page cache for %.1f GiB of checkpoint shards.",
+                        advised / (1 << 30),
+                    )
+            except Exception:
+                logger.exception("Failed to drop the checkpoint page cache")
             # The executor treats a worker that dies as a fatal engine error.
             os.kill(os.getpid(), signal.SIGTERM)
 

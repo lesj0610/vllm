@@ -107,7 +107,7 @@ def _load_test_ple_weights(
 
 def test_ple_offload_loads_mapped_checkpoint_names(
     monkeypatch: pytest.MonkeyPatch,
-    caplog: pytest.LogCaptureFixture,
+    caplog_vllm: pytest.LogCaptureFixture,
 ) -> None:
     checkpoint_names = [
         "checkpoint.ple.weight",
@@ -115,7 +115,7 @@ def test_ple_offload_loads_mapped_checkpoint_names(
         "checkpoint.ple.bias",
     ]
 
-    with caplog.at_level("INFO", logger=ple_offload_worker.__name__):
+    with caplog_vllm.at_level("INFO", logger=ple_offload_worker.__name__):
         runner, model = _load_test_ple_weights(monkeypatch, checkpoint_names)
 
     assert model.received_checkpoint_names == [
@@ -123,8 +123,8 @@ def test_ple_offload_loads_mapped_checkpoint_names(
         "checkpoint.ple.bias",
     ]
     assert runner.layer_names == ["ple"]
-    assert "matched 2 checkpoint tensor(s)" in caplog.text
-    assert "verified 2/2 materialized parameter(s)" in caplog.text
+    assert "matched 2 checkpoint tensor(s)" in caplog_vllm.text
+    assert "verified 2/2 materialized parameter(s)" in caplog_vllm.text
 
 
 def test_ple_offload_rejects_checkpoint_without_matching_weights(
@@ -752,3 +752,113 @@ def test_drop_checkpoint_page_cache_ignores_a_missing_directory():
     from vllm.v1.ple_offload.worker import drop_checkpoint_page_cache
 
     assert drop_checkpoint_page_cache("/nonexistent/checkpoint/path") == 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_release_all_semaphores_breaks_a_real_stream_wait():
+    """The release must run even while a stream is parked in the wait."""
+    import threading
+
+    semaphore = ple_offload_layer.CpuGpuSemaphore(torch.device("cuda"))
+    semaphore.reset()
+    torch.accelerator.synchronize()
+
+    waiting = torch.Stream(device="cuda")
+    marker = torch.zeros(1, dtype=torch.int32, device="cuda")
+    previous = torch.accelerator.current_stream()
+    torch.accelerator.set_stream(waiting)
+    try:
+        # Park this stream until the flag reads DONE, then leave a mark so the
+        # test can tell the wait actually cleared.
+        semaphore_wait = torch.ops.vllm.ple_offload_wait
+        semaphore_wait(semaphore.flag_tensor, marker, marker)
+        marker.fill_(7)
+    finally:
+        torch.accelerator.set_stream(previous)
+
+    finished = threading.Event()
+
+    def wait_for_stream() -> None:
+        waiting.synchronize()
+        finished.set()
+
+    watcher = threading.Thread(target=wait_for_stream, daemon=True)
+    watcher.start()
+    assert not finished.wait(0.5), "the stream should still be parked"
+
+    released = ple_offload_layer.release_all_semaphores()
+    assert released >= 1
+
+    assert finished.wait(10), "release_all_semaphores did not break the wait"
+    watcher.join(timeout=5)
+    assert marker.item() == 7
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_release_all_semaphores_uses_a_dedicated_non_blocking_stream(monkeypatch):
+    """The release must not queue behind the wait it is breaking.
+
+    Writing on the current or legacy default stream can be ordered against
+    the stalled ``cuStreamWaitValue32``, so the write would never run. Pin
+    the behaviour: the write goes to a stream created NON_BLOCKING, and it is
+    not the caller's current stream.
+    """
+    cuda_driver, _ = ple_offload_layer._stream_mem_ops()
+    ple_offload_layer._recovery_stream.cache_clear()
+
+    created_flags = []
+    created_streams = []
+    real_create = cuda_driver.cuStreamCreate
+
+    def record_create(flags):
+        created_flags.append(flags)
+        result = real_create(flags)
+        created_streams.append(int(result[1]))
+        return result
+
+    written_streams = []
+    real_write = cuda_driver.cuStreamWriteValue32
+
+    def record_write(stream, ptr, value, flags):
+        written_streams.append(int(stream))
+        return real_write(stream, ptr, value, flags)
+
+    monkeypatch.setattr(cuda_driver, "cuStreamCreate", record_create)
+    monkeypatch.setattr(cuda_driver, "cuStreamWriteValue32", record_write)
+
+    semaphore = ple_offload_layer.CpuGpuSemaphore(torch.device("cuda"))
+    released = ple_offload_layer.release_all_semaphores()
+
+    assert released >= 1
+    assert created_flags == [cuda_driver.CUstream_flags.CU_STREAM_NON_BLOCKING.value], (
+        "the recovery stream must be created non-blocking"
+    )
+    assert written_streams, "no release write was issued"
+    assert set(written_streams) == set(created_streams), (
+        "the release must write on the stream it created, not an ambient one"
+    )
+    del semaphore
+    ple_offload_layer._recovery_stream.cache_clear()
+
+
+def test_drop_checkpoint_page_cache_resolves_a_hub_model_id(tmp_path, monkeypatch):
+    """A repo id has to resolve to the hub cache, not be skipped."""
+    from vllm.transformers_utils import repo_utils
+    from vllm.v1.ple_offload.worker import drop_checkpoint_page_cache
+
+    (tmp_path / "model-00001-of-00001.safetensors").write_bytes(b"\0" * 2048)
+
+    monkeypatch.setattr(repo_utils, "get_model_path", lambda *a, **k: str(tmp_path))
+    assert drop_checkpoint_page_cache("org/model") == 2048
+
+
+def test_drop_checkpoint_page_cache_skips_an_unavailable_model_id(monkeypatch):
+    """No local copy means nothing to release, and no exception either."""
+    from vllm.transformers_utils import repo_utils
+    from vllm.v1.ple_offload.worker import drop_checkpoint_page_cache
+
+    def explode(*args, **kwargs):
+        raise OSError("not cached")
+
+    monkeypatch.setattr(repo_utils, "get_model_path", explode)
+    assert drop_checkpoint_page_cache("org/never-downloaded") == 0

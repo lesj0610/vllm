@@ -78,6 +78,27 @@ def _cuda_check(result: Any, operation: str) -> Any:
 _LIVE_SEMAPHORES: "weakref.WeakSet[CpuGpuSemaphore]" = weakref.WeakSet()
 
 
+@functools.cache
+def _recovery_stream(device_index: int) -> Any:
+    """Create the non-blocking stream used to break a stalled wait.
+
+    The write that releases a semaphore cannot be queued behind the wait it
+    is meant to break, and the legacy default stream can be ordered against
+    that wait. A stream created with CU_STREAM_NON_BLOCKING is ordered
+    against nothing, so the write runs even while another stream is parked in
+    ``cuStreamWaitValue32``.
+    """
+    del device_index  # One CUDA context per worker process.
+    cuda_driver, _ = _stream_mem_ops()
+    _, stream = _cuda_check(
+        cuda_driver.cuStreamCreate(
+            cuda_driver.CUstream_flags.CU_STREAM_NON_BLOCKING.value
+        ),
+        "cuStreamCreate(recovery)",
+    )
+    return stream
+
+
 def release_all_semaphores() -> int:
     """Write DONE to every live semaphore and return how many were released.
 
@@ -85,15 +106,36 @@ def release_all_semaphores() -> int:
     the streams waiting for them have to make progress so the worker can shut
     down instead of hanging in the driver.
     """
+    cuda_driver, _ = _stream_mem_ops()
     released = 0
+    streams = set()
     for semaphore in list(_LIVE_SEMAPHORES):
         try:
-            semaphore.signal()
+            flag = semaphore.flag_tensor
+            stream = _recovery_stream(flag.device.index or 0)
+            _cuda_check(
+                cuda_driver.cuStreamWriteValue32(
+                    cuda_driver.CUstream(stream),
+                    cuda_driver.CUdeviceptr(flag.data_ptr()),
+                    CpuGpuSemaphore.DONE_VALUE,
+                    0,
+                ),
+                "release_all_semaphores",
+            )
+            streams.add(stream)
             released += 1
         except Exception:
             logger.exception("Failed to release a PLE offload semaphore")
-    if released:
-        torch.accelerator.synchronize()
+    # Only the recovery streams are synchronized: a device-wide wait would
+    # block on the very stream this is trying to free.
+    for stream in streams:
+        try:
+            _cuda_check(
+                cuda_driver.cuStreamSynchronize(cuda_driver.CUstream(stream)),
+                "cuStreamSynchronize(recovery)",
+            )
+        except Exception:
+            logger.exception("Failed to synchronize a PLE recovery stream")
     return released
 
 
