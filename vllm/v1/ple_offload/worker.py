@@ -27,7 +27,7 @@ import signal
 import tempfile
 import threading
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from multiprocessing.connection import Connection
 from pathlib import Path
 from typing import Any, cast
@@ -98,6 +98,28 @@ def _resolve_local_checkpoint(model_path: str) -> "Path | None":
     return resolved if resolved.is_dir() else None
 
 
+def drop_page_cache_for(paths: "Iterable[str]") -> int:
+    """Release the cached pages of specific files, in bytes advised."""
+    advise = getattr(os, "posix_fadvise", None)
+    dontneed = getattr(os, "POSIX_FADV_DONTNEED", None)
+    if advise is None or dontneed is None:
+        return 0
+    advised = 0
+    for path in paths:
+        try:
+            fd = os.open(path, os.O_RDONLY)
+        except OSError:
+            continue
+        try:
+            advised += os.fstat(fd).st_size
+            advise(fd, 0, 0, dontneed)
+        except OSError:
+            logger.debug("Could not drop page cache for %s", path)
+        finally:
+            os.close(fd)
+    return advised
+
+
 def drop_checkpoint_page_cache(model_path: str) -> int:
     """Ask the kernel to drop the checkpoint's cached pages, in bytes advised.
 
@@ -150,6 +172,7 @@ class PleOffloadWorkerHandle:
     watchdog: "threading.Thread | None" = None
     shutting_down: bool = False
     model_path: str = ""
+    checkpoint_shards: list[str] = field(default_factory=list)
 
     def close(self) -> None:
         """Release all process resources. Safe to call more than once."""
@@ -290,6 +313,7 @@ class PleOffloadWorker:
                 f"{message.get('error', 'unknown error')}"
             )
         layer_names = message["layer_names"]
+        handle.checkpoint_shards = list(message.get("checkpoint_shards", ()))
         logger.info(
             "Worker ready - %d PleOffloadLayer(s): %s",
             len(layer_names),
@@ -333,7 +357,9 @@ class PleOffloadWorker:
                 logger.exception("Failed to release PLE offload semaphores")
             # A killed child skips its own cleanup, so release the shards here.
             try:
-                advised = drop_checkpoint_page_cache(handle.model_path)
+                advised = drop_page_cache_for(
+                    handle.checkpoint_shards
+                ) or drop_checkpoint_page_cache(handle.model_path)
                 if advised:
                     logger.info(
                         "Dropped the page cache for %.1f GiB of checkpoint shards.",
@@ -384,6 +410,7 @@ class PleOffloadWorker:
 
         zmq_context: zmq.Context | None = None
         pull_socket: zmq.Socket | None = None
+        runner: PleOffloadRunner | None = None
         try:
             # The flag lets PleOffloadLayer subclasses execute their complete
             # constructors instead of becoming empty GPU-worker placeholders.
@@ -414,6 +441,7 @@ class PleOffloadWorker:
                 {
                     "status": PleOffloadWorker.READY_STR,
                     "layer_names": sorted(runner.layer_names),
+                    "checkpoint_shards": list(runner.checkpoint_shards),
                 }
             )
             ready_writer.close()
@@ -434,7 +462,10 @@ class PleOffloadWorker:
             if ready_writer is not None:
                 ready_writer.close()
             death_pipe.close()
-            advised = drop_checkpoint_page_cache(vllm_config.model_config.model)
+            shards = runner.checkpoint_shards if runner is not None else []
+            advised = drop_page_cache_for(shards) or drop_checkpoint_page_cache(
+                vllm_config.model_config.model
+            )
             if advised:
                 logger.info(
                     "Dropped the page cache for %.1f GiB of checkpoint shards.",
@@ -460,6 +491,8 @@ class PleOffloadRunner:
         self._pinned_bufs: dict[int, dict[str, torch.Tensor]] = {}
         # Shared-memory inputs are registered once per DP rank by TP rank zero.
         self._input_bufs: dict[int, PleOffloadInputBuffers] = {}
+        # Shard files this load read, so their pages can be released later.
+        self.checkpoint_shards: list[str] = []
         self._load_weights()
 
     @property
@@ -533,6 +566,18 @@ class PleOffloadRunner:
                     yield weight_name, tensor
 
         loader = get_model_loader(load_config)
+        prepare = getattr(loader, "_prepare_weights", None)
+        if isinstance(loader, DefaultModelLoader) and prepare is not None:
+            # Remember the files this load touched. Re-deriving them later
+            # would have to guess at revisions, download dirs and hub caches,
+            # and it is these exact shards whose pages need releasing.
+
+            def prepare_and_record(*args: Any, **kwargs: Any):
+                folder, files, use_safetensors = prepare(*args, **kwargs)
+                self.checkpoint_shards.extend(files)
+                return folder, files, use_safetensors
+
+            loader._prepare_weights = prepare_and_record  # type: ignore[method-assign]
         if isinstance(loader, DummyModelLoader):
             logger.info(
                 "Initializing dummy weights for %d PleOffloadLayer(s) ...",

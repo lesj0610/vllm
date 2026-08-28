@@ -786,8 +786,21 @@ def test_release_all_semaphores_breaks_a_real_stream_wait():
     watcher.start()
     assert not finished.wait(0.5), "the stream should still be parked"
 
-    released = ple_offload_layer.release_all_semaphores()
-    assert released >= 1
+    # The real caller is the watchdog thread, which holds no CUDA context.
+    from_thread: dict[str, int] = {}
+    failure: dict[str, str] = {}
+
+    def release_from_fresh_thread() -> None:
+        try:
+            from_thread["released"] = ple_offload_layer.release_all_semaphores()
+        except Exception as error:  # pragma: no cover - surfaced by the assert
+            failure["error"] = repr(error)
+
+    releaser = threading.Thread(target=release_from_fresh_thread, daemon=True)
+    releaser.start()
+    releaser.join(timeout=30)
+    assert not failure, failure.get("error")
+    assert from_thread.get("released", 0) >= 1
 
     assert finished.wait(10), "release_all_semaphores did not break the wait"
     watcher.join(timeout=5)
@@ -803,6 +816,8 @@ def test_release_all_semaphores_uses_a_dedicated_non_blocking_stream(monkeypatch
     the behaviour: the write goes to a stream created NON_BLOCKING, and it is
     not the caller's current stream.
     """
+    import threading
+
     cuda_driver, _ = ple_offload_layer._stream_mem_ops()
     ple_offload_layer._recovery_stream.cache_clear()
 
@@ -827,7 +842,22 @@ def test_release_all_semaphores_uses_a_dedicated_non_blocking_stream(monkeypatch
     monkeypatch.setattr(cuda_driver, "cuStreamWriteValue32", record_write)
 
     semaphore = ple_offload_layer.CpuGpuSemaphore(torch.device("cuda"))
-    released = ple_offload_layer.release_all_semaphores()
+
+    # Run it where the watchdog runs: a thread with no current CUDA context.
+    outcome: dict[str, int] = {}
+    outcome_error: dict[str, str] = {}
+
+    def release_from_fresh_thread() -> None:
+        try:
+            outcome["released"] = ple_offload_layer.release_all_semaphores()
+        except Exception as error:  # pragma: no cover - surfaced by the assert
+            outcome_error["error"] = repr(error)
+
+    thread = threading.Thread(target=release_from_fresh_thread, daemon=True)
+    thread.start()
+    thread.join(timeout=30)
+    assert not outcome_error, outcome_error.get("error")
+    released = outcome.get("released", 0)
 
     assert released >= 1
     assert created_flags == [cuda_driver.CUstream_flags.CU_STREAM_NON_BLOCKING.value], (
@@ -862,3 +892,32 @@ def test_drop_checkpoint_page_cache_skips_an_unavailable_model_id(monkeypatch):
 
     monkeypatch.setattr(repo_utils, "get_model_path", explode)
     assert drop_checkpoint_page_cache("org/never-downloaded") == 0
+
+
+def test_drop_page_cache_for_releases_the_recorded_shards(tmp_path, monkeypatch):
+    """Cleanup follows the files the loader opened, not a re-derived path."""
+    from vllm.v1.ple_offload.worker import drop_page_cache_for
+
+    shards = []
+    for index, size in enumerate((4096, 8192)):
+        shard = tmp_path / f"shard-{index}.safetensors"
+        shard.write_bytes(b"\0" * size)
+        shards.append(str(shard))
+
+    advised = []
+    real_fadvise = ple_offload_worker.os.posix_fadvise
+
+    def record(fd, offset, length, advice):
+        advised.append(advice)
+        return real_fadvise(fd, offset, length, advice)
+
+    monkeypatch.setattr(ple_offload_worker.os, "posix_fadvise", record)
+    assert drop_page_cache_for(shards) == 12288
+    assert advised == [ple_offload_worker.os.POSIX_FADV_DONTNEED] * 2
+
+
+def test_drop_page_cache_for_ignores_paths_that_are_gone(tmp_path):
+    """A checkpoint deleted mid-run must not break shutdown."""
+    from vllm.v1.ple_offload.worker import drop_page_cache_for
+
+    assert drop_page_cache_for([str(tmp_path / "missing.safetensors")]) == 0
