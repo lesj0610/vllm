@@ -34,7 +34,7 @@ class Qwen4ExpMTPProposer(EagleProposer):
         """Return the multi-stream feedback width consumed by Qwen MTP."""
         return int(
             self.draft_model_config.get_hidden_size()
-            * self.draft_model_config.hf_config.hc_mult
+            * self.draft_model_config.hf_text_config.hc_count
         )
 
     def model_returns_tuple(self) -> bool:
