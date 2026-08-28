@@ -1828,6 +1828,8 @@ def test_v2_capture_reserves_workspace_before_measurement_and_locks(monkeypatch)
     runner.speculator = None
     runner.adaptive_verification = None
     runner.pcp_manager = None
+    # Fork-only: the PLE offload connector is read during decoder capture.
+    runner._ple_offload_connector = None
 
     memory_reserved_values = iter([1_000, 1_000, 1_128, 1_128])
     memory_allocated_values = iter([500, 500, 628, 628])
