@@ -23,12 +23,24 @@ from collections.abc import Callable
 from typing import Any, cast
 
 import torch
-from cuda.bindings import driver as cuda_driver
-from cuda.bindings.driver import CUstreamWaitValue_flags
 from torch import nn
 
 import vllm.envs as envs
 from vllm.utils.torch_utils import direct_register_custom_op
+
+
+@functools.cache
+def _stream_mem_ops() -> tuple[Any, Any]:
+    """Return the CUDA driver bindings the semaphore's stream ops need.
+
+    ROCm builds import this module for ``is_offload_process`` but never reach
+    a stream memory operation, and ``cuda-bindings`` is absent there, so the
+    import cannot sit at module scope.
+    """
+    from cuda.bindings import driver
+
+    return driver, driver.CUstreamWaitValue_flags
+
 
 # Module-level flag set to True inside the offload subprocess.
 # Because the offload process and GPU worker processes are separate OS
@@ -85,6 +97,7 @@ class CpuGpuSemaphore:
 
     def reset(self, stream: torch.cuda.Stream | None = None) -> None:
         """Enqueue ``WriteValue32(flag=0)`` on ``stream``."""
+        cuda_driver, CUstreamWaitValue_flags = _stream_mem_ops()
         if stream is None:
             stream = torch.cuda.current_stream()
         _cuda_check(
@@ -99,6 +112,7 @@ class CpuGpuSemaphore:
 
     def signal(self, stream: torch.cuda.Stream | None = None) -> None:
         """Enqueue ``WriteValue32(flag=1)`` on ``stream``."""
+        cuda_driver, CUstreamWaitValue_flags = _stream_mem_ops()
         if stream is None:
             stream = torch.cuda.current_stream()
         _cuda_check(
@@ -113,6 +127,7 @@ class CpuGpuSemaphore:
 
     def wait_reset(self, stream: torch.cuda.Stream | None = None) -> None:
         """Enqueue ``WaitValue32(flag==0)`` on ``stream``."""
+        cuda_driver, CUstreamWaitValue_flags = _stream_mem_ops()
         if stream is None:
             stream = torch.cuda.current_stream()
         _cuda_check(
@@ -142,6 +157,7 @@ def _ple_offload_wait_impl(
     hidden_states: torch.Tensor,
 ) -> None:
     """Wait for the CPU result without releasing its output buffer."""
+    cuda_driver, CUstreamWaitValue_flags = _stream_mem_ops()
     stream = torch.cuda.current_stream()
     cuda_stream = cuda_driver.CUstream(stream.cuda_stream)
     dev_ptr = cuda_driver.CUdeviceptr(sem_flag_tensor.data_ptr())

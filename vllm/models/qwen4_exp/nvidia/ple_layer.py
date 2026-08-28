@@ -560,6 +560,21 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
             leaf_name = name.rsplit(".", 1)[-1]
             if leaf_name.startswith("hashstats_") or leaf_name == "token_lookup":
                 continue
+            if name == "ngram_embedding.weight_scale" and not hasattr(
+                self.ngram_embedding, "weight_scale"
+            ):
+                # A checkpoint can serialize the PLE table in FP8 while the
+                # rest of the model uses another format, so the embedding is
+                # built unquantized and owns no scale parameter. Keep the
+                # scale here; the lookup path reads it back through
+                # _get_embedding_weight_scale.
+                self.register_buffer(
+                    "_offload_weight_scale",
+                    loaded_weight.to(device=self.ngram_embedding.weight.device),
+                    persistent=False,
+                )
+                loaded.add(name)
+                continue
             if name in persistent_buffers:
                 buffer = persistent_buffers[name]
                 if buffer.shape != loaded_weight.shape:

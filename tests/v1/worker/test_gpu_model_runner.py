@@ -177,7 +177,7 @@ def test_ple_offload_request_thread_failure_exits_worker(
     exit_mock.assert_called_once_with(1)
 
 
-@pytest.mark.skipif(not torch.accelerator.is_available(), reason="GPU is required")
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA is required")
 def test_ple_offload_mrv2_copies_into_pinned_shared_buffers() -> None:
     """Keep MRV2 D2H asynchronous without a second CPU staging buffer."""
     socket = Mock()

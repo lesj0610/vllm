@@ -454,6 +454,7 @@ class Qwen4ExpModel(nn.Module):
                 vllm_config.scheduler_config.max_num_batched_tokens,
                 config.hc_count * config.hidden_size,
                 dtype=vllm_config.model_config.dtype,
+                device=vllm_config.device_config.device,
             )
         else:
             self._mtp_hidden_buffer = None
