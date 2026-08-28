@@ -921,3 +921,95 @@ def test_drop_page_cache_for_ignores_paths_that_are_gone(tmp_path):
     from vllm.v1.ple_offload.worker import drop_page_cache_for
 
     assert drop_page_cache_for([str(tmp_path / "missing.safetensors")]) == 0
+
+
+def test_drop_page_cache_for_reports_only_what_the_kernel_accepted(
+    tmp_path, monkeypatch
+):
+    """A refused advise must not read as released, or the fallback is skipped."""
+    from vllm.v1.ple_offload.worker import drop_page_cache_for
+
+    shard = tmp_path / "shard.safetensors"
+    shard.write_bytes(b"\0" * 4096)
+
+    def refuse(fd, offset, length, advice):
+        raise OSError("advice refused")
+
+    monkeypatch.setattr(ple_offload_worker.os, "posix_fadvise", refuse)
+    assert drop_page_cache_for([str(shard)]) == 0
+
+
+def test_wait_for_ready_keeps_the_shards_the_child_reported():
+    """The parent needs the child's shard list to clean up after a kill."""
+    from multiprocessing import Pipe
+
+    from vllm.v1.ple_offload.worker import (
+        PleOffloadWorker,
+        PleOffloadWorkerHandle,
+    )
+
+    reader, writer = Pipe(duplex=False)
+    writer.send(
+        {
+            "status": PleOffloadWorker.READY_STR,
+            "layer_names": ["ple"],
+            "checkpoint_shards": ["/models/demo/shard-0.safetensors"],
+        }
+    )
+    handle = PleOffloadWorkerHandle(
+        proc=SimpleNamespace(is_alive=lambda: True),
+        death_writer=None,
+        ready_pipe_reader=reader,
+    )
+    PleOffloadWorker.wait_for_ready(handle)
+
+    assert handle.checkpoint_shards == ["/models/demo/shard-0.safetensors"]
+    writer.close()
+
+
+def test_watchdog_releases_the_reported_shards(monkeypatch):
+    """The kill path must release the same files the load opened."""
+    import signal as signal_module
+    import threading
+
+    from vllm.v1.ple_offload.worker import (
+        PleOffloadWorker,
+        PleOffloadWorkerHandle,
+    )
+
+    exited = threading.Event()
+
+    class DeadChild:
+        exitcode = -9
+
+        def join(self, timeout=None):
+            exited.wait(5)
+
+        def is_alive(self):
+            return not exited.is_set()
+
+    dropped: list[list[str]] = []
+    signals: list[int] = []
+    monkeypatch.setattr(ple_offload_layer, "release_all_semaphores", lambda: 0)
+
+    def fake_drop(paths) -> int:
+        dropped.append(list(paths))
+        return 4096
+
+    monkeypatch.setattr(ple_offload_worker, "drop_page_cache_for", fake_drop)
+    monkeypatch.setattr(
+        ple_offload_worker.os, "kill", lambda pid, sig: signals.append(sig)
+    )
+
+    handle = PleOffloadWorkerHandle(
+        proc=DeadChild(),
+        death_writer=None,
+        ready_pipe_reader=None,
+        checkpoint_shards=["/models/demo/shard-0.safetensors"],
+    )
+    PleOffloadWorker.start_watchdog(handle)
+    exited.set()
+    handle.watchdog.join(timeout=5)
+
+    assert dropped == [["/models/demo/shard-0.safetensors"]]
+    assert signals == [signal_module.SIGTERM]
