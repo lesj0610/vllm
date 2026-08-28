@@ -734,6 +734,23 @@ class _QSAStateCache(nn.Module, AttentionLayerBase):
 
     def forward(self) -> None: ...
 
+    @staticmethod
+    def _paged_state_view(kv_cache: torch.Tensor) -> torch.Tensor:
+        """Return the ``[blocks, block_size, 1, width]`` view QSA kernels read.
+
+        The unified allocator hands out canonical ``[blocks, heads, states,
+        width]`` views. Every QSA state kernel addresses a page as
+        ``[blocks, states, 1, width]`` and reads its page size off dim 1, so
+        the cache must be swapped before it is bound. One KV head keeps this
+        a free view.
+        """
+        if kv_cache.ndim == 4 and kv_cache.shape[1] == 1 and kv_cache.shape[2] != 1:
+            return kv_cache.transpose(1, 2)
+        return kv_cache
+
+    def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
+        super().bind_kv_cache(self._paged_state_view(kv_cache))
+
     def get_attn_backend(self) -> type[AttentionBackend]:
         return QSAStateBackend
 
@@ -759,11 +776,7 @@ class QSAKeyStateCache(_QSAStateCache):
         super().__init__(head_size=storage_head_size, **kwargs)
 
     def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
-        if kv_cache.ndim == 4 and kv_cache.shape[1] == 1 and kv_cache.shape[2] != 1:
-            # The unified allocator hands out canonical [blocks, heads,
-            # block_size, width] views; QSA caches address [blocks,
-            # block_size, 1, width]. One KV head makes the swap a free view.
-            kv_cache = kv_cache.transpose(1, 2)
+        kv_cache = self._paged_state_view(kv_cache)
         if kv_cache.ndim != 4 or kv_cache.shape[2] != 1:
             raise ValueError("QSA raw cache must be [blocks, block_size, 1, width]")
         if kv_cache.dtype != torch.bfloat16 or kv_cache.shape[3] != self.head_size:
