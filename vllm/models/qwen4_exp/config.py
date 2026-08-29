@@ -29,6 +29,11 @@ class Qwen4ExpTextConfig(Qwen3NextConfig):
     model_type = "qwen4_exp_text"
     base_config_key = "text_config"
     keys_to_ignore_at_inference = ["past_key_values"]
+    # Qwen4Exp drives M-RoPE through these two rope_parameters entries, which
+    # transformers' rope validator does not know about for rope_type="default".
+    # Declare them here so validation stays strict for every other key instead
+    # of warning on a configuration the model genuinely uses.
+    ignore_keys_at_rope_validation = {"mrope_section", "mrope_interleaved"}
 
     def __init__(
         self,
@@ -210,6 +215,9 @@ class Qwen4ExpConfig(PretrainedConfig):
         "text_config": Qwen4ExpTextConfig,
     }
     keys_to_ignore_at_inference = ["past_key_values"]
+    # The outer config mirrors the text config's rope_parameters (see below),
+    # so it is validated a second time and needs the same allowance.
+    ignore_keys_at_rope_validation = {"mrope_section", "mrope_interleaved"}
 
     def __init__(
         self,
