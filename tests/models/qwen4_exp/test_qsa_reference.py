@@ -1122,7 +1122,7 @@ def test_qsa_backend_advertises_the_kv_cache_dtypes_it_serves() -> None:
     assert not backend.supports_kv_cache_dtype("float16")
 
 
-def test_qsa_unquantized_call_reuses_one_unit_scale() -> None:
+def test_qsa_unquantized_call_reuses_one_unit_scale(monkeypatch) -> None:
     """A BF16 call must not allocate a fresh scale tensor every time."""
     if not current_platform.is_cuda():
         pytest.skip("CUDA is required")
@@ -1130,6 +1130,19 @@ def test_qsa_unquantized_call_reuses_one_unit_scale() -> None:
     device = q.device
     qsa_ops._QSA_UNIT_SCALE_BY_DEVICE.pop(device, None)
     assert qsa_ops._QSA_UNIT_SCALE_BY_DEVICE.get(device) is None
+
+    # Counting the builds is what catches the regression: dict.setdefault
+    # evaluates its default every call, so the cached object stays identical
+    # while a throwaway tensor is allocated each time.
+    builds = []
+    real_ones = torch.ones
+
+    def counting_ones(*args, **kwargs):
+        if kwargs.get("device") == device or device in args:
+            builds.append(1)
+        return real_ones(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "ones", counting_ones)
     k = torch.randn(2, 16, 1, 256, device=device, dtype=torch.bfloat16)
     v = torch.randn_like(k)
     block_table = torch.arange(2, device=device, dtype=torch.int32).reshape(1, 2)
@@ -1140,3 +1153,6 @@ def test_qsa_unquantized_call_reuses_one_unit_scale() -> None:
     cached = qsa_ops._QSA_UNIT_SCALE_BY_DEVICE[device]
     qsa_ops.qsa_sparse_paged_attention(q, k, v, indices, block_table, token_to_req)
     assert qsa_ops._QSA_UNIT_SCALE_BY_DEVICE[device] is cached
+    assert len(builds) == 1, (
+        f"the unit scale was built {len(builds)} times across three calls"
+    )
