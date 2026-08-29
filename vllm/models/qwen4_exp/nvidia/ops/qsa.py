@@ -15,6 +15,13 @@ from vllm.utils.torch_utils import nvfp4_kv_cache_full_dim
 _LOGITS_WORKSPACE_BYTES = 128 * 1024 * 1024
 _TOPK_WORKSPACE_BYTES = 1024 * 1024
 
+# The sparse split-K tile table was measured on SM100; leave that hardware on
+# it until someone re-measures there.
+_QSA_TUNED_CAPABILITY = 100
+# Splits thinner than this many KV tiles lose more to the merge kernel and the
+# partial writes than the extra parallelism recovers.
+_QSA_MIN_TILES_PER_SPLIT = 8
+
 
 @triton.jit
 def _qsa_mqa_paged_kernel(
@@ -195,17 +202,17 @@ def _dequant_fp4_e2m1(nibbles):
     """Decode FP4 E2M1 nibbles (int, 0..15) to BF16.
 
     normals (e>0): (-1)^s * 2^(e-1) * (1 + m/2); subnormals: (-1)^s * m/2.
-    Zero nibbles (masked loads) decode to +0.
+    All eight magnitudes are exact BF16 values, so the decode assembles the
+    BF16 bit pattern with integer ops instead of paying an exp2 and a chain of
+    float multiplies per element. Zero nibbles (masked loads) decode to +0.
     """
-    sign = tl.where((nibbles & 8) != 0, -1.0, 1.0)
-    exponent = (nibbles >> 1) & 3
-    mantissa = (nibbles & 1).to(tl.float32)
-    magnitude = tl.where(
-        exponent > 0,
-        tl.math.exp2(exponent.to(tl.float32) - 2.0) * (2.0 + mantissa),
-        mantissa * 0.5,
-    )
-    return (sign * magnitude).to(tl.bfloat16)
+    magnitude = nibbles & 7
+    # magnitude >= 2 is normal: exponent field 126 + (magnitude >> 1) and the
+    # single mantissa bit lands in bit 6 of the BF16 significand.
+    normal = ((126 + (magnitude >> 1)) << 7) | ((magnitude & 1) << 6)
+    # magnitude 0 -> +0 and magnitude 1 -> 0.5 (0x3F00), so a multiply covers both.
+    bits = tl.where(magnitude >= 2, normal, magnitude * 0x3F00)
+    return (bits | ((nibbles & 8) << 12)).to(tl.uint16).to(tl.bfloat16, bitcast=True)
 
 
 @triton.jit
@@ -227,6 +234,37 @@ def _dequant_e4m3fn_bits(bits):
         mantissa * 0.001953125,
     )
     return (sign * magnitude).to(tl.bfloat16)
+
+
+@triton.jit
+def _dequant_e4m3fn_block_scales(bits):
+    """Decode E4M3 block-scale bytes to BF16 without leaving the integer unit.
+
+    Same values as `_dequant_e4m3fn_bits`: E4M3 keeps four significant bits,
+    which BF16 holds exactly, so a normal maps exponent e to the BF16 exponent
+    field 120 + e and mantissa m to m << 4, while a subnormal (e == 0)
+    renormalizes m in 1..7 and 0x00 stays +0.
+
+    The arithmetic decoder is the faster one on a full FP8 cache tile, where
+    its exp2 issues on the multi-function unit while the rest of the loop keeps
+    the ALU busy. NVFP4 inverts that: the block scales are a sixteenth of a
+    tile, and the surrounding loop is already saturated decoding fp4 nibbles,
+    so the FP32 staging the arithmetic form needs costs more than the integer
+    chain it replaces.
+    """
+    x = bits.to(tl.int32)
+    exponent = (x >> 3) & 15
+    mantissa = x & 7
+    normal = ((120 + exponent) << 7) | (mantissa << 4)
+    shift = tl.where(mantissa >= 4, 2, tl.where(mantissa >= 2, 1, 0))
+    leading = tl.where(mantissa >= 4, 4, tl.where(mantissa >= 2, 2, 1))
+    subnormal = tl.where(
+        mantissa > 0,
+        ((118 + shift) << 7) | ((mantissa - leading) << (7 - shift)),
+        0,
+    )
+    decoded = tl.where(exponent > 0, normal, subnormal) | ((x & 128) << 8)
+    return decoded.to(tl.uint16).to(tl.bfloat16, bitcast=True)
 
 
 @triton.jit
@@ -324,8 +362,11 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
         safe_page = tl.maximum(physical_page, 0).to(tl.int64)
         if KV_QUANT == 2:
             # NVFP4 slot layout per (token, head): [fp4 data | e4m3 block
-            # scales]. Neighbouring dims share data bytes (2 per byte) and
-            # scale bytes (16 per scale); the redundant loads hit L1.
+            # scales]. Neighbouring dims share data bytes (2 per byte); the
+            # redundant loads hit L1. Block scales are shared by 16 dims, so
+            # they are decoded once per block and broadcast over the tile
+            # instead of being decoded 16 times.
+            scale_offsets = tl.arange(0, HEAD_DIM // 16)
             k_row = (
                 k_cache_ptr
                 + safe_page[None, :] * stride_k_block
@@ -336,12 +377,17 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
                 k_row + dim_offsets[:, None] // 2, mask=valid[None, :], other=0
             ).to(tl.int32)
             k_nibbles = (k_bytes >> ((dim_offsets[:, None] % 2) * 4)) & 15
-            k_scales = tl.load(
-                k_row + HEAD_DIM // 2 + dim_offsets[:, None] // 16,
-                mask=valid[None, :],
-                other=0,
+            k_scales = _dequant_e4m3fn_block_scales(
+                tl.load(
+                    k_row + HEAD_DIM // 2 + scale_offsets[:, None],
+                    mask=valid[None, :],
+                    other=0,
+                )
             )
-            keys = _dequant_fp4_e2m1(k_nibbles) * _dequant_e4m3fn_bits(k_scales)
+            keys = _dequant_fp4_e2m1(k_nibbles) * tl.reshape(
+                tl.broadcast_to(k_scales[:, None, :], (HEAD_DIM // 16, 16, BLOCK_N)),
+                (HEAD_DIM, BLOCK_N),
+            )
             v_row = (
                 v_cache_ptr
                 + safe_page[:, None] * stride_v_block
@@ -352,12 +398,17 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
                 v_row + dim_offsets[None, :] // 2, mask=valid[:, None], other=0
             ).to(tl.int32)
             v_nibbles = (v_bytes >> ((dim_offsets[None, :] % 2) * 4)) & 15
-            v_scales = tl.load(
-                v_row + HEAD_DIM // 2 + dim_offsets[None, :] // 16,
-                mask=valid[:, None],
-                other=0,
+            v_scales = _dequant_e4m3fn_block_scales(
+                tl.load(
+                    v_row + HEAD_DIM // 2 + scale_offsets[None, :],
+                    mask=valid[:, None],
+                    other=0,
+                )
             )
-            values = _dequant_fp4_e2m1(v_nibbles) * _dequant_e4m3fn_bits(v_scales)
+            values = _dequant_fp4_e2m1(v_nibbles) * tl.reshape(
+                tl.broadcast_to(v_scales[:, :, None], (BLOCK_N, HEAD_DIM // 16, 16)),
+                (BLOCK_N, HEAD_DIM),
+            )
         else:
             keys = tl.load(
                 k_cache_ptr
@@ -907,6 +958,62 @@ def qsa_select_paged_tokens(
     return out
 
 
+def _qsa_staged_block_n(head_dim: int, kv_quant: int) -> int | None:
+    """Widest KV tile the byte-staging path fits in registers, or None.
+
+    FP8 gains a native load path at SM89 and FP4 at SM100, but the sparse
+    kernel uses neither: it reads every quantized cache as raw bytes and
+    rebuilds the values in registers on all architectures. So each KV tile
+    carries integer staging tiles of BLOCK_N * HEAD_DIM on top of the BF16 tile
+    the dots consume -- three per side for NVFP4, one for FP8 -- and the switch
+    has to follow the code path that runs rather than what the hardware could
+    do natively. Wiring up native loads later means moving this switch with
+    them.
+
+    The budget is fitted on SM80 at head_dim 256, where BLOCK_N=64 spills about
+    1.9 KB per thread. SM100 keeps the profile measured there.
+    """
+
+    if kv_quant == 0 or current_platform.has_device_capability(_QSA_TUNED_CAPABILITY):
+        return None
+    return max(16, (4096 if kv_quant == 2 else 8192) // head_dim)
+
+
+def _qsa_splitk_profile(
+    base_programs: int, block_m: int, head_dim: int, selection_width: int, kv_quant: int
+) -> tuple[int, int, int, int]:
+    """Pick (BLOCK_N, split count, warps, stages) for the sparse split-K kernel."""
+
+    small_profile_limit = 8 if block_m <= 8 else 4
+    # Tuned on GB300 for the Qwen-Air TP1, TP2, and TP4 attention shapes.
+    # Narrow tiles favor decode; wide tiles improve throughput for prefill.
+    if base_programs <= small_profile_limit:
+        block_n, target_splits, partial_warps = 16, 64, 4
+    elif base_programs < 32:
+        block_n, target_splits, partial_warps = 16, 32, 4
+    elif base_programs <= 256:
+        block_n, target_splits, partial_warps = 64, 8, 2
+    elif base_programs <= 512:
+        block_n, target_splits, partial_warps = 64, 4, 2
+    else:
+        block_n, target_splits, partial_warps = 64, 1, 2
+
+    staged_block_n = _qsa_staged_block_n(head_dim, kv_quant)
+    if staged_block_n is None or block_n <= staged_block_n:
+        return block_n, target_splits, partial_warps, 2
+
+    # Only the wide prefill tiles overflow: at head_dim 256 an NVFP4 cache runs
+    # ~30x slower at BLOCK_N=64 than at the budgeted tile. The narrow tile also
+    # multiplies the tile count, which would let more splits through the
+    # max-useful clamp downstream; hold the tuned count instead, and thin it
+    # further when a split would no longer cover enough tiles to pay for its
+    # own merge. Never raising it keeps the FP32 partial workspace at or below
+    # what the tuned profile already asked for.
+    num_tiles = triton.cdiv(selection_width, staged_block_n)
+    target_splits = min(target_splits, max(1, num_tiles // _QSA_MIN_TILES_PER_SPLIT))
+    return staged_block_n, target_splits, 2 if kv_quant == 2 else 4, 1
+
+
 def qsa_sparse_paged_attention(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -1011,20 +1118,9 @@ def qsa_sparse_paged_attention(
     group_size = q.shape[1] // num_kv_heads
     block_m = triton.next_power_of_2(group_size)
     base_programs = q.shape[0] * num_kv_heads
-    small_profile_limit = 8 if block_m <= 8 else 4
-
-    # Tuned on GB300 for the Qwen-Air TP1, TP2, and TP4 attention shapes.
-    # Narrow tiles favor decode; wide tiles improve throughput for prefill.
-    if base_programs <= small_profile_limit:
-        block_n, target_splits, partial_warps = 16, 64, 4
-    elif base_programs < 32:
-        block_n, target_splits, partial_warps = 16, 32, 4
-    elif base_programs <= 256:
-        block_n, target_splits, partial_warps = 64, 8, 2
-    elif base_programs <= 512:
-        block_n, target_splits, partial_warps = 64, 4, 2
-    else:
-        block_n, target_splits, partial_warps = 64, 1, 2
+    block_n, target_splits, partial_warps, partial_stages = _qsa_splitk_profile(
+        base_programs, block_m, q.shape[2], logical_indices.shape[1], kv_quant
+    )
 
     num_tiles = triton.cdiv(logical_indices.shape[1], block_n)
     # Avoid empty splits when the selection width is smaller than the profile.
@@ -1088,7 +1184,7 @@ def qsa_sparse_paged_attention(
         BLOCK_N=block_n,
         KV_QUANT=kv_quant,
         num_warps=partial_warps,
-        num_stages=2,
+        num_stages=partial_stages,
     )
     if num_splits == 1:
         return out

@@ -1112,6 +1112,118 @@ def test_qsa_sparse_paged_attention_nvfp4_matches_dequantized_reference() -> Non
     torch.testing.assert_close(packed.float(), reference.float(), rtol=2e-2, atol=2e-2)
 
 
+@requires_qsa_kernels
+def test_qsa_packed_decoders_match_their_arithmetic_definitions() -> None:
+    """Every encoding the branch-free decoders accept must land on its value."""
+    from vllm.triton_utils import tl, triton
+
+    @triton.jit
+    def probe(source_ptr, fp4_ptr, scale_ptr, WIDTH: tl.constexpr):
+        offsets = tl.arange(0, WIDTH)
+        raw = tl.load(source_ptr + offsets)
+        tl.store(fp4_ptr + offsets, qsa_ops._dequant_fp4_e2m1(raw.to(tl.int32) & 15))
+        tl.store(scale_ptr + offsets, qsa_ops._dequant_e4m3fn_block_scales(raw))
+
+    width = 256
+    source = torch.arange(width, device="cuda", dtype=torch.uint8)
+    decoded_fp4 = torch.empty(width, device="cuda", dtype=torch.bfloat16)
+    decoded_scales = torch.empty(width, device="cuda", dtype=torch.bfloat16)
+    probe[(1,)](source, decoded_fp4, decoded_scales, WIDTH=width)
+
+    def assert_same_bits(decoded: torch.Tensor, expected: torch.Tensor) -> None:
+        # Compare BF16 encodings, not values: these decoders assemble the bit
+        # pattern by hand, and a float comparison would call -0.0 equal to +0.0
+        # and miss a dropped sign on the zero encodings (FP4 0x8, E4M3 0x80).
+        assert torch.equal(
+            decoded.cpu().view(torch.uint16),
+            expected.to(torch.bfloat16).view(torch.uint16),
+        )
+
+    # Both formats keep at most four significant bits, so BF16 holds every
+    # value exactly and the comparison can demand equality rather than a
+    # tolerance. The right-hand sides restate the FP4 E2M1 and FP8 E4M3
+    # definitions the arithmetic decoders implement.
+    nibbles = (source.to(torch.int32) & 15).cpu()
+    exponent = (nibbles >> 1) & 3
+    mantissa = (nibbles & 1).double()
+    expected_fp4 = torch.where(nibbles & 8 != 0, -1.0, 1.0).double() * torch.where(
+        exponent > 0,
+        torch.exp2(exponent.double() - 2.0) * (2.0 + mantissa),
+        mantissa * 0.5,
+    )
+    assert_same_bits(decoded_fp4, expected_fp4)
+
+    byte = source.to(torch.int32).cpu()
+    exponent = (byte >> 3) & 15
+    mantissa = (byte & 7).double()
+    expected_scales = torch.where(byte & 128 != 0, -1.0, 1.0).double() * torch.where(
+        exponent > 0,
+        torch.exp2(exponent.double() - 10.0) * (8.0 + mantissa),
+        mantissa * 0.001953125,
+    )
+    assert_same_bits(decoded_scales, expected_scales)
+
+
+def _stub_capability(monkeypatch, supported: bool) -> None:
+    monkeypatch.setattr(
+        qsa_ops,
+        "current_platform",
+        SimpleNamespace(has_device_capability=lambda capability: supported),
+    )
+
+
+@pytest.mark.parametrize("kv_quant", [1, 2])
+def test_qsa_splitk_profile_only_narrows_tiles_that_cannot_stage(
+    kv_quant, monkeypatch
+) -> None:
+    """Packed caches keep the tuned table until its KV tile stops fitting."""
+    _stub_capability(monkeypatch, supported=False)
+    head_dim, selection_width, block_m = 256, 2051, 16
+    budget = qsa_ops._qsa_staged_block_n(head_dim, kv_quant)
+    assert budget == (16 if kv_quant == 2 else 32)
+
+    def profile(base_programs, quant):
+        return qsa_ops._qsa_splitk_profile(
+            base_programs, block_m, head_dim, selection_width, quant
+        )
+
+    for base_programs in (1, 4, 16, 31):
+        # The table already picks a tile that stages, so nothing may move.
+        assert profile(base_programs, kv_quant) == profile(base_programs, 0)
+
+    for base_programs in (32, 256, 512, 2048):
+        tuned_block_n, tuned_splits, _, _ = profile(base_programs, 0)
+        assert tuned_block_n > budget
+        block_n, splits, _, _ = profile(base_programs, kv_quant)
+        assert block_n == budget
+        # The narrow tile must not buy its parallelism with a bigger FP32
+        # partial workspace than the tuned profile already allocated.
+        assert 1 <= splits <= tuned_splits
+        tiles = -(-selection_width // block_n)
+        assert splits <= max(1, tiles // qsa_ops._QSA_MIN_TILES_PER_SPLIT)
+
+
+def test_qsa_splitk_profile_keeps_the_tuned_table_where_it_was_measured(
+    monkeypatch,
+) -> None:
+    """SM100 and unquantized caches must see the profile they were tuned with."""
+    _stub_capability(monkeypatch, supported=True)
+    for kv_quant in (0, 1, 2):
+        assert qsa_ops._qsa_staged_block_n(256, kv_quant) is None
+        assert qsa_ops._qsa_splitk_profile(2048, 16, 256, 2051, kv_quant) == (
+            64,
+            1,
+            2,
+            2,
+        )
+
+    _stub_capability(monkeypatch, supported=False)
+    # An unquantized cache reads BF16 pages straight into the dots, so it never
+    # takes the staging profile no matter how old the device is.
+    assert qsa_ops._qsa_staged_block_n(256, 0) is None
+    assert qsa_ops._qsa_splitk_profile(2048, 16, 256, 2051, 0) == (64, 1, 2, 2)
+
+
 def test_qsa_backend_advertises_the_kv_cache_dtypes_it_serves() -> None:
     """The declared contract must match the caches the impl actually reads."""
     from vllm.models.qwen4_exp.nvidia.qsa import Qwen4ExpQSAFlashAttentionBackend
