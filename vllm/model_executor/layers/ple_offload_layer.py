@@ -259,6 +259,9 @@ def _ple_offload_wait_impl(
     stream = torch.cuda.current_stream()
     cuda_stream = cuda_driver.CUstream(stream.cuda_stream)
     dev_ptr = cuda_driver.CUdeviceptr(sem_flag_tensor.data_ptr())
+    # NOTE: CU_STREAM_WAIT_VALUE_FLUSH is not supported on sm89 (L40S)
+    # and is unnecessary when the synchronous PLE path pre-sets the flag
+    # before CUDA graph replay.
     _cuda_check(
         cuda_driver.cuStreamWaitValue32(
             cuda_stream,
