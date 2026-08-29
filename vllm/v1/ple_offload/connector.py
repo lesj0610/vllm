@@ -5,6 +5,7 @@
 import os
 import queue
 import threading
+import time
 from multiprocessing.reduction import ForkingPickler
 from typing import Any
 
@@ -14,6 +15,7 @@ import torch.nn as nn
 import zmq
 from cuda.bindings import driver as cuda_driver
 
+import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.distributed.parallel_state import get_dp_group, get_tp_group
 from vllm.logger import init_logger
@@ -94,8 +96,10 @@ class PleOffloadConnector:
         self._pinned_input_buffers: list[torch.Tensor] = []
         # PLE rejects DBO, and each forward consumes its output before the
         # next launch, so one pending request is sufficient.
-        self._request_queue: queue.Queue[PleOffloadRequest | None] = queue.Queue(
-            maxsize=1
+        # The queue also accepts pre-encoded bytes from the synchronous
+        # CUDA-graph path, where D2H staging is done by the caller.
+        self._request_queue: queue.Queue[PleOffloadRequest | bytes | None] = (
+            queue.Queue(maxsize=1)
         )
         self._request_thread: threading.Thread | None = None
         self._request_thread_ready = threading.Event()
@@ -272,8 +276,17 @@ class PleOffloadConnector:
             if socket is not None:
                 socket.close(linger=0)
 
-    def _process_request(self, request: PleOffloadRequest, socket: zmq.Socket) -> None:
+    def _process_request(
+        self, request: PleOffloadRequest | bytes, socket: zmq.Socket
+    ) -> None:
         """Stage one batch from fixed sources and publish its request."""
+        if isinstance(request, bytes):
+            # Pre-staged by _prepare_forward_sync: inputs are already in
+            # shared buffers, just forward the encoded message.
+            with torch.cuda.nvtx.range("ple_offload.send_request"):
+                socket.send(request)
+            return
+
         if self._uses_cuda_inputs:
             self._copy_cuda_inputs(request)
         else:
@@ -393,12 +406,73 @@ class PleOffloadConnector:
         num_reqs: int,
         num_tokens: int,
         dummy_run: bool,
+        use_cudagraph: bool = False,
     ) -> None:
         """Submit real inputs or satisfy the PLE wait for a dummy forward."""
         if dummy_run:
             self.signal_dummy_outputs(num_tokens)
             return
+        if use_cudagraph:
+            self._prepare_forward_sync(num_reqs, num_tokens)
+            return
         self._launch(num_reqs, num_tokens)
+
+    def _prepare_forward_sync(self, num_reqs: int, num_tokens: int) -> None:
+        """Complete PLE offload synchronously before CUDA graph replay.
+
+        On discrete-VRAM GPUs the async D2H pipeline deadlocks when a CUDA
+        graph replays: the graph's baked-in ``cuStreamWaitValue32(flag==1)``
+        creates a circular wait with the background D2H stream.  This path
+        stages inputs on the calling thread, dispatches the CPU worker, and
+        busy-waits for results so the flag is already ``DONE_VALUE`` when the
+        graph replays.
+        """
+        if self.tp_rank == 0:
+            # Ensure GPU input buffers are fully written.
+            torch.cuda.current_stream(self.device).synchronize()
+
+            # Synchronous D2H copy on calling thread (bypass _d2h_stream).
+            self._input_ids_buf[:num_tokens].copy_(self._input_ids_source[:num_tokens])
+            self._query_start_loc_buf[: num_reqs + 1].copy_(
+                self._query_start_loc_source[: num_reqs + 1]
+            )
+            if self._ngram_context_buf is not None:
+                assert self._ngram_context_source is not None
+                self._ngram_context_buf[:num_reqs].copy_(
+                    self._ngram_context_source[:num_reqs]
+                )
+
+            # Queue pre-encoded request so the request thread only does
+            # the ZMQ send without touching the D2H stream.
+            request = PleOffloadRequest(
+                dp_rank=self.dp_rank,
+                num_tokens=num_tokens,
+                num_reqs=num_reqs,
+            )
+            self._request_queue.put_nowait(msgspec.msgpack.encode(request))
+
+        # All TP ranks wait for the CPU worker to finish and signal.
+        self._poll_semaphores()
+
+    def _poll_semaphores(self) -> None:
+        """Host-side wait until every PLE layer flag reaches DONE.
+
+        A spin with no deadline turns a stuck offload process into a core
+        burning at 100% forever, with no error anywhere. Bound the wait and
+        raise instead: an unanswered lookup means this step has no PLE
+        output, so continuing would serve a wrong answer.
+        """
+        done = CpuGpuSemaphore.DONE_VALUE
+        deadline = time.monotonic() + envs.VLLM_PLE_OFFLOAD_STEP_TIMEOUT
+        for name, layer in self._layers.items():
+            while layer._sem.flag_tensor.item() != done:
+                if time.monotonic() > deadline:
+                    raise RuntimeError(
+                        f"PLE offload did not answer for {name} within "
+                        f"{envs.VLLM_PLE_OFFLOAD_STEP_TIMEOUT}s. The offload "
+                        "process is unreachable or stuck."
+                    )
+                time.sleep(0)
 
     def signal_dummy_outputs(self, num_tokens: int) -> None:
         """Locally satisfy PLE waits for dummy and capture forwards."""

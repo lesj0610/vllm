@@ -1026,3 +1026,81 @@ def test_watchdog_releases_the_reported_shards(monkeypatch):
 
     assert dropped == [["/models/demo/shard-0.safetensors"]]
     assert signals == [signal_module.SIGTERM]
+
+
+def _connector_stub(monkeypatch):
+    """A connector with only the routing surface prepare_forward touches."""
+    from vllm.v1.ple_offload.connector import PleOffloadConnector
+
+    connector = PleOffloadConnector.__new__(PleOffloadConnector)
+    calls: dict[str, int] = {"sync": 0, "async": 0, "dummy": 0}
+    monkeypatch.setattr(
+        PleOffloadConnector,
+        "_prepare_forward_sync",
+        lambda self, num_reqs, num_tokens: calls.__setitem__("sync", calls["sync"] + 1),
+    )
+    monkeypatch.setattr(
+        PleOffloadConnector,
+        "_launch",
+        lambda self, num_reqs, num_tokens: calls.__setitem__(
+            "async", calls["async"] + 1
+        ),
+    )
+    monkeypatch.setattr(
+        PleOffloadConnector,
+        "signal_dummy_outputs",
+        lambda self, num_tokens: calls.__setitem__("dummy", calls["dummy"] + 1),
+    )
+    return connector, calls
+
+
+def test_prepare_forward_takes_the_sync_path_only_for_full_graphs(monkeypatch):
+    """Graph replay needs the synchronous path; everything else must not pay for it."""
+    connector, calls = _connector_stub(monkeypatch)
+
+    connector.prepare_forward(1, 8, dummy_run=False, use_cudagraph=True)
+    assert (calls["sync"], calls["async"]) == (1, 0)
+
+    connector.prepare_forward(1, 8, dummy_run=False, use_cudagraph=False)
+    assert (calls["sync"], calls["async"]) == (1, 1)
+
+    connector.prepare_forward(1, 8, dummy_run=False)
+    assert (calls["sync"], calls["async"]) == (1, 2), "the default stays async"
+
+    connector.prepare_forward(1, 8, dummy_run=True, use_cudagraph=True)
+    assert calls["dummy"] == 1 and calls["sync"] == 1
+
+
+def test_both_model_runners_report_full_graph_replay():
+    """MRV1 and MRV2 must both tell the connector when a graph will replay."""
+    import inspect
+
+    import vllm.v1.worker.gpu.model_runner as mrv2
+    import vllm.v1.worker.gpu_model_runner as mrv1
+
+    for module in (mrv1, mrv2):
+        source = inspect.getsource(module)
+        index = source.find("_ple_offload_connector.prepare_forward(")
+        assert index != -1, f"{module.__name__} does not call prepare_forward"
+        call = source[index : index + 400]
+        assert "use_cudagraph=" in call, (
+            f"{module.__name__} never reports graph replay to the PLE connector"
+        )
+        assert "CUDAGraphMode.FULL" in call, (
+            f"{module.__name__} must gate the sync path on FULL graphs"
+        )
+
+
+def test_poll_semaphores_gives_up_instead_of_spinning_forever(monkeypatch):
+    """A stuck offload worker must fail the step, not burn a core silently."""
+    from vllm.v1.ple_offload.connector import PleOffloadConnector
+
+    connector = PleOffloadConnector.__new__(PleOffloadConnector)
+    never_done = SimpleNamespace(
+        _sem=SimpleNamespace(flag_tensor=SimpleNamespace(item=lambda: 0))
+    )
+    connector._layers = {"layers.1.ple": never_done}
+    monkeypatch.setattr(envs, "VLLM_PLE_OFFLOAD_STEP_TIMEOUT", 0.05)
+
+    with pytest.raises(RuntimeError, match="did not answer for layers.1.ple"):
+        connector._poll_semaphores()

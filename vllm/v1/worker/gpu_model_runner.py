@@ -4719,6 +4719,7 @@ class GPUModelRunner(
                         num_reqs,
                         num_tokens_padded,
                         dummy_run=False,
+                        use_cudagraph=(cudagraph_mode == CUDAGraphMode.FULL),
                     )
             model_output = self._model_forward(
                 input_ids=input_ids,

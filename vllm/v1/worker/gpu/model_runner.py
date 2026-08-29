@@ -1768,6 +1768,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 input_batch.num_reqs,
                 input_batch.num_tokens_after_padding,
                 dummy_run,
+                use_cudagraph=(batch_desc.cg_mode == CUDAGraphMode.FULL),
             )
 
         # Run model.
