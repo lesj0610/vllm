@@ -3,6 +3,7 @@
 """GPU-resident Qwen4Exp position-learning enhancement layers."""
 
 import math
+import os
 from collections.abc import Iterable, Sequence
 
 import torch
@@ -247,6 +248,63 @@ def _get_ple_embedding_quant_method(
     if any(name.startswith(shard_prefix) for name in ignored_layers):
         return None
     return Qwen4ExpPLEFp8EmbeddingMethod()
+
+
+def _mapped_file_location(tensor: torch.Tensor) -> tuple[str, int] | None:
+    """Return the file and offset a tensor's storage is mapped from.
+
+    Checkpoint tensors arrive as views into an mmap of their shard, so the
+    mapping tables say which bytes of which file back them. None means the
+    tensor is ordinary memory.
+    """
+    address = tensor.data_ptr()
+    try:
+        with open("/proc/self/maps") as maps:
+            for line in maps:
+                fields = line.split(maxsplit=5)
+                if len(fields) < 6:
+                    continue
+                path = fields[5].strip()
+                if not path.startswith("/"):
+                    continue
+                low, _, high = fields[0].partition("-")
+                start = int(low, 16)
+                if not start <= address < int(high, 16):
+                    continue
+                return path, int(fields[2], 16) + (address - start)
+    except OSError:
+        return None
+    return None
+
+
+def _release_consumed_source(
+    location: tuple[str, int] | None,
+    start_bytes: int,
+    length_bytes: int,
+) -> None:
+    """Drop the page cache of one converted slice of the source tensor.
+
+    The destination table is anonymous memory and the source is a file
+    mapping. Without this the kernel keeps both alive for the whole load,
+    which on a host with less RAM than their sum pushes the table into swap.
+    Only bytes that were already read are released, so nothing is re-read.
+    """
+    advise = getattr(os, "posix_fadvise", None)
+    dontneed = getattr(os, "POSIX_FADV_DONTNEED", None)
+    if location is None or advise is None or dontneed is None or length_bytes <= 0:
+        return
+    path, tensor_offset = location
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        advise(fd, tensor_offset + start_bytes, length_bytes, dontneed)
+    except OSError:
+        # A refused advice only means the pages stay cached.
+        pass
+    finally:
+        os.close(fd)
 
 
 class Qwen4ExpNGramEmbedding(PleOffloadLayer):
@@ -707,6 +765,8 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
         group_rows = self._runtime_fp8_group_rows
         fp8_max = torch.finfo(torch.float8_e4m3fn).max
         row_count = loaded_weight.shape[0]
+        source_location = _mapped_file_location(loaded_weight)
+        row_bytes = loaded_weight.stride(0) * loaded_weight.element_size()
         first_group = checkpoint_start // group_rows
         for group in range(first_group, self.split_ngram_parts):
             group_start = group * group_rows
@@ -728,6 +788,15 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
                 checkpoint_start=start,
                 tp_start=embedding.shard_indices.org_vocab_start_index,
                 tp_end=embedding.shard_indices.org_vocab_end_index,
+            )
+            # This table is the largest tensor in the checkpoint, so its
+            # source pages go back one group at a time. Advise this group's
+            # range alone: re-advising the whole consumed prefix every group
+            # would walk the table hundreds of times over.
+            _release_consumed_source(
+                source_location,
+                (start - checkpoint_start) * row_bytes,
+                (end - start) * row_bytes,
             )
 
 
