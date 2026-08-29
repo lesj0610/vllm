@@ -2,8 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """GPU-resident Qwen4Exp position-learning enhancement layers."""
 
+import json
 import math
 import os
+import struct
 from collections.abc import Iterable, Sequence
 
 import torch
@@ -300,6 +302,85 @@ def _release_consumed_source(
         return
     try:
         advise(fd, tensor_offset + start_bytes, length_bytes, dontneed)
+    except OSError:
+        # A refused advice only means the pages stay cached.
+        pass
+    finally:
+        os.close(fd)
+
+
+_SAFETENSORS_DTYPES = {
+    "BF16": torch.bfloat16,
+    "F16": torch.float16,
+    "F32": torch.float32,
+    "F8_E4M3": torch.float8_e4m3fn,
+}
+
+
+def read_safetensors_entry(
+    path: str, name: str
+) -> tuple[int, tuple[int, ...], torch.dtype]:
+    """Locate one tensor inside a safetensors file.
+
+    Returns its absolute byte offset, shape and dtype. ``data_offsets`` in the
+    header are relative to the data section, so the header length has to be
+    added to reach the file offset.
+    """
+    with open(path, "rb") as handle:
+        (header_len,) = struct.unpack("<Q", handle.read(8))
+        header = json.loads(handle.read(header_len))
+    entry = header.get(name)
+    if entry is None:
+        raise KeyError(f"{name} is not in {path}")
+    dtype = _SAFETENSORS_DTYPES.get(entry["dtype"])
+    if dtype is None:
+        raise ValueError(f"{name} has unsupported dtype {entry['dtype']}")
+    offset = 8 + header_len + entry["data_offsets"][0]
+    return offset, tuple(entry["shape"]), dtype
+
+
+def stream_tensor_rows(
+    path: str,
+    offset: int,
+    row_bytes: int,
+    dtype: torch.dtype,
+    columns: int,
+    start_row: int,
+    row_count: int,
+) -> torch.Tensor:
+    """Read one slice of rows straight from the file.
+
+    Reading with pread instead of walking an mmap keeps the source out of the
+    process for good: nothing stays mapped, so the page cache for the range
+    can be handed back once the rows are converted.
+    """
+    if row_count <= 0:
+        return torch.empty((0, columns), dtype=dtype)
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        raw = os.pread(fd, row_count * row_bytes, offset + start_row * row_bytes)
+    finally:
+        os.close(fd)
+    if len(raw) != row_count * row_bytes:
+        raise ValueError(
+            f"short read of {path}: wanted {row_count * row_bytes} bytes at "
+            f"row {start_row}, got {len(raw)}"
+        )
+    return torch.frombuffer(bytearray(raw), dtype=dtype).view(row_count, columns)
+
+
+def release_file_range(path: str, offset: int, length: int) -> None:
+    """Drop the page cache of a range that has been read and converted."""
+    advise = getattr(os, "posix_fadvise", None)
+    dontneed = getattr(os, "POSIX_FADV_DONTNEED", None)
+    if advise is None or dontneed is None or length <= 0:
+        return
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        advise(fd, offset, length, dontneed)
     except OSError:
         # A refused advice only means the pages stay cached.
         pass
@@ -754,6 +835,70 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
             row_ids, self._runtime_fp8_group_rows, rounding_mode="floor"
         ).clamp_(max=self.split_ngram_parts - 1)
         return self.runtime_fp8_scales[group_ids]
+
+    def quantize_runtime_fp8_from_file(
+        self,
+        path: str,
+        tensor_name: str,
+        checkpoint_start: int,
+    ) -> None:
+        """Build the FP8 table by streaming the source a row group at a time.
+
+        Converting from a mapped tensor keeps the whole BF16 table resident:
+        every group faults its pages in and nothing drops them while the FP8
+        table grows beside it, so the two together outgrow host memory. Read
+        each group from the file instead and release its pages once it is
+        converted, which caps residency at the destination plus one group.
+        """
+        offset, shape, dtype = read_safetensors_entry(path, tensor_name)
+        if len(shape) != 2:
+            raise ValueError(f"{tensor_name} is not a 2D table: {shape}")
+        rows, columns = shape
+        embedding = self.ngram_embedding
+        if columns != embedding.embedding_dim:
+            raise ValueError(
+                f"{tensor_name} has {columns} columns, expected "
+                f"{embedding.embedding_dim}"
+            )
+        row_bytes = columns * torch.empty((), dtype=dtype).element_size()
+        group_rows = self._runtime_fp8_group_rows
+        fp8_max = torch.finfo(torch.float8_e4m3fn).max
+        first_group = checkpoint_start // group_rows
+
+        for group in range(first_group, self.split_ngram_parts):
+            group_start = group * group_rows
+            start = max(group_start, checkpoint_start)
+            end = min(group_start + group_rows, checkpoint_start + rows)
+            if start >= end:
+                break
+            source_start = start - checkpoint_start
+            block = stream_tensor_rows(
+                path, offset, row_bytes, dtype, columns, source_start, end - start
+            )
+            rows_f32 = block.to(torch.float32)
+            del block
+            scale = (rows_f32.abs().max() / fp8_max).clamp(
+                min=torch.finfo(torch.float32).tiny
+            )
+            self.runtime_fp8_scales[group] = scale
+            quantized = (
+                (rows_f32 / scale).clamp_(-fp8_max, fp8_max).to(torch.float8_e4m3fn)
+            )
+            del rows_f32
+            copy_ple_embedding_shard_(
+                embedding.weight.data,
+                quantized,
+                checkpoint_start=start,
+                tp_start=embedding.shard_indices.org_vocab_start_index,
+                tp_end=embedding.shard_indices.org_vocab_end_index,
+            )
+            del quantized
+            # The rows are in the destination now; the file pages behind them
+            # are dead weight. pread leaves no mapping, so this actually frees
+            # them.
+            release_file_range(
+                path, offset + source_start * row_bytes, (end - start) * row_bytes
+            )
 
     def _quantize_runtime_fp8_rows(
         self,

@@ -20,10 +20,12 @@ Class structure mirrors the GPU worker pattern in multiproc_executor.py:
 """
 
 import contextlib
+import json
 import multiprocessing.process
 import os
 import pickle
 import signal
+import struct
 import tempfile
 import threading
 from collections.abc import Iterable
@@ -96,6 +98,28 @@ def _resolve_local_checkpoint(model_path: str) -> "Path | None":
         logger.debug("No local checkpoint directory for %s", model_path)
         return None
     return resolved if resolved.is_dir() else None
+
+
+def find_table_shard(shards: "Iterable[str]", suffix: str) -> tuple[str, str] | None:
+    """Return the shard file and tensor name holding a PLE table, if any.
+
+    Only safetensors shards can be streamed: the header gives the byte range
+    of one tensor, which is what lets the conversion read a row group without
+    mapping the whole table.
+    """
+    for shard in shards:
+        if not shard.endswith(".safetensors"):
+            continue
+        try:
+            with open(shard, "rb") as handle:
+                (header_len,) = struct.unpack("<Q", handle.read(8))
+                header = json.loads(handle.read(header_len))
+        except (OSError, ValueError):
+            continue
+        for name in header:
+            if name.endswith(suffix):
+                return shard, name
+    return None
 
 
 def drop_page_cache_for(paths: "Iterable[str]") -> int:
@@ -503,6 +527,78 @@ class PleOffloadRunner:
         """Return PleOffloadLayer names in model traversal order."""
         return list(self._layers)
 
+    def _resolve_checkpoint_shards(
+        self,
+        loader: Any,
+        model_config: Any,
+        model: Any,
+    ) -> None:
+        """Fill in the shard list before any weight is read.
+
+        The loader only resolves its files while its generator is consumed,
+        which is too late for a decision that has to be made before the table
+        is materialized. Ask for the same resolution up front; the loader
+        caches nothing, but the call is cheap next to the load itself.
+        """
+        if self.checkpoint_shards:
+            return
+        prepare = getattr(loader, "_prepare_weights", None)
+        if prepare is None:
+            return
+        try:
+            _, files, _ = prepare(
+                model_config.model,
+                getattr(model_config, "subfolder", None),
+                model_config.revision,
+                getattr(model, "fall_back_to_pt_during_load", True),
+                getattr(model, "allow_patterns_overrides", None),
+            )
+        except Exception:
+            logger.exception("Could not resolve the checkpoint shards up front")
+            return
+        self.checkpoint_shards.extend(files)
+
+    def _stream_runtime_fp8_tables(
+        self,
+        offload_layers: dict[str, PleOffloadLayer],
+        load_config: Any,
+    ) -> set[str]:
+        """Build every runtime-FP8 table straight from its shard.
+
+        Returns the checkpoint names that were consumed here so the normal
+        iterator skips them. A layer that is not requantizing at runtime, or
+        whose table is not in a safetensors shard, is left to the usual path.
+        """
+        strategy = getattr(load_config, "safetensors_load_strategy", None)
+        if strategy in ("eager", "prefetch"):
+            # Both read whole shards up front, which reinstates the peak this
+            # path exists to avoid.
+            logger.info(
+                "PLE table streaming is off: safetensors_load_strategy=%s "
+                "reads whole shards up front.",
+                strategy,
+            )
+            return set()
+
+        streamed: set[str] = set()
+        for layer_name, layer in offload_layers.items():
+            embedding = getattr(layer, "ngram_embedding", None)
+            if embedding is None or not getattr(layer, "runtime_fp8_table", False):
+                continue
+            located = find_table_shard(self.checkpoint_shards, "ngram_embedding.weight")
+            if located is None:
+                logger.info(
+                    "PLE table for %s is not in a safetensors shard; loading "
+                    "it through the normal path.",
+                    layer_name,
+                )
+                continue
+            shard, tensor_name = located
+            logger.info("Streaming the PLE table for %s from %s", layer_name, shard)
+            layer.quantize_runtime_fp8_from_file(shard, tensor_name, checkpoint_start=0)
+            streamed.add(tensor_name)
+        return streamed
+
     def _load_weights(self) -> None:
         """Load only :class:`PleOffloadLayer` subtrees into CPU memory.
 
@@ -555,11 +651,19 @@ class PleOffloadRunner:
         mapper = getattr(model, "hf_to_vllm_mapper", None)
         matched_checkpoint_tensors = 0
 
+        # Tables that will be streamed straight from their shard must not be
+        # yielded to the model: materializing them here is exactly the peak
+        # the streaming path exists to avoid.
+        streamed_tensor_names: set[str] = set()
+
         def offload_only_iter(
             weights: Iterable[tuple[str, torch.Tensor]],
         ) -> Iterable[tuple[str, torch.Tensor]]:
             nonlocal matched_checkpoint_tensors
             for weight_name, tensor in weights:
+                if weight_name in streamed_tensor_names:
+                    matched_checkpoint_tensors += 1
+                    continue
                 mapped_name: str | None = weight_name
                 if mapper is not None:
                     mapped_names = mapper.apply_list([weight_name])
@@ -589,8 +693,16 @@ class PleOffloadRunner:
             for layer in offload_layers.values():
                 initialize_dummy_weights(layer, model_config)
         elif isinstance(loader, DefaultModelLoader):
+            # get_all_weights() is a generator: nothing runs, and the shard
+            # list stays empty, until it is consumed. Resolve the shards here
+            # so the streaming decision has them.
+            self._resolve_checkpoint_shards(loader, model_config, model)
+            streamed_tensor_names.update(
+                self._stream_runtime_fp8_tables(offload_layers, load_config)
+            )
             all_weights = loader.get_all_weights(model_config, model)
             loaded_params = model.load_weights(offload_only_iter(all_weights))
+            loaded_params.update(streamed_tensor_names)
             if matched_checkpoint_tensors == 0:
                 raise RuntimeError(
                     "PLE offload checkpoint filter matched no weights for "
