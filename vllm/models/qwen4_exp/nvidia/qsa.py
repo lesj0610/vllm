@@ -288,26 +288,9 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
         gate = getattr(self, "_flashinfer_gate", None)
         if gate is not None:
             return gate
-        from .ops.qsa_flashinfer import (
-            QSAFlashInferRunner,
-            flatten_is_view,
-            supports_qsa_flashinfer,
-        )
+        from .ops.qsa_flashinfer import QSAFlashInferRunner, supports_qsa_flashinfer
 
         if not supports_qsa_flashinfer(self.head_size, self.kv_cache_dtype):
-            self._flashinfer_gate = False
-            return False
-        # The block-sparse wrapper is NHD-only, so an HND cache has to be
-        # permuted before it can be flattened. Where that is not a view it
-        # would copy the whole cache every forward, which costs more than the
-        # kernel saves; Triton keeps serving those shapes.
-        if not flatten_is_view(key_cache, self.is_kvcache_nvfp4):
-            logger.info_once(
-                "Qwen4Exp QSA keeps the Triton kernel: the %s KV cache cannot "
-                "be flattened into the NHD view FlashInfer's block-sparse "
-                "wrapper needs without copying.",
-                self.kv_cache_dtype,
-            )
             self._flashinfer_gate = False
             return False
         self._flashinfer_runner = QSAFlashInferRunner(device)
@@ -341,21 +324,25 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
         output: torch.Tensor,
         kv_quantized: bool,
     ) -> None:
-        """Flatten the QSA cache into token-indexed views and hand it over."""
+        """Split the QSA cache into data/scale views and hand it over.
+
+        The wrapper addresses KV entries of the cache as it is allocated, so
+        nothing is permuted or flattened here: the NVFP4 cache stays HND and
+        the unquantized one stays NHD, and both are views.
+        """
         runner = self._flashinfer_runner
         if self.is_kvcache_nvfp4:
-            # (pages, heads, page_size, full) -> (pages * page_size, heads, full)
-            pages, heads, page_size, full = key_cache.shape
+            # (pages, heads, page_size, full), full = data | e4m3 scales
+            _, heads, page_size, full = key_cache.shape
             data = full - full // 9
-            flat_k = key_cache.permute(0, 2, 1, 3).reshape(-1, heads, full)
-            flat_v = value_cache.permute(0, 2, 1, 3).reshape(-1, heads, full)
-            k_data, k_sf = flat_k[..., :data], flat_k[..., data:]
-            v_data, v_sf = flat_v[..., :data], flat_v[..., data:]
+            k_data, k_sf = key_cache[..., :data], key_cache[..., data:]
+            v_data, v_sf = value_cache[..., :data], value_cache[..., data:]
+            layout = "HND"
         else:
-            pages, page_size, heads, _ = key_cache.shape
-            k_data = key_cache.reshape(-1, heads, key_cache.shape[-1])
-            v_data = value_cache.reshape(-1, heads, value_cache.shape[-1])
+            _, page_size, heads, _ = key_cache.shape
+            k_data, v_data = key_cache, value_cache
             k_sf = v_sf = None
+            layout = "NHD"
         runner.run(
             query,
             k_data,
@@ -367,6 +354,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             token_to_req,
             output,
             page_size,
+            layout,
             self._resolved_scale(layer, "_k_scale") if kv_quantized else 1.0,
             self._resolved_scale(layer, "_v_scale") if kv_quantized else 1.0,
         )

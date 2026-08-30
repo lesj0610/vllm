@@ -11,6 +11,9 @@ slots plus a packed validity mask, so this module owns the translation:
       -> physical slot for the valid entries, slot 0 for the rest
       -> packed little-endian mask, ceil(width/8) bytes per row
 
+The route names entries of the cache as it is allocated, so no layout change
+is needed: an NVFP4 QSA cache stays HND and an unquantized one stays NHD.
+
 Geometry is fixed at ``plan()`` time and cached per row bucket; only the route
 and mask contents change per forward, written in place into the buffers the
 wrapper already holds. Everything here runs inside the QSA custom op, so the
@@ -40,24 +43,29 @@ _MAX_PLANS = 8
 
 
 @functools.cache
-def _sparse_wrapper_reads_nvfp4() -> bool:
-    """Whether the installed FlashInfer block-sparse wrapper takes NVFP4 scales."""
+def _sparse_wrapper_features() -> frozenset[str]:
+    """Which of the features this backend needs the installed FlashInfer has.
+
+    ``paged`` is a route over the cache as allocated; ``nvfp4`` is the packed
+    E2M1 path. Older releases serve neither, and reaching for one that is
+    missing would either raise or silently read the wrong bytes.
+    """
     try:
         from flashinfer import BlockSparseAttentionWrapper
-    except Exception:
-        return False
-    return (
-        "kv_cache_sf" in inspect.signature(BlockSparseAttentionWrapper.run).parameters
-    )
 
-
-@functools.cache
-def _has_sparse_wrapper() -> bool:
-    try:
-        from flashinfer import BlockSparseAttentionWrapper  # noqa: F401
+        run_params = inspect.signature(BlockSparseAttentionWrapper.run).parameters
+        plan_params = inspect.signature(BlockSparseAttentionWrapper.plan).parameters
+        init_params = inspect.signature(BlockSparseAttentionWrapper.__init__).parameters
     except Exception:
-        return False
-    return True
+        # A missing wrapper, a C-level signature, or a partially initialized
+        # module all mean the same thing here: this backend cannot be used.
+        return frozenset()
+    found = {"sparse"}
+    if "kv_cache_sf" in run_params:
+        found.add("nvfp4")
+    if "kv_cache_page_size" in plan_params and "kv_layout" in init_params:
+        found.add("paged")
+    return frozenset(found)
 
 
 def supports_qsa_flashinfer(head_dim: int, kv_cache_dtype: str) -> bool:
@@ -72,33 +80,13 @@ def supports_qsa_flashinfer(head_dim: int, kv_cache_dtype: str) -> bool:
         return False
     if head_dim > 256 or head_dim % 16:
         return False
-    if kv_cache_dtype == "nvfp4":
-        return _sparse_wrapper_reads_nvfp4()
-    if kv_cache_dtype in ("auto", "bfloat16"):
-        return _has_sparse_wrapper()
-    # Per-tensor FP8 has no block-sparse path yet; Triton keeps serving it.
-    return False
-
-
-def flatten_is_view(cache: torch.Tensor, nvfp4: bool) -> bool:
-    """Whether the token-major flatten this backend needs is copy-free.
-
-    The block-sparse wrapper hardcodes an NHD layout, so an HND cache has to be
-    permuted before it can be flattened. That collapses to a view only when the
-    permuted dimensions are already contiguous, which for the QSA slot layout
-    means a single KV head. Anything else would copy the whole cache on every
-    forward, so the caller must fall back rather than pay that.
-    """
-    if not nvfp4:
-        return True
-    try:
-        flat = cache.permute(0, 2, 1, 3).reshape(-1, cache.shape[1], cache.shape[3])
-    except RuntimeError:
+    features = _sparse_wrapper_features()
+    if "paged" not in features:
         return False
-    return (
-        flat.data_ptr() == cache.data_ptr()
-        and flat.untyped_storage().data_ptr() == cache.untyped_storage().data_ptr()
-    )
+    if kv_cache_dtype == "nvfp4":
+        return "nvfp4" in features
+    # Per-tensor FP8 has no block-sparse path yet; Triton keeps serving it.
+    return kv_cache_dtype in ("auto", "bfloat16")
 
 
 @functools.cache
@@ -124,6 +112,8 @@ class _RoutePlan:
         num_kv_heads,
         head_dim,
         num_slots,
+        page_size,
+        layout,
         kv_dtype,
         device,
         workspace,
@@ -150,7 +140,9 @@ class _RoutePlan:
         indptr = torch.arange(
             0, (rows + 1) * width, width, dtype=torch.int32, device=device
         )
-        self.wrapper = flashinfer.BlockSparseAttentionWrapper(workspace)
+        self.wrapper = flashinfer.BlockSparseAttentionWrapper(
+            workspace, kv_layout=layout
+        )
         # An all-true mask only fixes the geometry; contents are replaced below.
         self.wrapper.plan(
             indptr,
@@ -166,6 +158,10 @@ class _RoutePlan:
             q_data_type=torch.bfloat16,
             kv_data_type=kv_dtype,
             o_data_type=torch.bfloat16,
+            # The route addresses KV entries of a cache that stores whole
+            # pages, so the wrapper has to divide each index back into
+            # (page, entry) instead of treating it as a block id.
+            kv_cache_page_size=page_size,
         )
         # plan() may or may not alias the caller's tensor; bind whatever it kept
         # so stage() always writes the buffer run() reads.
@@ -243,14 +239,15 @@ class QSAFlashInferRunner:
         token_to_req,
         out,
         page_size,
+        layout,
         k_scale,
         v_scale,
     ):
         rows_in, num_qo_heads, head_dim = query.shape
         width = logical_indices.shape[1]
         rows = -(-rows_in // _ROW_BUCKET) * _ROW_BUCKET
-        num_kv_heads = k_data.shape[-2]
-        num_slots = k_data.shape[0]
+        num_kv_heads = k_data.shape[1 if layout == "HND" else 2]
+        num_slots = k_data.shape[0] * page_size
         key = (
             rows,
             width,
@@ -258,6 +255,8 @@ class QSAFlashInferRunner:
             num_kv_heads,
             head_dim,
             num_slots,
+            page_size,
+            layout,
             k_data.dtype,
         )
         plan = self._plan_for(
@@ -268,6 +267,8 @@ class QSAFlashInferRunner:
             num_kv_heads,
             head_dim,
             num_slots,
+            page_size,
+            layout,
             k_data.dtype,
             self._device,
             self._workspace,
