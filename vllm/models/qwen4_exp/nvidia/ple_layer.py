@@ -285,9 +285,20 @@ class Qwen4ExpPLENVFp4EmbeddingMethod(QuantizeMethodBase):
         )
 
 
+def _ple_dtype_is_fp8(ple_embedding_dtype: object) -> bool:
+    """Return whether the model config declares FP8 PLE checkpoint weights."""
+
+    if ple_embedding_dtype is None:
+        return False
+    if isinstance(ple_embedding_dtype, torch.dtype):
+        return ple_embedding_dtype == torch.float8_e4m3fn
+    return str(ple_embedding_dtype).rsplit(".", 1)[-1] == "float8_e4m3fn"
+
+
 def _get_ple_embedding_quant_method(
     quant_config: QuantizationConfig | None,
     prefix: str,
+    ple_embedding_dtype: object = None,
 ) -> QuantizeMethodBase | None:
     """Select a packed PLE embedding method for quantized checkpoint shards."""
 
@@ -309,13 +320,17 @@ def _get_ple_embedding_quant_method(
         return Qwen4ExpPLEFp8EmbeddingMethod()
 
     if isinstance(quant_config, ModelOptNvFp4Config):
-        if (
-            not quant_config.is_checkpoint_nvfp4_serialized
-            or quant_config.is_layer_excluded(prefix)
-        ):
+        if not quant_config.is_checkpoint_nvfp4_serialized:
             return None
-        logger.info_once("PLE embedding %s uses the runtime NVFP4 method", prefix)
-        return Qwen4ExpPLENVFp4EmbeddingMethod()
+        if not quant_config.is_layer_excluded(prefix):
+            logger.info_once("PLE embedding %s uses the runtime NVFP4 method", prefix)
+            return Qwen4ExpPLENVFp4EmbeddingMethod()
+        if _ple_dtype_is_fp8(ple_embedding_dtype):
+            logger.info_once(
+                "Excluded ModelOpt PLE embedding %s uses the runtime FP8 method",
+                prefix,
+            )
+            return Qwen4ExpPLEFp8EmbeddingMethod()
 
     return None
 
@@ -452,7 +467,9 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
             padding_size=divisor,
             prefix=f"{prefix}.ngram_embedding",
             quant_method=_get_ple_embedding_quant_method(
-                quant_config, f"{prefix}.ngram_embedding"
+                quant_config,
+                f"{prefix}.ngram_embedding",
+                getattr(config, "ple_embedding_dtype", None),
             ),
         )
         self.register_buffer(
@@ -661,6 +678,8 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load hash buffers and checkpoint-split embedding rows."""
 
+        # Prefix grouping may invoke this method repeatedly for one module.
+        # Treat the global FP8 scale as incrementally loaded state.
         # GPU workers retain only dequantization metadata. The CPU process owns
         # the embedding table and transfers quantized lookup rows unchanged.
         if envs.VLLM_PLE_CPU_OFFLOAD and not is_offload_process():
@@ -678,8 +697,6 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
                         persistent=False,
                     )
                     retained.add(name)
-                if not retained:
-                    raise ValueError("FP8 PLE offload checkpoint is missing its scale")
             elif isinstance(quant_method, Qwen4ExpPLENVFp4EmbeddingMethod):
                 outer_scales: dict[int, torch.Tensor] = {}
                 for name, loaded_weight in weights:
@@ -725,7 +742,6 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
         shard_prefix = "ngram_embedding.shard_"
         quant_method = getattr(self.ngram_embedding, "quant_method", None)
         nvfp4_runtime = isinstance(quant_method, Qwen4ExpPLENVFp4EmbeddingMethod)
-        fp8_runtime = isinstance(quant_method, Qwen4ExpPLEFp8EmbeddingMethod)
         packed_codes: dict[int, torch.Tensor] = {}
         packed_scales: dict[int, torch.Tensor] = {}
         packed_outer_scales: dict[int, torch.Tensor] = {}
@@ -872,8 +888,6 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
 
         if regular_weights:
             loaded.update(AutoWeightsLoader(self).load_weights(regular_weights))
-        if fp8_runtime and "ngram_embedding.weight_scale" not in loaded:
-            raise ValueError("FP8 PLE checkpoint is missing its global scale")
         return loaded
 
 
@@ -930,6 +944,7 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
             ple_embedding._offload_quant_method = _get_ple_embedding_quant_method(
                 quant_config,
                 f"{prefix}.ple_embedding.ngram_embedding",
+                getattr(config, "ple_embedding_dtype", None),
             )
         self.ple_embedding: nn.Module = ple_embedding
         self.key_proj = ReplicatedLinear(
