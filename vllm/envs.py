@@ -298,7 +298,6 @@ if TYPE_CHECKING:
     VLLM_USE_V2_MODEL_RUNNER: bool | None = None
     VLLM_PLE_CPU_OFFLOAD: bool = False
     VLLM_PLE_OFFLOAD_READY_TIMEOUT: float = 600.0
-    VLLM_PLE_OFFLOAD_STEP_TIMEOUT: float = 60.0
     VLLM_LOG_MODEL_INSPECTION: bool = False
     VLLM_DEBUG_MFU_METRICS: bool = False
     VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY: bool = False
@@ -2048,9 +2047,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # How long one forward step waits for the CPU offload worker to answer
     # before the engine gives up. A step that never answers would otherwise
     # spin a core forever with nothing reported.
-    "VLLM_PLE_OFFLOAD_STEP_TIMEOUT": lambda: float(
-        os.getenv("VLLM_PLE_OFFLOAD_STEP_TIMEOUT", "60")
-    ),
     # Log model inspection after loading.
     # If enabled, logs a transformers-style hierarchical view of the model
     # with quantization methods and attention backends.
