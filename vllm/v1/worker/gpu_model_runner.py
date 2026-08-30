@@ -53,6 +53,7 @@ from vllm.distributed.parallel_state import (
     graph_capture,
     is_global_first_rank,
 )
+from vllm.distributed.utils import get_pp_indices
 from vllm.forward_context import (
     BatchDescriptor,
     set_forward_context,
@@ -600,12 +601,26 @@ class GPUModelRunner(
         if self.uses_ngram_embedding and self.ngram_context_len <= 0:
             raise ValueError("N-gram embedding requires context length >= 1.")
         if self.uses_ngram_embedding and len(get_pp_group().ranks) > 1:
-            raise RuntimeError(
-                "N-gram PLE embedding currently requires "
-                "pipeline_parallel_size=1. With PP>1, ngram context is only "
-                "injected on the first rank and can become incorrect on "
-                "non-first ranks. Please run with PP=1."
+            # Only the first pipeline stage sees `input_ids`, so it is the only
+            # stage that can build a correct n-gram context. That is sufficient
+            # as long as every PLE layer lives on that stage: a decoder layer at
+            # index `i` owns the PLE block for `ple_layer_ids` entry `i + 1`.
+            pp_size = len(get_pp_group().ranks)
+            _, first_stage_end = get_pp_indices(
+                int(model_config.hf_text_config.num_hidden_layers), 0, pp_size
             )
+            ple_layer_indices = [int(i) - 1 for i in ple_layer_ids]
+            offstage = [i for i in ple_layer_indices if not 0 <= i < first_stage_end]
+            if offstage:
+                raise RuntimeError(
+                    "N-gram PLE embedding requires every PLE layer to sit on "
+                    "the first pipeline stage, because only that stage receives "
+                    "input_ids and can build the n-gram context. Decoder "
+                    f"layer(s) {sorted(offstage)} hold PLE blocks but fall "
+                    f"outside the first stage's range [0, {first_stage_end}). "
+                    "Move the pipeline split later (VLLM_PP_LAYER_PARTITION) or "
+                    "run with pipeline_parallel_size=1."
+                )
 
         self.cascade_attn_enabled = not self.model_config.disable_cascade_attn
         self.is_mm_prefix_lm = self.model_config.is_mm_prefix_lm

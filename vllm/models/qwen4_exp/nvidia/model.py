@@ -420,7 +420,7 @@ class Qwen4ExpModel(nn.Module):
             ["hidden_states"], intermediate_size
         )
 
-        self.hyper_connection_mixer: GatedResidual | None
+        self.hyper_connection_mixer: GatedResidual | StageMissingLayer
         if get_pp_group().is_last_rank:
             hc_config = HyperConnectionConfig(
                 hc_count=config.hc_count,
@@ -436,7 +436,12 @@ class Qwen4ExpModel(nn.Module):
                 prefix=maybe_prefix(prefix, "hyper_connection_mixer"),
             )
         else:
-            self.hyper_connection_mixer = None
+            # Non-final pipeline stages never run the mixer, but the weight
+            # loader still walks the checkpoint's `hyper_connection_mixer.*`
+            # tensors on every stage. A plain ``None`` makes that walk fail with
+            # "no module or parameter named 'hyper_connection_mixer'", so use the
+            # placeholder the loader already skips (same treatment as `visual`).
+            self.hyper_connection_mixer = StageMissingLayer("hyper_connection_mixer")
 
         spec_config = vllm_config.speculative_config
         # MTP HC multi-stream outputs: when speculative method=="mtp" and the

@@ -8,6 +8,7 @@ import torch
 import torch.nn as nn
 
 from vllm.config import VllmConfig
+from vllm.distributed.utils import get_pp_indices
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
@@ -32,13 +33,30 @@ class Qwen4ExpModelState(MambaHybridModelState):
             self.ngram_eos_token_id = 0
             return
 
-        if vllm_config.parallel_config.pipeline_parallel_size > 1:
-            raise RuntimeError(
-                "N-gram PLE embedding currently requires "
-                "pipeline_parallel_size=1 because non-first pipeline ranks do "
-                "not receive the raw input_ids required by PLE. Please run "
-                "with PP=1."
+        pp_size = vllm_config.parallel_config.pipeline_parallel_size
+        if pp_size > 1:
+            # Non-first pipeline ranks never receive the raw input_ids that PLE
+            # needs, so the n-gram context is only correct on the first stage.
+            # That is enough as long as every PLE layer lives there: decoder
+            # layer `i` owns the PLE block for `ple_layer_ids` entry `i + 1`.
+            _, first_stage_end = get_pp_indices(
+                int(config.num_hidden_layers), 0, pp_size
             )
+            offstage = [
+                int(i) - 1
+                for i in config.ple_layer_ids
+                if not 0 <= int(i) - 1 < first_stage_end
+            ]
+            if offstage:
+                raise RuntimeError(
+                    "N-gram PLE embedding requires every PLE layer to sit on "
+                    "the first pipeline stage, because only that stage receives "
+                    "the raw input_ids PLE needs. Decoder layer(s) "
+                    f"{sorted(offstage)} hold PLE blocks but fall outside the "
+                    f"first stage's range [0, {first_stage_end}). Move the "
+                    "pipeline split later (VLLM_PP_LAYER_PARTITION) or run with "
+                    "pipeline_parallel_size=1."
+                )
 
         self.ngram_context_len = int(config.ngram_size) - 1
         if self.ngram_context_len <= 0:

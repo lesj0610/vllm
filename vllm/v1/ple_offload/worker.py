@@ -521,11 +521,20 @@ class PleOffloadRunner:
         # memory. All transformer, MoE, and vision parameters remain on meta.
         logger.info("Initializing model structure for PLE weight discovery ...")
         model_dtype = cast(torch.dtype, model_config.dtype)
-        with set_default_torch_dtype(model_dtype), torch.device("meta"):
-            model = initialize_model(
-                vllm_config=self.vllm_config,
-                model_config=model_config,
-            )
+        # This process builds the whole decoder to locate the PLE layers, so it
+        # runs unpartitioned (PP1) like the DP/TP overrides above. A pipeline
+        # partition inherited through the environment would be validated against
+        # that PP1 world and rejected, so drop it for the construction only.
+        saved_pp_partition = os.environ.pop("VLLM_PP_LAYER_PARTITION", None)
+        try:
+            with set_default_torch_dtype(model_dtype), torch.device("meta"):
+                model = initialize_model(
+                    vllm_config=self.vllm_config,
+                    model_config=model_config,
+                )
+        finally:
+            if saved_pp_partition is not None:
+                os.environ["VLLM_PP_LAYER_PARTITION"] = saved_pp_partition
 
         # Step 2: preserve named_modules DFS order so CPU execution follows the
         # same layer order as the GPU model forward.
@@ -665,10 +674,26 @@ class PleOffloadRunner:
 
         dp_size = self.vllm_config.parallel_config.data_parallel_size
         tp_size = self.vllm_config.parallel_config.tensor_parallel_size
-        if num_workers != dp_size * tp_size:
+        pp_size = self.vllm_config.parallel_config.pipeline_parallel_size
+        if num_workers != dp_size * tp_size * pp_size:
             raise RuntimeError(
-                f"Expected {dp_size * tp_size} registrations for DP={dp_size}, "
-                f"TP={tp_size}, got {num_workers}"
+                f"Expected {dp_size * tp_size * pp_size} registrations for "
+                f"DP={dp_size}, TP={tp_size}, PP={pp_size}, got {num_workers}"
+            )
+
+        # Only the pipeline stage that holds the PLE decoder layer registers
+        # output buffers; the other stages register empty so the count above
+        # stays exact. Everything below addresses layer owners only, which with
+        # PP=1 is every rank.
+        registrations = [
+            registration
+            for registration in registrations
+            if registration.gpu_output_buffers
+        ]
+        if not registrations:
+            raise RuntimeError(
+                "No GPU worker registered a PLE layer; expected the pipeline "
+                "stage owning the PLE decoder layer to register one"
             )
 
         registrations_by_dp: dict[int, list[PleOffloadRegistration]] = {}

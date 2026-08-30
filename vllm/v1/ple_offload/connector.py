@@ -60,6 +60,12 @@ class PleOffloadConnector:
         self.dp_rank = get_dp_group().rank_in_group
         self.tp_rank = get_tp_group().rank_in_group
         self._layers = self._setup_layers(vllm_config, model)
+        # Under pipeline parallelism only the stage holding the PLE decoder
+        # layer owns any PleOffloadLayer; the other stages register so the CPU
+        # worker can account for every rank, but they neither drive requests nor
+        # receive lookups. With PP=1 every rank owns the layers, so this keeps
+        # the previous "TP rank zero is the request source" behaviour.
+        self._is_request_source = self.tp_rank == 0 and bool(self._layers)
 
         # Both runner paths stage into the same shared buffers. TP0 registers
         # them with CUDA so MRV2 can use asynchronous D2H copies.
@@ -115,7 +121,7 @@ class PleOffloadConnector:
             self._registration_socket.connect(ipc_addr)
             self._register_with_offload_worker(vllm_config, ipc_addr)
 
-            if self.tp_rank == 0:
+            if self._is_request_source:
                 # ForkingPickler may replace CPU storage while converting its
                 # sharing strategy, so register only the final addresses.
                 with torch.accelerator.device_index(self.device.index):
@@ -140,7 +146,7 @@ class PleOffloadConnector:
             for name, module in model.named_modules()
             if isinstance(module, PleOffloadLayer)
         }
-        if not layers:
+        if not layers and vllm_config.parallel_config.pipeline_parallel_size == 1:
             raise RuntimeError(
                 "VLLM_PLE_CPU_OFFLOAD is enabled, but the model has no PleOffloadLayer"
             )
@@ -387,8 +393,10 @@ class PleOffloadConnector:
     ) -> None:
         """Queue one batch while keeping staging off the model thread."""
         # Inputs are replicated across TP ranks. One request per DP rank drives
-        # the CPU result fan-out to every registered TP output buffer.
-        if self.tp_rank != 0:
+        # the CPU result fan-out to every registered TP output buffer. Stages
+        # that hold no PLE layer never started a request thread, so a queued
+        # request there would sit unread and fill the depth-one queue.
+        if not self._is_request_source:
             return
 
         if self._uses_cuda_inputs:
@@ -429,7 +437,7 @@ class PleOffloadConnector:
         busy-waits for results so the flag is already ``DONE_VALUE`` when the
         graph replays.
         """
-        if self.tp_rank == 0:
+        if self._is_request_source:
             # Ensure GPU input buffers are fully written.
             torch.cuda.current_stream(self.device).synchronize()
 
