@@ -1762,14 +1762,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
         self.step_timing.forward_start()
 
-        # prepare_inputs has finalized MRV2's GPU buffers. Record readiness so
-        # the request thread can stage them before the PLE placeholder runs.
+        # prepare_inputs has finalized MRV2's GPU buffers. Stage D2H on this
+        # stream before the PLE placeholder can wait for CPU output.
         if self._ple_offload_connector is not None:
             self._ple_offload_connector.prepare_forward(
                 input_batch.num_reqs,
                 input_batch.num_tokens_after_padding,
                 dummy_run,
-                use_cudagraph=(batch_desc.cg_mode == CUDAGraphMode.FULL),
             )
 
         # Run model.
