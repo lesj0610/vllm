@@ -102,6 +102,7 @@ def test_ple_offload_h2h_uses_bound_input_buffers() -> None:
     connector._query_start_loc_source = source_query_start_loc
     connector._ngram_context_source = None
     connector._uses_cuda_inputs = False
+    connector._is_request_source = True
     connector._validate_input_sources()
     connector._d2h_event_pool = None
     connector._request_queue = queue.Queue(maxsize=1)
@@ -132,6 +133,7 @@ def test_ple_offload_request_thread_copies_mrv1_and_stops() -> None:
     connector._query_start_loc_source = torch.tensor([0, 2, 4], dtype=torch.int32)
     connector._ngram_context_source = None
     connector._uses_cuda_inputs = False
+    connector._is_request_source = True
     connector._pinned_input_buffers = []
     connector._d2h_event_pool = None
     connector._request_queue = queue.Queue(maxsize=1)
@@ -166,6 +168,7 @@ def test_ple_offload_mrv2_uses_event_per_inflight_batch() -> None:
     connector.tp_rank = 0
     connector.dp_rank = 0
     connector._uses_cuda_inputs = True
+    connector._is_request_source = True
     connector._request_queue = queue.Queue(maxsize=2)
     connector._d2h_event_pool = queue.Queue(maxsize=2)
     first_event = Mock()
@@ -193,7 +196,7 @@ def test_ple_offload_mrv2_uses_event_per_inflight_batch() -> None:
     with pytest.raises(RuntimeError, match="configured concurrent batches"):
         connector._launch(num_reqs=1, num_tokens=1)
 
-    connector.tp_rank = 1
+    connector._is_request_source = False
     connector._launch(num_reqs=1, num_tokens=1)
     assert enqueue_cuda_inputs.call_count == 2
     assert connector._request_queue.empty()
@@ -268,6 +271,7 @@ def test_ple_offload_mrv2_copies_into_pinned_shared_buffers() -> None:
         connector._query_start_loc_source = query_start_loc
         connector._ngram_context_source = ngram_context
         connector._uses_cuda_inputs = True
+        connector._is_request_source = True
         connector._validate_input_sources()
         connector._pin_input_buffers()
         assert (
