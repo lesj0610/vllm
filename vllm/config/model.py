@@ -467,6 +467,7 @@ class ModelConfig:
         # here early.
         if self.multimodal_config:
             factors["language_model_only"] = self.multimodal_config.language_model_only
+        factors["mrope_cache_max_position"] = self.mrope_cache_max_position
         return hash_factors(factors)
 
     def _update_nested(
@@ -1838,6 +1839,24 @@ class ModelConfig:
     @property
     def uses_mrope(self) -> bool:
         return uses_mrope(self.hf_config)
+
+    @property
+    def mrope_cache_max_position(self) -> int | None:
+        """Exclusive M-RoPE cache position bound, if certified for this model.
+
+        ``None`` keeps the legacy 4x physical cos/sin cache. A bound is only
+        returned when the concrete model class certifies that its unpruned
+        M-RoPE positions stay within the sequence length, and when no
+        config-dependent transform can push positions past it.
+        """
+        if not self._model_info.mrope_positions_are_sequence_bounded:
+            return None
+        if (
+            self.multimodal_config is not None
+            and self.multimodal_config.is_multimodal_pruning_enabled()
+        ):
+            return None
+        return self.max_model_len
 
     @property
     def uses_xdrope_dim(self) -> int:

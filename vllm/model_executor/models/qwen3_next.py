@@ -268,6 +268,11 @@ class Qwen3NextAttention(nn.Module):
             max_position=config.max_position_embeddings,
             rope_parameters=config.rope_parameters,
             dual_chunk_attention_config=self.dual_chunk_attention_config,
+            mrope_cache_max_position=(
+                model_config.mrope_cache_max_position
+                if model_config is not None
+                else None
+            ),
         )
 
         # Late-interaction retrieval models (e.g. ColQwen3.5) run BIDIRECTIONAL
