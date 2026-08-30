@@ -14,6 +14,7 @@ from vllm.config import VllmConfig
 from vllm.config.cache import CacheDType
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.forward_context import get_forward_context
+from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.attention import (
     set_default_quant_scales,
 )
@@ -57,6 +58,8 @@ from vllm.v1.kv_cache_interface import (
 from ..common.qsa_cache import QSAForwardMetadata
 from . import model
 from .indexer_qsa import QSAIndexer
+
+logger = init_logger(__name__)
 
 
 class Qwen4ExpQSAMetadataBuilder(FlashAttentionMetadataBuilder):
@@ -252,6 +255,20 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
         if query.dtype != torch.bfloat16:
             raise NotImplementedError("Qwen4Exp QSA requires BF16 queries")
 
+        if self._flashinfer_usable(query.device, key_cache):
+            self._run_flashinfer(
+                layer,
+                query[:num_tokens],
+                key_cache,
+                value_cache,
+                logical_indices,
+                attn_metadata.block_table,
+                token_to_req,
+                output[:num_tokens],
+                kv_quantized,
+            )
+            return output
+
         qsa_sparse_paged_attention(
             query[:num_tokens],
             key_cache,
@@ -265,6 +282,94 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             nvfp4=self.is_kvcache_nvfp4,
         )
         return output
+
+    def _flashinfer_usable(self, device: torch.device, key_cache) -> bool:
+        """Whether this layer runs QSA on FlashInfer instead of Triton."""
+        gate = getattr(self, "_flashinfer_gate", None)
+        if gate is not None:
+            return gate
+        from .ops.qsa_flashinfer import (
+            QSAFlashInferRunner,
+            flatten_is_view,
+            supports_qsa_flashinfer,
+        )
+
+        if not supports_qsa_flashinfer(self.head_size, self.kv_cache_dtype):
+            self._flashinfer_gate = False
+            return False
+        # The block-sparse wrapper is NHD-only, so an HND cache has to be
+        # permuted before it can be flattened. Where that is not a view it
+        # would copy the whole cache every forward, which costs more than the
+        # kernel saves; Triton keeps serving those shapes.
+        if not flatten_is_view(key_cache, self.is_kvcache_nvfp4):
+            logger.info_once(
+                "Qwen4Exp QSA keeps the Triton kernel: the %s KV cache cannot "
+                "be flattened into the NHD view FlashInfer's block-sparse "
+                "wrapper needs without copying.",
+                self.kv_cache_dtype,
+            )
+            self._flashinfer_gate = False
+            return False
+        self._flashinfer_runner = QSAFlashInferRunner(device)
+        self._flashinfer_gate = True
+        logger.info_once("Qwen4Exp QSA attention backend: FlashInfer block-sparse")
+        return True
+
+    def _resolved_scale(self, layer: torch.nn.Module, name: str) -> float:
+        """Read a KV scale once and keep the host value.
+
+        The scales are registered CUDA buffers fixed at load time. Reading one
+        per forward would be a device-to-host sync, which CUDA graph capture
+        rejects outright.
+        """
+        cache = self.__dict__.setdefault("_scale_cache", {})
+        value = cache.get(name)
+        if value is None:
+            value = float(getattr(layer, name))
+            cache[name] = value
+        return value
+
+    def _run_flashinfer(
+        self,
+        layer: torch.nn.Module,
+        query: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        logical_indices: torch.Tensor,
+        block_table: torch.Tensor,
+        token_to_req: torch.Tensor,
+        output: torch.Tensor,
+        kv_quantized: bool,
+    ) -> None:
+        """Flatten the QSA cache into token-indexed views and hand it over."""
+        runner = self._flashinfer_runner
+        if self.is_kvcache_nvfp4:
+            # (pages, heads, page_size, full) -> (pages * page_size, heads, full)
+            pages, heads, page_size, full = key_cache.shape
+            data = full - full // 9
+            flat_k = key_cache.permute(0, 2, 1, 3).reshape(-1, heads, full)
+            flat_v = value_cache.permute(0, 2, 1, 3).reshape(-1, heads, full)
+            k_data, k_sf = flat_k[..., :data], flat_k[..., data:]
+            v_data, v_sf = flat_v[..., :data], flat_v[..., data:]
+        else:
+            pages, page_size, heads, _ = key_cache.shape
+            k_data = key_cache.reshape(-1, heads, key_cache.shape[-1])
+            v_data = value_cache.reshape(-1, heads, value_cache.shape[-1])
+            k_sf = v_sf = None
+        runner.run(
+            query,
+            k_data,
+            v_data,
+            k_sf,
+            v_sf,
+            logical_indices,
+            block_table,
+            token_to_req,
+            output,
+            page_size,
+            self._resolved_scale(layer, "_k_scale") if kv_quantized else 1.0,
+            self._resolved_scale(layer, "_v_scale") if kv_quantized else 1.0,
+        )
 
 
 class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
