@@ -123,15 +123,12 @@ def test_every_supported_dtype_is_served_by_flashinfer(dtype, head_dim):
     """The gate has to accept every cache dtype the model config allows.
 
     Pre-SM100 only: from SM100 a packed NVFP4 cache converts natively and this
-    route is not the right one, so the whole thing stays on Triton there. The
-    one combination left out is a 512-wide FP8 head, which is built for SM100
-    and newer and has no kernel here.
+    route is not the right one, so the whole thing stays on Triton there.
     """
     if current_platform.has_device_capability(100):
         pytest.skip("this route is pre-SM100")
-    expected = not (head_dim > 256 and dtype in ("fp8", "fp8_e4m3"))
-    assert supports_qsa_flashinfer(head_dim, dtype) == expected, (
-        f"{dtype} at head_dim {head_dim} is gated the wrong way"
+    assert supports_qsa_flashinfer(head_dim, dtype), (
+        f"{dtype} at head_dim {head_dim} would fall back to Triton"
     )
 
 

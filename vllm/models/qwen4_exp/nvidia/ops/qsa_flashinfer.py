@@ -89,11 +89,6 @@ def supports_qsa_flashinfer(head_dim: int, kv_cache_dtype: str) -> bool:
     # into scale groups.
     if head_dim % 16:
         return False
-    # The FA2 sparse kernel serves a 512-wide head by splitting it across the
-    # value dimension, but only the unquantized and packed-NVFP4 forms: an FP8
-    # cache that wide is built for SM100 and newer and has no kernel here.
-    if head_dim > 256 and kv_cache_dtype in ("fp8", "fp8_e4m3"):
-        return False
     features = _sparse_wrapper_features()
     if "paged" not in features:
         return False
