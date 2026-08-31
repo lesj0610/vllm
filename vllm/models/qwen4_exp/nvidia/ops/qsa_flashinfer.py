@@ -69,7 +69,7 @@ def _sparse_wrapper_features() -> frozenset[str]:
 
 
 def supports_qsa_flashinfer(head_dim: int, kv_cache_dtype: str) -> bool:
-    """Gate: pre-SM100 CUDA, a shape the FA2 sparse kernel serves, FlashInfer.
+    """Gate: pre-SM100 CUDA, a head the scale groups divide, FlashInfer.
 
     This route reads a quantized cache as raw bytes and rebuilds the values
     before the dots, on every architecture -- the same thing the Triton kernel
@@ -85,7 +85,14 @@ def supports_qsa_flashinfer(head_dim: int, kv_cache_dtype: str) -> bool:
         return False
     if current_platform.has_device_capability(_NATIVE_FP4_CAPABILITY):
         return False
-    if head_dim > 256 or head_dim % 16:
+    # NVFP4 packs one E4M3 scale per 16 elements, so the head has to divide
+    # into scale groups.
+    if head_dim % 16:
+        return False
+    # The FA2 sparse kernel serves a 512-wide head by splitting it across the
+    # value dimension, but only the unquantized and packed-NVFP4 forms: an FP8
+    # cache that wide is built for SM100 and newer and has no kernel here.
+    if head_dim > 256 and kv_cache_dtype in ("fp8", "fp8_e4m3"):
         return False
     features = _sparse_wrapper_features()
     if "paged" not in features:

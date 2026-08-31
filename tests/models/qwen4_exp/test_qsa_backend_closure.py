@@ -118,24 +118,27 @@ def _build(dtype, rows, heads, head_dim, seq_len, num_requests, width, device):
 
 @requires_cuda
 @pytest.mark.parametrize("dtype", SUPPORTED_DTYPES)
-@pytest.mark.parametrize("head_dim", [128, 256])
+@pytest.mark.parametrize("head_dim", [128, 256, 512])
 def test_every_supported_dtype_is_served_by_flashinfer(dtype, head_dim):
     """The gate has to accept every cache dtype the model config allows.
 
     Pre-SM100 only: from SM100 a packed NVFP4 cache converts natively and this
-    route is not the right one, so the whole thing stays on Triton there.
+    route is not the right one, so the whole thing stays on Triton there. The
+    one combination left out is a 512-wide FP8 head, which is built for SM100
+    and newer and has no kernel here.
     """
     if current_platform.has_device_capability(100):
         pytest.skip("this route is pre-SM100")
-    assert supports_qsa_flashinfer(head_dim, dtype), (
-        f"{dtype} at head_dim {head_dim} would fall back to Triton"
+    expected = not (head_dim > 256 and dtype in ("fp8", "fp8_e4m3"))
+    assert supports_qsa_flashinfer(head_dim, dtype) == expected, (
+        f"{dtype} at head_dim {head_dim} is gated the wrong way"
     )
 
 
 @requires_cuda
 @pytest.mark.parametrize("dtype", ("auto", "fp8", "nvfp4"))
 @pytest.mark.parametrize(
-    "head_dim,rows", list(itertools.product((128, 256), (1, 8, 64)))
+    "head_dim,rows", list(itertools.product((128, 256, 512), (1, 8, 64)))
 )
 def test_attention_never_reaches_triton(monkeypatch, dtype, head_dim, rows):
     """With the Triton entry points poisoned, the step still has to complete."""
