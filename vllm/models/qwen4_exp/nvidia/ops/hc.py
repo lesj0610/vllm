@@ -2,11 +2,18 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """NVIDIA HyperConnection kernels for Qwen4Exp."""
 
+import functools
+
 import torch
 
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
+
+
+@functools.cache
+def _has_cuda_hc() -> bool:
+    return hasattr(torch.ops._C, "qwen4_exp_hc_silu")
 
 
 @triton.jit
@@ -55,6 +62,10 @@ def _grouped_gemma_rmsnorm_kernel(
 def _grouped_gemma_rmsnorm(
     x: torch.Tensor, weight: torch.Tensor, eps: float, num_groups: int
 ) -> torch.Tensor:
+    if _has_cuda_hc() and x.is_cuda:
+        y = x.new_empty(x.shape)
+        torch.ops._C.qwen4_exp_grouped_gemma_rmsnorm(x, weight, eps, num_groups, y)
+        return y
     N, DIM = x.shape
     assert x.stride(1) == 1, "grouped Gemma RMSNorm requires unit inner stride"
     assert weight.is_contiguous(), "grouped Gemma RMSNorm weight must be contiguous"
@@ -106,6 +117,10 @@ def _hc_silu_kernel(
 
 
 def _hc_silu(x: torch.Tensor, hc_count: int) -> torch.Tensor:
+    if _has_cuda_hc() and x.is_cuda:
+        y = x.new_empty(x.shape)
+        torch.ops._C.qwen4_exp_hc_silu(x, hc_count, y)
+        return y
     num_tokens, DIM = x.shape
     assert x.stride(1) == 1
 
@@ -161,6 +176,10 @@ def _hc_gate_mix_kernel(
 
 
 def _hc_gate_mix(x: torch.Tensor, gate: torch.Tensor, hc_count: int) -> torch.Tensor:
+    if _has_cuda_hc() and x.is_cuda:
+        y = x.new_empty(gate.shape[0], gate.shape[1] // hc_count)
+        torch.ops._C.qwen4_exp_hc_gate_mix(x, gate, hc_count, y)
+        return y
     N, DIM = gate.shape
     assert x.shape == gate.shape
     assert DIM % hc_count == 0
@@ -235,6 +254,12 @@ def _hc_combine(
     injection_logits: torch.Tensor,
     hc_count: int,
 ) -> torch.Tensor:
+    if _has_cuda_hc() and residual.is_cuda:
+        out = residual.new_empty(residual.shape)
+        torch.ops._C.qwen4_exp_hc_combine(
+            residual, block_output, injection_logits, hc_count, out
+        )
+        return out
     N, DIM = residual.shape
     assert DIM % hc_count == 0
     hc_dim = DIM // hc_count
@@ -339,6 +364,13 @@ def _hc_combine_norm(
     eps: float,
     hc_count: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    if _has_cuda_hc() and residual.is_cuda:
+        out = residual.new_empty(residual.shape)
+        y = residual.new_empty(residual.shape)
+        torch.ops._C.qwen4_exp_hc_combine_norm(
+            residual, block_output, injection_logits, norm_weight, eps, hc_count, out, y
+        )
+        return out, y
     N, DIM = residual.shape
     assert DIM % hc_count == 0
     hc_dim = DIM // hc_count

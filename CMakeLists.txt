@@ -448,6 +448,7 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
     "csrc/libtorch_stable/sampler.cu"
     "csrc/libtorch_stable/topk.cu"
     "csrc/libtorch_stable/qsa_metadata.cu"
+    "csrc/libtorch_stable/qwen4_exp_hc.cu"
     "csrc/libtorch_stable/mamba/selective_scan_fwd.cu"
     "csrc/libtorch_stable/cache_kernels.cu"
     "csrc/libtorch_stable/cache_kernels_fused.cu"

@@ -575,6 +575,22 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
       "Tensor(a!)? work_metadata, int storage_block_size, int compress_ratio, "
       "int circular_buffer_size, int num_mapped_tokens) -> ()");
 
+  // Qwen4Exp hyper-connection ops.
+  ops.def(
+      "qwen4_exp_grouped_gemma_rmsnorm(Tensor x, Tensor weight, float eps, "
+      "int num_groups, Tensor! y) -> ()");
+  ops.def("qwen4_exp_hc_silu(Tensor x, int hc_count, Tensor! y) -> ()");
+  ops.def(
+      "qwen4_exp_hc_gate_mix(Tensor x, Tensor gate, int hc_count, Tensor! y) "
+      "-> ()");
+  ops.def(
+      "qwen4_exp_hc_combine(Tensor residual, Tensor block_output, "
+      "Tensor injection_logits, int hc_count, Tensor! out) -> ()");
+  ops.def(
+      "qwen4_exp_hc_combine_norm(Tensor residual, Tensor block_output, "
+      "Tensor injection_logits, Tensor norm_weight, float eps, int hc_count, "
+      "Tensor! out, Tensor! y) -> ()");
+
 #ifdef VLLM_ENABLE_COOPERATIVE_TOPK
   ops.def(
       "cooperative_topk(Tensor logits, Tensor lengths, Tensor! output, "
@@ -832,6 +848,12 @@ STABLE_TORCH_LIBRARY_IMPL(_C, CUDA, ops) {
   ops.impl("top_k_per_row_decode", TORCH_BOX(&top_k_per_row_decode));
   ops.impl("persistent_topk", TORCH_BOX(&persistent_topk));
   ops.impl("qsa_build_metadata", TORCH_BOX(&qsa_build_metadata));
+  ops.impl("qwen4_exp_grouped_gemma_rmsnorm",
+           TORCH_BOX(&qwen4_exp_grouped_gemma_rmsnorm));
+  ops.impl("qwen4_exp_hc_silu", TORCH_BOX(&qwen4_exp_hc_silu));
+  ops.impl("qwen4_exp_hc_gate_mix", TORCH_BOX(&qwen4_exp_hc_gate_mix));
+  ops.impl("qwen4_exp_hc_combine", TORCH_BOX(&qwen4_exp_hc_combine));
+  ops.impl("qwen4_exp_hc_combine_norm", TORCH_BOX(&qwen4_exp_hc_combine_norm));
 #ifdef VLLM_ENABLE_COOPERATIVE_TOPK
   ops.impl("cooperative_topk", TORCH_BOX(&cooperative_topk));
 #endif
