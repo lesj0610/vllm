@@ -126,16 +126,11 @@ class _RoutePlan:
         # plan() validates indices.max(), so the buffer must hold a legal route
         # before the first stage() call fills it.
         self.route = torch.zeros(rows * width, dtype=torch.int32, device=device)
-        self.valid = torch.empty(rows, width, dtype=torch.bool, device=device)
-        self._log = torch.empty(rows, width, dtype=torch.int64, device=device)
-        self._page = torch.empty(rows, width, dtype=torch.int64, device=device)
-        self._phys = torch.empty(rows, width, dtype=torch.int64, device=device)
-        self._bits = torch.empty(rows, self.nbytes, 8, dtype=torch.int32, device=device)
-        self._sum = torch.empty(rows, self.nbytes, dtype=torch.int32, device=device)
-        self._weights = 1 << torch.arange(8, dtype=torch.int32, device=device)
-        self._packed = torch.empty(rows * self.nbytes, dtype=torch.uint8, device=device)
-        self._table = torch.empty(rows, 1, dtype=torch.int64, device=device)
+        # Rows the step does not fill still have to hold a legal route, so the
+        # padding is staged along with the real rows rather than left behind.
+        self._logical = torch.full((rows, width), -1, dtype=torch.int32, device=device)
         self._num_slots = num_slots
+        self._page_size = page_size
 
         indptr = torch.arange(
             0, (rows + 1) * width, width, dtype=torch.int32, device=device
@@ -168,44 +163,34 @@ class _RoutePlan:
         self._route_buf = self.wrapper._paged_kv_indices_buf
         self._mask_buf = self.wrapper._packed_mask_buf
 
-    def stage(self, logical, block_table, token_to_req, page_size):
-        """Write this step's route and mask into the wrapper's buffers."""
+    def stage(self, logical, block_table, token_to_req):
+        """Write this step's route and mask into the wrapper's buffers.
+
+        One kernel turns the logical route into physical slots and packs the
+        validity: every bound the Triton kernel checks -- a negative sentinel, a
+        logical page past the block table, an unmapped page, a slot outside the
+        cache -- clears the same bit, and a cleared entry still holds an in-range
+        slot because the kernel reads the slot before the mask applies.
+        """
+        import flashinfer
+
         rows_in = logical.shape[0]
-        table_width = block_table.shape[1]
-        self._log.fill_(-1)
-        self._log[:rows_in].copy_(logical)
-
-        # Validity folds every bound the Triton kernel checks: a negative
-        # sentinel, a logical page past the block table, an unmapped page, and
-        # a physical slot outside the cache. Padding rows stay false because
-        # their logical entries are -1.
-        valid = self.valid
-        torch.ge(self._log, 0, out=valid)
-        safe = torch.clamp_min(self._log, 0, out=self._phys)
-        torch.div(safe, page_size, rounding_mode="floor", out=self._page)
-        valid &= self._page < table_width
-        self._page.clamp_(max=table_width - 1)
-
-        rows_req = self._table[:rows_in]
-        rows_req.copy_(token_to_req.long().unsqueeze(1))
-        table = block_table.long()[rows_req.squeeze(1)]
+        source = logical
         if rows_in < self.rows:
-            table = torch.cat(
-                [table, table.new_zeros(self.rows - rows_in, table_width)], dim=0
-            )
-        page = torch.gather(table, 1, self._page, out=self._page)
-        valid &= page >= 0
-        page.clamp_(min=0).mul_(page_size)
-        phys = safe.remainder_(page_size).add_(page)
-        valid &= phys < self._num_slots
-        phys.mul_(valid)
-        self._route_buf.view(self.rows, self.width).copy_(phys)
-
-        self._bits.zero_()
-        self._bits.view(self.rows, -1)[:, : self.width].copy_(valid)
-        self._bits.mul_(self._weights)
-        torch.sum(self._bits, -1, dtype=torch.int32, out=self._sum)
-        self._mask_buf.view(self.rows, self.nbytes).copy_(self._sum)
+            # A shorter step reuses the buffer; the tail rows are masked off by
+            # passing the live row count, so their contents do not matter.
+            self._logical[:rows_in].copy_(logical)
+            source = self._logical
+        flashinfer.qsa_route_from_logical(
+            source,
+            token_to_req,
+            block_table,
+            self._route_buf.view(self.rows, self.width),
+            self._mask_buf,
+            rows_in,
+            self._page_size,
+            self._num_slots,
+        )
 
 
 class QSAFlashInferRunner:
@@ -273,7 +258,7 @@ class QSAFlashInferRunner:
             self._device,
             self._workspace,
         )
-        plan.stage(logical_indices, block_table, token_to_req, page_size)
+        plan.stage(logical_indices, block_table, token_to_req)
 
         q = query
         if rows > rows_in:
