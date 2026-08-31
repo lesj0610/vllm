@@ -69,13 +69,21 @@ def _sparse_wrapper_features() -> frozenset[str]:
 
 
 def supports_qsa_flashinfer(head_dim: int, kv_cache_dtype: str) -> bool:
-    """Whether the FlashInfer block-sparse route serves this configuration.
+    """Gate: pre-SM100 CUDA, a shape the FA2 sparse kernel serves, FlashInfer.
 
-    The packed NVFP4 path decodes E2M1 in software, which is a pre-SM100
-    construct: from SM100 the conversion is one instruction and a different
-    specialization applies. Nothing else here is architecture-dependent.
+    This route reads a quantized cache as raw bytes and rebuilds the values
+    before the dots, on every architecture -- the same thing the Triton kernel
+    it replaces does. From SM100 a packed NVFP4 cache converts in one
+    instruction and a different specialization applies, so the whole route
+    stops here rather than pretending the software decode is still the right
+    one.
+
+    NVFP4 additionally needs a FlashInfer whose block-sparse wrapper accepts
+    ``kv_cache_sf``; older releases only serve the unpacked path.
     """
     if not current_platform.is_cuda():
+        return False
+    if current_platform.has_device_capability(_NATIVE_FP4_CAPABILITY):
         return False
     if head_dim > 256 or head_dim % 16:
         return False
@@ -83,8 +91,6 @@ def supports_qsa_flashinfer(head_dim: int, kv_cache_dtype: str) -> bool:
     if "paged" not in features:
         return False
     if kv_cache_dtype == "nvfp4":
-        if current_platform.has_device_capability(_NATIVE_FP4_CAPABILITY):
-            return False
         return "nvfp4" in features
     # FP8 rides the same route, its scale folded per tensor.
     return kv_cache_dtype in ("auto", "bfloat16", "fp8", "fp8_e4m3")

@@ -120,7 +120,13 @@ def _build(dtype, rows, heads, head_dim, seq_len, num_requests, width, device):
 @pytest.mark.parametrize("dtype", SUPPORTED_DTYPES)
 @pytest.mark.parametrize("head_dim", [128, 256])
 def test_every_supported_dtype_is_served_by_flashinfer(dtype, head_dim):
-    """The gate has to accept every cache dtype the model config allows."""
+    """The gate has to accept every cache dtype the model config allows.
+
+    Pre-SM100 only: from SM100 a packed NVFP4 cache converts natively and this
+    route is not the right one, so the whole thing stays on Triton there.
+    """
+    if current_platform.has_device_capability(100):
+        pytest.skip("this route is pre-SM100")
     assert supports_qsa_flashinfer(head_dim, dtype), (
         f"{dtype} at head_dim {head_dim} would fall back to Triton"
     )
