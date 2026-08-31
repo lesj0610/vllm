@@ -61,6 +61,17 @@ struct __align__(kVec * sizeof(T)) Vec {
   T v[kVec];
 };
 
+// The alignment is the point of the type, so it is checked rather than
+// assumed: without it an access lowers to one per element and the kernel runs
+// at a third of the memory's speed with nothing else looking wrong.
+static_assert(sizeof(Vec<__nv_bfloat16>) == 16,
+              "the vector must be sixteen bytes");
+static_assert(alignof(Vec<__nv_bfloat16>) == 16,
+              "the vector must be sixteen-byte aligned");
+static_assert(sizeof(Vec<__half>) == 16, "the vector must be sixteen bytes");
+static_assert(alignof(Vec<__half>) == 16,
+              "the vector must be sixteen-byte aligned");
+
 template <typename T>
 __device__ __forceinline__ float to_float(T x);
 template <>
@@ -89,7 +100,11 @@ __device__ __forceinline__ __half from_float<__half>(float x) {
  * One block owns one group. The affine is either a group's worth, shared by
  * every group, or the whole row's, following the grouped checkpoint layout.
  */
-template <typename T, bool W_SHARED>
+// ROW_VECS is the row's width in per-lane vectors, or zero for a width this is
+// not built for. Knowing it makes the trip count compile-time, which is what
+// lets the row stay in registers between the reduction and the affine rather
+// than being read a second time.
+template <typename T, bool W_SHARED, int ROW_VECS>
 __global__ void __launch_bounds__(kRowBlock)
     grouped_gemma_rmsnorm_kernel(const T* __restrict__ x,
                                  const T* __restrict__ w, T* __restrict__ y,
@@ -108,29 +123,58 @@ __global__ void __launch_bounds__(kRowBlock)
       w + (W_SHARED ? 0 : static_cast<int64_t>(group) * group_dim);
 
   float sum = 0.f;
-  for (int i = lane * kVec; i < group_dim; i += kWarp * kVec) {
-    const Vec<T> v = *reinterpret_cast<const Vec<T>*>(src + i);
+  Vec<T> held[ROW_VECS > 0 ? ROW_VECS : 1];
+  if constexpr (ROW_VECS > 0) {
 #pragma unroll
-    for (int j = 0; j < kVec; ++j) {
-      const float f = to_float<T>(v.v[j]);
-      sum += f * f;
+    for (int r = 0; r < ROW_VECS; ++r) {
+      held[r] =
+          *reinterpret_cast<const Vec<T>*>(src + (lane + r * kWarp) * kVec);
+#pragma unroll
+      for (int j = 0; j < kVec; ++j) {
+        const float f = to_float<T>(held[r].v[j]);
+        sum += f * f;
+      }
+    }
+  } else {
+    for (int i = lane * kVec; i < group_dim; i += kWarp * kVec) {
+      const Vec<T> v = *reinterpret_cast<const Vec<T>*>(src + i);
+#pragma unroll
+      for (int j = 0; j < kVec; ++j) {
+        const float f = to_float<T>(v.v[j]);
+        sum += f * f;
+      }
     }
   }
   const float rrms =
       rsqrtf(warp_sum(sum) / static_cast<float>(group_dim) + eps);
 
-  for (int i = lane * kVec; i < group_dim; i += kWarp * kVec) {
-    const Vec<T> v = *reinterpret_cast<const Vec<T>*>(src + i);
-    const Vec<T> g = *reinterpret_cast<const Vec<T>*>(weight + i);
-    Vec<T> out;
+  // Gemma's one-plus-weight affine, written as the caller writes it so the
+  // rounding matches: scale first, then add the weighted scale.
+  if constexpr (ROW_VECS > 0) {
 #pragma unroll
-    for (int j = 0; j < kVec; ++j) {
-      // Gemma's one-plus-weight affine, written as the caller writes it so the
-      // rounding matches: scale first, then add the weighted scale.
-      const float s = to_float<T>(v.v[j]) * rrms;
-      out.v[j] = from_float<T>(s + s * to_float<T>(g.v[j]));
+    for (int r = 0; r < ROW_VECS; ++r) {
+      const int i = (lane + r * kWarp) * kVec;
+      const Vec<T> g = *reinterpret_cast<const Vec<T>*>(weight + i);
+      Vec<T> out;
+#pragma unroll
+      for (int j = 0; j < kVec; ++j) {
+        const float sc = to_float<T>(held[r].v[j]) * rrms;
+        out.v[j] = from_float<T>(sc + sc * to_float<T>(g.v[j]));
+      }
+      *reinterpret_cast<Vec<T>*>(dst + i) = out;
     }
-    *reinterpret_cast<Vec<T>*>(dst + i) = out;
+  } else {
+    for (int i = lane * kVec; i < group_dim; i += kWarp * kVec) {
+      const Vec<T> v = *reinterpret_cast<const Vec<T>*>(src + i);
+      const Vec<T> g = *reinterpret_cast<const Vec<T>*>(weight + i);
+      Vec<T> out;
+#pragma unroll
+      for (int j = 0; j < kVec; ++j) {
+        const float sc = to_float<T>(v.v[j]) * rrms;
+        out.v[j] = from_float<T>(sc + sc * to_float<T>(g.v[j]));
+      }
+      *reinterpret_cast<Vec<T>*>(dst + i) = out;
+    }
   }
 }
 
@@ -244,7 +288,7 @@ int shift_of(int64_t v) {
  * before the norm reads it back, which is where the caller's unfused pair
  * rounds it.
  */
-template <typename T, bool W_SHARED>
+template <typename T, bool W_SHARED, int ROW_VECS>
 __global__ void __launch_bounds__(kRowBlock)
     hc_combine_norm_kernel(const T* __restrict__ block,
                            const T* __restrict__ res, const T* __restrict__ inj,
@@ -269,33 +313,68 @@ __global__ void __launch_bounds__(kRowBlock)
       2.f * sigmoidf_(to_float<T>(inj[row * stride_inj + stream]) * inv_hc);
 
   float sum = 0.f;
-  for (int i = lane * kVec; i < hc_dim; i += kWarp * kVec) {
-    const Vec<T> bv = *reinterpret_cast<const Vec<T>*>(bsrc + i);
-    const Vec<T> rv = *reinterpret_cast<const Vec<T>*>(rsrc + i);
-    Vec<T> o;
+  Vec<T> held[ROW_VECS > 0 ? ROW_VECS : 1];
+  // Rounded on the way out, as the unfused combine would leave it, so the norm
+  // sees the same values either way.
+  if constexpr (ROW_VECS > 0) {
 #pragma unroll
-    for (int j = 0; j < kVec; ++j) {
-      // Rounded here, as the unfused combine would leave it, so the norm sees
-      // the same values either way.
-      o.v[j] =
-          from_float<T>(to_float<T>(rv.v[j]) + to_float<T>(bv.v[j]) * gate);
-      const float f = to_float<T>(o.v[j]);
-      sum += f * f;
+    for (int r = 0; r < ROW_VECS; ++r) {
+      const int i = (lane + r * kWarp) * kVec;
+      const Vec<T> bv = *reinterpret_cast<const Vec<T>*>(bsrc + i);
+      const Vec<T> rv = *reinterpret_cast<const Vec<T>*>(rsrc + i);
+      Vec<T> o;
+#pragma unroll
+      for (int j = 0; j < kVec; ++j) {
+        o.v[j] =
+            from_float<T>(to_float<T>(rv.v[j]) + to_float<T>(bv.v[j]) * gate);
+        const float f = to_float<T>(o.v[j]);
+        sum += f * f;
+      }
+      held[r] = o;
+      *reinterpret_cast<Vec<T>*>(odst + i) = o;
     }
-    *reinterpret_cast<Vec<T>*>(odst + i) = o;
+  } else {
+    for (int i = lane * kVec; i < hc_dim; i += kWarp * kVec) {
+      const Vec<T> bv = *reinterpret_cast<const Vec<T>*>(bsrc + i);
+      const Vec<T> rv = *reinterpret_cast<const Vec<T>*>(rsrc + i);
+      Vec<T> o;
+#pragma unroll
+      for (int j = 0; j < kVec; ++j) {
+        o.v[j] =
+            from_float<T>(to_float<T>(rv.v[j]) + to_float<T>(bv.v[j]) * gate);
+        const float f = to_float<T>(o.v[j]);
+        sum += f * f;
+      }
+      *reinterpret_cast<Vec<T>*>(odst + i) = o;
+    }
   }
   const float rrms = rsqrtf(warp_sum(sum) / static_cast<float>(hc_dim) + eps);
 
-  for (int i = lane * kVec; i < hc_dim; i += kWarp * kVec) {
-    const Vec<T> o = *reinterpret_cast<const Vec<T>*>(odst + i);
-    const Vec<T> g = *reinterpret_cast<const Vec<T>*>(weight + i);
-    Vec<T> yv;
+  if constexpr (ROW_VECS > 0) {
 #pragma unroll
-    for (int j = 0; j < kVec; ++j) {
-      const float s = to_float<T>(o.v[j]) * rrms;
-      yv.v[j] = from_float<T>(s + s * to_float<T>(g.v[j]));
+    for (int r = 0; r < ROW_VECS; ++r) {
+      const int i = (lane + r * kWarp) * kVec;
+      const Vec<T> g = *reinterpret_cast<const Vec<T>*>(weight + i);
+      Vec<T> yv;
+#pragma unroll
+      for (int j = 0; j < kVec; ++j) {
+        const float sc = to_float<T>(held[r].v[j]) * rrms;
+        yv.v[j] = from_float<T>(sc + sc * to_float<T>(g.v[j]));
+      }
+      *reinterpret_cast<Vec<T>*>(ydst + i) = yv;
     }
-    *reinterpret_cast<Vec<T>*>(ydst + i) = yv;
+  } else {
+    for (int i = lane * kVec; i < hc_dim; i += kWarp * kVec) {
+      const Vec<T> o = *reinterpret_cast<const Vec<T>*>(odst + i);
+      const Vec<T> g = *reinterpret_cast<const Vec<T>*>(weight + i);
+      Vec<T> yv;
+#pragma unroll
+      for (int j = 0; j < kVec; ++j) {
+        const float sc = to_float<T>(o.v[j]) * rrms;
+        yv.v[j] = from_float<T>(sc + sc * to_float<T>(g.v[j]));
+      }
+      *reinterpret_cast<Vec<T>*>(ydst + i) = yv;
+    }
   }
 }
 
@@ -345,6 +424,42 @@ void check_hc_dtype(const Tensor& t, ScalarType want, const char* name) {
                       "Qwen4Exp HC ops take two, four or eight streams"); \
   }
 
+// Row widths, in per-lane vectors, that the held-row form is built for. Wider
+// than four and the held row spills, which costs more than the read it saves,
+// so those walk the row at runtime instead. The form is also only taken when
+// the launch is small: holding costs registers, and a launch that fills the
+// device would rather have the warps.
+#define QWEN4EXP_HC_ROW(row_dim, small, fn)      \
+  switch (!(small) || (row_dim) % (kWarp * kVec) \
+              ? -1                               \
+              : (row_dim) / (kWarp * kVec)) {    \
+    case 1:                                      \
+      fn(std::integral_constant<int, 1>{});      \
+      break;                                     \
+    case 2:                                      \
+      fn(std::integral_constant<int, 2>{});      \
+      break;                                     \
+    case 4:                                      \
+      fn(std::integral_constant<int, 4>{});      \
+      break;                                     \
+    default:                                     \
+      fn(std::integral_constant<int, 0>{});      \
+  }
+
+// A launch small enough that a row's registers are cheaper than more warps.
+inline bool hc_small_launch(int64_t units) {
+  static thread_local int num_sms = 0;
+  if (num_sms == 0) {
+    int dev = 0;
+    STD_TORCH_CHECK(cudaGetDevice(&dev) == cudaSuccess, "cudaGetDevice failed");
+    STD_TORCH_CHECK(
+        cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, dev) ==
+            cudaSuccess,
+        "cudaDeviceGetAttribute failed");
+  }
+  return units < static_cast<int64_t>(num_sms) * kRowsPerBlock;
+}
+
 #define QWEN4EXP_HC_DISPATCH(dtype, ...)                                \
   if ((dtype) == ScalarType::BFloat16) {                                \
     using scalar_t = __nv_bfloat16;                                     \
@@ -381,8 +496,9 @@ void qwen4_exp_grouped_gemma_rmsnorm(const Tensor& x, const Tensor& weight,
   const dim3 grid(
       static_cast<unsigned>((units + kRowsPerBlock - 1) / kRowsPerBlock));
   QWEN4EXP_HC_DISPATCH(x.scalar_type(), {
-    auto go = [&](auto shared_tag) {
-      grouped_gemma_rmsnorm_kernel<scalar_t, decltype(shared_tag)::value>
+    auto launch_one = [&](auto shared_tag, auto row_tag) {
+      grouped_gemma_rmsnorm_kernel<scalar_t, decltype(shared_tag)::value,
+                                   decltype(row_tag)::value>
           <<<grid, kRowBlock, 0, 0>>>(
               reinterpret_cast<const scalar_t*>(x.data_ptr()),
               reinterpret_cast<const scalar_t*>(weight.data_ptr()),
@@ -391,9 +507,11 @@ void qwen4_exp_grouped_gemma_rmsnorm(const Tensor& x, const Tensor& weight,
               static_cast<int>(num_groups), units, static_cast<float>(eps));
     };
     if (shared) {
-      go(std::true_type{});
+      auto fn = [&](auto row_tag) { launch_one(std::true_type{}, row_tag); };
+      QWEN4EXP_HC_ROW(group_dim, hc_small_launch(units), fn);
     } else {
-      go(std::false_type{});
+      auto fn = [&](auto row_tag) { launch_one(std::false_type{}, row_tag); };
+      QWEN4EXP_HC_ROW(group_dim, hc_small_launch(units), fn);
     }
   });
 }
@@ -517,8 +635,9 @@ void qwen4_exp_hc_combine_norm(const Tensor& residual,
   const dim3 grid(
       static_cast<unsigned>((units + kRowsPerBlock - 1) / kRowsPerBlock));
   QWEN4EXP_HC_DISPATCH(residual.scalar_type(), {
-    auto go = [&](auto shared_tag) {
-      hc_combine_norm_kernel<scalar_t, decltype(shared_tag)::value>
+    auto launch_one = [&](auto shared_tag, auto row_tag) {
+      hc_combine_norm_kernel<scalar_t, decltype(shared_tag)::value,
+                             decltype(row_tag)::value>
           <<<grid, kRowBlock, 0, 0>>>(
               reinterpret_cast<const scalar_t*>(block_output.data_ptr()),
               reinterpret_cast<const scalar_t*>(residual.data_ptr()),
@@ -532,9 +651,11 @@ void qwen4_exp_hc_combine_norm(const Tensor& residual,
               static_cast<float>(eps));
     };
     if (shared) {
-      go(std::true_type{});
+      auto fn = [&](auto row_tag) { launch_one(std::true_type{}, row_tag); };
+      QWEN4EXP_HC_ROW(hc_dim, hc_small_launch(units), fn);
     } else {
-      go(std::false_type{});
+      auto fn = [&](auto row_tag) { launch_one(std::false_type{}, row_tag); };
+      QWEN4EXP_HC_ROW(hc_dim, hc_small_launch(units), fn);
     }
   });
 }
