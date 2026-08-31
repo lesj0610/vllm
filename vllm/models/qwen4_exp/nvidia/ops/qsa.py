@@ -907,6 +907,21 @@ def _flashinfer_selection() -> bool:
         return False
 
 
+# What the scorer has an instantiation for. Its mma tile fixes both: a head
+# dimension it was built with, and one n-tile of query heads. A shape outside
+# this is one FlashInfer cannot build, not one it is merely slower at.
+_SCORER_HEAD_DIMS = (64, 128, 192, 256)
+_SCORER_MAX_HEADS = 16
+
+
+def _flashinfer_scores(head_dim: int, num_heads: int) -> bool:
+    return (
+        _flashinfer_selection()
+        and head_dim in _SCORER_HEAD_DIMS
+        and num_heads <= _SCORER_MAX_HEADS
+    )
+
+
 def _score_paged(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -917,7 +932,7 @@ def _score_paged(
     compress_ratio: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Score the compressed cache, on FlashInfer where it is available."""
-    if _flashinfer_selection():
+    if _flashinfer_scores(q.shape[2], q.shape[1]):
         import flashinfer
 
         # QSA holds the compressed keys as [pages, page_size, 1, head_dim]; the
