@@ -126,9 +126,6 @@ class _RoutePlan:
         # plan() validates indices.max(), so the buffer must hold a legal route
         # before the first stage() call fills it.
         self.route = torch.zeros(rows * width, dtype=torch.int32, device=device)
-        # Rows the step does not fill still have to hold a legal route, so the
-        # padding is staged along with the real rows rather than left behind.
-        self._logical = torch.full((rows, width), -1, dtype=torch.int32, device=device)
         self._num_slots = num_slots
         self._page_size = page_size
 
@@ -174,20 +171,15 @@ class _RoutePlan:
         """
         import flashinfer
 
-        rows_in = logical.shape[0]
-        source = logical
-        if rows_in < self.rows:
-            # A shorter step reuses the buffer; the tail rows are masked off by
-            # passing the live row count, so their contents do not matter.
-            self._logical[:rows_in].copy_(logical)
-            source = self._logical
+        # A shorter step hands over its own rows: the kernel reads the logical
+        # route only below the live count and masks the rest of the buffer off.
         flashinfer.qsa_route_from_logical(
-            source,
+            logical,
             token_to_req,
             block_table,
             self._route_buf.view(self.rows, self.width),
             self._mask_buf,
-            rows_in,
+            logical.shape[0],
             self._page_size,
             self._num_slots,
         )
