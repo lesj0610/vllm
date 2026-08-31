@@ -85,9 +85,9 @@ __device__ __forceinline__ float unit_sum(float v, int lane_in_unit) {
 // A vector of kVec elements of the tensor's own type, moved as one access.
 // The alignment is what makes it one: without it the array's alignment is the
 // element's, and every access lowers to kVec of them.
-template <typename T>
-struct __align__(kVec * sizeof(T)) Vec {
-  T v[kVec];
+template <typename T, int N = kVec>
+struct __align__(N * sizeof(T)) Vec {
+  T v[N];
 };
 
 // The alignment is the point of the type, so it is checked rather than
@@ -253,34 +253,34 @@ __global__ void hc_silu_kernel(const T* __restrict__ x, T* __restrict__ y,
  */
 // The stream count is a model constant, and a runtime loop bound stops the
 // unroll: the loads of one stream then wait on the branch of the last.
-template <typename T, int HC>
+template <typename T, int HC, int VEC>
 __global__ void hc_gate_mix_kernel(const T* __restrict__ x,
                                    const T* __restrict__ g, T* __restrict__ y,
                                    int64_t stride_x, int64_t stride_g,
                                    int64_t stride_y, int hc_dim, int rows,
                                    float inv_hc) {
-  const int vec = (blockIdx.x * blockDim.x + threadIdx.x) * kVec;
+  const int vec = (blockIdx.x * blockDim.x + threadIdx.x) * VEC;
   if (vec >= hc_dim) return;
   // The row is a grid dimension, so nothing has to be divided out of a flat
   // index, and no width has to be a power of two.
   for (int row = blockIdx.y; row < rows; row += gridDim.y) {
     const T* xr = x + row * stride_x + vec;
     const T* gr = g + row * stride_g + vec;
-    float acc[kVec] = {};
+    float acc[VEC] = {};
 #pragma unroll
     for (int stream = 0; stream < HC; ++stream) {
       const int64_t at = static_cast<int64_t>(stream) * hc_dim;
-      const Vec<T> gv = *reinterpret_cast<const Vec<T>*>(gr + at);
-      const Vec<T> xv = *reinterpret_cast<const Vec<T>*>(xr + at);
+      const Vec<T, VEC> gv = *reinterpret_cast<const Vec<T, VEC>*>(gr + at);
+      const Vec<T, VEC> xv = *reinterpret_cast<const Vec<T, VEC>*>(xr + at);
 #pragma unroll
-      for (int j = 0; j < kVec; ++j) {
+      for (int j = 0; j < VEC; ++j) {
         acc[j] += sigmoidf_(to_float<T>(gv.v[j])) * to_float<T>(xv.v[j]);
       }
     }
-    Vec<T> out;
+    Vec<T, VEC> out;
 #pragma unroll
-    for (int j = 0; j < kVec; ++j) out.v[j] = from_float<T>(acc[j] * inv_hc);
-    *reinterpret_cast<Vec<T>*>(y + row * stride_y + vec) = out;
+    for (int j = 0; j < VEC; ++j) out.v[j] = from_float<T>(acc[j] * inv_hc);
+    *reinterpret_cast<Vec<T, VEC>*>(y + row * stride_y + vec) = out;
   }
 }
 
@@ -290,7 +290,7 @@ __global__ void hc_gate_mix_kernel(const T* __restrict__ x,
  * A thread takes one slice of the block's output and writes it into all of the
  * streams. Taking one stream at a time would read that slice once per stream.
  */
-template <typename T, int HC>
+template <typename T, int HC, int VEC>
 __global__ void hc_combine_kernel(const T* __restrict__ block,
                                   const T* __restrict__ res,
                                   const T* __restrict__ inj,
@@ -298,11 +298,11 @@ __global__ void hc_combine_kernel(const T* __restrict__ block,
                                   int64_t stride_res, int64_t stride_inj,
                                   int64_t stride_out, int hc_dim, int rows,
                                   float inv_hc) {
-  const int vec = (blockIdx.x * blockDim.x + threadIdx.x) * kVec;
+  const int vec = (blockIdx.x * blockDim.x + threadIdx.x) * VEC;
   if (vec >= hc_dim) return;
   for (int row = blockIdx.y; row < rows; row += gridDim.y) {
-    const Vec<T> bv =
-        *reinterpret_cast<const Vec<T>*>(block + row * stride_block + vec);
+    const Vec<T, VEC> bv =
+        *reinterpret_cast<const Vec<T, VEC>*>(block + row * stride_block + vec);
     const T* rr = res + row * stride_res + vec;
     T* orow = out + row * stride_out + vec;
     const T* injr = inj + row * stride_inj;
@@ -310,14 +310,14 @@ __global__ void hc_combine_kernel(const T* __restrict__ block,
     for (int stream = 0; stream < HC; ++stream) {
       const float gate = 2.f * sigmoidf_(to_float<T>(injr[stream]) * inv_hc);
       const int64_t at = static_cast<int64_t>(stream) * hc_dim;
-      const Vec<T> rv = *reinterpret_cast<const Vec<T>*>(rr + at);
-      Vec<T> o;
+      const Vec<T, VEC> rv = *reinterpret_cast<const Vec<T, VEC>*>(rr + at);
+      Vec<T, VEC> o;
 #pragma unroll
-      for (int j = 0; j < kVec; ++j) {
+      for (int j = 0; j < VEC; ++j) {
         o.v[j] =
             from_float<T>(to_float<T>(rv.v[j]) + to_float<T>(bv.v[j]) * gate);
       }
-      *reinterpret_cast<Vec<T>*>(orow + at) = o;
+      *reinterpret_cast<Vec<T, VEC>*>(orow + at) = o;
     }
   }
 }
@@ -526,6 +526,17 @@ void check_hc_dtype(const Tensor& t, ScalarType want, const char* name) {
 // The column kernels have no reduction, so the only lever on a small launch
 // is the block: narrowing it turns one block into several without changing
 // what any thread does. Only worth it while the grid is short of the device.
+// How many elements a thread of the column kernels should move. Sixteen bytes
+// is the right width once the device is full, but at a small launch it halves
+// the threads and doubles the chain each of them has to walk -- and those
+// kernels are then waiting on that chain rather than on memory. Narrower gives
+// the work back to more threads.
+int hc_column_vec(int64_t hc_dim, int64_t rows) {
+  const int64_t threads = (hc_dim / kVec) * rows;
+  return threads < static_cast<int64_t>(hc_device_sms()) * kWarp ? kVec / 2
+                                                                 : kVec;
+}
+
 int hc_narrow_block(int64_t vecs, int64_t rows, int block) {
   const int sms = hc_device_sms();
   while (block > kWarp && ((vecs + block - 1) / block) * rows * 4 < sms) {
@@ -652,18 +663,26 @@ void qwen4_exp_hc_gate_mix(const Tensor& x, const Tensor& gate,
   check_hc_dtype(y, x.scalar_type(), "y");
   if (rows == 0) return;
 
-  const int block = hc_narrow_block(hc_dim / kVec, rows, kBlock);
-  const dim3 grid(static_cast<unsigned>((hc_dim / kVec + block - 1) / block),
+  const int vec = hc_column_vec(hc_dim, rows);
+  const int block = hc_narrow_block(hc_dim / vec, rows, kBlock);
+  const dim3 grid(static_cast<unsigned>((hc_dim / vec + block - 1) / block),
                   static_cast<unsigned>(rows < 65535 ? rows : 65535));
   QWEN4EXP_HC_DISPATCH(x.scalar_type(), {
     auto go = [&](auto hc_tag) {
-      hc_gate_mix_kernel<scalar_t, decltype(hc_tag)::value>
-          <<<grid, block, 0, 0>>>(
-              reinterpret_cast<const scalar_t*>(x.data_ptr()),
-              reinterpret_cast<const scalar_t*>(gate.data_ptr()),
-              reinterpret_cast<scalar_t*>(y.data_ptr()), x.stride(0),
-              gate.stride(0), y.stride(0), static_cast<int>(hc_dim),
-              static_cast<int>(rows), 1.f / static_cast<float>(hc_count));
+      auto launch = [&](auto vec_tag) {
+        hc_gate_mix_kernel<scalar_t, decltype(hc_tag)::value,
+                           decltype(vec_tag)::value><<<grid, block, 0, 0>>>(
+            reinterpret_cast<const scalar_t*>(x.data_ptr()),
+            reinterpret_cast<const scalar_t*>(gate.data_ptr()),
+            reinterpret_cast<scalar_t*>(y.data_ptr()), x.stride(0),
+            gate.stride(0), y.stride(0), static_cast<int>(hc_dim),
+            static_cast<int>(rows), 1.f / static_cast<float>(hc_count));
+      };
+      if (vec == kVec) {
+        launch(std::integral_constant<int, kVec>{});
+      } else {
+        launch(std::integral_constant<int, kVec / 2>{});
+      }
     };
     QWEN4EXP_HC_STREAMS(hc_count, go);
   });
@@ -686,21 +705,28 @@ void qwen4_exp_hc_combine(const Tensor& residual, const Tensor& block_output,
   check_hc_dtype(out, residual.scalar_type(), "out");
   if (rows == 0) return;
 
-  const int block = hc_narrow_block(hc_dim / kVec, rows, kBlock);
-  const dim3 grid(static_cast<unsigned>((hc_dim / kVec + block - 1) / block),
+  const int vec = hc_column_vec(hc_dim, rows);
+  const int block = hc_narrow_block(hc_dim / vec, rows, kBlock);
+  const dim3 grid(static_cast<unsigned>((hc_dim / vec + block - 1) / block),
                   static_cast<unsigned>(rows < 65535 ? rows : 65535));
   QWEN4EXP_HC_DISPATCH(residual.scalar_type(), {
     auto go = [&](auto hc_tag) {
-      hc_combine_kernel<scalar_t, decltype(hc_tag)::value>
-          <<<grid, block, 0, 0>>>(
-              reinterpret_cast<const scalar_t*>(block_output.data_ptr()),
-              reinterpret_cast<const scalar_t*>(residual.data_ptr()),
-              reinterpret_cast<const scalar_t*>(injection_logits.data_ptr()),
-              reinterpret_cast<scalar_t*>(out.data_ptr()),
-              block_output.stride(0), residual.stride(0),
-              injection_logits.stride(0), out.stride(0),
-              static_cast<int>(hc_dim), static_cast<int>(rows),
-              1.f / static_cast<float>(hc_count));
+      auto launch = [&](auto vec_tag) {
+        hc_combine_kernel<scalar_t, decltype(hc_tag)::value,
+                          decltype(vec_tag)::value><<<grid, block, 0, 0>>>(
+            reinterpret_cast<const scalar_t*>(block_output.data_ptr()),
+            reinterpret_cast<const scalar_t*>(residual.data_ptr()),
+            reinterpret_cast<const scalar_t*>(injection_logits.data_ptr()),
+            reinterpret_cast<scalar_t*>(out.data_ptr()), block_output.stride(0),
+            residual.stride(0), injection_logits.stride(0), out.stride(0),
+            static_cast<int>(hc_dim), static_cast<int>(rows),
+            1.f / static_cast<float>(hc_count));
+      };
+      if (vec == kVec) {
+        launch(std::integral_constant<int, kVec>{});
+      } else {
+        launch(std::integral_constant<int, kVec / 2>{});
+      }
     };
     QWEN4EXP_HC_STREAMS(hc_count, go);
   });
