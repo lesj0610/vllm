@@ -133,11 +133,20 @@ __global__ void __launch_bounds__(kRowBlock)
 
   float sum = 0.f;
   Vec<T> held[ROW_VECS > 0 ? ROW_VECS : 1];
+  Vec<T> gain[ROW_VECS > 0 ? ROW_VECS : 1];
   if constexpr (ROW_VECS > 0) {
+    // The affine weight does not depend on the sum, so it is fetched with the
+    // row rather than after it: issued behind the reduction it is a second
+    // round trip that the whole warp waits on, and at one row there is no
+    // other warp to cover it.
 #pragma unroll
     for (int r = 0; r < ROW_VECS; ++r) {
-      held[r] =
-          *reinterpret_cast<const Vec<T>*>(src + (lane + r * kWarp) * kVec);
+      const int i = (lane + r * kWarp) * kVec;
+      held[r] = *reinterpret_cast<const Vec<T>*>(src + i);
+      gain[r] = *reinterpret_cast<const Vec<T>*>(weight + i);
+    }
+#pragma unroll
+    for (int r = 0; r < ROW_VECS; ++r) {
 #pragma unroll
       for (int j = 0; j < kVec; ++j) {
         const float f = to_float<T>(held[r].v[j]);
@@ -162,15 +171,13 @@ __global__ void __launch_bounds__(kRowBlock)
   if constexpr (ROW_VECS > 0) {
 #pragma unroll
     for (int r = 0; r < ROW_VECS; ++r) {
-      const int i = (lane + r * kWarp) * kVec;
-      const Vec<T> g = *reinterpret_cast<const Vec<T>*>(weight + i);
       Vec<T> out;
 #pragma unroll
       for (int j = 0; j < kVec; ++j) {
         const float sc = to_float<T>(held[r].v[j]) * rrms;
-        out.v[j] = from_float<T>(sc + sc * to_float<T>(g.v[j]));
+        out.v[j] = from_float<T>(sc + sc * to_float<T>(gain[r].v[j]));
       }
-      *reinterpret_cast<Vec<T>*>(dst + i) = out;
+      *reinterpret_cast<Vec<T>*>(dst + (lane + r * kWarp) * kVec) = out;
     }
   } else {
     for (int i = lane * kVec; i < group_dim; i += kWarp * kVec) {
@@ -323,14 +330,19 @@ __global__ void __launch_bounds__(kRowBlock)
 
   float sum = 0.f;
   Vec<T> held[ROW_VECS > 0 ? ROW_VECS : 1];
+  Vec<T> gain[ROW_VECS > 0 ? ROW_VECS : 1];
   // Rounded on the way out, as the unfused combine would leave it, so the norm
   // sees the same values either way.
   if constexpr (ROW_VECS > 0) {
+    // The affine weight is fetched here with the rest: it does not depend on
+    // the sum, and issued after the reduction it is a round trip the warp
+    // waits on alone.
 #pragma unroll
     for (int r = 0; r < ROW_VECS; ++r) {
       const int i = (lane + r * kWarp) * kVec;
       const Vec<T> bv = *reinterpret_cast<const Vec<T>*>(bsrc + i);
       const Vec<T> rv = *reinterpret_cast<const Vec<T>*>(rsrc + i);
+      gain[r] = *reinterpret_cast<const Vec<T>*>(weight + i);
       Vec<T> o;
 #pragma unroll
       for (int j = 0; j < kVec; ++j) {
@@ -362,15 +374,13 @@ __global__ void __launch_bounds__(kRowBlock)
   if constexpr (ROW_VECS > 0) {
 #pragma unroll
     for (int r = 0; r < ROW_VECS; ++r) {
-      const int i = (lane + r * kWarp) * kVec;
-      const Vec<T> g = *reinterpret_cast<const Vec<T>*>(weight + i);
       Vec<T> yv;
 #pragma unroll
       for (int j = 0; j < kVec; ++j) {
         const float sc = to_float<T>(held[r].v[j]) * rrms;
-        yv.v[j] = from_float<T>(sc + sc * to_float<T>(g.v[j]));
+        yv.v[j] = from_float<T>(sc + sc * to_float<T>(gain[r].v[j]));
       }
-      *reinterpret_cast<Vec<T>*>(ydst + i) = yv;
+      *reinterpret_cast<Vec<T>*>(ydst + (lane + r * kWarp) * kVec) = yv;
     }
   } else {
     for (int i = lane * kVec; i < hc_dim; i += kWarp * kVec) {
