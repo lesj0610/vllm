@@ -62,6 +62,26 @@ __device__ __forceinline__ float warp_sum(float v) {
   return v;
 }
 
+// The sum over the WARPS warps that share one unit, left in every lane of
+// them. At one warp this is the shuffle chain and nothing else; past that the
+// partial sums go through shared, which costs the two barriers a block-wide
+// reduction costs and is why the one-warp form stays the default.
+template <int WARPS, int BLOCK>
+__device__ __forceinline__ float unit_sum(float v, int lane_in_unit) {
+  v = warp_sum(v);
+  if constexpr (WARPS == 1) return v;
+  __shared__ float part[BLOCK / kWarp];
+  const int warp = threadIdx.x / kWarp;
+  if (threadIdx.x % kWarp == 0) part[warp] = v;
+  __syncthreads();
+  const int first = warp - lane_in_unit / kWarp;
+  float total = 0.f;
+#pragma unroll
+  for (int i = 0; i < WARPS; ++i) total += part[first + i];
+  __syncthreads();
+  return total;
+}
+
 // A vector of kVec elements of the tensor's own type, moved as one access.
 // The alignment is what makes it one: without it the array's alignment is the
 // element's, and every access lowers to kVec of them.
@@ -113,16 +133,27 @@ __device__ __forceinline__ __half from_float<__half>(float x) {
 // not built for. Knowing it makes the trip count compile-time, which is what
 // lets the row stay in registers between the reduction and the affine rather
 // than being read a second time.
-template <typename T, bool W_SHARED, int ROW_VECS>
+// WARPS is how many warps share one group. One is the cheapest per group --
+// the sum never leaves the warp -- but it also pins a group to one warp, and
+// at a single token there are only as many groups as streams, so the whole
+// launch is one block on one SM. Spreading a group across the block trades a
+// barrier for the rest of the device.
+template <typename T, bool W_SHARED, int ROW_VECS, int WARPS = 1>
 __global__ void __launch_bounds__(kRowBlock)
     grouped_gemma_rmsnorm_kernel(const T* __restrict__ x,
                                  const T* __restrict__ w, T* __restrict__ y,
                                  int64_t stride_x, int64_t stride_y,
                                  int group_dim, int num_groups, int64_t units,
                                  float eps) {
-  const int lane = threadIdx.x % kWarp;
-  const int64_t unit =
-      static_cast<int64_t>(blockIdx.x) * kRowsPerBlock + threadIdx.x / kWarp;
+  constexpr int kLanesPerUnit = kWarp * WARPS;
+  constexpr int kUnitsPerBlock = kRowBlock / kLanesPerUnit;
+  // The reduction below is barrier-free only at one warp; past that the whole
+  // block has to reach it, so a block may not hold a unit that returns early.
+  static_assert(WARPS == 1 || kUnitsPerBlock == 1,
+                "a block spanning warps must hold exactly one unit");
+  const int lane = threadIdx.x % kLanesPerUnit;
+  const int64_t unit = static_cast<int64_t>(blockIdx.x) * kUnitsPerBlock +
+                       threadIdx.x / kLanesPerUnit;
   if (unit >= units) return;
   const int group = static_cast<int>(unit % num_groups);
   const int64_t row = unit / num_groups;
@@ -141,7 +172,7 @@ __global__ void __launch_bounds__(kRowBlock)
     // other warp to cover it.
 #pragma unroll
     for (int r = 0; r < ROW_VECS; ++r) {
-      const int i = (lane + r * kWarp) * kVec;
+      const int i = (lane + r * kLanesPerUnit) * kVec;
       held[r] = *reinterpret_cast<const Vec<T>*>(src + i);
       gain[r] = *reinterpret_cast<const Vec<T>*>(weight + i);
     }
@@ -154,7 +185,7 @@ __global__ void __launch_bounds__(kRowBlock)
       }
     }
   } else {
-    for (int i = lane * kVec; i < group_dim; i += kWarp * kVec) {
+    for (int i = lane * kVec; i < group_dim; i += kLanesPerUnit * kVec) {
       const Vec<T> v = *reinterpret_cast<const Vec<T>*>(src + i);
 #pragma unroll
       for (int j = 0; j < kVec; ++j) {
@@ -163,8 +194,9 @@ __global__ void __launch_bounds__(kRowBlock)
       }
     }
   }
-  const float rrms =
-      rsqrtf(warp_sum(sum) / static_cast<float>(group_dim) + eps);
+  const float rrms = rsqrtf(unit_sum<WARPS, kRowBlock>(sum, lane) /
+                                static_cast<float>(group_dim) +
+                            eps);
 
   // Gemma's one-plus-weight affine, written as the caller writes it so the
   // rounding matches: scale first, then add the weighted scale.
@@ -177,10 +209,10 @@ __global__ void __launch_bounds__(kRowBlock)
         const float sc = to_float<T>(held[r].v[j]) * rrms;
         out.v[j] = from_float<T>(sc + sc * to_float<T>(gain[r].v[j]));
       }
-      *reinterpret_cast<Vec<T>*>(dst + (lane + r * kWarp) * kVec) = out;
+      *reinterpret_cast<Vec<T>*>(dst + (lane + r * kLanesPerUnit) * kVec) = out;
     }
   } else {
-    for (int i = lane * kVec; i < group_dim; i += kWarp * kVec) {
+    for (int i = lane * kVec; i < group_dim; i += kLanesPerUnit * kVec) {
       const Vec<T> v = *reinterpret_cast<const Vec<T>*>(src + i);
       const Vec<T> g = *reinterpret_cast<const Vec<T>*>(weight + i);
       Vec<T> out;
@@ -304,7 +336,7 @@ int shift_of(int64_t v) {
  * before the norm reads it back, which is where the caller's unfused pair
  * rounds it.
  */
-template <typename T, bool W_SHARED, int ROW_VECS>
+template <typename T, bool W_SHARED, int ROW_VECS, int WARPS = 1>
 __global__ void __launch_bounds__(kRowBlock)
     hc_combine_norm_kernel(const T* __restrict__ block,
                            const T* __restrict__ res, const T* __restrict__ inj,
@@ -313,9 +345,13 @@ __global__ void __launch_bounds__(kRowBlock)
                            int64_t stride_res, int64_t stride_inj,
                            int64_t stride_out, int64_t stride_y, int hc_dim,
                            int hc, int64_t units, float inv_hc, float eps) {
-  const int lane = threadIdx.x % kWarp;
-  const int64_t unit =
-      static_cast<int64_t>(blockIdx.x) * kRowsPerBlock + threadIdx.x / kWarp;
+  constexpr int kLanesPerUnit = kWarp * WARPS;
+  constexpr int kUnitsPerBlock = kRowBlock / kLanesPerUnit;
+  static_assert(WARPS == 1 || kUnitsPerBlock == 1,
+                "a block spanning warps must hold exactly one unit");
+  const int lane = threadIdx.x % kLanesPerUnit;
+  const int64_t unit = static_cast<int64_t>(blockIdx.x) * kUnitsPerBlock +
+                       threadIdx.x / kLanesPerUnit;
   if (unit >= units) return;
   const int stream = static_cast<int>(unit % hc);
   const int64_t row = unit / hc;
@@ -339,7 +375,7 @@ __global__ void __launch_bounds__(kRowBlock)
     // waits on alone.
 #pragma unroll
     for (int r = 0; r < ROW_VECS; ++r) {
-      const int i = (lane + r * kWarp) * kVec;
+      const int i = (lane + r * kLanesPerUnit) * kVec;
       const Vec<T> bv = *reinterpret_cast<const Vec<T>*>(bsrc + i);
       const Vec<T> rv = *reinterpret_cast<const Vec<T>*>(rsrc + i);
       gain[r] = *reinterpret_cast<const Vec<T>*>(weight + i);
@@ -355,7 +391,7 @@ __global__ void __launch_bounds__(kRowBlock)
       *reinterpret_cast<Vec<T>*>(odst + i) = o;
     }
   } else {
-    for (int i = lane * kVec; i < hc_dim; i += kWarp * kVec) {
+    for (int i = lane * kVec; i < hc_dim; i += kLanesPerUnit * kVec) {
       const Vec<T> bv = *reinterpret_cast<const Vec<T>*>(bsrc + i);
       const Vec<T> rv = *reinterpret_cast<const Vec<T>*>(rsrc + i);
       Vec<T> o;
@@ -369,7 +405,8 @@ __global__ void __launch_bounds__(kRowBlock)
       *reinterpret_cast<Vec<T>*>(odst + i) = o;
     }
   }
-  const float rrms = rsqrtf(warp_sum(sum) / static_cast<float>(hc_dim) + eps);
+  const float rrms = rsqrtf(
+      unit_sum<WARPS, kRowBlock>(sum, lane) / static_cast<float>(hc_dim) + eps);
 
   if constexpr (ROW_VECS > 0) {
 #pragma unroll
@@ -380,10 +417,10 @@ __global__ void __launch_bounds__(kRowBlock)
         const float sc = to_float<T>(held[r].v[j]) * rrms;
         yv.v[j] = from_float<T>(sc + sc * to_float<T>(gain[r].v[j]));
       }
-      *reinterpret_cast<Vec<T>*>(ydst + (lane + r * kWarp) * kVec) = yv;
+      *reinterpret_cast<Vec<T>*>(ydst + (lane + r * kLanesPerUnit) * kVec) = yv;
     }
   } else {
-    for (int i = lane * kVec; i < hc_dim; i += kWarp * kVec) {
+    for (int i = lane * kVec; i < hc_dim; i += kLanesPerUnit * kVec) {
       const Vec<T> o = *reinterpret_cast<const Vec<T>*>(odst + i);
       const Vec<T> g = *reinterpret_cast<const Vec<T>*>(weight + i);
       Vec<T> yv;
@@ -397,7 +434,7 @@ __global__ void __launch_bounds__(kRowBlock)
   }
 }
 
-int elementwise_grid(int64_t work, int block) {
+int hc_device_sms() {
   static thread_local int num_sms = 0;
   if (num_sms == 0) {
     int dev = 0;
@@ -407,10 +444,14 @@ int elementwise_grid(int64_t work, int block) {
             cudaSuccess,
         "cudaDeviceGetAttribute failed");
   }
+  return num_sms;
+}
+
+int elementwise_grid(int64_t work, int block) {
   // Enough blocks to cover the device several times over, and never more than
   // there is work for.
   const int64_t want = (work + block - 1) / block;
-  const int64_t cap = static_cast<int64_t>(num_sms) * 8;
+  const int64_t cap = static_cast<int64_t>(hc_device_sms()) * 8;
   return static_cast<int>(want < cap ? (want > 0 ? want : 1) : cap);
 }
 
@@ -448,35 +489,45 @@ void check_hc_dtype(const Tensor& t, ScalarType want, const char* name) {
 // so those walk the row at runtime instead. The form is also only taken when
 // the launch is small: holding costs registers, and a launch that fills the
 // device would rather have the warps.
-#define QWEN4EXP_HC_ROW(row_dim, small, fn)      \
-  switch (!(small) || (row_dim) % (kWarp * kVec) \
-              ? -1                               \
-              : (row_dim) / (kWarp * kVec)) {    \
-    case 1:                                      \
-      fn(std::integral_constant<int, 1>{});      \
-      break;                                     \
-    case 2:                                      \
-      fn(std::integral_constant<int, 2>{});      \
-      break;                                     \
-    case 4:                                      \
-      fn(std::integral_constant<int, 4>{});      \
-      break;                                     \
-    default:                                     \
-      fn(std::integral_constant<int, 0>{});      \
+#define QWEN4EXP_HC_ROW(row_dim, fn)                                      \
+  switch ((row_dim) % (kWarp * kVec) ? -1 : (row_dim) / (kWarp * kVec)) { \
+    case 1:                                                               \
+      fn(std::integral_constant<int, 1>{});                               \
+      break;                                                              \
+    case 2:                                                               \
+      fn(std::integral_constant<int, 2>{});                               \
+      break;                                                              \
+    case 4:                                                               \
+      fn(std::integral_constant<int, 4>{});                               \
+      break;                                                              \
+    default:                                                              \
+      fn(std::integral_constant<int, 0>{});                               \
   }
 
-// A launch small enough that a row's registers are cheaper than more warps.
-inline bool hc_small_launch(int64_t units) {
-  static thread_local int num_sms = 0;
-  if (num_sms == 0) {
-    int dev = 0;
-    STD_TORCH_CHECK(cudaGetDevice(&dev) == cudaSuccess, "cudaGetDevice failed");
-    STD_TORCH_CHECK(
-        cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, dev) ==
-            cudaSuccess,
-        "cudaDeviceGetAttribute failed");
+// The same, for a unit spread over several warps: the width a lane covers
+// shrinks by however many warps share the unit.
+#define QWEN4EXP_HC_ROW_WIDE(row_dim, warps, fn)        \
+  switch ((row_dim) % (kWarp * kVec * (warps))          \
+              ? -1                                      \
+              : (row_dim) / (kWarp * kVec * (warps))) { \
+    case 1:                                             \
+      fn(std::integral_constant<int, 1>{});             \
+      break;                                            \
+    case 2:                                             \
+      fn(std::integral_constant<int, 2>{});             \
+      break;                                            \
+    case 4:                                             \
+      fn(std::integral_constant<int, 4>{});             \
+      break;                                            \
+    default:                                            \
+      fn(std::integral_constant<int, 0>{});             \
   }
-  return units < static_cast<int64_t>(num_sms) * kRowsPerBlock;
+
+// Whether there is so little to do that a unit should take a whole block. One
+// warp per unit is the cheaper shape, but it caps the launch at units/4 blocks
+// and below the SM count that leaves most of the device idle.
+inline bool hc_wide_unit(int64_t units) {
+  return units < static_cast<int64_t>(hc_device_sms());
 }
 
 #define QWEN4EXP_HC_DISPATCH(dtype, ...)                                \
@@ -512,12 +563,17 @@ void qwen4_exp_grouped_gemma_rmsnorm(const Tensor& x, const Tensor& weight,
   if (rows == 0) return;
 
   const int64_t units = rows * num_groups;
-  const dim3 grid(
-      static_cast<unsigned>((units + kRowsPerBlock - 1) / kRowsPerBlock));
+  constexpr int kWideWarps = kRowBlock / kWarp;
+  const bool wide =
+      hc_wide_unit(units) && group_dim % (kWarp * kVec * kWideWarps) == 0;
   QWEN4EXP_HC_DISPATCH(x.scalar_type(), {
-    auto launch_one = [&](auto shared_tag, auto row_tag) {
+    auto launch_one = [&](auto shared_tag, auto row_tag, auto warp_tag) {
+      constexpr int kWarps = decltype(warp_tag)::value;
+      const dim3 grid(
+          static_cast<unsigned>((units + kRowBlock / (kWarp * kWarps) - 1) /
+                                (kRowBlock / (kWarp * kWarps))));
       grouped_gemma_rmsnorm_kernel<scalar_t, decltype(shared_tag)::value,
-                                   decltype(row_tag)::value>
+                                   decltype(row_tag)::value, kWarps>
           <<<grid, kRowBlock, 0, 0>>>(
               reinterpret_cast<const scalar_t*>(x.data_ptr()),
               reinterpret_cast<const scalar_t*>(weight.data_ptr()),
@@ -525,12 +581,24 @@ void qwen4_exp_grouped_gemma_rmsnorm(const Tensor& x, const Tensor& weight,
               y.stride(0), static_cast<int>(group_dim),
               static_cast<int>(num_groups), units, static_cast<float>(eps));
     };
+    auto pick = [&](auto shared_tag) {
+      if (wide) {
+        auto fn = [&](auto row_tag) {
+          launch_one(shared_tag, row_tag,
+                     std::integral_constant<int, kWideWarps>{});
+        };
+        QWEN4EXP_HC_ROW_WIDE(group_dim, kWideWarps, fn);
+      } else {
+        auto fn = [&](auto row_tag) {
+          launch_one(shared_tag, row_tag, std::integral_constant<int, 1>{});
+        };
+        QWEN4EXP_HC_ROW(group_dim, fn);
+      }
+    };
     if (shared) {
-      auto fn = [&](auto row_tag) { launch_one(std::true_type{}, row_tag); };
-      QWEN4EXP_HC_ROW(group_dim, hc_small_launch(units), fn);
+      pick(std::true_type{});
     } else {
-      auto fn = [&](auto row_tag) { launch_one(std::false_type{}, row_tag); };
-      QWEN4EXP_HC_ROW(group_dim, hc_small_launch(units), fn);
+      pick(std::false_type{});
     }
   });
 }
@@ -651,12 +719,17 @@ void qwen4_exp_hc_combine_norm(const Tensor& residual,
   if (rows == 0) return;
 
   const int64_t units = rows * hc_count;
-  const dim3 grid(
-      static_cast<unsigned>((units + kRowsPerBlock - 1) / kRowsPerBlock));
+  constexpr int kWideWarps = kRowBlock / kWarp;
+  const bool wide =
+      hc_wide_unit(units) && hc_dim % (kWarp * kVec * kWideWarps) == 0;
   QWEN4EXP_HC_DISPATCH(residual.scalar_type(), {
-    auto launch_one = [&](auto shared_tag, auto row_tag) {
+    auto launch_one = [&](auto shared_tag, auto row_tag, auto warp_tag) {
+      constexpr int kWarps = decltype(warp_tag)::value;
+      const dim3 grid(
+          static_cast<unsigned>((units + kRowBlock / (kWarp * kWarps) - 1) /
+                                (kRowBlock / (kWarp * kWarps))));
       hc_combine_norm_kernel<scalar_t, decltype(shared_tag)::value,
-                             decltype(row_tag)::value>
+                             decltype(row_tag)::value, kWarps>
           <<<grid, kRowBlock, 0, 0>>>(
               reinterpret_cast<const scalar_t*>(block_output.data_ptr()),
               reinterpret_cast<const scalar_t*>(residual.data_ptr()),
@@ -669,12 +742,24 @@ void qwen4_exp_hc_combine_norm(const Tensor& residual,
               units, 1.f / static_cast<float>(hc_count),
               static_cast<float>(eps));
     };
+    auto pick = [&](auto shared_tag) {
+      if (wide) {
+        auto fn = [&](auto row_tag) {
+          launch_one(shared_tag, row_tag,
+                     std::integral_constant<int, kWideWarps>{});
+        };
+        QWEN4EXP_HC_ROW_WIDE(hc_dim, kWideWarps, fn);
+      } else {
+        auto fn = [&](auto row_tag) {
+          launch_one(shared_tag, row_tag, std::integral_constant<int, 1>{});
+        };
+        QWEN4EXP_HC_ROW(hc_dim, fn);
+      }
+    };
     if (shared) {
-      auto fn = [&](auto row_tag) { launch_one(std::true_type{}, row_tag); };
-      QWEN4EXP_HC_ROW(hc_dim, hc_small_launch(units), fn);
+      pick(std::true_type{});
     } else {
-      auto fn = [&](auto row_tag) { launch_one(std::false_type{}, row_tag); };
-      QWEN4EXP_HC_ROW(hc_dim, hc_small_launch(units), fn);
+      pick(std::false_type{});
     }
   });
 }
