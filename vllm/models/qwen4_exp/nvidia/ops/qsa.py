@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import functools
 import math
 
 import torch
@@ -889,6 +890,93 @@ def expand_qsa_block_indices_cuda(
     return out
 
 
+@functools.cache
+def _flashinfer_selection() -> bool:
+    """Whether FlashInfer serves the scoring and expansion this path needs.
+
+    Both arrived together; a build with one but not the other is not something
+    this checks for beyond the import.
+    """
+    try:
+        import flashinfer
+
+        return hasattr(flashinfer, "sparse_paged_scores") and hasattr(
+            flashinfer, "expand_block_route"
+        )
+    except Exception:
+        return False
+
+
+def _score_paged(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    token_to_req: torch.Tensor,
+    query_positions: torch.Tensor,
+    sequence_lengths: torch.Tensor,
+    compress_ratio: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Score the compressed cache, on FlashInfer where it is available."""
+    if _flashinfer_selection():
+        import flashinfer
+
+        # QSA holds the compressed keys as [pages, page_size, 1, head_dim]; the
+        # single KV head makes dropping that axis a view.
+        return flashinfer.sparse_paged_scores(
+            q,
+            k_cache.squeeze(2),
+            page_table,
+            token_to_req,
+            query_positions,
+            sequence_lengths,
+            compress_ratio,
+            math.sqrt(q.shape[2]),
+            num_columns=page_table.shape[1] * k_cache.shape[1],
+        )
+    return qsa_mqa_paged(
+        q,
+        k_cache,
+        page_table,
+        token_to_req,
+        query_positions,
+        sequence_lengths,
+        compress_ratio,
+    )
+
+
+def _expand_blocks(
+    block_indices: torch.Tensor,
+    query_positions: torch.Tensor,
+    sequence_lengths: torch.Tensor,
+    token_to_req: torch.Tensor,
+    compress_ratio: int,
+    token_topk: int,
+    out: torch.Tensor,
+) -> None:
+    """Expand the selected blocks into the token route the attention reads."""
+    if _flashinfer_selection():
+        import flashinfer
+
+        flashinfer.expand_block_route(
+            block_indices,
+            query_positions,
+            sequence_lengths,
+            token_to_req,
+            compress_ratio,
+            out=out,
+        )
+        return
+    expand_qsa_block_indices_cuda(
+        block_indices,
+        query_positions,
+        sequence_lengths,
+        token_to_req,
+        compress_ratio,
+        token_topk,
+        out,
+    )
+
+
 def qsa_select_paged_tokens(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -924,7 +1012,7 @@ def qsa_select_paged_tokens(
     for row_start in range(0, rows, rows_per_chunk):
         row_end = min(row_start + rows_per_chunk, rows)
         row_slice = slice(row_start, row_end)
-        logits, visible_blocks = qsa_mqa_paged(
+        logits, visible_blocks = _score_paged(
             q[row_slice],
             k_cache,
             page_table,
@@ -946,7 +1034,7 @@ def qsa_select_paged_tokens(
             else torch.ops._C.persistent_topk
         )
         topk_op(logits, visible_blocks, blocks, topk_workspace, block_topk, columns)
-        expand_qsa_block_indices_cuda(
+        _expand_blocks(
             blocks,
             query_positions[row_slice],
             sequence_lengths,

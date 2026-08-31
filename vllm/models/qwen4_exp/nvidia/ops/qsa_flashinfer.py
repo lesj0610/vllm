@@ -85,8 +85,8 @@ def supports_qsa_flashinfer(head_dim: int, kv_cache_dtype: str) -> bool:
         return False
     if kv_cache_dtype == "nvfp4":
         return "nvfp4" in features
-    # Per-tensor FP8 has no block-sparse path yet; Triton keeps serving it.
-    return kv_cache_dtype in ("auto", "bfloat16")
+    # FP8 rides the same route; its scale reaches the kernel per KV head.
+    return kv_cache_dtype in ("auto", "bfloat16", "fp8", "fp8_e4m3")
 
 
 @functools.cache
@@ -265,6 +265,10 @@ class QSAFlashInferRunner:
                 "k_scale": k_scale,
                 "v_scale": v_scale,
             }
+        elif k_data.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+            # QSA quantizes FP8 per tensor, which folds outside the dots the
+            # same way the packed NVFP4 scale does.
+            kwargs = {"k_scale": k_scale, "v_scale": v_scale}
         result = plan.wrapper.run(q, k_data, v_data, **kwargs)
         out.copy_(result[:rows_in])
         return out
