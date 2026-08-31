@@ -73,6 +73,26 @@ __device__ __forceinline__ void build_work_tile(
   const int32_t in_warp = lane & 31;
   const int32_t work = block * kWorkBlock + lane;
 
+  if (num_reqs == 1) {
+    // One request owns every item, so there is nothing to scan, no barrier to
+    // wait on and nothing to search. This is what a single stream prefilling a
+    // prompt looks like, and it is the shape the scan costs the most on.
+    const int32_t query_len = query_start_loc[1] - query_start_loc[0];
+    const int32_t seq_len = seq_lens[0];
+    const int32_t chunk_start = seq_len - query_len;
+    const int32_t groups =
+        ratio_shift >= 0
+            ? (seq_len >> ratio_shift) - (chunk_start >> ratio_shift)
+            : seq_len / compress_ratio - chunk_start / compress_ratio;
+    const int32_t count = query_len > 0 ? max(groups, 1) : 0;
+    if (work < max_num_work) {
+      const bool live = work < count;
+      work_metadata[2 * work] = live ? 0 : -1;
+      work_metadata[2 * work + 1] = live ? work : -1;
+    }
+    return;
+  }
+
   // Walk the requests a window at a time so a step with more of them than this
   // block is wide still resolves, carrying the running total across windows.
   int32_t carry = 0;
@@ -222,6 +242,12 @@ __global__ void qsa_metadata_kernel(
   token_to_req[token] = mapped ? request : 0;
   logical_positions[token] = static_cast<int64_t>(position);
 
+  // The main cache's decision and the block table are independent of each
+  // other, so this is read here rather than behind the page lookup: chaining
+  // them with && puts one global round trip after the other, and at one request
+  // per step that round trip is what the kernel costs.
+  const int64_t main_slot = mapped ? common_slot_mapping[token] : int64_t{-1};
+
   int64_t slot = -1;
   if constexpr (CIRCULAR) {
     // A ring keeps the last circular_buffer_size tokens of each request.
@@ -251,9 +277,8 @@ __global__ void qsa_metadata_kernel(
                              ? block_table[request * block_table_stride_0 +
                                            logical_block * block_table_stride_1]
                              : -1;
-    valid = valid && page >= 0;
     // The main cache decides whether this token is stored at all.
-    valid = valid && (mapped ? common_slot_mapping[token] : int64_t{-1}) >= 0;
+    valid = valid && page >= 0 && main_slot >= 0;
     if (valid) {
       const int32_t in_block = POW2 ? (compressed & (storage_block_size - 1))
                                     : compressed % storage_block_size;
@@ -265,7 +290,7 @@ __global__ void qsa_metadata_kernel(
   } else {
     // Neither owner rewrites the mapping, so the side cache follows the main
     // one token for token.
-    slot_mapping[token] = mapped ? common_slot_mapping[token] : int64_t{-1};
+    slot_mapping[token] = main_slot;
   }
 }
 
