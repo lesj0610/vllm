@@ -42,8 +42,17 @@ constexpr int kVec = 8;
 // The reciprocal is the approximate one: a plain division here is IEEE-correct
 // and lowers to a call into a slow path, which on a kernel this simple is most
 // of the arithmetic. Two ulp is far below what the half-width result keeps.
+//
+// It is taken on the negative side and reflected, rather than written as
+// 1/(1+exp(-v)). __fdividef returns zero outright once its denominator passes
+// 2^126, and 1+exp(-v) crosses that at v = -87.4 -- exactly where sigmoid
+// still has 1e-38 left, and the whole tail below it. Feeding exp(-|v|) keeps
+// the denominator in (1, 2] and the result is then good down to -103, where
+// exp underflows for real. __expf itself returns the subnormals correctly.
 __device__ __forceinline__ float sigmoidf_(float v) {
-  return __fdividef(1.f, 1.f + __expf(-v));
+  const float e = __expf(-fabsf(v));
+  const float s = __fdividef(e, 1.f + e);
+  return v >= 0.f ? 1.f - s : s;
 }
 
 __device__ __forceinline__ float warp_sum(float v) {
