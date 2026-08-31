@@ -567,6 +567,14 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
       "persistent_topk(Tensor logits, Tensor lengths, Tensor! output, "
       "Tensor workspace, int k, int max_seq_len) -> ()");
 
+  // Per-step metadata for the Qwen4Exp QSA side cache.
+  ops.def(
+      "qsa_build_metadata(Tensor query_start_loc, Tensor seq_lens, "
+      "Tensor common_slot_mapping, Tensor block_table, Tensor! token_to_req, "
+      "Tensor! logical_positions, Tensor! slot_mapping, "
+      "Tensor(a!)? work_metadata, int storage_block_size, int compress_ratio, "
+      "int circular_buffer_size, int num_mapped_tokens) -> ()");
+
 #ifdef VLLM_ENABLE_COOPERATIVE_TOPK
   ops.def(
       "cooperative_topk(Tensor logits, Tensor lengths, Tensor! output, "
@@ -823,6 +831,7 @@ STABLE_TORCH_LIBRARY_IMPL(_C, CUDA, ops) {
   ops.impl("top_k_per_row_prefill", TORCH_BOX(&top_k_per_row_prefill));
   ops.impl("top_k_per_row_decode", TORCH_BOX(&top_k_per_row_decode));
   ops.impl("persistent_topk", TORCH_BOX(&persistent_topk));
+  ops.impl("qsa_build_metadata", TORCH_BOX(&qsa_build_metadata));
 #ifdef VLLM_ENABLE_COOPERATIVE_TOPK
   ops.impl("cooperative_topk", TORCH_BOX(&cooperative_topk));
 #endif

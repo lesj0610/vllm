@@ -414,6 +414,52 @@ def test_qsa_compressed_metadata_keeps_dummy_slots_inert() -> None:
 
 
 @requires_qsa_kernels
+def test_qsa_metadata_builder_rejects_a_mistyped_buffer() -> None:
+    """The op reads these through typed pointers, so a wrong width has to raise.
+
+    A narrower buffer than the kernel writes would otherwise be filled with half
+    of every value and no complaint from anyone.
+    """
+    if not hasattr(torch.ops._C, "qsa_build_metadata"):
+        pytest.skip("the CUDA metadata builder is not in this build")
+    device = torch.device("cuda")
+    query_start_loc = torch.tensor([0, 2], dtype=torch.int32, device=device)
+    args = dict(
+        query_start_loc=query_start_loc,
+        seq_lens=torch.tensor([8], dtype=torch.int32, device=device),
+        common_slot_mapping=torch.zeros(2, dtype=torch.int64, device=device),
+        block_table=torch.zeros((1, 1), dtype=torch.int32, device=device),
+        token_to_req=torch.empty(2, dtype=torch.int32, device=device),
+        logical_positions=torch.empty(2, dtype=torch.int64, device=device),
+        slot_mapping=torch.empty(2, dtype=torch.int64, device=device),
+    )
+
+    def call(**overrides):
+        merged = {**args, **overrides}
+        torch.ops._C.qsa_build_metadata(
+            merged["query_start_loc"],
+            merged["seq_lens"],
+            merged["common_slot_mapping"],
+            merged["block_table"],
+            merged["token_to_req"],
+            merged["logical_positions"],
+            merged["slot_mapping"],
+            None,
+            16,
+            4,
+            0,
+            2,
+        )
+
+    call()
+    for name in ("logical_positions", "slot_mapping"):
+        with pytest.raises(RuntimeError, match=name):
+            call(**{name: torch.empty(2, dtype=torch.int32, device=device)})
+    with pytest.raises(RuntimeError, match="token_to_req"):
+        call(token_to_req=torch.empty(2, dtype=torch.int64, device=device))
+
+
+@requires_qsa_kernels
 @pytest.mark.parametrize("compress_ratio", [1, 4])
 @pytest.mark.parametrize("num_reqs", [2, 3, 4, 7, 8, 9])
 def test_qsa_triton_metadata_matches_pytorch(
