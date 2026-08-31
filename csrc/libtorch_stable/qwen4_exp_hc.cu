@@ -523,6 +523,17 @@ void check_hc_dtype(const Tensor& t, ScalarType want, const char* name) {
       fn(std::integral_constant<int, 0>{});             \
   }
 
+// The column kernels have no reduction, so the only lever on a small launch
+// is the block: narrowing it turns one block into several without changing
+// what any thread does. Only worth it while the grid is short of the device.
+int hc_narrow_block(int64_t vecs, int64_t rows, int block) {
+  const int sms = hc_device_sms();
+  while (block > kWarp && ((vecs + block - 1) / block) * rows * 4 < sms) {
+    block >>= 1;
+  }
+  return block;
+}
+
 // Whether there is so little to do that a unit should take a whole block. One
 // warp per unit is the cheaper shape, but it caps the launch at units/4 blocks
 // and below the SM count that leaves most of the device idle.
@@ -641,12 +652,13 @@ void qwen4_exp_hc_gate_mix(const Tensor& x, const Tensor& gate,
   check_hc_dtype(y, x.scalar_type(), "y");
   if (rows == 0) return;
 
-  const dim3 grid(static_cast<unsigned>((hc_dim / kVec + kBlock - 1) / kBlock),
+  const int block = hc_narrow_block(hc_dim / kVec, rows, kBlock);
+  const dim3 grid(static_cast<unsigned>((hc_dim / kVec + block - 1) / block),
                   static_cast<unsigned>(rows < 65535 ? rows : 65535));
   QWEN4EXP_HC_DISPATCH(x.scalar_type(), {
     auto go = [&](auto hc_tag) {
       hc_gate_mix_kernel<scalar_t, decltype(hc_tag)::value>
-          <<<grid, kBlock, 0, 0>>>(
+          <<<grid, block, 0, 0>>>(
               reinterpret_cast<const scalar_t*>(x.data_ptr()),
               reinterpret_cast<const scalar_t*>(gate.data_ptr()),
               reinterpret_cast<scalar_t*>(y.data_ptr()), x.stride(0),
@@ -674,12 +686,13 @@ void qwen4_exp_hc_combine(const Tensor& residual, const Tensor& block_output,
   check_hc_dtype(out, residual.scalar_type(), "out");
   if (rows == 0) return;
 
-  const dim3 grid(static_cast<unsigned>((hc_dim / kVec + kBlock - 1) / kBlock),
+  const int block = hc_narrow_block(hc_dim / kVec, rows, kBlock);
+  const dim3 grid(static_cast<unsigned>((hc_dim / kVec + block - 1) / block),
                   static_cast<unsigned>(rows < 65535 ? rows : 65535));
   QWEN4EXP_HC_DISPATCH(residual.scalar_type(), {
     auto go = [&](auto hc_tag) {
       hc_combine_kernel<scalar_t, decltype(hc_tag)::value>
-          <<<grid, kBlock, 0, 0>>>(
+          <<<grid, block, 0, 0>>>(
               reinterpret_cast<const scalar_t*>(block_output.data_ptr()),
               reinterpret_cast<const scalar_t*>(residual.data_ptr()),
               reinterpret_cast<const scalar_t*>(injection_logits.data_ptr()),
