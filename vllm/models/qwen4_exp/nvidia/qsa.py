@@ -40,6 +40,7 @@ from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
     AttentionType,
+    MultipleOf,
 )
 from vllm.v1.attention.backends.fa_utils import is_flash_attn_varlen_func_available
 from vllm.v1.attention.backends.flash_attn import (
@@ -92,6 +93,11 @@ class Qwen4ExpQSAFlashAttentionBackend(FlashAttentionBackend):
     @staticmethod
     def get_name() -> str:
         return "QWEN4_EXP_QSA_TRITON"
+
+    @staticmethod
+    def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
+        # QSA consumes manager pages directly and does not use FA4 paged attention.
+        return [MultipleOf(16)]
 
     @staticmethod
     def get_impl_cls() -> type[Qwen4ExpQSAFlashAttentionImpl]:

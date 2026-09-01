@@ -359,6 +359,30 @@ def _qsa_key_cache(block_size: int, compress_ratio: int) -> qsa_cache.QSAKeyStat
     )
 
 
+def test_qsa_state_caches_adapt_the_unified_logical_layout() -> None:
+    raw_cache = _qsa_key_cache(block_size=32, compress_ratio=4)
+    compressed_cache = qsa_cache.QSACompressedKeyCache(
+        head_size=64,
+        dtype=torch.bfloat16,
+        cache_config=SimpleNamespace(block_size=32),
+        prefix="compressed.bind",
+        vllm_config=SimpleNamespace(
+            compilation_config=SimpleNamespace(static_forward_context={})
+        ),
+        compress_ratio=4,
+    )
+    raw_view = torch.empty(2, 1, 8, 64, dtype=torch.bfloat16)
+    compressed_view = torch.empty(2, 1, 8, 64, dtype=torch.bfloat16)
+
+    raw_cache.bind_kv_cache(raw_view)
+    compressed_cache.bind_kv_cache(compressed_view)
+
+    assert raw_cache.kv_cache.shape == (2, 8, 1, 64)
+    assert compressed_cache.kv_cache.shape == (2, 8, 1, 64)
+    assert raw_cache.kv_cache.data_ptr() == raw_view.data_ptr()
+    assert compressed_cache.kv_cache.data_ptr() == compressed_view.data_ptr()
+
+
 @pytest.mark.parametrize(
     ("compress_ratio", "num_spec", "expected"),
     [(4, 0, 4), (4, 1, 8), (4, 3, 8), (4, 4, 8), (4, 5, 12), (2, 3, 6)],
@@ -371,13 +395,6 @@ def test_qsa_ring_capacity_covers_one_speculative_step(
         block_size=48, compress_ratio=compress_ratio
     ).get_kv_cache_spec(SimpleNamespace(num_speculative_tokens=num_spec))
     assert spec.block_size == expected
-
-
-def test_qsa_ring_capacity_must_divide_the_attention_block_size() -> None:
-    """A ring that does not divide the block size inflates the scheduler's LCM."""
-    cache = _qsa_key_cache(block_size=40, compress_ratio=4)
-    with pytest.raises(AssertionError, match="must divide the attention block size"):
-        cache.get_kv_cache_spec(SimpleNamespace(num_speculative_tokens=5))
 
 
 @requires_qsa_kernels

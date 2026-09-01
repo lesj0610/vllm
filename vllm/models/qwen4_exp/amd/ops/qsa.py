@@ -604,11 +604,6 @@ def qsa_mqa_paged(
     _validate_mqa(q)
     if not q.is_cuda or not HAS_TRITON:
         raise RuntimeError("paged QSA scoring requires a GPU and Triton")
-    if k_cache.ndim == 4 and k_cache.shape[1] == 1 and k_cache.shape[2] != 1:
-        # Canonical allocator views are [pages, heads, page_size, head_dim];
-        # QSA kernels address [pages, page_size, 1, head_dim]. One KV head
-        # makes the swap a free view.
-        k_cache = k_cache.transpose(1, 2)
     if k_cache.ndim != 4 or k_cache.shape[2] != 1:
         raise ValueError("QSA cache must be [pages, page_size, 1, head_dim]")
     if k_cache.shape[3] != q.shape[2]:

@@ -55,16 +55,6 @@ MODELS = [
 ]
 
 
-def test_static_fp8_moe_input_scales_remain_scalar() -> None:
-    a1_scale, a2_scale = process_fp8_input_tensor_strategy_moe(
-        torch.tensor([0.25, 0.5]),
-        torch.tensor([0.75, 0.6]),
-        enable_eplb=False,
-    )
-
-    assert a1_scale.ndim == a2_scale.ndim == 0
-
-
 def test_prepare_gated_trtllm_fp8_moe_weights_pads_each_projection(monkeypatch):
     monkeypatch.setattr(
         flashinfer_utils,
@@ -102,6 +92,16 @@ def test_prepare_gated_trtllm_fp8_moe_weights_pads_each_projection(monkeypatch):
     expected[:, padded_intermediate : padded_intermediate + intermediate] = gate
     assert layer.moe_config.intermediate_size_per_partition == padded_intermediate
     assert torch.equal(padded_w31, expected)
+
+
+def test_static_fp8_moe_input_scales_remain_scalar() -> None:
+    a1_scale, a2_scale = process_fp8_input_tensor_strategy_moe(
+        torch.tensor([0.25, 0.5]),
+        torch.tensor([0.75, 0.6]),
+        enable_eplb=False,
+    )
+
+    assert a1_scale.ndim == a2_scale.ndim == 0
 
 
 @pytest.mark.skipif(

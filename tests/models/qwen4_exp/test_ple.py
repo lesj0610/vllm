@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from functools import partial
 from types import SimpleNamespace
 
 import pytest
@@ -856,3 +857,99 @@ def test_ple_state_shape_reserves_speculative_tokens() -> None:
     module.num_spec_tokens = 3
 
     assert module.get_state_shape()[0] in ((32, 12), (12, 32))
+
+
+def _set_test_embedding_weight_loader(embedding) -> None:
+    embedding.weight.weight_loader = partial(
+        copy_ple_embedding_shard_,
+        tp_start=embedding.shard_indices.org_vocab_start_index,
+        tp_end=embedding.shard_indices.org_vocab_end_index,
+    )
+
+
+def test_ngram_embedding_loads_fp8_shards_and_global_scale() -> None:
+    module = _make_fp8_ngram_embedding_for_load_test()
+    shard_0 = torch.arange(8, dtype=torch.float32).reshape(4, 2).to(torch.float8_e4m3fn)
+    shard_1 = (
+        torch.arange(8, 16, dtype=torch.float32).reshape(4, 2).to(torch.float8_e4m3fn)
+    )
+    weight_scale = torch.tensor([0.25], dtype=torch.bfloat16)
+
+    loaded = module.load_weights(
+        [
+            ("ngram_embedding.shard_0.weight", shard_0),
+            ("ngram_embedding.shard_1.weight", shard_1),
+            ("ngram_embedding.weight_scale", weight_scale),
+        ]
+    )
+
+    assert loaded == {"ngram_embedding.weight", "ngram_embedding.weight_scale"}
+    assert module.ngram_embedding.weight.dtype == torch.float8_e4m3fn
+    assert torch.equal(
+        module.ngram_embedding.weight.float(),
+        torch.cat((shard_0[2:4], shard_1[0:2])).float(),
+    )
+    assert torch.equal(module.ngram_embedding.weight_scale, weight_scale)
+
+
+def test_ple_ngram_ids_custom_op_uses_current_request_layout(monkeypatch) -> None:
+    class RuntimeNGramEmbedding(nn.Module):
+        def compute_ngram_ids(
+            self,
+            input_ids: torch.Tensor,
+            query_start_loc: torch.Tensor,
+            ngram_context: torch.Tensor,
+        ) -> torch.Tensor:
+            del input_ids, ngram_context
+            num_reqs = query_start_loc.numel() - 1
+            return torch.full((4, 2), num_reqs, dtype=torch.long)
+
+    layer = Qwen4ExpPLELayer.__new__(Qwen4ExpPLELayer)
+    nn.Module.__init__(layer)
+    layer.ple_embedding = RuntimeNGramEmbedding()
+    monkeypatch.setattr(
+        ple_layer_module,
+        "get_forward_context",
+        lambda: SimpleNamespace(no_compile_layers={"ple": layer}),
+    )
+    input_ids = torch.arange(4)
+    ngram_context = torch.zeros(2, 2, dtype=torch.long)
+    output = torch.empty(4, 2, dtype=torch.long)
+
+    ple_layer_module.qwen4_exp_compute_ple_ngram_ids(
+        input_ids,
+        torch.tensor([0, 4]),
+        ngram_context,
+        output,
+        "ple",
+    )
+    assert torch.equal(output, torch.ones_like(output))
+
+    ple_layer_module.qwen4_exp_compute_ple_ngram_ids(
+        input_ids,
+        torch.tensor([0, 2, 4]),
+        ngram_context,
+        output,
+        "ple",
+    )
+    assert torch.equal(output, torch.full_like(output, 2))
+
+
+def test_ple_short_conv_uses_fallback_when_profile_metadata_is_omitted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = Qwen4ExpPLELayer.__new__(Qwen4ExpPLELayer)
+    nn.Module.__init__(module)
+    module.prefix = "model.layers.1.ple"
+    inputs = torch.arange(6, dtype=torch.float32).reshape(3, 2)
+    expected = inputs + 1
+    monkeypatch.setattr(module, "_short_conv_fallback", lambda _: expected)
+    monkeypatch.setattr(
+        ple_layer_module,
+        "get_forward_context",
+        lambda: SimpleNamespace(attn_metadata={"model.layers.0.self_attn": object()}),
+    )
+
+    output = module._short_conv(inputs)
+
+    assert output is expected

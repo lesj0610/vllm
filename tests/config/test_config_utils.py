@@ -217,11 +217,6 @@ def test_cache_config_hash_ignores_kv_cache_sizing_knobs():
     assert CacheConfig(gpu_memory_utilization=0.5).compute_hash() == base_hash
 
 
-def test_cache_config_hash_ignores_prefix_cache_retention_interval():
-    base_hash = CacheConfig().compute_hash()
-    assert CacheConfig(prefix_cache_retention_interval=64).compute_hash() == base_hash
-
-
 def test_scheduler_config_hash_includes_max_num_seqs():
     """Per-request workspace sizes must invalidate compiled graphs."""
     base_hash = SchedulerConfig(
@@ -238,6 +233,11 @@ def test_scheduler_config_hash_includes_max_num_seqs():
     ).compute_hash()
 
     assert larger_batch_hash != base_hash
+
+
+def test_cache_config_hash_ignores_prefix_cache_retention_interval():
+    base_hash = CacheConfig().compute_hash()
+    assert CacheConfig(prefix_cache_retention_interval=64).compute_hash() == base_hash
 
 
 def test_envs_compile_factors_relocation_invariant(tmp_path):

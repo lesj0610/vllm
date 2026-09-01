@@ -334,7 +334,10 @@ def test_ple_offload_accepts_supported_configurations(
         use_ubatching=False,
     )
     worker.model_config = SimpleNamespace(architecture=architecture)
-    worker.vllm_config = SimpleNamespace(weight_transfer_config=None)
+    worker.vllm_config = SimpleNamespace(
+        weight_transfer_config=None,
+        use_v2_model_runner=True,
+    )
     monkeypatch.setattr(gpu_worker_module.current_platform, "is_cuda", lambda: True)
 
     if unsupported_setting is None:
@@ -344,6 +347,35 @@ def test_ple_offload_accepts_supported_configurations(
             worker._validate_ple_offload_config()
         assert f"Unsupported settings: {unsupported_setting}" in str(exc_info.value)
         assert architecture not in str(exc_info.value)
+
+
+def test_ple_offload_rejects_model_runner_v1(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only MRV2 wires the offload client, so MRV1 must be refused up front."""
+    worker = Worker.__new__(Worker)
+    worker.parallel_config = SimpleNamespace(
+        distributed_executor_backend="mp",
+        nnodes=1,
+        data_parallel_backend="mp",
+        data_parallel_size_local=1,
+        data_parallel_size=1,
+        pipeline_parallel_size=1,
+        prefill_context_parallel_size=1,
+        decode_context_parallel_size=1,
+        enable_expert_parallel=False,
+        use_ubatching=False,
+    )
+    worker.model_config = SimpleNamespace(architecture="Qwen4ExpForCausalLM")
+    worker.vllm_config = SimpleNamespace(
+        weight_transfer_config=None,
+        use_v2_model_runner=False,
+    )
+    monkeypatch.setattr(gpu_worker_module.current_platform, "is_cuda", lambda: True)
+
+    with pytest.raises(ValueError) as exc_info:
+        worker._validate_ple_offload_config()
+    assert "Unsupported settings: model runner V1" in str(exc_info.value)
 
 
 @pytest.mark.parametrize(
@@ -1110,24 +1142,22 @@ def test_prepare_forward_takes_the_sync_path_only_for_full_graphs(monkeypatch):
     assert calls["dummy"] == 1 and calls["sync"] == 1
 
 
-def test_both_model_runners_report_full_graph_replay():
-    """MRV1 and MRV2 must both tell the connector when a graph will replay."""
+def test_the_model_runner_reports_full_graph_replay():
+    """MRV2 is the only runner wired to PLE, and it must report graph replay."""
     import inspect
 
     import vllm.v1.worker.gpu.model_runner as mrv2
-    import vllm.v1.worker.gpu_model_runner as mrv1
 
-    for module in (mrv1, mrv2):
-        source = inspect.getsource(module)
-        index = source.find("_ple_offload_connector.prepare_forward(")
-        assert index != -1, f"{module.__name__} does not call prepare_forward"
-        call = source[index : index + 400]
-        assert "use_cudagraph=" in call, (
-            f"{module.__name__} never reports graph replay to the PLE connector"
-        )
-        assert "CUDAGraphMode.FULL" in call, (
-            f"{module.__name__} must gate the sync path on FULL graphs"
-        )
+    source = inspect.getsource(mrv2)
+    index = source.find("_ple_offload_connector.prepare_forward(")
+    assert index != -1, f"{mrv2.__name__} does not call prepare_forward"
+    call = source[index : index + 400]
+    assert "use_cudagraph=" in call, (
+        f"{mrv2.__name__} never reports graph replay to the PLE connector"
+    )
+    assert "CUDAGraphMode.FULL" in call, (
+        f"{mrv2.__name__} must gate the sync path on FULL graphs"
+    )
 
 
 def test_poll_semaphores_gives_up_instead_of_spinning_forever(monkeypatch):
