@@ -5,6 +5,7 @@
 import os
 import queue
 import threading
+import time
 from dataclasses import dataclass
 from multiprocessing.reduction import ForkingPickler
 from typing import Any
@@ -15,6 +16,7 @@ import torch.nn as nn
 import zmq
 from cuda.bindings import driver as cuda_driver
 
+from vllm import envs
 from vllm.config import VllmConfig
 from vllm.distributed.parallel_state import get_dp_group, get_tp_group
 from vllm.logger import init_logger
@@ -423,12 +425,46 @@ class PleOffloadConnector:
         num_reqs: int,
         num_tokens: int,
         dummy_run: bool,
+        use_cudagraph: bool = False,
     ) -> None:
         """Submit real inputs or satisfy the PLE wait for a dummy forward."""
         if dummy_run:
             self.signal_dummy_outputs(num_tokens)
             return
+        if use_cudagraph:
+            self._prepare_forward_sync(num_reqs, num_tokens)
+            return
         self._launch(num_reqs, num_tokens)
+
+    def _prepare_forward_sync(self, num_reqs: int, num_tokens: int) -> None:
+        """Complete the PLE round trip before a full graph replays.
+
+        A replayed graph runs the semaphore wait inside the capture, so the
+        launching thread cannot service the offload worker while the wait is
+        pending. Three parties would then block on each other: the main thread
+        on the replay, the request thread on the D2H event, and the CPU worker
+        on a request that was never sent. Finishing the round trip up front
+        costs the overlap but keeps graph replay deadlock-free.
+        """
+        self._launch(num_reqs, num_tokens)
+        self._poll_semaphores()
+
+    def _poll_semaphores(self) -> None:
+        """Spin until every PLE layer reports a completed output.
+
+        Bounded on purpose: a worker that never answers must fail the step
+        instead of burning a core with nothing reported.
+        """
+        deadline = time.monotonic() + envs.VLLM_PLE_OFFLOAD_STEP_TIMEOUT
+        for layer_name, layer in self._layers.items():
+            flag = layer._sem.flag_tensor
+            while flag.item() != CpuGpuSemaphore.DONE_VALUE:
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(
+                        "PLE offload worker did not answer for "
+                        f"{layer_name} within "
+                        f"{envs.VLLM_PLE_OFFLOAD_STEP_TIMEOUT}s"
+                    )
 
     def signal_dummy_outputs(self, num_tokens: int) -> None:
         """Locally satisfy PLE waits for dummy and capture forwards."""
