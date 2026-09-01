@@ -227,18 +227,12 @@ class AutoWeightsLoader:
         self,
         module: nn.Module,
         *,
-        skip_prefixes: list[str] | None = None,
-        skip_substrs: list[str] | None = None,
         ignore_unexpected_prefixes: list[str] | None = None,
         ignore_unexpected_suffixes: list[str] | None = None,
     ) -> None:
         super().__init__()
 
         self.module = module
-        # Checkpoint weights matching these are dropped before loading (e.g.
-        # submodules that a differently-configured run does not construct).
-        self.skip_prefixes = skip_prefixes or []
-        self.skip_substrs = skip_substrs or []
         self.ignore_unexpected_prefixes = ignore_unexpected_prefixes or []
         self.ignore_unexpected_suffixes = ignore_unexpected_suffixes or []
 
@@ -279,11 +273,7 @@ class AutoWeightsLoader:
         return ".".join((prefix, rest))
 
     def _can_skip(self, qualname: str) -> bool:
-        return (
-            qualname in self.aliased_params
-            or any(qualname.startswith(p) for p in self.skip_prefixes)
-            or any(substr in qualname for substr in self.skip_substrs)
-        )
+        return qualname in self.aliased_params
 
     def _can_ignore_unexpected(self, qualname: str) -> bool:
         iup = (qualname.startswith(p) for p in self.ignore_unexpected_prefixes)

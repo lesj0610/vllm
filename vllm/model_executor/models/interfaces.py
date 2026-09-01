@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import asyncio
+import weakref
 from collections.abc import (
     AsyncGenerator,
     Callable,
@@ -53,7 +54,6 @@ if TYPE_CHECKING:
         MambaStateCopyFuncsByType,
     )
     from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
-    from vllm.model_executor.models.interfaces_base import VllmModel
     from vllm.model_executor.models.utils import WeightsMapper
     from vllm.multimodal.inputs import MultiModalFeatureSpec, MultiModalKwargsItem
     from vllm.multimodal.registry import _ProcessorFactories
@@ -126,7 +126,9 @@ def _require_is_multimodal(is_multimodal: Tensor | None) -> Tensor:
 
 
 # Cache results of `SupportsMultiModal.get_language_model`
-_language_model_by_module = dict[nn.Module, "VllmModel"]()
+_language_model_by_module: "weakref.WeakKeyDictionary[nn.Module, VllmModel]" = (
+    weakref.WeakKeyDictionary()
+)
 
 
 @runtime_checkable
@@ -1140,6 +1142,20 @@ class SupportsMambaPrefixCaching(Protocol):
     """
 
     supports_mamba_prefix_caching: ClassVar[Literal[True]] = True
+
+    @classmethod
+    def get_mamba_state_copy_func(cls) -> tuple["MambaStateCopyFunc", ...]:
+        """Return copy functions for the model's Mamba states."""
+        ...
+
+    @classmethod
+    def get_mamba_state_copy_funcs(
+        cls,
+        mamba_types: set["MambaAttentionBackendEnum"],
+    ) -> "MambaStateCopyFuncsByType":
+        """Map legacy copy functions to each requested Mamba backend."""
+        copy_funcs = cls.get_mamba_state_copy_func()
+        return {mamba_type: copy_funcs for mamba_type in mamba_types}
 
 
 @overload

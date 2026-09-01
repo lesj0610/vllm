@@ -11,6 +11,7 @@ from vllm.config.compilation import CompilationConfig
 from vllm.config.speculative import SpeculativeConfig
 from vllm.model_executor.models.config import (
     MODELS_CONFIG_MAP,
+    Qwen3_5ForConditionalGenerationConfig,
     Qwen4ExpForCausalLMConfig,
     Qwen4ExpForConditionalGenerationConfig,
     Qwen4ExpMTPConfig,
@@ -443,7 +444,7 @@ def test_qwen4_exp_model_state_skips_ngram_state_without_ple() -> None:
         assert model_state.prepare_dummy_inputs(1, 1) is base_inputs
 
 
-def test_qwen4_exp_model_state_rejects_pp_with_ple() -> None:
+def test_qwen4_exp_model_state_rejects_offstage_ple_with_pp() -> None:
     def init_base_state(
         state,
         vllm_config,
@@ -455,15 +456,16 @@ def test_qwen4_exp_model_state_rejects_pp_with_ple() -> None:
         state.max_num_reqs = 4
         state.device = device
 
+    # Decoder layer 1 sits on the second stage, which never sees input_ids.
     vllm_config = SimpleNamespace(
         model_config=SimpleNamespace(
-            hf_text_config=SimpleNamespace(ple_layer_ids=[1]),
+            hf_text_config=SimpleNamespace(ple_layer_ids=[2], num_hidden_layers=2),
         ),
         parallel_config=SimpleNamespace(pipeline_parallel_size=2),
     )
     with (
         patch.object(MambaHybridModelState, "__init__", init_base_state),
-        pytest.raises(RuntimeError, match="pipeline_parallel_size=1"),
+        pytest.raises(RuntimeError, match="first pipeline stage"),
     ):
         Qwen4ExpModelState(
             vllm_config,
@@ -505,3 +507,67 @@ def test_text_config_normalizes_transformers_sparse_attention_spelling():
     )
 
     assert config.layer_types == ["linear_attention", "full_attention"]
+
+
+@pytest.mark.parametrize("wrapped_config", [False, True])
+def test_qwen4_exp_mtp_override_sets_draft_config(
+    wrapped_config: bool,
+) -> None:
+    text_config = _text_config(
+        architectures=["Qwen4ExpForCausalLM"],
+        index_share_for_mtp_iteration=True,
+    )
+    config = (
+        Qwen4ExpConfig(
+            architectures=["Qwen4ExpForConditionalGeneration"],
+            text_config=text_config,
+        )
+        if wrapped_config
+        else text_config
+    )
+
+    draft_config = SpeculativeConfig.hf_config_override(config)
+
+    assert draft_config.index_share_for_mtp_iteration is True
+    assert draft_config.model_type == "qwen4_exp_mtp"
+    assert draft_config.architectures == ["Qwen4ExpMTP"]
+    assert draft_config.hc_mult == 2
+    assert draft_config.n_predict == 1
+
+
+@pytest.mark.parametrize(
+    ("ple_layer_ids", "rejected"),
+    [
+        # Decoder layer 0, inside the first stage's [0, 1) range: supported.
+        ([1], False),
+        # Decoder layer 1, on the second stage: it would never see input_ids.
+        ([2], True),
+        ([], False),
+    ],
+)
+def test_qwen4_exp_rejects_pipeline_parallel_only_for_offstage_ple(
+    ple_layer_ids, rejected
+) -> None:
+    """PLE needs raw input_ids, which non-first pipeline ranks never see. Only
+    a PLE layer outside the first stage is refused, and the refusal must land
+    before the engine spends time loading weights."""
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_text_config=_text_config(ple_layer_ids=ple_layer_ids),
+            multimodal_config=None,
+        ),
+        parallel_config=SimpleNamespace(
+            pipeline_parallel_size=2, enable_dbo=False, ubatch_size=1
+        ),
+        speculative_config=None,
+    )
+    with patch.object(
+        Qwen3_5ForConditionalGenerationConfig, "verify_and_update_config"
+    ):
+        if rejected:
+            with pytest.raises(NotImplementedError, match="first pipeline stage"):
+                Qwen4ExpForConditionalGenerationConfig.verify_and_update_config(
+                    vllm_config
+                )
+        else:
+            Qwen4ExpForConditionalGenerationConfig.verify_and_update_config(vllm_config)

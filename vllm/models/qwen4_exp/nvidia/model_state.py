@@ -9,6 +9,10 @@ import torch.nn as nn
 
 from vllm.config import VllmConfig
 from vllm.distributed.utils import get_pp_indices
+from vllm.models.qwen4_exp.common.ple import (
+    ple_layers_off_first_pipeline_stage,
+    ple_pipeline_stage_error,
+)
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
@@ -34,29 +38,14 @@ class Qwen4ExpModelState(MambaHybridModelState):
             return
 
         pp_size = vllm_config.parallel_config.pipeline_parallel_size
-        if pp_size > 1:
-            # Non-first pipeline ranks never receive the raw input_ids that PLE
-            # needs, so the n-gram context is only correct on the first stage.
-            # That is enough as long as every PLE layer lives there: decoder
-            # layer `i` owns the PLE block for `ple_layer_ids` entry `i + 1`.
+        offstage = ple_layers_off_first_pipeline_stage(
+            config.ple_layer_ids, config.num_hidden_layers, pp_size
+        )
+        if offstage:
             _, first_stage_end = get_pp_indices(
                 int(config.num_hidden_layers), 0, pp_size
             )
-            offstage = [
-                int(i) - 1
-                for i in config.ple_layer_ids
-                if not 0 <= int(i) - 1 < first_stage_end
-            ]
-            if offstage:
-                raise RuntimeError(
-                    "N-gram PLE embedding requires every PLE layer to sit on "
-                    "the first pipeline stage, because only that stage receives "
-                    "the raw input_ids PLE needs. Decoder layer(s) "
-                    f"{sorted(offstage)} hold PLE blocks but fall outside the "
-                    f"first stage's range [0, {first_stage_end}). Move the "
-                    "pipeline split later (VLLM_PP_LAYER_PARTITION) or run with "
-                    "pipeline_parallel_size=1."
-                )
+            raise RuntimeError(ple_pipeline_stage_error(offstage, first_stage_end))
 
         self.ngram_context_len = int(config.ngram_size) - 1
         if self.ngram_context_len <= 0:
