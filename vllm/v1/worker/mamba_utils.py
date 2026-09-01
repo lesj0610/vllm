@@ -713,9 +713,10 @@ def validate_mamba_state_copy_funcs(
             f"missing state copy funcs for {mamba_spec.mamba_type}"
         )
         state_copy_funcs = copy_funcs[mamba_spec.mamba_type]
-        assert len(state_copy_funcs) == len(mamba_spec.shapes), (
+        assert 0 < len(state_copy_funcs) <= len(mamba_spec.shapes), (
             f"{mamba_spec.mamba_type} declares {len(mamba_spec.shapes)} states, "
-            f"but provides {len(state_copy_funcs)} state copy funcs"
+            f"but provides {len(state_copy_funcs)} state copy funcs; expected "
+            "a non-empty copyable prefix"
         )
 
 
@@ -988,12 +989,10 @@ class MambaSpecDecodeGPUContext:
                 state_copy_funcs = mamba_state_copy_funcs[mamba_spec.mamba_type]
                 attention = forward_context[layer_name]
                 kv_caches: list[torch.Tensor] = attention.kv_cache
-                # Layers may expose auxiliary cache tensors (e.g. prefill
-                # checkpoints) beyond the copyable state types; ignore them.
                 if len(kv_caches) < len(state_copy_funcs):
                     raise ValueError(
-                        f"layer {layer_name} exposes {len(kv_caches)} Mamba "
-                        f"states, but {len(state_copy_funcs)} are required"
+                        f"Expected at least {len(state_copy_funcs)} Mamba state "
+                        f"tensors, got {len(kv_caches)}"
                     )
                 for state_type_idx, copy_func in enumerate(state_copy_funcs):
                     state = kv_caches[state_type_idx]
@@ -1360,10 +1359,6 @@ def collect_mamba_copy_meta(
             state_copy_funcs = mamba_state_copy_funcs[mamba_spec.mamba_type]
             attention = forward_context[layer_name]
             kv_caches: list[torch.Tensor] = attention.kv_cache
-            assert len(kv_caches) == len(mamba_spec.shapes), (
-                f"layer {layer_name} exposes {len(kv_caches)} Mamba states, "
-                f"but its cache spec declares {len(mamba_spec.shapes)}"
-            )
             for state, state_copy_func in zip(kv_caches, state_copy_funcs):
                 copy_spec = state_copy_func(
                     state, block_ids, src_block_idx, accept_token_bias + 1

@@ -9,7 +9,7 @@ from collections.abc import Callable
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from datetime import timedelta
 from types import NoneType
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 import regex as re
@@ -45,6 +45,8 @@ from vllm.distributed.parallel_state import (
     checkpoint_restore_distributed_state,
     get_pp_group,
     get_tp_group,
+    resume_device_comms,
+    suspend_device_comms,
 )
 from vllm.distributed.weight_transfer import (
     WeightTransferEngine,
@@ -66,7 +68,12 @@ from vllm.tracing import instrument
 from vllm.utils.gc_utils import freeze_gc_heap, maybe_attach_gc_debug_callback
 from vllm.utils.gpu_sync_debug import enable_gpu_sync_check, with_gpu_sync_check
 from vllm.utils.mem_constants import GiB_bytes
-from vllm.utils.mem_utils import MemorySnapshot, format_gib, memory_profiling
+from vllm.utils.mem_utils import (
+    MemoryProfilingResult,
+    MemorySnapshot,
+    format_gib,
+    memory_profiling,
+)
 from vllm.utils.torch_utils import set_random_seed, set_torch_threads_for_runtime
 from vllm.v1.attention.backends.utils import record_kv_cache_layout
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
@@ -100,6 +107,33 @@ def _num_workspace_lanes(vllm_config: VllmConfig, use_v2_model_runner: bool) -> 
         if use_v2_model_runner and spec_config is not None and spec_config.use_dspark()
         else 1
     )
+
+
+def maybe_rocm_profiling_fallback(profile_result: MemoryProfilingResult) -> int | None:
+    """Memory in bytes to size the KV cache from when profiling measured a
+    release on ROCm, or None to keep what profiling measured.
+
+    The measurement is the drop in free device memory across startup, so it comes
+    out negative when anything else on the device released memory meanwhile. Torch
+    reserved is process local, so it stands in as a lower bound instead of refusing
+    to start. Kept to ROCm, where the AMD CI groups hit this, following #45490.
+    """
+    if profile_result.total_consumed >= 0 or not current_platform.is_rocm():
+        return None
+
+    baseline = profile_result.before_create
+    after_profile = profile_result.after_profile
+    torch_reserved = max(after_profile.torch_memory - baseline.torch_memory, 0)
+    logger.warning(
+        "Free memory grew by %s GiB during profiling (initial %s GiB, current "
+        "%s GiB). Sizing the KV cache from the %s GiB torch reserved instead of "
+        "the profiling difference.",
+        format_gib(-profile_result.total_consumed),
+        format_gib(baseline.free_memory),
+        format_gib(after_profile.free_memory),
+        format_gib(torch_reserved),
+    )
+    return torch_reserved
 
 
 if TYPE_CHECKING:
@@ -184,6 +218,10 @@ class Worker(WorkerBase):
         self.profiler_config = vllm_config.profiler_config
 
         self.use_v2_model_runner = vllm_config.use_v2_model_runner
+
+        # Resolved lazily on first sleep/wake; persists worker-process state.
+        self._sleep_mode_backend: SleepModeBackend | None = None
+
         self._ple_offload_worker_handle: Any | None = None
         self._ple_offload_enabled = self._has_ple_layers()
         if envs.VLLM_PLE_CPU_OFFLOAD:
@@ -197,11 +235,6 @@ class Worker(WorkerBase):
                     "process creation.",
                     getattr(text_config, "ple_layer_ids", None),
                 )
-        # pending non-blocking PP send work from the previous iteration
-        self._pp_send_work: list[Handle] = []
-
-        # Resolved lazily on first sleep/wake; persists worker-process state.
-        self._sleep_mode_backend: SleepModeBackend | None = None
 
     def _has_ple_layers(self) -> bool:
         """Return whether this model configuration constructs PLE layers."""
@@ -244,6 +277,10 @@ class Worker(WorkerBase):
             unsupported.append("architecture")
         if self.vllm_config.weight_transfer_config is not None:
             unsupported.append("weight transfer")
+        if not self.vllm_config.use_v2_model_runner:
+            # Qwen4Exp's QSA state caches only have a model runner V2 path, so
+            # the offload client is only wired into that runner.
+            unsupported.append("model runner V1")
 
         if unsupported:
             raise ValueError(
@@ -295,7 +332,8 @@ class Worker(WorkerBase):
 
         PleOffloadWorker.wait_for_ready(self._ple_offload_worker_handle)
 
-    def _get_sleep_mode_backend(self) -> "SleepModeBackend":
+    @property
+    def sleep_mode_backend(self) -> "SleepModeBackend":
         if self._sleep_mode_backend is None:
             from vllm.device_allocator.sleep_mode_backend import (
                 SleepModeBackendFactory,
@@ -322,7 +360,9 @@ class Worker(WorkerBase):
                     name: buffer.cpu().clone() for name, buffer in draft.named_buffers()
                 }
 
-        self._get_sleep_mode_backend().suspend(level)
+        self.sleep_mode_backend.suspend(level)
+        if self.vllm_config.model_config.enable_nccl_comm_suspend:
+            suspend_device_comms()
 
         torch.accelerator.synchronize()
         deadline = time.monotonic() + (5.0 if current_platform.is_rocm() else 0)
@@ -342,7 +382,9 @@ class Worker(WorkerBase):
         )
 
     def wake_up(self, tags: list[str] | None = None) -> None:
-        self._get_sleep_mode_backend().resume(tags)
+        self.sleep_mode_backend.resume(tags)
+        if self.vllm_config.model_config.enable_nccl_comm_suspend:
+            resume_device_comms()
 
         # Restore the buffers after level 2 sleep
         wake_weights = tags is None or "weights" in tags
@@ -566,10 +608,11 @@ class Worker(WorkerBase):
         ):
             self.model_runner.load_model(load_dummy_weights=load_dummy_weights)
 
-        # Model loading constructs the PLE placeholders whose CUDA buffers are
-        # registered by the shared MRV1/MRV2 offload client.
+        # Model loading constructs the PLE placeholders whose CUDA buffers the
+        # offload client registers. Only the V2 runner reaches here: model
+        # runner V1 is rejected in _validate_ple_offload_config.
         if self._ple_offload_enabled:
-            self.model_runner._setup_ple_offload(
+            cast(Any, self.model_runner)._setup_ple_offload(
                 self.parallel_config._ple_offload_ipc_path
             )
 
@@ -659,24 +702,33 @@ class Worker(WorkerBase):
             else 0
         )
 
+        init_free_memory = self.init_snapshot.free_memory
+        free_gpu_memory = profile_result.after_profile.free_memory
+        rocm_fallback = maybe_rocm_profiling_fallback(profile_result)
+        if rocm_fallback is None:
+            # NOTE(woosuk): Here we assume that the other processes using the same
+            # GPU did not change their memory usage during the profiling.
+            assert init_free_memory >= free_gpu_memory, (
+                "Error in memory profiling. "
+                f"Initial free memory {format_gib(init_free_memory)} GiB, "
+                f"current free memory {format_gib(free_gpu_memory)} GiB. "
+                "This happens when other processes sharing the same container "
+                "release GPU memory while vLLM is profiling during initialization. "
+                "To fix this, ensure consistent GPU memory allocation or "
+                "isolate vLLM in its own container."
+            )
+        else:
+            profile_result.total_consumed = rocm_fallback
+            profile_result.non_kv_cache_memory = (
+                profile_result.total_consumed + profile_result.transient_peak_headroom
+            )
+
         self.total_consumed = profile_result.total_consumed
         self.peak_activation_memory = (
             profile_result.transient_peak_headroom + cudagraph_memory_estimate_applied
         )
         self.cudagraph_memory_estimate = cudagraph_memory_estimate
 
-        free_gpu_memory = profile_result.after_profile.free_memory
-        # NOTE(woosuk): Here we assume that the other processes using the same
-        # GPU did not change their memory usage during the profiling.
-        assert self.init_snapshot.free_memory >= free_gpu_memory, (
-            "Error in memory profiling. "
-            f"Initial free memory {format_gib(self.init_snapshot.free_memory)} GiB, "
-            f"current free memory {format_gib(free_gpu_memory)} GiB. "
-            "This happens when other processes sharing the same container "
-            "release GPU memory while vLLM is profiling during initialization. "
-            "To fix this, ensure consistent GPU memory allocation or "
-            "isolate vLLM in its own container."
-        )
         self.available_kv_cache_memory_bytes = (
             self.requested_memory
             - profile_result.non_kv_cache_memory
@@ -1183,12 +1235,6 @@ class Worker(WorkerBase):
     def execute_model(
         self, scheduler_output: "SchedulerOutput"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
-        # ensure any previous non-blocking PP sends are complete
-        if self._pp_send_work:
-            for handle in self._pp_send_work:
-                handle.wait()
-            self._pp_send_work = []
-
         intermediate_tensors = None
         forward_pass = scheduler_output.total_num_scheduled_tokens > 0
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
@@ -1261,8 +1307,12 @@ class Worker(WorkerBase):
             and not get_pp_group().is_last_rank
         )
 
-        # launch non-blocking send of intermediate tensors
-        self._pp_send_work = get_pp_group().isend_tensor_dict(
+        # launch non-blocking send of intermediate tensors; the
+        # GroupCoordinator self-retains the source tensors and the
+        # metadata handle in ``_pending_isends`` and reaps them lazily on
+        # the next ``isend_tensor_dict(is_async=True)`` call, so this
+        # step returns without waiting for the receiver to drain.
+        get_pp_group().isend_tensor_dict(
             output.tensors,
             all_gather_group=get_tp_group(),
             all_gather_tensors=all_gather_tensors,

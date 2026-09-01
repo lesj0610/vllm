@@ -336,8 +336,6 @@ def _compute_slot_mappings_kernel(
             local_offsets = rounds * CP_INTERLEAVE + remainder
             local_positions = virtual_block_indices * kv_block_size + local_offsets
 
-        # Disabled groups (custom slot mapping, e.g. QSA circular buffers)
-        # must not index past their narrow block table.
         block_indices = tl.where(
             mapping_enabled, local_positions // kernel_block_size, 0
         )

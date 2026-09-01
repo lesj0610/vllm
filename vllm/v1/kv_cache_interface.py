@@ -54,6 +54,7 @@ class KVQuantMode(IntEnum):
     TURBOQUANT_4BIT_NC = 7
     TURBOQUANT_K3V4_NC = 8
     TURBOQUANT_3BIT_NC = 9
+    NVFP4_DS_MLA = 10  # opaque-bytes NVFP4 DS-MLA layouts (FlashMLA sparse)
 
     @property
     def is_per_token_head(self) -> bool:
@@ -88,6 +89,11 @@ def get_kv_quant_mode(kv_cache_dtype: str) -> KVQuantMode:
         return KVQuantMode.INT8_PER_TOKEN_HEAD
     if kv_cache_dtype == "fp8_per_token_head":
         return KVQuantMode.FP8_PER_TOKEN_HEAD
+    # Must precede the ``nvfp4`` prefix test below, which would otherwise match.
+    if kv_cache_dtype == "nvfp4_ds_mla":
+        # Page size is keyed on cache_dtype_str in the MLA specs, not
+        # nvfp4_kv_cache_full_dim.
+        return KVQuantMode.NVFP4_DS_MLA
     if kv_cache_dtype.startswith("nvfp4"):
         return KVQuantMode.NVFP4
     if isinstance(kv_cache_dtype, str) and kv_cache_dtype.startswith("turboquant_"):
@@ -151,6 +157,10 @@ class KVCacheSpec:
     block_size: int
 
     @property
+    def prefix_cacheable(self) -> bool:
+        return True
+
+    @property
     def num_heads(self) -> int:
         raise NotImplementedError
 
@@ -161,10 +171,6 @@ class KVCacheSpec:
     @property
     def state_content_size_bytes(self) -> int:
         raise NotImplementedError
-
-    @property
-    def prefix_cacheable(self) -> bool:
-        return True
 
     @property
     def page_size_bytes(self) -> int:
@@ -574,6 +580,11 @@ class MLAAttentionSpec(FullAttentionSpec):
             "All attention layers in the same KV cache group must use the same "
             "quantization method, tokens per state, and model version."
         )
+        non_causal_mtd_set = {spec.non_causal_multi_token_decode for spec in specs}
+        assert len(non_causal_mtd_set) == 1, (
+            "All attention layers in the same KV cache group must agree on "
+            "non_causal_multi_token_decode."
+        )
         merged_spec = cls(
             block_size=specs[0].block_size,
             num_kv_heads=specs[0].num_kv_heads,
@@ -586,9 +597,7 @@ class MLAAttentionSpec(FullAttentionSpec):
             cache_dtype_str=cache_dtype_str_set.pop(),
             tokens_per_state=tokens_per_state_set.pop(),
             model_version=model_version_set.pop(),
-            non_causal_multi_token_decode=any(
-                spec.non_causal_multi_token_decode for spec in specs
-            ),
+            non_causal_multi_token_decode=non_causal_mtd_set.pop(),
         )
         for spec in specs:
             for f in fields(AttentionSpec):
@@ -909,6 +918,8 @@ class MambaSpec(KVCacheSpec):
             isinstance(spec, MambaSpec)
             and spec.num_speculative_blocks == self.num_speculative_blocks
             and spec.num_prefill_checkpoint_blocks == self.num_prefill_checkpoint_blocks
+            and spec.page_size_bytes == self.page_size_bytes
+            and spec.tp_replicated == self.tp_replicated
             for spec in kv_cache_specs.values()
         )
 
@@ -1060,12 +1071,10 @@ class UniformTypeKVCacheSpecs(KVCacheSpec):
         else:
             return None
 
-    # NOTE: below util functions are only used by DeepseekV4 for now.
     # Helpers for cache formats composed of repeated physical layer tuples.
-    def get_page_sizes(self) -> list[int]:
-        return list(set(spec.page_size_bytes for spec in self.kv_cache_specs.values()))
-
-    def get_num_layer_tuples(self) -> int:
+    def get_max_layers_per_page_size(self) -> int:
+        """Max number of layers sharing a page size. For a balanced bucket
+        this equals the number of repetitions of the layer pattern."""
         return Counter(
             spec.page_size_bytes for spec in self.kv_cache_specs.values()
         ).most_common(1)[0][1]
@@ -1261,13 +1270,11 @@ class KVCacheConfig:
 
     @property
     def has_mamba_layers(self) -> bool:
-        for group in self.kv_cache_groups:
-            group_spec = group.kv_cache_spec
-            if isinstance(group_spec, UniformTypeKVCacheSpecs):
-                group_spec = group_spec.first_spec
-            if isinstance(group_spec, MambaSpec):
-                return True
-        return False
+        return any(
+            isinstance(spec, MambaSpec)
+            for group in self.kv_cache_groups
+            for spec in iter_layer_specs(group.kv_cache_spec)
+        )
 
     @property
     def has_mixed_precision_kv_cache(self) -> bool:

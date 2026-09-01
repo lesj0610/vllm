@@ -11,6 +11,7 @@ from vllm.config.compilation import CompilationConfig
 from vllm.config.speculative import SpeculativeConfig
 from vllm.model_executor.models.config import (
     MODELS_CONFIG_MAP,
+    Qwen3_5ForConditionalGenerationConfig,
     Qwen4ExpForCausalLMConfig,
     Qwen4ExpForConditionalGenerationConfig,
     Qwen4ExpMTPConfig,
@@ -505,3 +506,56 @@ def test_text_config_normalizes_transformers_sparse_attention_spelling():
     )
 
     assert config.layer_types == ["linear_attention", "full_attention"]
+
+
+@pytest.mark.parametrize("wrapped_config", [False, True])
+def test_qwen4_exp_mtp_override_sets_draft_config(
+    wrapped_config: bool,
+) -> None:
+    text_config = _text_config(
+        architectures=["Qwen4ExpForCausalLM"],
+        index_share_for_mtp_iteration=True,
+    )
+    config = (
+        Qwen4ExpConfig(
+            architectures=["Qwen4ExpForConditionalGeneration"],
+            text_config=text_config,
+        )
+        if wrapped_config
+        else text_config
+    )
+
+    draft_config = SpeculativeConfig.hf_config_override(config)
+
+    assert draft_config.index_share_for_mtp_iteration is True
+    assert draft_config.model_type == "qwen4_exp_mtp"
+    assert draft_config.architectures == ["Qwen4ExpMTP"]
+    assert draft_config.hc_mult == 2
+    assert draft_config.n_predict == 1
+
+
+@pytest.mark.parametrize("ple_layer_ids", [[1], []])
+def test_qwen4_exp_rejects_pipeline_parallel_only_with_ple(ple_layer_ids) -> None:
+    """PLE needs raw input_ids, which non-first pipeline ranks never see. The
+    rest of the architecture is PP-capable, so the refusal must be conditional
+    -- and must land before the engine spends time loading weights."""
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_text_config=_text_config(ple_layer_ids=ple_layer_ids),
+            multimodal_config=None,
+        ),
+        parallel_config=SimpleNamespace(
+            pipeline_parallel_size=2, enable_dbo=False, ubatch_size=1
+        ),
+        speculative_config=None,
+    )
+    with patch.object(
+        Qwen3_5ForConditionalGenerationConfig, "verify_and_update_config"
+    ):
+        if ple_layer_ids:
+            with pytest.raises(NotImplementedError, match="pipeline_parallel_size=1"):
+                Qwen4ExpForConditionalGenerationConfig.verify_and_update_config(
+                    vllm_config
+                )
+        else:
+            Qwen4ExpForConditionalGenerationConfig.verify_and_update_config(vllm_config)
