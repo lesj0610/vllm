@@ -2,9 +2,60 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Fused QSA pre-indexer kernel for Qwen4Exp."""
 
+import functools
+
 import torch
+from torch.utils.weak import WeakTensorKeyDictionary
 
 from vllm.triton_utils import tl, triton
+
+
+@functools.cache
+def _has_cuda_pre_indexer() -> bool:
+    """Whether FlashInfer carries the pre-indexer this path would otherwise run.
+
+    It builds the rows FlashInfer's own scorer reads, so the two live together
+    there rather than one of them here.
+    """
+    try:
+        import flashinfer
+
+        return hasattr(flashinfer, "qsa_pre_indexer")
+    except Exception:
+        return False
+
+
+# Keyed on the tensor itself, not on where it happens to sit: an address is
+# only unique while the tensor holding it is alive, and a cache that does not
+# keep it alive can be handed a recycled one and answer with the wrong table.
+# The weak key also lets the entry go when the model does.
+_PAIRED_COS_SIN = WeakTensorKeyDictionary()
+
+
+def _paired_cos_sin(cos_sin_cache: torch.Tensor) -> torch.Tensor:
+    """The rotary table with each pair's cosine and sine side by side.
+
+    A row of the shared table is every cosine then every sine, so reading one
+    pair is two loads a half-row apart. The pre-indexer reads a pair per lane on
+    its dependency chain -- position, then factors -- so it gets a permuted copy
+    instead. The table is a model constant; this builds it once.
+    """
+    paired = _PAIRED_COS_SIN.get(cos_sin_cache)
+    if paired is None:
+        if torch.cuda.is_current_stream_capturing():
+            # Anything allocated under capture belongs to the graph's own pool,
+            # and reading it outside a replay reads whatever the pool holds by
+            # then. A table built here would be cached and then handed to eager
+            # calls, so this is raised rather than left to come out as wrong
+            # rotary factors. The profile run builds it before capture starts.
+            raise RuntimeError(
+                "the pair-major rotary table is being built during graph "
+                "capture; it has to exist before the graph is captured"
+            )
+        cos, sin = cos_sin_cache.chunk(2, dim=-1)
+        paired = torch.stack((cos, sin), dim=-1).reshape_as(cos_sin_cache).contiguous()
+        _PAIRED_COS_SIN[cos_sin_cache] = paired
+    return paired
 
 
 @triton.jit
@@ -450,6 +501,34 @@ def qsa_pre_indexer(
         pos_stride_axis, pos_stride_token = 0, positions.stride(0)
     section = mrope_section if mrope_section is not None else (0, 0, 0)
     assert len(section) == 3
+
+    if _has_cuda_pre_indexer() and head_dim in (128, 256) and q.is_cuda:
+        import flashinfer
+
+        flashinfer.qsa_pre_indexer(
+            q,
+            k,
+            positions,
+            _paired_cos_sin(cos_sin_cache),
+            q_norm_weight,
+            k_norm_weight,
+            eps,
+            q_out,
+            state_cache,
+            state_slots,
+            state_block_table,
+            query_start_loc,
+            logical_positions,
+            compressed_cache,
+            compressed_slots,
+            k_work_metadata,
+            compress_ratio,
+            mrope_h=section[1],
+            mrope_w=section[2],
+            is_k_mrope=is_k_mrope,
+            cache_has_rope_pos=cache_has_rope_pos,
+        )
+        return
 
     if num_tokens <= 4096:
         TILE_T_Q, TILE_H_Q = 2, 2
