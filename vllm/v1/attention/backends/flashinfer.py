@@ -2999,6 +2999,17 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     prefill_start : num_reqs + 1
                 ]
                 assert paged_kv_indptr_prefill_cpu.shape[0] == num_prefills + 1
+                # plan() copies these to the GPU with non_blocking=True;
+                # stage them in pinned memory so the copies stay async
+                # (the reused buffers themselves are intentionally not pinned).
+                if PIN_MEMORY:
+                    qo_indptr_prefill_cpu = qo_indptr_prefill_cpu.pin_memory()
+                    paged_kv_indptr_prefill_cpu = (
+                        paged_kv_indptr_prefill_cpu.pin_memory()
+                    )
+                    paged_kv_last_page_len_prefill_cpu = (
+                        paged_kv_last_page_len_prefill_cpu.pin_memory()
+                    )
                 if self.use_dcp:
                     assert isinstance(prefill_wrapper, BatchDCPPrefillWrapper)
                     prefill_wrapper.plan(
@@ -3184,6 +3195,12 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 )
                 indptr_cpu = self.paged_kv_indptr.cpu[: num_input_tokens + 1]
                 last_page_len_cpu = self.paged_kv_last_page_len.cpu[:num_input_tokens]
+                # The sizing probe and plan() both copy these to the GPU with
+                # non_blocking=True; stage them in pinned memory so the copies stay
+                # async (the reused buffers themselves are intentionally not pinned).
+                if PIN_MEMORY:
+                    indptr_cpu = indptr_cpu.pin_memory()
+                    last_page_len_cpu = last_page_len_cpu.pin_memory()
                 self._ensure_flashinfer_wrapper_workspace(
                     decode_wrapper,
                     self._get_decode_workspace_size(
@@ -3198,6 +3215,9 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 # Use the persistent buffer with padding length,
                 # instead of the same address but chunked version
                 # in atten_metadata when using cudagraph.
+                # Native FlashInfer wrappers (fa2/fa3) reject FP8 output; only the
+                # trtllm-gen kernels require it, and those bypass wrapper planning.
+                o_dtype = self.model_config.dtype
                 fast_plan_decode(
                     decode_wrapper,
                     indptr_cpu=indptr_cpu,
@@ -3214,7 +3234,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     logits_soft_cap=self.logits_soft_cap,
                     q_data_type=self.q_data_type_decode,
                     kv_data_type=self.kv_cache_dtype,
-                    o_data_type=self.model_config.dtype,
+                    o_data_type=o_dtype,
                     fixed_split_size=self.decode_fixed_split_size,
                     disable_split_kv=self.disable_split_kv,
                 )
