@@ -295,3 +295,69 @@ def test_qsa_fused_pre_indexer_matches_unfused(
     torch.testing.assert_close(
         fused_compressed, unfused_compressed, rtol=RTOL, atol=ATOL
     )
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda(), reason="the rotary table cache is a CUDA path"
+)
+def test_paired_cos_sin_is_not_keyed_on_an_address() -> None:
+    """A freed table's address can come back under a different one."""
+    import gc
+
+    from vllm.models.qwen4_exp.nvidia.ops.qsa_pre_indexer import (
+        _PAIRED_COS_SIN,
+        _paired_cos_sin,
+    )
+
+    first = torch.arange(2 * 128, dtype=torch.bfloat16, device="cuda").reshape(2, 128)
+    paired_first = _paired_cos_sin(first)
+    assert _paired_cos_sin(first) is paired_first, "the same table is built once"
+
+    held = paired_first.clone()
+    del first, paired_first
+    gc.collect()
+    # Other tables built by other tests are alive and stay cached, so what is
+    # counted here is this one's entry rather than the whole cache.
+    baseline = len(_PAIRED_COS_SIN)
+
+    # Whatever lands here next is a different table, and must not be answered
+    # with the one built for whatever was here before.
+    second = torch.arange(2 * 128, dtype=torch.bfloat16, device="cuda").reshape(2, 128)
+    second += 1
+    paired_second = _paired_cos_sin(second)
+    assert len(_PAIRED_COS_SIN) == baseline + 1
+    assert not torch.equal(paired_second, held)
+    cos, sin = second.chunk(2, dim=-1)
+    expected = torch.stack((cos, sin), dim=-1).reshape_as(second)
+    torch.testing.assert_close(paired_second, expected)
+    del second, paired_second
+    gc.collect()
+    assert len(_PAIRED_COS_SIN) == baseline, "the entry goes when the table does"
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda(), reason="the rotary table cache is a CUDA path"
+)
+def test_paired_cos_sin_refuses_to_build_under_capture() -> None:
+    """A table built under capture lives in the graph's pool, not the caller's."""
+    from vllm.models.qwen4_exp.nvidia.ops.qsa_pre_indexer import _paired_cos_sin
+
+    table = torch.arange(2 * 128, dtype=torch.bfloat16, device="cuda").reshape(2, 128)
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        torch.empty(1, device="cuda")
+    torch.cuda.current_stream().wait_stream(side)
+
+    graph = torch.cuda.CUDAGraph()
+    with (
+        pytest.raises(RuntimeError, match="before the graph is captured"),
+        torch.cuda.graph(graph),
+    ):
+        _paired_cos_sin(table)
+
+    # Built ahead of capture, the same table is served from the cache instead.
+    built = _paired_cos_sin(table)
+    graph2 = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph2):
+        assert _paired_cos_sin(table) is built
