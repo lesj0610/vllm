@@ -230,6 +230,7 @@ class QSAIndexer(nn.Module):
             return result
 
         from .ops.qsa import qsa_compress_groups_with_ratio, qsa_store_cache_rows
+        from .ops.qsa_flashinfer import select_and_expand, supports_qsa_selection
         from .ops.qsa_indexer import (
             expand_qsa_block_indices,
             qsa_select_paged_decode,
@@ -373,6 +374,25 @@ class QSAIndexer(nn.Module):
             dtype=torch.int32,
             device=q.device,
         )
+
+        # FlashInfer serves scoring and expansion as one pair, so the choice is
+        # made for the whole batch rather than per decode/prefill split. Its
+        # ops take (token_to_req, query_positions, sequence_lengths), which only
+        # this caller holds; ops/qsa_indexer.py stays upstream-identical.
+        if supports_qsa_selection(q.shape[2], q.shape[1]):
+            select_and_expand(
+                q,
+                compressed_key_cache,
+                compressed_metadata.block_table,
+                compressed_metadata.token_to_req,
+                compressed_metadata.logical_positions[:num_tokens],
+                compressed_metadata.seq_lens,
+                self.compress_ratio,
+                self.token_topk,
+                block_indices,
+                out,
+            )
+            return out
 
         # Decode requests occupy the leading rows and share one query length.
         if num_decode_tokens:
