@@ -262,8 +262,6 @@ class Worker(WorkerBase):
                 f"({parallel_config.data_parallel_size_local}/"
                 f"{parallel_config.data_parallel_size} local ranks)"
             )
-        if parallel_config.pipeline_parallel_size != 1:
-            unsupported.append(f"PP={parallel_config.pipeline_parallel_size}")
         if parallel_config.prefill_context_parallel_size != 1:
             unsupported.append(f"PCP={parallel_config.prefill_context_parallel_size}")
         if parallel_config.decode_context_parallel_size != 1:
@@ -305,15 +303,19 @@ class Worker(WorkerBase):
             raise RuntimeError("PLE offload IPC address was not initialized")
         dp_size = self.parallel_config.data_parallel_size
         tp_size = self.parallel_config.tensor_parallel_size
-        num_workers = dp_size * tp_size
+        pp_size = self.parallel_config.pipeline_parallel_size
+        # Every rank registers so the worker can account for the whole world,
+        # including the pipeline stages that hold no PLE layer.
+        num_workers = dp_size * tp_size * pp_size
         logger.info(
             "PleOffload: spawning worker "
-            "(rank=%d, local_rank=%d, dp_size=%d, tp_size=%d, "
+            "(rank=%d, local_rank=%d, dp_size=%d, tp_size=%d, pp_size=%d, "
             "num_workers=%d, ipc_addr=%s).",
             self.rank,
             self.local_rank,
             dp_size,
             tp_size,
+            pp_size,
             num_workers,
             ipc_addr,
         )

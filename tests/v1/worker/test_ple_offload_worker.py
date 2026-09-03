@@ -398,6 +398,7 @@ def test_only_dp0_tp0_spawns_shared_ple_offload_worker(
         data_parallel_rank=dp_rank,
         data_parallel_size=2,
         tensor_parallel_size=2,
+        pipeline_parallel_size=1,
         _ple_offload_ipc_path="ipc:///tmp/test-ple-offload",
     )
     handle = object()
@@ -515,6 +516,7 @@ def test_ple_offload_runner_groups_registrations_by_dp_rank(
         parallel_config=SimpleNamespace(
             data_parallel_size=2,
             tensor_parallel_size=2,
+            pipeline_parallel_size=1,
         ),
         scheduler_config=SimpleNamespace(max_num_batched_tokens=8),
         model_config=SimpleNamespace(

@@ -8,6 +8,11 @@ import torch
 import torch.nn as nn
 
 from vllm.config import VllmConfig
+from vllm.distributed.utils import get_pp_indices
+from vllm.models.qwen4_exp.common.ple import (
+    ple_layers_off_first_pipeline_stage,
+    ple_pipeline_stage_error,
+)
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
@@ -32,13 +37,15 @@ class Qwen4ExpModelState(MambaHybridModelState):
             self.ngram_eos_token_id = 0
             return
 
-        if vllm_config.parallel_config.pipeline_parallel_size > 1:
-            raise RuntimeError(
-                "N-gram PLE embedding currently requires "
-                "pipeline_parallel_size=1 because non-first pipeline ranks do "
-                "not receive the raw input_ids required by PLE. Please run "
-                "with PP=1."
+        pp_size = vllm_config.parallel_config.pipeline_parallel_size
+        offstage = ple_layers_off_first_pipeline_stage(
+            config.ple_layer_ids, config.num_hidden_layers, pp_size
+        )
+        if offstage:
+            _, first_stage_end = get_pp_indices(
+                int(config.num_hidden_layers), 0, pp_size
             )
+            raise RuntimeError(ple_pipeline_stage_error(offstage, first_stage_end))
 
         self.ngram_context_len = int(config.ngram_size) - 1
         if self.ngram_context_len <= 0:
