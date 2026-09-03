@@ -5,6 +5,7 @@ import pytest
 
 from vllm.model_executor.models.qwen3_vl import Qwen3_VisionTransformer
 from vllm.models.qwen4_exp.nvidia.model import (
+    Qwen4ExpForCausalLM,
     Qwen4ExpForConditionalGeneration,
     Qwen4ExpModel,
     _remap_qsa_cache_scale_name,
@@ -91,9 +92,9 @@ def test_text_checkpoint_mapper_preserves_qwen4_exp_specific_weights(
 
 def test_vl_checkpoint_mapper_composes_language_and_vision_paths() -> None:
     outer_mapper = Qwen4ExpForConditionalGeneration.hf_to_vllm_mapper
-    assert outer_mapper._map_name(
-        "model.language_model.layers.0.ple.key_proj.weight"
-    ) == ("language_model.model.layers.0.ple.key_proj.weight")
+    assert outer_mapper._map_name("model.language_model.layers.0.ple.norm.weight") == (
+        "language_model.model.layers.0.ple.norm.weight"
+    )
     assert outer_mapper._map_name("lm_head.weight") == ("language_model.lm_head.weight")
 
     visual_name = outer_mapper._map_name("model.visual.blocks.0.attn.q.weight")
@@ -191,3 +192,33 @@ def test_qwen4_exp_mtp_weight_name_mapping(
     model_name: str | None,
 ) -> None:
     assert _remap_mtp_weight_name(checkpoint_name) == model_name
+
+
+@pytest.mark.parametrize(
+    ("leaf", "shard_id"),
+    [("key_proj", 0), ("value_proj", 1)],
+)
+def test_ple_projections_load_into_the_merged_kv_proj(leaf: str, shard_id: int) -> None:
+    """The PLE layer exposes one merged ``kv_proj``, not two projections.
+
+    Dropping either half of this mapping leaves the checkpoint's ``key_proj`` /
+    ``value_proj`` tensors with no destination, so the guard has to look at the
+    stacked mapping rather than the plain rename.
+    """
+    assert Qwen4ExpModel.hf_to_vllm_mapper._map_name_with_shard(
+        f"layers.0.ple.{leaf}.weight"
+    ) == ("layers.0.ple.kv_proj.weight", shard_id)
+
+
+@pytest.mark.parametrize(
+    "packed_modules_mapping",
+    [
+        Qwen4ExpForConditionalGeneration.packed_modules_mapping,
+        Qwen4ExpForCausalLM.packed_modules_mapping,
+    ],
+)
+def test_ple_kv_proj_is_declared_packed(
+    packed_modules_mapping: dict[str, list[str]],
+) -> None:
+    """``kv_proj`` must be packed so the loader accepts two shard ids."""
+    assert packed_modules_mapping["kv_proj"] == ["key_proj", "value_proj"]
