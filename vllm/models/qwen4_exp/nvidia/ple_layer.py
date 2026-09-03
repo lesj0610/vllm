@@ -28,7 +28,10 @@ from vllm.model_executor.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from vllm.model_executor.layers.quantization.fp8 import Fp8Config
-from vllm.model_executor.layers.quantization.modelopt import ModelOptNvFp4Config
+from vllm.model_executor.layers.quantization.modelopt import (
+    ModelOptMixedPrecisionConfig,
+    ModelOptNvFp4Config,
+)
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     create_fp8_scale_parameter,
     create_fp8_weight_parameter,
@@ -331,6 +334,28 @@ def _get_ple_embedding_quant_method(
 ) -> QuantizeMethodBase | None:
     """Select a packed PLE embedding method for quantized checkpoint shards."""
 
+    if isinstance(quant_config, ModelOptMixedPrecisionConfig):
+        # A mixed-precision checkpoint names an algorithm per prefix, so the
+        # PLE embedding can be either format here. The NVFP4 branch below only
+        # matches ModelOptNvFp4Config, so it cannot recover this case: leaving
+        # it unhandled would drop the packed create/load/dequantize path and
+        # leave _offload_quant_method unset.
+        if not prefix.endswith(".ple_embedding.ngram_embedding"):
+            return None
+        algo = quant_config._resolve_quant_algo(prefix)
+        if algo is None:
+            return None
+        # Both "NVFP4" and "W4A16_NVFP4" name the packed format, matching how
+        # ModelOptNvFp4Config itself reads the algorithm string.
+        if "NVFP4" in algo:
+            logger.info_once("PLE embedding %s uses the runtime NVFP4 method", prefix)
+            return Qwen4ExpPLENVFp4EmbeddingMethod()
+        if algo == "FP8":
+            return Qwen4ExpPLEFp8EmbeddingMethod()
+        return None
+
+    # Kept nested rather than upstream's early return: the NVFP4 branch below
+    # is a second config type this selector has to reach.
     if isinstance(quant_config, Fp8Config):
         if not quant_config.is_checkpoint_fp8_serialized:
             return None
