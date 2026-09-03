@@ -444,6 +444,21 @@ void persistent_topk(const torch::stable::Tensor& logits,
                      torch::stable::Tensor& workspace, int64_t k,
                      int64_t max_seq_len);
 
+// Per-step metadata for the Qwen4Exp QSA side cache: which request each token
+// belongs to, where it sits in that request, how many compressed blocks it may
+// score, which side-cache slot it writes, and the pre-indexer's work list.
+void qsa_build_metadata(
+    const torch::stable::Tensor& query_start_loc,
+    const torch::stable::Tensor& seq_lens,
+    const torch::stable::Tensor& common_slot_mapping,
+    const torch::stable::Tensor& block_table,
+    torch::stable::Tensor& token_to_req,
+    torch::stable::Tensor& logical_positions,
+    torch::stable::Tensor& visible_blocks, torch::stable::Tensor& slot_mapping,
+    const std::optional<torch::stable::Tensor>& work_metadata,
+    int64_t storage_block_size, int64_t compress_ratio,
+    int64_t circular_buffer_size, int64_t num_mapped_tokens);
+
 #ifdef VLLM_ENABLE_COOPERATIVE_TOPK
 void cooperative_topk(const torch::stable::Tensor& logits,
                       const torch::stable::Tensor& lengths,
