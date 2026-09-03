@@ -444,6 +444,34 @@ void persistent_topk(const torch::stable::Tensor& logits,
                      torch::stable::Tensor& workspace, int64_t k,
                      int64_t max_seq_len);
 
+// The Qwen4Exp hyper-connection ops: a grouped RMSNorm over each residual
+// stream, the gated mix down to one, the injection back out to all, and the
+// combine fused with the norm that follows it.
+void qwen4_exp_grouped_gemma_rmsnorm(const torch::stable::Tensor& x,
+                                     const torch::stable::Tensor& weight,
+                                     double eps, int64_t num_groups,
+                                     torch::stable::Tensor& y);
+
+void qwen4_exp_hc_silu(const torch::stable::Tensor& x, int64_t hc_count,
+                       torch::stable::Tensor& y);
+
+void qwen4_exp_hc_gate_mix(const torch::stable::Tensor& x,
+                           const torch::stable::Tensor& gate, int64_t hc_count,
+                           torch::stable::Tensor& y);
+
+void qwen4_exp_hc_combine(const torch::stable::Tensor& residual,
+                          const torch::stable::Tensor& block_output,
+                          const torch::stable::Tensor& injection_logits,
+                          int64_t hc_count, torch::stable::Tensor& out);
+
+void qwen4_exp_hc_combine_norm(const torch::stable::Tensor& residual,
+                               const torch::stable::Tensor& block_output,
+                               const torch::stable::Tensor& injection_logits,
+                               const torch::stable::Tensor& norm_weight,
+                               double eps, int64_t hc_count,
+                               torch::stable::Tensor& out,
+                               torch::stable::Tensor& y);
+
 #ifdef VLLM_ENABLE_COOPERATIVE_TOPK
 void cooperative_topk(const torch::stable::Tensor& logits,
                       const torch::stable::Tensor& lengths,
