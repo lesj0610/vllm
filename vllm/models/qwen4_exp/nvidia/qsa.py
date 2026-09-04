@@ -31,6 +31,7 @@ from vllm.utils.torch_utils import (
     LayerNameType,
     _encode_layer_name,
     _resolve_layer_name,
+    canonicalize_singleton_dim_strides,
     direct_register_custom_op,
     kv_cache_dtype_str_to_dtype,
     nvfp4_kv_cache_full_dim,
