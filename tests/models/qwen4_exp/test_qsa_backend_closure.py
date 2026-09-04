@@ -247,3 +247,119 @@ def test_selection_routing_prefers_flashinfer(monkeypatch):
     # A shape the scorer has no instantiation for falls back instead.
     assert not qsa_flashinfer.supports_qsa_selection(96, 12)
     assert not qsa_flashinfer.supports_qsa_selection(128, 17)
+
+
+def _selection_call(*, block_indices_dtype=torch.int32, out_dtype=torch.int32):
+    """Arguments as the QSA indexer hands them down: int32 tables, int64
+    positions. common/qsa_cache.py builds the positions with ``.long()``."""
+    rows, heads, head_dim = 3, 2, 128
+    pages, page_size, requests = 4, 8, 2
+    compress_ratio, token_topk = 4, 8
+    return {
+        "q": torch.zeros(rows, heads, head_dim),
+        "k_cache": torch.zeros(pages, page_size, 1, head_dim),
+        "page_table": torch.zeros(requests, pages, dtype=torch.int32),
+        "token_to_req": torch.zeros(rows, dtype=torch.int32),
+        "query_positions": torch.arange(rows, dtype=torch.int64),
+        "sequence_lengths": torch.full((requests,), page_size, dtype=torch.int32),
+        "compress_ratio": compress_ratio,
+        "token_topk": token_topk,
+        "block_indices": torch.zeros(
+            rows, token_topk // compress_ratio, dtype=block_indices_dtype
+        ),
+        "out": torch.zeros(rows, token_topk, dtype=out_dtype),
+    }
+
+
+def _record_index_dtypes(monkeypatch) -> list[dict[str, torch.dtype]]:
+    """Capture the dtype of every index tensor each FlashInfer call receives."""
+    from vllm.models.qwen4_exp.nvidia.ops import qsa_flashinfer
+
+    seen: list[dict[str, torch.dtype]] = []
+
+    def fake_scores(
+        q,
+        k_cache,
+        page_table,
+        token_to_req,
+        query_positions,
+        sequence_lengths,
+        compress_ratio,
+        scale,
+        num_columns,
+    ):
+        seen.append(
+            {
+                "page_table": page_table.dtype,
+                "token_to_req": token_to_req.dtype,
+                "query_positions": query_positions.dtype,
+                "sequence_lengths": sequence_lengths.dtype,
+            }
+        )
+        return (
+            torch.zeros(q.shape[0], num_columns),
+            torch.zeros(q.shape[0], dtype=page_table.dtype),
+        )
+
+    def fake_expand(
+        block_indices,
+        query_positions,
+        sequence_lengths,
+        token_to_req,
+        compress_ratio,
+        out,
+    ):
+        seen.append(
+            {
+                "block_indices": block_indices.dtype,
+                "query_positions": query_positions.dtype,
+                "sequence_lengths": sequence_lengths.dtype,
+                "token_to_req": token_to_req.dtype,
+                "out": out.dtype,
+            }
+        )
+
+    monkeypatch.setattr(
+        flashinfer, "sparse_paged_scores", fake_scores, raising=False
+    )
+    monkeypatch.setattr(
+        flashinfer, "expand_block_route", fake_expand, raising=False
+    )
+    monkeypatch.setattr(qsa_flashinfer, "_topk", lambda *args, **kwargs: None)
+    return seen
+
+
+def test_selection_narrows_the_positions_to_the_block_table_dtype(monkeypatch):
+    """Each FlashInfer call reads its index tensors through one pointer type.
+
+    The scorer instantiates that type from ``page_table`` and the expansion
+    from ``block_indices``, so an int64 position tensor reaching either one
+    fails the kernel's own dtype check rather than being converted for us.
+    """
+    from vllm.models.qwen4_exp.nvidia.ops import qsa_flashinfer
+
+    seen = _record_index_dtypes(monkeypatch)
+
+    qsa_flashinfer.select_and_expand(**_selection_call())
+
+    assert len(seen) == 2, "the scorer and the expansion must both be reached"
+    for call in seen:
+        assert set(call.values()) == {torch.int32}, call
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"block_indices_dtype": torch.int64},
+        {"out_dtype": torch.int64},
+    ],
+)
+def test_selection_rejects_a_second_index_dtype(monkeypatch, overrides):
+    """One narrowing cannot reconcile two block-table dtypes, so say so here
+    instead of letting the kernel report it from inside a captured graph."""
+    from vllm.models.qwen4_exp.nvidia.ops import qsa_flashinfer
+
+    _record_index_dtypes(monkeypatch)
+
+    with pytest.raises(ValueError, match="one index dtype"):
+        qsa_flashinfer.select_and_expand(**_selection_call(**overrides))

@@ -375,6 +375,22 @@ def select_and_expand(
     assert block_indices.shape == (rows, token_topk // compress_ratio)
     columns = page_table.shape[1] * k_cache.shape[1]
 
+    # Each of these calls reads its index tensors through a single pointer type,
+    # instantiated from the block table it is given: page_table for the scorer,
+    # block_indices for the expansion. So every index tensor of a call has to
+    # carry that one dtype. QSA metadata builds its positions in int64
+    # (common/qsa_cache.py) while vLLM block tables are int32, so narrow the
+    # positions once here instead of letting the mismatch reach the kernel.
+    index_dtype = page_table.dtype
+    for name, tensor in (("block_indices", block_indices), ("out", out)):
+        if tensor.dtype != index_dtype:
+            raise ValueError(
+                "QSA FlashInfer selection needs one index dtype per batch, got "
+                f"page_table={index_dtype} and {name}={tensor.dtype}"
+            )
+    if query_positions.dtype != index_dtype:
+        query_positions = query_positions.to(index_dtype)
+
     # The scores are the one large temporary here: FP32 and as wide as the
     # block table. Chunk the rows against the same budget the Triton path uses,
     # or a long prefill allocates the whole batch at once and runs out.
