@@ -24,6 +24,18 @@ requires_qsa_kernels = pytest.mark.skipif(
 )
 
 
+def _packed_selection(width: int, num_rows: int, device: str = "cuda") -> torch.Tensor:
+    """Selection rows 0..width-1 in the packed layout the kernel reads.
+
+    The trailing column carries the row's valid-entry count, so a test that
+    hands the kernel a bare index range would lose its last column to it.
+    """
+    packed = torch.empty((num_rows, width + 1), device=device, dtype=torch.int32)
+    packed[:, :width] = torch.arange(width, device=device, dtype=torch.int32)
+    packed[:, width] = width
+    return packed
+
+
 def test_qsa_mtp_index_share_updates_cache_but_skips_selection(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -754,7 +766,10 @@ def test_qsa_block_expansion_correctness() -> None:
         sequence_lengths.index_select(0, token_to_req.long()) // 4,
     ).to(torch.int32)
 
-    actual = torch.empty((2, 11), device="cuda", dtype=torch.int32)
+    # Packed layout: one trailing column per row holds the valid-entry count
+    # (never a token index). Row 0: 1 visible block + 2 tail; row 1: 2 blocks
+    # + 3 tail.
+    actual = torch.empty((2, 12), device="cuda", dtype=torch.int32)
     qsa_indexer_ops.expand_qsa_block_indices(
         blocks,
         query_positions,
@@ -771,19 +786,35 @@ def test_qsa_block_expansion_correctness() -> None:
         token_topk=8,
     )
 
-    torch.testing.assert_close(actual, expected)
+    torch.testing.assert_close(actual[:, :11], expected)
+    assert actual[:, 11].tolist() == [6, 11]
 
 
 @requires_qsa_kernels
 @pytest.mark.parametrize(
-    ("num_rows", "num_query_heads", "num_kv_heads", "page_size"),
+    (
+        "num_rows",
+        "num_query_heads",
+        "num_kv_heads",
+        "page_size",
+        "use_prefill_config",
+        "num_requests",
+    ),
     [
-        # Kernel-visible pages with --block-size 256 and hybrid-cache alignment.
-        pytest.param(1, 24, 2, 1792, id="tp1_split64"),
-        pytest.param(16, 12, 1, 1792, id="tp2_split32"),
-        pytest.param(32, 6, 1, 1024, id="tp4_split8"),
-        pytest.param(257, 6, 1, 1024, id="tp4_split4"),
-        pytest.param(513, 6, 1, 1024, id="tp4_split1"),
+        # Production page sizes from hybrid-cache block alignment: 784/800
+        # at TP4 and 1568/1600 at TP1/TP2 (no-MTP / MTP num_spec=3). Head
+        # splits are per-rank TP1/TP2/TP4; the largest batch runs both
+        # use_prefill_config variants.
+        pytest.param(1, 24, 2, 1600, True, 2, id="tp1_r1"),
+        pytest.param(16, 12, 1, 1600, True, 3, id="tp2_r16"),
+        pytest.param(32, 6, 1, 800, True, 5, id="tp4_r32"),
+        pytest.param(128, 24, 2, 1568, True, 7, id="tp1_r128"),
+        pytest.param(257, 6, 1, 800, True, 13, id="tp4_r257"),
+        pytest.param(513, 6, 1, 784, True, 17, id="tp4_r513"),
+        pytest.param(700, 6, 1, 800, True, 23, id="tp4_r700"),
+        pytest.param(1024, 24, 2, 1600, True, 33, id="tp1_r1024"),
+        pytest.param(2048, 24, 2, 1600, True, 63, id="tp1_r2048_prefill"),
+        pytest.param(2048, 24, 2, 1600, False, 63, id="tp1_r2048_uniform"),
     ],
 )
 def test_qsa_sparse_paged_attention_correctness(
@@ -791,10 +822,11 @@ def test_qsa_sparse_paged_attention_correctness(
     num_query_heads: int,
     num_kv_heads: int,
     page_size: int,
+    use_prefill_config: bool,
+    num_requests: int,
 ) -> None:
     torch.manual_seed(2)
     head_dim = 256
-    num_requests = 2
     num_selected_pages = 64
     # Keep the newest page outside the synthetic top-k as causal headroom.
     num_pages_per_request = num_selected_pages + 1
@@ -822,13 +854,22 @@ def test_qsa_sparse_paged_attention_correctness(
     rows_per_request = math.ceil(num_rows / num_requests)
     row_indices = torch.arange(num_rows, device="cuda", dtype=torch.int32)
     token_to_req = row_indices // rows_per_request
-    request_row_counts = torch.tensor(
-        [rows_per_request, num_rows - rows_per_request],
+    # Uniform row split; the last request takes the remainder (possibly 0).
+    request_row_counts = torch.full(
+        (num_requests,), rows_per_request, device="cuda", dtype=torch.int32
+    )
+    request_row_counts[-1] = num_rows - rows_per_request * (num_requests - 1)
+
+    # Mix context lengths: every third request is short-context, attending
+    # to only its first few pages; the rest fill their cache.
+    context_lengths = torch.full(
+        (num_requests,),
+        num_pages_per_request * page_size - 1,
         device="cuda",
         dtype=torch.int32,
     )
-
-    context_length = num_pages_per_request * page_size - 1
+    short_requests = torch.arange(num_requests, device="cuda") % 3 == 1
+    context_lengths[short_requests] = request_row_counts[short_requests] + 8
     block_topk = indexer_budget // indexer_compress_ratio
     compressed_blocks_per_page = page_size // indexer_compress_ratio
     selection = torch.arange(block_topk, device="cuda")
@@ -842,17 +883,19 @@ def test_qsa_sparse_paged_attention_correctness(
     )
     rows_within_request = row_indices % rows_per_request
     query_positions = (
-        context_length - request_row_counts[token_to_req.long()] + rows_within_request
+        context_lengths[token_to_req.long()]
+        - request_row_counts[token_to_req.long()]
+        + rows_within_request
     ).to(torch.int64)
-    sequence_lengths = torch.full(
-        (num_requests,), context_length, device="cuda", dtype=torch.int32
-    )
+    sequence_lengths = context_lengths
     visible_blocks = torch.minimum(
         (query_positions + 1) // indexer_compress_ratio,
         sequence_lengths.index_select(0, token_to_req.long()) // indexer_compress_ratio,
     ).to(torch.int32)
+    # +1: the packed trailing column holds each row's valid-entry count
+    # (never a token index); the reference reads only the selection region.
     logical_indices = torch.empty(
-        (num_rows, selection_width), device="cuda", dtype=torch.int32
+        (num_rows, selection_width + 1), device="cuda", dtype=torch.int32
     )
     qsa_indexer_ops.expand_qsa_block_indices(
         block_indices,
@@ -862,7 +905,7 @@ def test_qsa_sparse_paged_attention_correctness(
         indexer_budget,
         logical_indices,
     )
-    assert logical_indices.shape == (num_rows, selection_width)
+    assert logical_indices.shape == (num_rows, selection_width + 1)
     scale = q.shape[-1] ** -0.5
 
     actual = qsa_ops.qsa_sparse_paged_attention(
@@ -872,12 +915,13 @@ def test_qsa_sparse_paged_attention_correctness(
         logical_indices,
         block_table,
         token_to_req,
+        use_prefill_config=use_prefill_config,
     )
     expected = _qsa_sparse_paged_attention_reference(
         q,
         k_cache,
         v_cache,
-        logical_indices,
+        logical_indices[:, :selection_width],
         block_table,
         token_to_req,
         scale,
@@ -948,8 +992,10 @@ def test_qsa_split_selection_correctness(workspace_init, decode_query_len: int) 
         block_indices[prefill_slice],
         max_seq_len=sequence_lengths.max().item(),
     )
+    # +1: the packed trailing count column (never a token index; excluded
+    # from the comparison).
     actual = torch.empty(
-        (rows, token_topk + compress_ratio - 1), device="cuda", dtype=torch.int32
+        (rows, token_topk + compress_ratio), device="cuda", dtype=torch.int32
     )
     qsa_indexer_ops.expand_qsa_block_indices(
         block_indices,
@@ -977,7 +1023,10 @@ def test_qsa_split_selection_correctness(workspace_init, decode_query_len: int) 
         token_topk,
     )
 
-    torch.testing.assert_close(actual.sort().values, expected.sort().values)
+    torch.testing.assert_close(
+        actual[:, : token_topk + compress_ratio - 1].sort().values,
+        expected.sort().values,
+    )
 
 
 @requires_qsa_kernels
@@ -1001,7 +1050,7 @@ def test_qsa_selection_handles_no_complete_compressed_blocks(workspace_init) -> 
         block_indices=block_indices,
         max_seq_len=64,  # clamps to the page-table capacity
     )
-    selected = torch.empty((2, 2051), device="cuda", dtype=torch.int32)
+    selected = torch.empty((2, 2052), device="cuda", dtype=torch.int32)
     qsa_indexer_ops.expand_qsa_block_indices(
         block_indices,
         query_positions,
@@ -1013,8 +1062,10 @@ def test_qsa_selection_handles_no_complete_compressed_blocks(workspace_init) -> 
 
     assert selected[0, :2].tolist() == [0, 1]
     assert selected[1, :3].tolist() == [0, 1, 2]
-    assert torch.all(selected[0, 2:] == -1)
-    assert torch.all(selected[1, 3:] == -1)
+    assert torch.all(selected[0, 2:2051] == -1)
+    assert torch.all(selected[1, 3:2051] == -1)
+    # The packed trailing column holds each row's valid-entry count.
+    assert selected[:, 2051].tolist() == [2, 3]
 
 
 @requires_qsa_kernels
@@ -1193,9 +1244,7 @@ def test_qsa_sparse_paged_attention_fp8_matches_dequantized_reference() -> None:
     )
     token_to_req = torch.zeros(num_rows, device="cuda", dtype=torch.int32)
     width = 8
-    logical_indices = torch.arange(width, device="cuda", dtype=torch.int32).repeat(
-        num_rows, 1
-    )
+    logical_indices = _packed_selection(width, num_rows)
 
     quantized = qsa_ops.qsa_sparse_paged_attention(
         q,
@@ -1204,6 +1253,7 @@ def test_qsa_sparse_paged_attention_fp8_matches_dequantized_reference() -> None:
         logical_indices,
         block_table,
         token_to_req,
+        use_prefill_config=False,
         k_scale=k_scale,
         v_scale=v_scale,
     )
@@ -1214,6 +1264,7 @@ def test_qsa_sparse_paged_attention_fp8_matches_dequantized_reference() -> None:
         logical_indices,
         block_table,
         token_to_req,
+        use_prefill_config=False,
     )
     torch.testing.assert_close(
         quantized.float(), reference.float(), rtol=2e-2, atol=2e-2
@@ -1268,9 +1319,7 @@ def test_qsa_sparse_paged_attention_nvfp4_matches_dequantized_reference() -> Non
         1, -1
     )
     token_to_req = torch.zeros(num_rows, device="cuda", dtype=torch.int32)
-    logical_indices = torch.arange(8, device="cuda", dtype=torch.int32).repeat(
-        num_rows, 1
-    )
+    logical_indices = _packed_selection(8, num_rows)
 
     packed = qsa_ops.qsa_sparse_paged_attention(
         q,
@@ -1279,6 +1328,7 @@ def test_qsa_sparse_paged_attention_nvfp4_matches_dequantized_reference() -> Non
         logical_indices,
         block_table,
         token_to_req,
+        use_prefill_config=False,
         k_scale=unit,
         v_scale=unit,
         nvfp4=True,
@@ -1311,6 +1361,7 @@ def test_qsa_sparse_paged_attention_nvfp4_matches_dequantized_reference() -> Non
         logical_indices,
         block_table,
         token_to_req,
+        use_prefill_config=False,
     )
     torch.testing.assert_close(packed.float(), reference.float(), rtol=2e-2, atol=2e-2)
 
@@ -1376,33 +1427,36 @@ def _stub_capability(monkeypatch, supported: bool) -> None:
 
 
 @pytest.mark.parametrize("kv_quant", [1, 2])
+@pytest.mark.parametrize("use_prefill_config", [False, True])
 def test_qsa_splitk_profile_only_narrows_tiles_that_cannot_stage(
-    kv_quant, monkeypatch
+    kv_quant, use_prefill_config, monkeypatch
 ) -> None:
     """Packed caches keep the tuned table until its KV tile stops fitting."""
     _stub_capability(monkeypatch, supported=False)
-    head_dim, selection_width, block_m = 256, 2051, 16
+    head_dim, selection_width = 256, 2051
     budget = qsa_ops._qsa_staged_block_n(head_dim, kv_quant)
     assert budget == (16 if kv_quant == 2 else 32)
 
-    def profile(base_programs, quant):
+    def profile(num_rows, quant):
         return qsa_ops._qsa_splitk_profile(
-            base_programs, block_m, head_dim, selection_width, quant
+            num_rows, 1, use_prefill_config, selection_width, head_dim, quant
         )
 
-    for base_programs in (1, 4, 16, 31):
-        # The table already picks a tile that stages, so nothing may move.
-        assert profile(base_programs, kv_quant) == profile(base_programs, 0)
-
-    for base_programs in (32, 256, 512, 2048):
-        tuned_block_n, tuned_splits, _, _ = profile(base_programs, 0)
-        assert tuned_block_n > budget
-        block_n, splits, _, _ = profile(base_programs, kv_quant)
+    # Keyed off the table rather than a fixed row list, so a retuned
+    # _select_config moves this test with it instead of pinning stale widths.
+    for num_rows in (1, 4, 16, 31, 32, 64, 128, 256, 512, 1024, 2048, 4096):
+        tuned = profile(num_rows, 0)
+        narrowed = profile(num_rows, kv_quant)
+        if tuned[0] <= budget:
+            # The table already picks a tile that stages, so nothing may move.
+            assert narrowed == tuned
+            continue
+        block_n, _, tiles, splits, _ = narrowed
         assert block_n == budget
+        assert tiles == -(-selection_width // block_n)
         # The narrow tile must not buy its parallelism with a bigger FP32
         # partial workspace than the tuned profile already allocated.
-        assert 1 <= splits <= tuned_splits
-        tiles = -(-selection_width // block_n)
+        assert 1 <= splits <= tuned[3]
         assert splits <= max(1, tiles // qsa_ops._QSA_MIN_TILES_PER_SPLIT)
 
 
@@ -1410,13 +1464,13 @@ def test_qsa_splitk_profile_keeps_the_tuned_table_where_it_was_measured(
     monkeypatch,
 ) -> None:
     """SM100 and unquantized caches must see the profile they were tuned with."""
+    tuned = qsa_ops._select_config(2048, 1, False, 2051)
+
     _stub_capability(monkeypatch, supported=True)
     for kv_quant in (0, 1, 2):
         assert qsa_ops._qsa_staged_block_n(256, kv_quant) is None
-        assert qsa_ops._qsa_splitk_profile(2048, 16, 256, 2051, kv_quant) == (
-            64,
-            1,
-            2,
+        assert qsa_ops._qsa_splitk_profile(2048, 1, False, 2051, 256, kv_quant) == (
+            *tuned,
             2,
         )
 
@@ -1424,7 +1478,7 @@ def test_qsa_splitk_profile_keeps_the_tuned_table_where_it_was_measured(
     # An unquantized cache reads BF16 pages straight into the dots, so it never
     # takes the staging profile no matter how old the device is.
     assert qsa_ops._qsa_staged_block_n(256, 0) is None
-    assert qsa_ops._qsa_splitk_profile(2048, 16, 256, 2051, 0) == (64, 1, 2, 2)
+    assert qsa_ops._qsa_splitk_profile(2048, 1, False, 2051, 256, 0) == (*tuned, 2)
 
 
 def test_qsa_backend_advertises_the_kv_cache_dtypes_it_serves() -> None:
@@ -1462,11 +1516,15 @@ def test_qsa_unquantized_call_reuses_one_unit_scale(monkeypatch) -> None:
     v = torch.randn_like(k)
     block_table = torch.arange(2, device=device, dtype=torch.int32).reshape(1, 2)
     token_to_req = torch.zeros(1, device=device, dtype=torch.int32)
-    indices = torch.arange(8, device=device, dtype=torch.int32).reshape(1, 8)
+    indices = _packed_selection(8, 1, device=device)
     for _ in range(2):
-        qsa_ops.qsa_sparse_paged_attention(q, k, v, indices, block_table, token_to_req)
+        qsa_ops.qsa_sparse_paged_attention(
+            q, k, v, indices, block_table, token_to_req, use_prefill_config=False
+        )
     cached = qsa_ops._QSA_UNIT_SCALE_BY_DEVICE[device]
-    qsa_ops.qsa_sparse_paged_attention(q, k, v, indices, block_table, token_to_req)
+    qsa_ops.qsa_sparse_paged_attention(
+        q, k, v, indices, block_table, token_to_req, use_prefill_config=False
+    )
     assert qsa_ops._QSA_UNIT_SCALE_BY_DEVICE[device] is cached
     assert len(builds) == 1, (
         f"the unit scale was built {len(builds)} times across three calls"
