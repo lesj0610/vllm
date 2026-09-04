@@ -255,6 +255,9 @@ def _selection_call(*, block_indices_dtype=torch.int32, out_dtype=torch.int32):
     rows, heads, head_dim = 3, 2, 128
     pages, page_size, requests = 4, 8, 2
     compress_ratio, token_topk = 4, 8
+    block_topk = token_topk // compress_ratio
+    # The packed buffer is the route width plus the trailing count column.
+    packed_width = block_topk * compress_ratio + compress_ratio
     return {
         "q": torch.zeros(rows, heads, head_dim),
         "k_cache": torch.zeros(pages, page_size, 1, head_dim),
@@ -264,10 +267,8 @@ def _selection_call(*, block_indices_dtype=torch.int32, out_dtype=torch.int32):
         "sequence_lengths": torch.full((requests,), page_size, dtype=torch.int32),
         "compress_ratio": compress_ratio,
         "token_topk": token_topk,
-        "block_indices": torch.zeros(
-            rows, token_topk // compress_ratio, dtype=block_indices_dtype
-        ),
-        "out": torch.zeros(rows, token_topk, dtype=out_dtype),
+        "block_indices": torch.zeros(rows, block_topk, dtype=block_indices_dtype),
+        "out": torch.zeros(rows, packed_width, dtype=out_dtype),
     }
 
 
@@ -319,12 +320,8 @@ def _record_index_dtypes(monkeypatch) -> list[dict[str, torch.dtype]]:
             }
         )
 
-    monkeypatch.setattr(
-        flashinfer, "sparse_paged_scores", fake_scores, raising=False
-    )
-    monkeypatch.setattr(
-        flashinfer, "expand_block_route", fake_expand, raising=False
-    )
+    monkeypatch.setattr(flashinfer, "sparse_paged_scores", fake_scores, raising=False)
+    monkeypatch.setattr(flashinfer, "expand_block_route", fake_expand, raising=False)
     monkeypatch.setattr(qsa_flashinfer, "_topk", lambda *args, **kwargs: None)
     return seen
 
@@ -363,3 +360,73 @@ def test_selection_rejects_a_second_index_dtype(monkeypatch, overrides):
 
     with pytest.raises(ValueError, match="one index dtype"):
         qsa_flashinfer.select_and_expand(**_selection_call(**overrides))
+
+
+@requires_cuda
+@pytest.mark.parametrize("position", [11, 15, 19, 31])
+def test_selection_packs_the_same_route_and_count_as_triton(position):
+    """The packed buffer must agree with the Triton expansion, count included.
+
+    FlashInfer writes only the index region, so the trailing count column is
+    computed alongside it. A count that disagrees with the route silently
+    changes the attention kernel's tile-loop bound rather than failing.
+
+    Held to the case top-k actually produces: every selected block complete
+    and behind the query's own block. The two expansions diverge outside it --
+    Triton caps how many blocks it expands at the visible count, while
+    FlashInfer expands all of them and drops the query's own block -- so a
+    comparison there would be comparing policies, not expansions.
+    """
+
+    compress_ratio, token_topk = 4, 8
+    block_topk = token_topk // compress_ratio
+    route_width = block_topk * compress_ratio + compress_ratio - 1
+
+    # Blocks 0..block_topk-1 are complete and none of them is the query's.
+    assert position // compress_ratio >= block_topk
+    block_indices = torch.arange(
+        block_topk, dtype=torch.int32, device="cuda"
+    ).unsqueeze(0)
+    query_positions = torch.tensor([position], dtype=torch.int32, device="cuda")
+    sequence_lengths = torch.tensor([position + 1], dtype=torch.int32, device="cuda")
+    token_to_req = torch.zeros(1, dtype=torch.int32, device="cuda")
+    # FlashInfer derives the visible-block count from the sequence length, so
+    # the Triton call has to be handed the same number or the two expansions
+    # cover different blocks and the comparison means nothing.
+    visible_blocks = torch.div(
+        query_positions + 1, compress_ratio, rounding_mode="floor"
+    ).to(torch.int32)
+
+    expected = torch.empty(1, route_width + 1, dtype=torch.int32, device="cuda")
+    qsa_indexer_ops.expand_qsa_block_indices(
+        block_indices,
+        query_positions,
+        visible_blocks,
+        compress_ratio,
+        token_topk,
+        expected,
+    )
+
+    got = torch.full_like(expected, -7)
+    flashinfer.expand_block_route(
+        block_indices,
+        query_positions,
+        sequence_lengths,
+        token_to_req,
+        compress_ratio,
+        out=got[:, :route_width],
+    )
+    tail_start = (
+        torch.div(query_positions + 1, compress_ratio, rounding_mode="floor")
+        * compress_ratio
+    )
+    got[:, route_width] = (
+        visible_blocks.clamp(max=block_topk) * compress_ratio
+        + (query_positions + 1)
+        - tail_start
+    )
+
+    assert got[:, route_width].item() == expected[:, route_width].item(), (
+        "count column disagrees with the Triton expansion"
+    )
+    torch.testing.assert_close(got, expected)

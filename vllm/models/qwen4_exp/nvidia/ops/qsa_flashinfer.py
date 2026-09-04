@@ -368,12 +368,26 @@ def select_and_expand(
     into the padded token route the sparse attention reads. The top-k itself
     stays on the shared CUDA kernel that the Triton path also calls, so only
     the scoring and the expansion move.
+
+    ``out`` is the packed selection buffer: ``token_topk + compress_ratio``
+    columns, of which the last holds the row's valid-entry count. FlashInfer
+    only writes the index region, so the count is computed here -- the Triton
+    expansion kernel writes it from the same two quantities.
     """
     import flashinfer
 
     rows = q.shape[0]
-    assert block_indices.shape == (rows, token_topk // compress_ratio)
+    block_topk = token_topk // compress_ratio
+    assert block_indices.shape == (rows, block_topk)
     columns = page_table.shape[1] * k_cache.shape[1]
+    # FlashInfer writes only the index region; the packed buffer is one column
+    # wider, and that column is the count this function fills in below.
+    route_width = block_topk * compress_ratio + compress_ratio - 1
+    if out.shape != (rows, route_width + 1):
+        raise ValueError(
+            "QSA packed selection buffer must be "
+            f"{(rows, route_width + 1)}, got {tuple(out.shape)}"
+        )
 
     # Each of these calls reads its index tensors through a single pointer type,
     # instantiated from the block table it is given: page_table for the scorer,
@@ -424,11 +438,26 @@ def select_and_expand(
             block_indices[rows_slice],
             topk_workspace,
         )
+        # Trailing count column: the complete blocks that get expanded, plus
+        # the causal tail of the query's own block. The Triton expansion
+        # kernel stores exactly this, from exactly these two quantities.
+        positions = query_positions[rows_slice]
+        tail_start = (
+            torch.div(positions + 1, compress_ratio, rounding_mode="floor")
+            * compress_ratio
+        )
+        out[rows_slice, route_width] = (
+            visible_blocks.clamp(max=block_topk) * compress_ratio
+            + (positions + 1)
+            - tail_start
+        )
+    # The index region only: the kernel takes out's strides, so the packed
+    # buffer's count column stays out of its reach without a copy.
     flashinfer.expand_block_route(
         block_indices,
         query_positions,
         sequence_lengths,
         token_to_req,
         compress_ratio,
-        out=out,
+        out=out[:, :route_width],
     )
