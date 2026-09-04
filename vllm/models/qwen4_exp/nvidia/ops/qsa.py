@@ -759,15 +759,13 @@ def qsa_sparse_paged_attention(
     group_size = q.shape[1] // num_kv_heads
     block_m = triton.next_power_of_2(group_size)
     selection_width = logical_indices.shape[1] - 1  # trailing column is the count
-    block_n, partial_warps, num_tiles, num_splits, partial_stages = (
-        _qsa_splitk_profile(
-            q.shape[0],
-            num_kv_heads,
-            use_prefill_config,
-            selection_width,
-            head_dim,
-            kv_quant,
-        )
+    block_n, partial_warps, num_tiles, num_splits, partial_stages = _qsa_splitk_profile(
+        q.shape[0],
+        num_kv_heads,
+        use_prefill_config,
+        selection_width,
+        head_dim,
+        kv_quant,
     )
 
     # Split=1 writes output directly and compiles out all workspace accesses.
@@ -857,18 +855,61 @@ def warmup_qsa_sparse_paged_attention(
     *,
     num_query_heads: int,
     selection_width: int,
+    head_size: int | None = None,
+    nvfp4: bool = False,
+    kv_quantized: bool = False,
 ) -> tuple[tuple[int, int, int], ...]:
-    """Compile every production-reachable split-K/merge specialization."""
+    """Compile every production-reachable split-K/merge specialization.
 
-    head_dim = kv_cache.shape[-1] // 2
-    key_cache, value_cache = kv_cache.transpose(1, 2).split(head_dim, dim=-1)
-    num_kv_heads = key_cache.shape[2]
+    The layout the deployment actually serves decides what gets compiled: an
+    NVFP4 cache is read through per-side slot views and takes the narrowed
+    staging profile, so warming the BF16 shape instead would leave every
+    served specialization to be JIT-compiled on the first request.
+    """
+
+    if nvfp4:
+        if head_size is None:
+            raise ValueError("NVFP4 QSA warmup needs the layer's head_size")
+        head_dim = head_size
+        key_cache, value_cache = kv_cache[:, 0::2], kv_cache[:, 1::2]
+        num_kv_heads = key_cache.shape[1]
+        page_size = key_cache.shape[2]
+        kv_quant = 2
+        cache_strides = (
+            key_cache.stride(0),
+            key_cache.stride(2),
+            key_cache.stride(1),
+            value_cache.stride(0),
+            value_cache.stride(2),
+            value_cache.stride(1),
+        )
+    else:
+        head_dim = head_size if head_size is not None else kv_cache.shape[-1] // 2
+        key_cache, value_cache = kv_cache.transpose(1, 2).split(head_dim, dim=-1)
+        num_kv_heads = key_cache.shape[2]
+        page_size = key_cache.shape[1]
+        kv_quant = 1 if kv_quantized else 0
+        cache_strides = (
+            key_cache.stride(0),
+            key_cache.stride(1),
+            key_cache.stride(2),
+            value_cache.stride(0),
+            value_cache.stride(1),
+            value_cache.stride(2),
+        )
     group_size = num_query_heads // num_kv_heads
     block_m = triton.next_power_of_2(group_size)
 
     # Every config the dispatch can pick for this group size.
     profiles = {
-        _select_config(num_rows, num_kv_heads, use_prefill_config, selection_width)
+        _qsa_splitk_profile(
+            num_rows,
+            num_kv_heads,
+            use_prefill_config,
+            selection_width,
+            head_dim,
+            kv_quant,
+        )
         for num_rows in range(1, 8193)
         for use_prefill_config in (False, True)
     }
@@ -902,12 +943,16 @@ def warmup_qsa_sparse_paged_attention(
     output_ptr = TritonWarmupTensor(
         torch.bfloat16, shape=(num_rows, num_query_heads, head_dim)
     )
+    # The kernel materializes both scale pointers whatever KV_QUANT is; an
+    # unquantized cache is fed the cached unit scale at call time.
+    k_scale_ptr = TritonWarmupTensor(torch.float32, shape=(1,))
+    v_scale_ptr = TritonWarmupTensor(torch.float32, shape=(1,))
     head_stride = head_dim
     row_stride = num_query_heads * head_dim
     num_cache_blocks = triton_scalar_specialization_rep(kv_cache.shape[0])
 
     warmed = []
-    for block_n, warps, num_tiles, num_splits in sorted(profiles):
+    for block_n, warps, num_tiles, num_splits, stages in sorted(profiles):
         if num_splits == 1:
             partial_output_ptr = output_ptr
             partial_lse_ptr = output_ptr
@@ -926,17 +971,14 @@ def warmup_qsa_sparse_paged_attention(
             indices_ptr,
             block_table_ptr,
             token_to_req_ptr,
+            k_scale_ptr,
+            v_scale_ptr,
             partial_output_ptr,
             partial_lse_ptr,
             output_ptr,
             row_stride,
             head_stride,
-            key_cache.stride(0),
-            key_cache.stride(1),
-            key_cache.stride(2),
-            value_cache.stride(0),
-            value_cache.stride(1),
-            value_cache.stride(2),
+            *cache_strides,
             selection_width + 1,
             block_table.stride(0),
             row_stride,
@@ -945,7 +987,7 @@ def warmup_qsa_sparse_paged_attention(
             num_cache_blocks,
             num_requests,
             TOPK=selection_width,
-            PAGE_SIZE=key_cache.shape[1],
+            PAGE_SIZE=page_size,
             PAGE_TABLE_WIDTH=block_table.shape[1],
             GROUP_SIZE=group_size,
             HEAD_DIM=head_dim,
@@ -954,8 +996,9 @@ def warmup_qsa_sparse_paged_attention(
             NUM_TILES=num_tiles,
             BLOCK_M=block_m,
             BLOCK_N=block_n,
+            KV_QUANT=kv_quant,
             num_warps=warps,
-            num_stages=2,
+            num_stages=stages,
             grid=(num_rows, num_kv_heads, num_splits),
         )
         if num_splits > 1:

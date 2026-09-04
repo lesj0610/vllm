@@ -1529,3 +1529,60 @@ def test_qsa_unquantized_call_reuses_one_unit_scale(monkeypatch) -> None:
     assert len(builds) == 1, (
         f"the unit scale was built {len(builds)} times across three calls"
     )
+
+
+@requires_qsa_kernels
+@pytest.mark.parametrize(
+    ("nvfp4", "kv_quantized", "expected_quant"),
+    [(False, False, 0), (False, True, 1), (True, False, 2)],
+)
+def test_qsa_warmup_compiles_the_layout_it_is_given(
+    nvfp4, kv_quantized, expected_quant, monkeypatch
+) -> None:
+    """Warmup must bind the same kernel signature the forward path calls.
+
+    It runs only at startup, so a signature that drifted from the kernel --
+    a missing scale pointer, a missing KV_QUANT -- surfaces as a TypeError
+    during engine init rather than in any forward test.
+    """
+    from vllm.utils.torch_utils import nvfp4_kv_cache_full_dim
+
+    head_size, num_kv_heads, pages, page_size = 256, 2, 4, 8
+    if nvfp4:
+        width = nvfp4_kv_cache_full_dim(head_size)
+        kv_cache = torch.zeros(
+            pages, 2 * num_kv_heads, page_size, width, dtype=torch.uint8, device="cuda"
+        )
+    else:
+        # The unquantized allocation is [pages, kv_heads, page_size, 2 * head]:
+        # the transpose in the warmup is what turns it into paged NHD.
+        dtype = torch.uint8 if kv_quantized else torch.bfloat16
+        kv_cache = torch.zeros(
+            pages, num_kv_heads, page_size, 2 * head_size, dtype=dtype, device="cuda"
+        )
+    block_table = torch.zeros(2, pages, dtype=torch.int32, device="cuda")
+
+    seen: list[dict] = []
+    real_warmup = qsa_ops._qsa_sparse_paged_gqa_splitk_kernel.warmup
+
+    def capture(*args, **kwargs):
+        seen.append(kwargs)
+        return real_warmup(*args, **kwargs)
+
+    monkeypatch.setattr(qsa_ops._qsa_sparse_paged_gqa_splitk_kernel, "warmup", capture)
+
+    qsa_ops.warmup_qsa_sparse_paged_attention(
+        kv_cache,
+        block_table,
+        num_query_heads=num_kv_heads * 2,
+        selection_width=64,
+        head_size=head_size,
+        nvfp4=nvfp4,
+        kv_quantized=kv_quantized,
+    )
+
+    assert seen, "warmup compiled no specialization"
+    for kwargs in seen:
+        assert kwargs["KV_QUANT"] == expected_quant
+        assert kwargs["PAGE_SIZE"] == page_size
+        assert kwargs["HEAD_DIM"] == head_size
