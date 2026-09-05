@@ -249,11 +249,17 @@ def test_selection_routing_prefers_flashinfer(monkeypatch):
     assert not qsa_flashinfer.supports_qsa_selection(128, 17)
 
 
-def _selection_call(*, block_indices_dtype=torch.int32, out_dtype=torch.int32):
+def _selection_call(
+    *,
+    block_indices_dtype=torch.int32,
+    out_dtype=torch.int32,
+    pages=4,
+    max_seq_len=None,
+):
     """Arguments as the QSA indexer hands them down: int32 tables, int64
     positions. common/qsa_cache.py builds the positions with ``.long()``."""
     rows, heads, head_dim = 3, 2, 128
-    pages, page_size, requests = 4, 8, 2
+    page_size, requests = 8, 2
     compress_ratio, token_topk = 4, 8
     block_topk = token_topk // compress_ratio
     # The packed buffer is the route width plus the trailing count column.
@@ -267,6 +273,7 @@ def _selection_call(*, block_indices_dtype=torch.int32, out_dtype=torch.int32):
         "sequence_lengths": torch.full((requests,), page_size, dtype=torch.int32),
         "compress_ratio": compress_ratio,
         "token_topk": token_topk,
+        "max_seq_len": page_size if max_seq_len is None else max_seq_len,
         "block_indices": torch.zeros(rows, block_topk, dtype=block_indices_dtype),
         "out": torch.zeros(rows, packed_width, dtype=out_dtype),
     }
@@ -295,6 +302,7 @@ def _record_index_dtypes(monkeypatch) -> list[dict[str, torch.dtype]]:
                 "token_to_req": token_to_req.dtype,
                 "query_positions": query_positions.dtype,
                 "sequence_lengths": sequence_lengths.dtype,
+                "num_columns": num_columns,
             }
         )
         return (
@@ -341,7 +349,8 @@ def test_selection_narrows_the_positions_to_the_block_table_dtype(monkeypatch):
 
     assert len(seen) == 2, "the scorer and the expansion must both be reached"
     for call in seen:
-        assert set(call.values()) == {torch.int32}, call
+        dtypes = {k: v for k, v in call.items() if isinstance(v, torch.dtype)}
+        assert set(dtypes.values()) == {torch.int32}, call
 
 
 @pytest.mark.parametrize(
@@ -360,6 +369,41 @@ def test_selection_rejects_a_second_index_dtype(monkeypatch, overrides):
 
     with pytest.raises(ValueError, match="one index dtype"):
         qsa_flashinfer.select_and_expand(**_selection_call(**overrides))
+
+
+@pytest.mark.parametrize(
+    ("max_seq_len", "pages", "expected"),
+    [
+        # 33898 tokens compress to 8475 columns, rounded up to the 64 the
+        # cooperative top-k wants. Sizing off the block table instead would
+        # ask for 8 * 65536 * 4 bytes of FP32 scores per 2048-row chunk.
+        (33898, 8192, 8512),
+        # A batch shorter than one aligned tile still gets a whole one.
+        (1, 8192, 64),
+        # Never past what the cache can address, whatever the config allows.
+        (1 << 20, 4, 32),
+    ],
+)
+def test_selection_sizes_the_scores_off_the_batch_not_the_block_table(
+    monkeypatch, max_seq_len, pages, expected
+):
+    """The FP32 scores are the one large temporary on this path.
+
+    Sizing them off max_model_len leaves the memory profile blind to them --
+    the profile run returns before selection ever executes -- so the first real
+    request meets a KV cache that already took the headroom.
+    """
+    from vllm.models.qwen4_exp.nvidia.ops import qsa_flashinfer
+
+    seen = _record_index_dtypes(monkeypatch)
+
+    qsa_flashinfer.select_and_expand(
+        **_selection_call(pages=pages, max_seq_len=max_seq_len)
+    )
+
+    widths = [call["num_columns"] for call in seen if "num_columns" in call]
+    assert widths, "the scorer was never reached"
+    assert set(widths) == {expected}
 
 
 @requires_cuda

@@ -31,6 +31,7 @@ import torch
 
 import vllm.envs as envs
 from vllm.platforms import current_platform
+from vllm.utils.math_utils import cdiv, round_up
 
 from .qsa_indexer import _TOPK_WORKSPACE_BYTES, _topk
 
@@ -358,6 +359,7 @@ def select_and_expand(
     sequence_lengths: torch.Tensor,
     compress_ratio: int,
     token_topk: int,
+    max_seq_len: int,
     block_indices: torch.Tensor,
     out: torch.Tensor,
 ) -> None:
@@ -379,7 +381,17 @@ def select_and_expand(
     rows = q.shape[0]
     block_topk = token_topk // compress_ratio
     assert block_indices.shape == (rows, block_topk)
-    columns = page_table.shape[1] * k_cache.shape[1]
+    # No row scores beyond cdiv(max_seq_len, compress_ratio) compressed
+    # columns, so scoring the whole block table would size the FP32 logits off
+    # max_model_len rather than off the batch. Round up to 64 to keep the
+    # logits row stride cooperative_topk-compatible, and clamp to what the
+    # cache can actually address. ops/qsa_indexer.py sizes its own logits the
+    # same way.
+    capacity = page_table.shape[1] * k_cache.shape[1]
+    columns = min(
+        max(64, round_up(cdiv(max_seq_len, compress_ratio), 64)),
+        capacity,
+    )
     # FlashInfer writes only the index region; the packed buffer is one column
     # wider, and that column is the count this function fills in below.
     route_width = block_topk * compress_ratio + compress_ratio - 1
@@ -405,9 +417,10 @@ def select_and_expand(
     if query_positions.dtype != index_dtype:
         query_positions = query_positions.to(index_dtype)
 
-    # The scores are the one large temporary here: FP32 and as wide as the
-    # block table. Chunk the rows against the same budget the Triton path uses,
-    # or a long prefill allocates the whole batch at once and runs out.
+    # The scores are the one large temporary here: FP32, as wide as the batch's
+    # own context above, clamped to the block table. Chunk the rows against the
+    # same budget the Triton path uses, or a long prefill allocates the whole
+    # batch at once and runs out.
     max_logits_bytes = envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024
     rows_per_chunk = max(1, max_logits_bytes // (columns * 4))
     topk_workspace = torch.empty(

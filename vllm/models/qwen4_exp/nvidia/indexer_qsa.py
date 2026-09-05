@@ -409,6 +409,7 @@ class QSAIndexer(nn.Module):
                 compressed_metadata.seq_lens,
                 self.compress_ratio,
                 self.token_topk,
+                compressed_metadata.max_seq_len,
                 block_indices,
                 out,
             )
