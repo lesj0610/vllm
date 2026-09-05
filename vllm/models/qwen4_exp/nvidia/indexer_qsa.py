@@ -7,7 +7,6 @@ from typing import cast
 import torch
 from torch import nn
 
-import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm
@@ -17,6 +16,7 @@ from vllm.model_executor.layers.rotary_embedding.mrope import triton_mrope
 from vllm.transformers_utils.configs.qwen4_exp import (
     Qwen4ExpTextConfig,
 )
+from vllm.utils.math_utils import cdiv, round_up
 
 from ..common.qsa_cache import (
     QSACompressedKeyCache,
@@ -181,6 +181,17 @@ class QSAIndexer(nn.Module):
             vllm_config=vllm_config,
         )
 
+        # What the profiling run has to reserve for: the widest score row this
+        # deployment's context can reach, by the same rule select_and_expand
+        # sizes an actual batch by, and the most rows a batch can bring.
+        self._max_selection_columns = max(
+            64,
+            round_up(
+                cdiv(vllm_config.model_config.max_model_len, self.compress_ratio), 64
+            ),
+        )
+        self._max_batched_tokens = vllm_config.scheduler_config.max_num_batched_tokens
+
     @property
     def output_width(self) -> int:
         """Selection (index) columns per row."""
@@ -249,18 +260,20 @@ class QSAIndexer(nn.Module):
 
         metadata = self._metadata()
         if metadata is None:
-            # No attention metadata means the profiling run, and it returns
-            # before selection executes -- so the scores that selection is
-            # about to allocate on every real forward would never appear in
-            # the measured peak, and the KV cache would be sized over them.
-            # Stand in for them here, the way the sparse indexer upstream
-            # ships does, and let the allocation go: this only has to be held
-            # long enough for profiling to see it, not reused afterwards.
-            _ = torch.empty(
-                envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024,
-                dtype=torch.uint8,
-                device=projected_qk.device,
+            # No attention metadata means the profiling run, which returns
+            # before selection executes. Reserve its scratch here or the KV
+            # cache is sized over memory the first real request then needs.
+            # The reservation has to cover the widest chunk the config allows,
+            # since the run that would have revealed it never happens.
+            from .ops.qsa_flashinfer import (
+                reserve_selection_workspace,
+                supports_qsa_selection,
             )
+
+            if supports_qsa_selection(self.index_head_dim, self.index_n_heads):
+                reserve_selection_workspace(
+                    self._max_batched_tokens, self._max_selection_columns
+                )
             # Preserve step-0 indices when later MTP steps reuse the buffer.
             if self.skip_topk and out is not None:
                 return out

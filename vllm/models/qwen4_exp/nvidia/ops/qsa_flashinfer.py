@@ -33,10 +33,17 @@ import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.utils.math_utils import cdiv, round_up
+from vllm.v1.worker.workspace import (
+    current_workspace_manager,
+    is_workspace_manager_initialized,
+)
 
 from .qsa_indexer import _TOPK_WORKSPACE_BYTES, _topk
 
 logger = init_logger(__name__)
+# Every index tensor of a FlashInfer call shares the block table's dtype, and
+# every vLLM block table is int32. The selection scratch is sized on that.
+_SELECTION_INDEX_DTYPE = torch.int32
 
 # The software E2M1 decode this path relies on is a pre-SM100 construct: from
 # SM100 the conversion is a single instruction and a different specialization
@@ -369,6 +376,79 @@ def supports_qsa_selection(head_dim: int, num_heads: int) -> bool:
     )
 
 
+def selection_chunk_rows(columns: int, max_rows: int) -> int:
+    """Rows one chunk covers at this score width.
+
+    The score budget bounds a chunk, so the width decides how many rows fit in
+    it. Never zero: a width past the whole budget still has to score its row,
+    which is what the reservation below has to be able to hold.
+    """
+    budget = envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024
+    return max(1, min(max_rows, budget // (columns * 4)))
+
+
+def selection_workspace_specs(
+    max_num_batched_tokens: int, max_columns: int
+) -> list[tuple[tuple[int, ...], torch.dtype]]:
+    """Shapes the selection scratch needs, worst case over the config.
+
+    Three buffers live at once inside a chunk: the FP32 scores, the per-row
+    visible-block counts the scorer writes beside them, and the top-k's own
+    workspace. ``max_columns`` is what the deployment's context can reach, so
+    the widest chunk is the one that fixes the reservation -- including the
+    single-row chunk a width past the whole budget falls back to.
+    """
+    rows = selection_chunk_rows(max_columns, max_num_batched_tokens)
+    return [
+        ((rows, max_columns), torch.float32),
+        ((max_num_batched_tokens,), _SELECTION_INDEX_DTYPE),
+        ((_TOPK_WORKSPACE_BYTES,), torch.uint8),
+    ]
+
+
+def reserve_selection_workspace(max_num_batched_tokens: int, max_columns: int) -> None:
+    """Size the shared workspace for selection before it is locked.
+
+    Called from the profiling run, which happens before the KV cache is sized:
+    the initial memory snapshot is taken before the model loads, so anything
+    still held when profiling ends is part of the difference the KV budget is
+    computed from. Reserving here is what puts these bytes on that side of the
+    line -- nobody subtracts them afterwards.
+
+    The buffer itself belongs to the shared WorkspaceManager, so it follows the
+    engine's ubatch/lane slots and its teardown rather than outliving the model
+    in a module-level cache.
+    """
+    current_workspace_manager().get_simultaneous(
+        *selection_workspace_specs(max_num_batched_tokens, max_columns)
+    )
+
+
+def _selection_views(
+    rows: int, columns: int, device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Scores, visible counts and top-k scratch, from one shared allocation.
+
+    Goes through the WorkspaceManager so the buffer is the engine's, sized
+    while it could still grow and locked before execution. A width the
+    reservation did not anticipate therefore fails at the lock rather than
+    quietly allocating beside it.
+
+    Outside a worker -- a direct call from a test -- there is no manager, and
+    the same shapes are allocated for the duration of the call instead.
+    """
+    specs: list[tuple[tuple[int, ...], torch.dtype]] = [
+        ((rows, columns), torch.float32),
+        ((rows,), _SELECTION_INDEX_DTYPE),
+        ((_TOPK_WORKSPACE_BYTES,), torch.uint8),
+    ]
+    if not is_workspace_manager_initialized():
+        return tuple(  # type: ignore[return-value]
+            torch.empty(shape, dtype=dtype, device=device) for shape, dtype in specs
+        )
+    return tuple(current_workspace_manager().get_simultaneous(*specs))  # type: ignore[return-value]
+
+
 def select_and_expand(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -394,6 +474,9 @@ def select_and_expand(
     columns, of which the last holds the row's valid-entry count. FlashInfer
     only writes the index region, so the count is computed here -- the Triton
     expansion kernel writes it from the same two quantities.
+
+    The scratch comes from the shared workspace, reserved during the profiling
+    run by ``reserve_selection_workspace()`` and locked before execution.
     """
     import flashinfer
 
@@ -437,21 +520,27 @@ def select_and_expand(
         query_positions = query_positions.to(index_dtype)
 
     # The scores are the one large temporary here: FP32, as wide as the batch's
-    # own context above, clamped to the block table. Chunk the rows against the
-    # same budget the Triton path uses, or a long prefill allocates the whole
-    # batch at once and runs out.
-    max_logits_bytes = envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024
-    rows_per_chunk = max(1, max_logits_bytes // (columns * 4))
-    topk_workspace = torch.empty(
-        (_TOPK_WORKSPACE_BYTES,), dtype=torch.uint8, device=q.device
+    # own context above, clamped to the block table. The score budget bounds a
+    # chunk, so it decides how many rows one pass covers.
+    rows_per_chunk = selection_chunk_rows(columns, rows)
+
+    # Every chunk writes into the same reserved scratch. Letting each chunk
+    # allocate its own instead would hold two of them at the boundary -- the
+    # next allocation happens before the previous chunk's tensor is released --
+    # and none of it would be inside the reservation the memory profile saw.
+    logits_buf, counts_buf, topk_workspace = _selection_views(
+        rows_per_chunk, columns, q.device
     )
 
     for start in range(0, rows, rows_per_chunk):
         end = min(start + rows_per_chunk, rows)
         rows_slice = slice(start, end)
+        chunk_rows = end - start
+        logits = logits_buf[:chunk_rows]
+        visible_blocks = counts_buf[:chunk_rows]
         # QSA holds the compressed keys as [pages, page_size, 1, head_dim]; the
         # single KV head makes dropping that axis a view.
-        logits, visible_blocks = flashinfer.sparse_paged_scores(
+        flashinfer.sparse_paged_scores(
             q[rows_slice],
             k_cache.squeeze(2),
             page_table,
@@ -461,6 +550,8 @@ def select_and_expand(
             compress_ratio,
             math.sqrt(q.shape[2]),
             num_columns=columns,
+            logits=logits,
+            visible_blocks=visible_blocks,
         )
         _topk(
             logits,

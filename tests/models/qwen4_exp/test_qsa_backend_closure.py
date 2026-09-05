@@ -14,6 +14,7 @@ import itertools
 import pytest
 import torch
 
+import vllm.envs as envs
 from vllm.models.qwen4_exp.nvidia.ops import qsa as qsa_ops
 from vllm.models.qwen4_exp.nvidia.ops import qsa_indexer as qsa_indexer_ops
 from vllm.platforms import current_platform
@@ -255,10 +256,11 @@ def _selection_call(
     out_dtype=torch.int32,
     pages=4,
     max_seq_len=None,
+    rows=3,
 ):
     """Arguments as the QSA indexer hands them down: int32 tables, int64
     positions. common/qsa_cache.py builds the positions with ``.long()``."""
-    rows, heads, head_dim = 3, 2, 128
+    heads, head_dim = 2, 128
     page_size, requests = 8, 2
     compress_ratio, token_topk = 4, 8
     block_topk = token_topk // compress_ratio
@@ -280,11 +282,14 @@ def _selection_call(
 
 
 def _record_index_dtypes(
-    monkeypatch, widths: list[int] | None = None
+    monkeypatch,
+    widths: list[int] | None = None,
+    buffers: list[tuple[int, int]] | None = None,
 ) -> list[dict[str, torch.dtype]]:
     """Capture the dtype of every index tensor each FlashInfer call receives.
 
-    Pass ``widths`` to also collect the score width the scorer is asked for.
+    Pass ``widths`` to also collect the score width the scorer is asked for,
+    and ``buffers`` to collect the score/count addresses it writes into.
     """
     from vllm.models.qwen4_exp.nvidia.ops import qsa_flashinfer
 
@@ -300,6 +305,8 @@ def _record_index_dtypes(
         compress_ratio,
         scale,
         num_columns,
+        logits=None,
+        visible_blocks=None,
     ):
         seen.append(
             {
@@ -311,10 +318,14 @@ def _record_index_dtypes(
         )
         if widths is not None:
             widths.append(num_columns)
-        return (
-            torch.zeros(q.shape[0], num_columns),
-            torch.zeros(q.shape[0], dtype=page_table.dtype),
-        )
+        # The real op writes into the buffers it is handed and returns them.
+        if logits is None:
+            logits = torch.zeros(q.shape[0], num_columns)
+        if visible_blocks is None:
+            visible_blocks = torch.zeros(q.shape[0], dtype=page_table.dtype)
+        if buffers is not None:
+            buffers.append((logits.data_ptr(), visible_blocks.data_ptr()))
+        return logits, visible_blocks
 
     def fake_expand(
         block_indices,
@@ -410,6 +421,67 @@ def test_selection_sizes_the_scores_off_the_batch_not_the_block_table(
 
     assert widths, "the scorer was never reached"
     assert set(widths) == {expected}
+
+
+def test_selection_reservation_covers_the_widest_chunk(monkeypatch):
+    """What the profiling run reserves has to hold what execution then asks for.
+
+    The reservation is taken from config alone, because the run that would
+    reveal the real shapes returns before selection executes. It therefore has
+    to cover the widest chunk the config permits -- including the single-row
+    chunk a width past the whole budget falls back to, which is the case that
+    would otherwise allocate outside the reservation.
+    """
+    from vllm.models.qwen4_exp.nvidia.ops import qsa_flashinfer
+
+    for budget_mb, tokens, columns in [
+        (512, 2048, 65536),  # the serving config
+        # A single row of scores is already wider than the whole budget, so
+        # the chunk floors at one row and the reservation has to hold it.
+        (1, 2048, 524288),
+        (512, 16384, 64),  # a short context, many rows
+    ]:
+        monkeypatch.setattr(envs, "VLLM_SPARSE_INDEXER_MAX_LOGITS_MB", budget_mb)
+        specs = qsa_flashinfer.selection_workspace_specs(tokens, columns)
+        (score_shape, score_dtype), (count_shape, count_dtype), (topk_shape, _) = specs
+
+        # The rows the reservation is cut for are the rows execution will use.
+        assert score_shape == (
+            qsa_flashinfer.selection_chunk_rows(columns, tokens),
+            columns,
+        )
+        assert score_shape[0] >= 1, "a chunk always covers at least one row"
+        assert score_dtype is torch.float32
+        # Counts are sized for the whole batch, not for one chunk: the caller
+        # slices them per chunk and never grows them.
+        assert count_shape == (tokens,) and count_dtype is torch.int32
+        assert topk_shape[0] == qsa_flashinfer._TOPK_WORKSPACE_BYTES
+
+
+def test_selection_reuses_one_buffer_across_chunks(monkeypatch):
+    """Every chunk has to write into one buffer, not allocate beside it.
+
+    A chunk that allocates its own holds two at the boundary: the next
+    allocation happens while the previous chunk's tensor is still referenced.
+    Neither of them is inside what the memory profile counted.
+    """
+    from vllm.models.qwen4_exp.nvidia.ops import qsa_flashinfer
+
+    # One MiB of scores is 512 rows at 512 columns, so a 1536-row batch is
+    # three chunks. The budget is an integer number of MiB, as the env is.
+    rows, columns = 1536, 512
+    monkeypatch.setattr(envs, "VLLM_SPARSE_INDEXER_MAX_LOGITS_MB", 1)
+
+    # The block table has to address that width, or the clamp shortens it and
+    # the batch stops needing more than one chunk.
+    call = _selection_call(rows=rows, pages=columns // 8, max_seq_len=columns * 4)
+    buffers: list[tuple[int, int]] = []
+    _record_index_dtypes(monkeypatch, buffers=buffers)
+
+    qsa_flashinfer.select_and_expand(**call)
+
+    assert len(buffers) >= 3, f"wanted several chunks, got {len(buffers)}"
+    assert len(set(buffers)) == 1, f"a chunk allocated its own scratch: {buffers}"
 
 
 @requires_cuda
