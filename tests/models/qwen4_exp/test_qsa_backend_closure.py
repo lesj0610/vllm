@@ -279,8 +279,13 @@ def _selection_call(
     }
 
 
-def _record_index_dtypes(monkeypatch) -> list[dict[str, torch.dtype]]:
-    """Capture the dtype of every index tensor each FlashInfer call receives."""
+def _record_index_dtypes(
+    monkeypatch, widths: list[int] | None = None
+) -> list[dict[str, torch.dtype]]:
+    """Capture the dtype of every index tensor each FlashInfer call receives.
+
+    Pass ``widths`` to also collect the score width the scorer is asked for.
+    """
     from vllm.models.qwen4_exp.nvidia.ops import qsa_flashinfer
 
     seen: list[dict[str, torch.dtype]] = []
@@ -302,9 +307,10 @@ def _record_index_dtypes(monkeypatch) -> list[dict[str, torch.dtype]]:
                 "token_to_req": token_to_req.dtype,
                 "query_positions": query_positions.dtype,
                 "sequence_lengths": sequence_lengths.dtype,
-                "num_columns": num_columns,
             }
         )
+        if widths is not None:
+            widths.append(num_columns)
         return (
             torch.zeros(q.shape[0], num_columns),
             torch.zeros(q.shape[0], dtype=page_table.dtype),
@@ -349,8 +355,7 @@ def test_selection_narrows_the_positions_to_the_block_table_dtype(monkeypatch):
 
     assert len(seen) == 2, "the scorer and the expansion must both be reached"
     for call in seen:
-        dtypes = {k: v for k, v in call.items() if isinstance(v, torch.dtype)}
-        assert set(dtypes.values()) == {torch.int32}, call
+        assert set(call.values()) == {torch.int32}, call
 
 
 @pytest.mark.parametrize(
@@ -376,7 +381,8 @@ def test_selection_rejects_a_second_index_dtype(monkeypatch, overrides):
     [
         # 33898 tokens compress to 8475 columns, rounded up to the 64 the
         # cooperative top-k wants. Sizing off the block table instead would
-        # ask for 8 * 65536 * 4 bytes of FP32 scores per 2048-row chunk.
+        # ask for 2048 * 65536 * 4 bytes -- 512 MiB -- of FP32 scores for a
+        # single 2048-row chunk.
         (33898, 8192, 8512),
         # A batch shorter than one aligned tile still gets a whole one.
         (1, 8192, 64),
@@ -395,13 +401,13 @@ def test_selection_sizes_the_scores_off_the_batch_not_the_block_table(
     """
     from vllm.models.qwen4_exp.nvidia.ops import qsa_flashinfer
 
-    seen = _record_index_dtypes(monkeypatch)
+    widths: list[int] = []
+    _record_index_dtypes(monkeypatch, widths)
 
     qsa_flashinfer.select_and_expand(
         **_selection_call(pages=pages, max_seq_len=max_seq_len)
     )
 
-    widths = [call["num_columns"] for call in seen if "num_columns" in call]
     assert widths, "the scorer was never reached"
     assert set(widths) == {expected}
 
