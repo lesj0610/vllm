@@ -382,7 +382,12 @@ def selection_chunk_rows(columns: int, max_rows: int) -> int:
     The score budget bounds a chunk, so the width decides how many rows fit in
     it. Never zero: a width past the whole budget still has to score its row,
     which is what the reservation below has to be able to hold.
+
+    A zero width has no chunk to speak of; the caller skips the scoring loop
+    entirely rather than dividing by it.
     """
+    if columns <= 0:
+        return 0
     budget = envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024
     return max(1, min(max_rows, budget // (columns * 4)))
 
@@ -413,6 +418,8 @@ def selection_workspace_specs(
     scores = min(max_num_batched_tokens * max_columns, max(budget_elems, max_columns))
     return [
         ((scores,), torch.float32),
+        # Counts are cut per chunk at execution, and a chunk never exceeds the
+        # batch, so the batch bound covers it.
         ((max_num_batched_tokens,), _SELECTION_INDEX_DTYPE),
         ((_TOPK_WORKSPACE_BYTES,), torch.uint8),
     ]

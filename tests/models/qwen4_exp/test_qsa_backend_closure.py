@@ -19,6 +19,7 @@ import vllm.envs as envs
 from vllm.models.qwen4_exp.nvidia.ops import qsa as qsa_ops
 from vllm.models.qwen4_exp.nvidia.ops import qsa_indexer as qsa_indexer_ops
 from vllm.platforms import current_platform
+from vllm.utils.math_utils import round_up
 from vllm.utils.torch_utils import nvfp4_kv_cache_full_dim
 
 flashinfer = pytest.importorskip("flashinfer")
@@ -255,6 +256,7 @@ def _selection_call(
     *,
     block_indices_dtype=torch.int32,
     out_dtype=torch.int32,
+    page_table_dtype=torch.int32,
     pages=4,
     max_seq_len=None,
     rows=3,
@@ -270,7 +272,7 @@ def _selection_call(
     return {
         "q": torch.zeros(rows, heads, head_dim),
         "k_cache": torch.zeros(pages, page_size, 1, head_dim),
-        "page_table": torch.zeros(requests, pages, dtype=torch.int32),
+        "page_table": torch.zeros(requests, pages, dtype=page_table_dtype),
         "token_to_req": torch.zeros(rows, dtype=torch.int32),
         "query_positions": torch.arange(rows, dtype=torch.int64),
         "sequence_lengths": torch.full((requests,), page_size, dtype=torch.int32),
@@ -458,9 +460,17 @@ def test_selection_reservation_covers_every_width_execution_can_ask_for(
 
     monkeypatch.setattr(envs, "VLLM_SPARSE_INDEXER_MAX_LOGITS_MB", budget_mb)
     specs = qsa_flashinfer.selection_workspace_specs(tokens, max_columns)
-    reserved = sum(
-        math.prod(shape) * torch.empty(0, dtype=dtype).element_size()
-        for shape, dtype in specs
+
+    # get_simultaneous rounds each sub-buffer to 256 bytes and sums that, so
+    # compare on the same terms the manager actually enforces.
+    def _total(sizes: list[int]) -> int:
+        return sum(round_up(n, 256) for n in sizes)
+
+    reserved = _total(
+        [
+            math.prod(shape) * torch.empty(0, dtype=dtype).element_size()
+            for shape, dtype in specs
+        ]
     )
     (_, score_dtype), (count_shape, count_dtype), (topk_shape, _) = specs
     assert score_dtype is torch.float32
@@ -471,10 +481,12 @@ def test_selection_reservation_covers_every_width_execution_can_ask_for(
         for rows in {1, tokens}:
             chunk_rows = qsa_flashinfer.selection_chunk_rows(columns, rows)
             assert chunk_rows >= 1, "a chunk always covers at least one row"
-            needed = (
-                chunk_rows * columns * 4
-                + chunk_rows * 4
-                + qsa_flashinfer._TOPK_WORKSPACE_BYTES
+            needed = _total(
+                [
+                    chunk_rows * columns * 4,
+                    chunk_rows * 4,
+                    qsa_flashinfer._TOPK_WORKSPACE_BYTES,
+                ]
             )
             assert needed <= reserved, (
                 f"columns={columns} rows={rows} needs {needed} bytes, "
@@ -506,6 +518,40 @@ def test_selection_reuses_one_buffer_across_chunks(monkeypatch):
 
     assert len(buffers) >= 3, f"wanted several chunks, got {len(buffers)}"
     assert len(set(buffers)) == 1, f"a chunk allocated its own scratch: {buffers}"
+
+
+def test_selection_rejects_a_block_table_the_reservation_was_not_cut_for():
+    """The counts come from a reservation cut for int32, and the scorer
+    requires them to match the block table. A wider table therefore has to be
+    refused here, where the reason can be stated, rather than inside the kernel
+    where it surfaces as an opaque TVM FFI dtype mismatch."""
+    from vllm.models.qwen4_exp.nvidia.ops import qsa_flashinfer
+
+    call = _selection_call(
+        page_table_dtype=torch.int64,
+        block_indices_dtype=torch.int64,
+        out_dtype=torch.int64,
+    )
+    with pytest.raises(ValueError, match="reserves its counts"):
+        qsa_flashinfer.select_and_expand(**call)
+
+
+def test_reserving_without_a_worker_is_a_no_op():
+    """Outside a worker there is no workspace to reserve into.
+
+    The profiling branch runs in unit tests too, and a manager is only created
+    by a real worker, so reserving unguarded would turn any such call into
+    "WorkspaceManager not initialized".
+    """
+    from vllm.models.qwen4_exp.nvidia.ops import qsa_flashinfer
+    from vllm.v1.worker.workspace import (
+        is_workspace_manager_initialized,
+        reset_workspace_manager,
+    )
+
+    reset_workspace_manager()
+    assert not is_workspace_manager_initialized()
+    qsa_flashinfer.reserve_selection_workspace(2048, 65536)
 
 
 def test_selection_runs_against_a_locked_reservation(monkeypatch):

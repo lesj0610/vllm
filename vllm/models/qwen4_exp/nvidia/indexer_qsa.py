@@ -181,6 +181,18 @@ class QSAIndexer(nn.Module):
             vllm_config=vllm_config,
         )
 
+        # The reservation below lands in whichever workspace ubatch slot the
+        # profiling run occupies, and that run has ubatching disabled, so it is
+        # always slot 0. A second slot would go to execution unreserved and
+        # then be locked, so refuse the combination rather than fail on the
+        # first full-width request that lands there.
+        if vllm_config.parallel_config.enable_dbo:
+            raise NotImplementedError(
+                "Qwen4Exp QSA selection does not support dual-batch overlap: "
+                "its scratch is reserved during profiling, which runs on one "
+                "ubatch slot only"
+            )
+
         # What the profiling run has to reserve for: the widest score row this
         # deployment's context can reach, by the same rule select_and_expand
         # sizes an actual batch by, and the most rows a batch can bring.
