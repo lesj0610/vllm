@@ -10,6 +10,7 @@ regressing to the slower path.
 """
 
 import itertools
+import math
 
 import pytest
 import torch
@@ -423,39 +424,62 @@ def test_selection_sizes_the_scores_off_the_batch_not_the_block_table(
     assert set(widths) == {expected}
 
 
-def test_selection_reservation_covers_the_widest_chunk(monkeypatch):
-    """What the profiling run reserves has to hold what execution then asks for.
+@pytest.mark.parametrize(
+    ("budget_mb", "tokens", "max_columns"),
+    [
+        # The serving config: 262144 context at compress_ratio 4.
+        (512, 2048, 65536),
+        # 4 * max_columns divides the budget exactly here, which is the only
+        # reason reserving the widest rectangle happened to be safe above.
+        # These do not divide, and the widest rectangle under-reserves:
+        (512, 2048, 75008),  # max_model_len 300000, compress_ratio 4
+        (512, 2048, 87424),  # max_model_len 262144, compress_ratio 3
+        (512, 4096, 50048),  # max_model_len 400000, compress_ratio 8
+        # A single row of scores already exceeds the whole budget.
+        (1, 2048, 524288),
+        (512, 16384, 64),  # a short context, many rows
+    ],
+)
+def test_selection_reservation_covers_every_width_execution_can_ask_for(
+    monkeypatch, budget_mb, tokens, max_columns
+):
+    """The reservation has to dominate execution over *every* admissible width.
 
-    The reservation is taken from config alone, because the run that would
-    reveal the real shapes returns before selection executes. It therefore has
-    to cover the widest chunk the config permits -- including the single-row
-    chunk a width past the whole budget falls back to, which is the case that
-    would otherwise allocate outside the reservation.
+    Chunk bytes are ``selection_chunk_rows(c) * c * 4``, which is not monotone
+    in ``c`` -- it peaks wherever the budget divides evenly by ``4c``. Sizing
+    the reservation at ``max_columns`` alone therefore leaves some narrower
+    width the same deployment can still produce asking for more than was
+    reserved, and under a locked workspace that is a runtime failure.
+
+    Compares bytes, not shapes: a shape assertion that re-derives the shape
+    from the same helper cannot fail.
     """
     from vllm.models.qwen4_exp.nvidia.ops import qsa_flashinfer
 
-    for budget_mb, tokens, columns in [
-        (512, 2048, 65536),  # the serving config
-        # A single row of scores is already wider than the whole budget, so
-        # the chunk floors at one row and the reservation has to hold it.
-        (1, 2048, 524288),
-        (512, 16384, 64),  # a short context, many rows
-    ]:
-        monkeypatch.setattr(envs, "VLLM_SPARSE_INDEXER_MAX_LOGITS_MB", budget_mb)
-        specs = qsa_flashinfer.selection_workspace_specs(tokens, columns)
-        (score_shape, score_dtype), (count_shape, count_dtype), (topk_shape, _) = specs
+    monkeypatch.setattr(envs, "VLLM_SPARSE_INDEXER_MAX_LOGITS_MB", budget_mb)
+    specs = qsa_flashinfer.selection_workspace_specs(tokens, max_columns)
+    reserved = sum(
+        math.prod(shape) * torch.empty(0, dtype=dtype).element_size()
+        for shape, dtype in specs
+    )
+    (_, score_dtype), (count_shape, count_dtype), (topk_shape, _) = specs
+    assert score_dtype is torch.float32
+    assert count_shape == (tokens,) and count_dtype is torch.int32
+    assert topk_shape[0] == qsa_flashinfer._TOPK_WORKSPACE_BYTES
 
-        # The rows the reservation is cut for are the rows execution will use.
-        assert score_shape == (
-            qsa_flashinfer.selection_chunk_rows(columns, tokens),
-            columns,
-        )
-        assert score_shape[0] >= 1, "a chunk always covers at least one row"
-        assert score_dtype is torch.float32
-        # Counts are sized for the whole batch, not for one chunk: the caller
-        # slices them per chunk and never grows them.
-        assert count_shape == (tokens,) and count_dtype is torch.int32
-        assert topk_shape[0] == qsa_flashinfer._TOPK_WORKSPACE_BYTES
+    for columns in range(64, max_columns + 1, 64):
+        for rows in {1, tokens}:
+            chunk_rows = qsa_flashinfer.selection_chunk_rows(columns, rows)
+            assert chunk_rows >= 1, "a chunk always covers at least one row"
+            needed = (
+                chunk_rows * columns * 4
+                + chunk_rows * 4
+                + qsa_flashinfer._TOPK_WORKSPACE_BYTES
+            )
+            assert needed <= reserved, (
+                f"columns={columns} rows={rows} needs {needed} bytes, "
+                f"reservation is {reserved}"
+            )
 
 
 def test_selection_reuses_one_buffer_across_chunks(monkeypatch):
@@ -482,6 +506,40 @@ def test_selection_reuses_one_buffer_across_chunks(monkeypatch):
 
     assert len(buffers) >= 3, f"wanted several chunks, got {len(buffers)}"
     assert len(set(buffers)) == 1, f"a chunk allocated its own scratch: {buffers}"
+
+
+def test_selection_runs_against_a_locked_reservation(monkeypatch):
+    """reserve -> lock -> execute, through the manager the worker actually uses.
+
+    The pair above runs with no manager, so it exercises the per-call fallback
+    and says nothing about the sequence this whole path exists to establish. A
+    reservation that is short shows up here as the lock refusing to grow, which
+    is the failure a real boot would hit.
+    """
+    from vllm.models.qwen4_exp.nvidia.ops import qsa_flashinfer
+    from vllm.v1.worker.workspace import (
+        init_workspace_manager,
+        lock_workspace,
+        reset_workspace_manager,
+    )
+
+    rows, columns = 1536, 512
+    monkeypatch.setattr(envs, "VLLM_SPARSE_INDEXER_MAX_LOGITS_MB", 1)
+
+    reset_workspace_manager()
+    try:
+        init_workspace_manager(torch.device("cpu"))
+        # What the profiling run would reserve, from config alone.
+        qsa_flashinfer.reserve_selection_workspace(rows, columns)
+        lock_workspace()
+
+        _record_index_dtypes(monkeypatch)
+        # Widest admissible batch: the reservation has to already hold it.
+        qsa_flashinfer.select_and_expand(
+            **_selection_call(rows=rows, pages=columns // 8, max_seq_len=columns * 4)
+        )
+    finally:
+        reset_workspace_manager()
 
 
 @requires_cuda

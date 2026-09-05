@@ -394,13 +394,25 @@ def selection_workspace_specs(
 
     Three buffers live at once inside a chunk: the FP32 scores, the per-row
     visible-block counts the scorer writes beside them, and the top-k's own
-    workspace. ``max_columns`` is what the deployment's context can reach, so
-    the widest chunk is the one that fixes the reservation -- including the
-    single-row chunk a width past the whole budget falls back to.
+    workspace.
+
+    The scores are reserved flat, not as the widest chunk's rectangle. Chunk
+    elements are ``selection_chunk_rows(c) * c``, and that is not monotone in
+    ``c``: it peaks wherever the budget divides evenly by ``4c``, which is not
+    generally at ``max_columns``. Reserving the rectangle at ``max_columns``
+    therefore under-reserves for some narrower width the same deployment can
+    still produce -- and under a locked workspace that is a hard failure at
+    runtime, not a resize.
+
+    Bounding it instead of maximising over widths: a chunk that fits the budget
+    is capped by the budget, and a width so wide that not even one row fits is
+    capped by that single row. So the reservation is the larger of the two,
+    which no width can exceed, clamped to what the whole batch could ever be.
     """
-    rows = selection_chunk_rows(max_columns, max_num_batched_tokens)
+    budget_elems = envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024 // 4
+    scores = min(max_num_batched_tokens * max_columns, max(budget_elems, max_columns))
     return [
-        ((rows, max_columns), torch.float32),
+        ((scores,), torch.float32),
         ((max_num_batched_tokens,), _SELECTION_INDEX_DTYPE),
         ((_TOPK_WORKSPACE_BYTES,), torch.uint8),
     ]
@@ -409,16 +421,27 @@ def selection_workspace_specs(
 def reserve_selection_workspace(max_num_batched_tokens: int, max_columns: int) -> None:
     """Size the shared workspace for selection before it is locked.
 
-    Called from the profiling run, which happens before the KV cache is sized:
-    the initial memory snapshot is taken before the model loads, so anything
-    still held when profiling ends is part of the difference the KV budget is
-    computed from. Reserving here is what puts these bytes on that side of the
-    line -- nobody subtracts them afterwards.
+    Called from the profiling run, which is the only place this path can be
+    sized from: the run returns before selection executes, so nothing else
+    would ever ask for these bytes until a real request did.
 
-    The buffer itself belongs to the shared WorkspaceManager, so it follows the
+    Where the KV cache is sized automatically, holding the buffer from here on
+    is what puts it outside that budget -- the initial snapshot predates model
+    load, so anything still held when profiling ends is inside the difference
+    the budget is computed from. Where ``kv_cache_memory_bytes`` is set instead,
+    memory profiling is skipped entirely (see gpu_worker's early return), the KV
+    size is whatever the operator asked for, and the benefit here is only that
+    the bytes are claimed once at startup and reused. A deployment that pins the
+    KV size has to leave room for this reservation itself.
+
+    The buffer belongs to the shared WorkspaceManager, so it follows the
     engine's ubatch/lane slots and its teardown rather than outliving the model
     in a module-level cache.
     """
+    if not is_workspace_manager_initialized():
+        # No worker owns a workspace here -- a direct call from a test. There
+        # is nothing to reserve into, and _selection_views allocates per call.
+        return
     current_workspace_manager().get_simultaneous(
         *selection_workspace_specs(max_num_batched_tokens, max_columns)
     )
@@ -510,6 +533,15 @@ def select_and_expand(
     # (common/qsa_cache.py) while vLLM block tables are int32, so narrow the
     # positions once here instead of letting the mismatch reach the kernel.
     index_dtype = page_table.dtype
+    if index_dtype is not _SELECTION_INDEX_DTYPE:
+        # The visible-block counts come out of a reservation cut for int32, and
+        # the scorer requires them to match the block table. A wider table would
+        # therefore fail inside the kernel on a dtype it cannot report usefully.
+        raise ValueError(
+            "QSA FlashInfer selection reserves its counts as "
+            f"{_SELECTION_INDEX_DTYPE}, so the block table must carry that "
+            f"dtype; got page_table={index_dtype}"
+        )
     for name, tensor in (("block_indices", block_indices), ("out", out)):
         if tensor.dtype != index_dtype:
             raise ValueError(
