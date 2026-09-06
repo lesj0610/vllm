@@ -889,12 +889,12 @@ class MambaSpec(KVCacheSpec):
     mamba_type: MambaAttentionBackendEnum = MambaAttentionBackendEnum.MAMBA2
     mamba_cache_mode: str = "none"
     num_speculative_blocks: int = 0
-    num_prefill_checkpoint_blocks: int = 0
-    num_heads: int = 1
-    tokens_per_state: int = -1
     # False: the state is sharded across TP ranks (e.g. GDN). True: every TP
     # rank holds the full state (e.g. the replicated PLE conv state).
     tp_replicated: bool = False
+    num_prefill_checkpoint_blocks: int = 0
+    num_heads: int = 1
+    tokens_per_state: int = -1
 
     @property
     def state_content_size_bytes(self) -> int:
@@ -1103,6 +1103,7 @@ class UniformTypeKVCacheSpecs(KVCacheSpec):
         else:
             return None
 
+    # Helpers for cache formats composed of repeated physical layer tuples.
     def get_max_layers_per_page_size(self) -> int:
         """Max number of layers sharing a page size. For a balanced bucket
         this equals the number of repetitions of the layer pattern."""
