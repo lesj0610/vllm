@@ -7,6 +7,7 @@ from typing import cast
 import torch
 from torch import nn
 
+import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm
@@ -233,6 +234,18 @@ class QSAIndexer(nn.Module):
 
         metadata = self._metadata()
         if metadata is None:
+            # No attention metadata means the profiling run, and it returns
+            # before selection executes -- so the scores that selection is
+            # about to allocate on every real forward would never appear in
+            # the measured peak, and the KV cache would be sized over them.
+            # Stand in for them here, the way the sparse indexer upstream
+            # ships does, and let the allocation go: this only has to be held
+            # long enough for profiling to see it, not reused afterwards.
+            _ = torch.empty(
+                envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024,
+                dtype=torch.uint8,
+                device=hidden_states.device,
+            )
             # Preserve step-0 indices when later MTP steps reuse the buffer.
             if self.skip_topk and out is not None:
                 return out
