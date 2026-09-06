@@ -508,6 +508,25 @@ def hc_gate_mix(x: torch.Tensor, gate: torch.Tensor, hc_count: int) -> torch.Ten
     return torch.ops.vllm.qwen4_exp_hc_gate_mix(x, gate, hc_count)
 
 
+def _unit_injection(
+    injection_logits: torch.Tensor | None,
+    residual: torch.Tensor,
+    hc_count: int,
+) -> torch.Tensor:
+    """Stand in for a missing injection with the logits that mean unit weight.
+
+    The first hyper-connection layer has no previous injection, and the kernels
+    take the tensor unconditionally -- the op schema declares it non-optional,
+    so ``None`` reaches C++ as an undefined handle and the first stride query
+    on it fails. Both kernels gate on ``2 * sigmoid(logit * inv_hc)``, which is
+    exactly 1 at a logit of zero, so zeros reproduce the unweighted add the
+    unfused path does. Exact in floating point, not an approximation.
+    """
+    if injection_logits is not None:
+        return injection_logits
+    return residual.new_zeros((residual.shape[0], hc_count))
+
+
 def hc_combine(
     residual: torch.Tensor,
     block_output: torch.Tensor,
@@ -515,7 +534,10 @@ def hc_combine(
     hc_count: int,
 ) -> torch.Tensor:
     return torch.ops.vllm.qwen4_exp_hc_combine(
-        residual, block_output, injection_logits, hc_count
+        residual,
+        block_output,
+        _unit_injection(injection_logits, residual, hc_count),
+        hc_count,
     )
 
 
@@ -530,7 +552,7 @@ def hc_combine_norm(
     return torch.ops.vllm.qwen4_exp_hc_combine_norm(
         residual,
         block_output,
-        injection_logits,
+        _unit_injection(injection_logits, residual, hc_count),
         norm_weight,
         eps,
         hc_count,
