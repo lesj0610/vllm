@@ -1789,6 +1789,19 @@ class SupportsMRoPE(Protocol):
         ...
 
 
+def has_sequence_bounded_mrope_positions(model: type[object]) -> bool:
+    """Whether unpruned M-RoPE positions of ``model`` fit its sequence bound.
+
+    Optional and fail-closed: a concrete model class must opt in by setting
+    ``mrope_positions_are_sequence_bounded = True`` in its own body. A
+    declaration inherited from a parent does not certify a derived position
+    implementation, so the attribute is read off ``__dict__`` instead of via
+    attribute lookup. Config-dependent position transforms such as multimodal
+    pruning must be checked separately before this is used as a cache bound.
+    """
+    return model.__dict__.get("mrope_positions_are_sequence_bounded") is True
+
+
 @overload
 def supports_mrope(model: type[object]) -> TypeIs[type[SupportsMRoPE]]: ...
 

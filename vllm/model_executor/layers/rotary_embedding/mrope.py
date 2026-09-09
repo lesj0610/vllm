@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import math
 
 import numpy as np
 import torch
@@ -249,8 +250,9 @@ class MRotaryEmbedding(RotaryEmbeddingBase):
         dtype: torch.dtype,
         mrope_section: list[int] | None = None,
         mrope_interleaved: bool = False,
-        # YaRN parameters.
         *,
+        mrope_cache_max_position: int | None = None,
+        # YaRN parameters.
         scaling_factor: float | None = None,
         extrapolation_factor: float = 1,
         attn_factor: float = 1,
@@ -273,11 +275,33 @@ class MRotaryEmbedding(RotaryEmbeddingBase):
         # In Qwen2.5-VL, the maximum index value is related to the duration of
         # the input video. We enlarge max_position_embeddings to 4 times to get
         # a larger the cos and sin cache.
-        self.cache_max_position_num = max_position_embeddings * 4
+        #
+        # That 4x is the semantic position maximum: YaRN's correction range is
+        # derived from `self.max_position_embeddings`, so it must keep seeing
+        # the enlarged value. `mrope_cache_max_position` only lowers how many
+        # rows the physical cos/sin cache holds, for models that certify their
+        # M-RoPE positions stay inside it.
+        semantic_max_position_embeddings = max_position_embeddings * 4
+        self._uses_bounded_cache = mrope_cache_max_position is not None
+        if mrope_cache_max_position is not None:
+            if mrope_cache_max_position <= 0:
+                raise ValueError(
+                    "mrope_cache_max_position must be positive, got "
+                    f"{mrope_cache_max_position}"
+                )
+            self.cache_max_position_num = mrope_cache_max_position
+        elif scaling_factor is None:
+            self.cache_max_position_num = semantic_max_position_embeddings
+        else:
+            # Mirror the row count `YaRNScalingRotaryEmbedding` would produce
+            # from `torch.arange(max_position_embeddings * scaling_factor)`.
+            self.cache_max_position_num = math.ceil(
+                semantic_max_position_embeddings * scaling_factor
+            )
         super().__init__(
             head_size,
             rotary_dim,
-            self.cache_max_position_num,
+            semantic_max_position_embeddings,
             base,
             is_neox_style,
             dtype,
@@ -294,9 +318,30 @@ class MRotaryEmbedding(RotaryEmbeddingBase):
         return YaRNScalingRotaryEmbedding._compute_inv_freq(self, base)
 
     def _compute_cos_sin_cache(self) -> torch.Tensor:
-        if self.scaling_factor is None:
-            return super()._compute_cos_sin_cache()
-        return YaRNScalingRotaryEmbedding._compute_cos_sin_cache(self)
+        if not self._uses_bounded_cache:
+            if self.scaling_factor is None:
+                return super()._compute_cos_sin_cache()
+            return YaRNScalingRotaryEmbedding._compute_cos_sin_cache(self)
+
+        # Bounded models build the cache from `cache_max_position_num` instead
+        # of delegating, because the base and YaRN implementations size it from
+        # `self.max_position_embeddings`, which stays at the semantic maximum.
+        # The cache is created on the accelerator (see
+        # `RotaryEmbeddingBase._compute_inv_freq`), so materializing the
+        # semantic-sized cache and slicing it afterwards would keep the peak
+        # allocation this bound exists to avoid. Row `i` is identical to the
+        # delegated cache's row `i`; `test_mrope.py` pins that.
+        inv_freq = self._compute_inv_freq(
+            self.base if self.scaling_factor is None else self.scaling_factor
+        )
+        t = torch.arange(self.cache_max_position_num, dtype=torch.float32)
+        freqs = torch.einsum("i,j -> ij", t, inv_freq)
+        cos = freqs.cos()
+        sin = freqs.sin()
+        if self.scaling_factor is not None:
+            cos = cos * self.mscale
+            sin = sin * self.mscale
+        return torch.cat((cos, sin), dim=-1)
 
     def forward_native(
         self,
