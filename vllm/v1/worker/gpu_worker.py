@@ -28,6 +28,8 @@ from vllm.distributed import (
 from vllm.distributed.ec_transfer import (
     ensure_ec_transfer_initialized,
     ensure_ec_transfer_shutdown,
+    get_ec_transfer,
+    has_ec_transfer,
 )
 from vllm.distributed.eplb.eplb_utils import override_envs_for_eplb
 from vllm.distributed.kv_transfer import (
@@ -620,6 +622,9 @@ class Worker(WorkerBase):
             cast(Any, self.model_runner)._setup_ple_offload(
                 self.parallel_config._ple_offload_ipc_path
             )
+
+        if has_ec_transfer():
+            get_ec_transfer().start_worker_services()
 
         if self.vllm_config.weight_transfer_config is not None:
             self.weight_transfer_engine = WeightTransferEngineFactory.create_engine(

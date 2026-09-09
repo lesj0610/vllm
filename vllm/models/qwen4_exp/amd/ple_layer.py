@@ -1124,7 +1124,7 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         gated_value = gate * value.unsqueeze(-2)
         normalized = self._apply_norm(self.norm_conv, gated_value).flatten(-2)
         conv_output = torch.zeros_like(normalized)
-        torch.ops.vllm.qwen4_exp_ple_short_conv_rocm(
+        torch.ops.vllm.qwen4_exp_ple_short_conv(
             normalized,
             conv_output,
             self.prefix,
@@ -1149,14 +1149,6 @@ def qwen4_exp_amd_ple_ngram_embedding(
     output.copy_(result)
 
 
-def qwen4_exp_amd_ple_ngram_embedding_fake(
-    ngram_ids: torch.Tensor,
-    output: torch.Tensor,
-    layer_name: str,
-) -> None:
-    return
-
-
 def qwen4_exp_ple_short_conv(
     inputs: torch.Tensor,
     output: torch.Tensor,
@@ -1167,27 +1159,17 @@ def qwen4_exp_ple_short_conv(
     output[: result.shape[0]].copy_(result)
 
 
-def qwen4_exp_ple_short_conv_fake(
-    inputs: torch.Tensor,
-    output: torch.Tensor,
-    layer_name: str,
-) -> None:
-    return
-
-
 direct_register_custom_op(
     op_name="qwen4_exp_amd_ple_ngram_embedding",
     op_func=qwen4_exp_amd_ple_ngram_embedding,
     mutates_args=["output"],
-    fake_impl=qwen4_exp_amd_ple_ngram_embedding_fake,
 )
 
 
 direct_register_custom_op(
-    op_name="qwen4_exp_ple_short_conv_rocm",
+    op_name="qwen4_exp_ple_short_conv",
     op_func=qwen4_exp_ple_short_conv,
     mutates_args=["output"],
-    fake_impl=qwen4_exp_ple_short_conv_fake,
 )
 
 

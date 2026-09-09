@@ -534,6 +534,17 @@ def _ngram_hash_params(device: torch.device, context_len: int) -> dict:
         ([4, 4], [0, 7], [[11, 12], [13, 14]], 20),
         ([4, 0, 3], [], [[11, 12], [13, 14], [15, 16]], 20),
         (
+            [3, 2, 0, 0],
+            [],
+            [
+                [11, 12],
+                [13, 14],
+                [_NGRAM_EOS_TOKEN_ID, _NGRAM_EOS_TOKEN_ID],
+                [_NGRAM_EOS_TOKEN_ID, _NGRAM_EOS_TOKEN_ID],
+            ],
+            20,
+        ),
+        (
             [1, 33, 2],
             [5, 32],
             [[_NGRAM_EOS_TOKEN_ID, 11], [12, 13], [14, _NGRAM_EOS_TOKEN_ID]],
@@ -563,6 +574,7 @@ def _ngram_hash_params(device: torch.device, context_len: int) -> dict:
         "bigram-only",
         "power-of-two",
         "empty-request",
+        "trailing-padded-requests",
         "three-requests",
         "six-requests",
         "four-gram",
@@ -1425,25 +1437,6 @@ def test_fused_gate_correctness(num_tokens: int, strided_kv: bool) -> None:
     torch.testing.assert_close(normed, expected_normed, atol=1e-2, rtol=1e-2)
 
 
-def _patch_ngram_ids_forward_context(
-    monkeypatch: pytest.MonkeyPatch, embedding: Qwen4ExpNGramEmbedding
-) -> None:
-    """Let ``qwen4_exp_compute_ple_ngram_ids`` resolve back to ``embedding``.
-
-    ``forward_impl`` routes ID generation through the custom op, which looks the
-    owning layer up in the forward context.
-    """
-    monkeypatch.setattr(
-        ple_layer_module,
-        "get_forward_context",
-        lambda: SimpleNamespace(
-            no_compile_layers={
-                embedding.layer_name: SimpleNamespace(ple_embedding=embedding)
-            }
-        ),
-    )
-
-
 def _make_nvfp4_ngram_embedding_for_load_test() -> Qwen4ExpNGramEmbedding:
     module = _make_ngram_embedding_for_load_test()
     embedding = nn.Module()
@@ -1911,7 +1904,6 @@ def test_ngram_fp8_cpu_offload_preserves_quantized_output(
     module.ngram_size = 2
     module.heads_per_ngram = 1
     module.ngram_heads = 1
-    module.layer_name = "ple"
     module.eos_token_id = 99
     module.register_buffer("layer_multipliers", torch.tensor([1, 1]))
     module.register_buffer("ngram_heads_vocab_sizes", torch.tensor([3]))
@@ -1919,7 +1911,6 @@ def test_ngram_fp8_cpu_offload_preserves_quantized_output(
     module.ngram_embedding = _make_fp8_embedding_layer(monkeypatch)
 
     monkeypatch.setattr(ple_layer_module, "is_offload_process", lambda: True)
-    _patch_ngram_ids_forward_context(monkeypatch, module)
     hidden_states = torch.empty(2, 0)
     input_ids = torch.tensor([0, 1])
     query_start_loc = torch.tensor([0, 2])
@@ -1955,7 +1946,6 @@ def test_ngram_nvfp4_cpu_offload_preserves_packed_output(
     module.ngram_size = 2
     module.heads_per_ngram = 1
     module.ngram_heads = 1
-    module.layer_name = "ple"
     module.eos_token_id = 99
     module.register_buffer("layer_multipliers", torch.tensor([1, 1]))
     module.register_buffer("ngram_heads_vocab_sizes", torch.tensor([3]))
@@ -1963,7 +1953,6 @@ def test_ngram_nvfp4_cpu_offload_preserves_packed_output(
     module.ngram_embedding = _make_nvfp4_embedding_layer(monkeypatch)
 
     monkeypatch.setattr(ple_layer_module, "is_offload_process", lambda: True)
-    _patch_ngram_ids_forward_context(monkeypatch, module)
     args = (
         torch.empty(2, 0),
         torch.tensor([0, 1]),
@@ -1989,54 +1978,6 @@ def test_ple_state_shape_reserves_speculative_tokens() -> None:
     module.num_spec_tokens = 3
 
     assert module.get_state_shape()[0] in ((32, 12), (12, 32))
-
-
-def test_ple_ngram_ids_custom_op_uses_current_request_layout(monkeypatch) -> None:
-    class RuntimeNGramEmbedding(nn.Module):
-        def compute_ngram_ids(
-            self,
-            input_ids: torch.Tensor,
-            query_start_loc: torch.Tensor,
-            ngram_context: torch.Tensor,
-            output: torch.Tensor | None = None,
-        ) -> torch.Tensor:
-            del input_ids, ngram_context
-            num_reqs = query_start_loc.numel() - 1
-            ids = torch.full((4, 2), num_reqs, dtype=torch.long)
-            if output is None:
-                return ids
-            output.copy_(ids)
-            return output
-
-    layer = Qwen4ExpPLELayer.__new__(Qwen4ExpPLELayer)
-    nn.Module.__init__(layer)
-    layer.ple_embedding = RuntimeNGramEmbedding()
-    monkeypatch.setattr(
-        ple_layer_module,
-        "get_forward_context",
-        lambda: SimpleNamespace(no_compile_layers={"ple": layer}),
-    )
-    input_ids = torch.arange(4)
-    ngram_context = torch.zeros(2, 2, dtype=torch.long)
-    output = torch.empty(4, 2, dtype=torch.long)
-
-    ple_layer_module.qwen4_exp_compute_ple_ngram_ids(
-        input_ids,
-        torch.tensor([0, 4]),
-        ngram_context,
-        output,
-        "ple",
-    )
-    assert torch.equal(output, torch.ones_like(output))
-
-    ple_layer_module.qwen4_exp_compute_ple_ngram_ids(
-        input_ids,
-        torch.tensor([0, 2, 4]),
-        ngram_context,
-        output,
-        "ple",
-    )
-    assert torch.equal(output, torch.full_like(output, 2))
 
 
 @pytest.mark.parametrize(
