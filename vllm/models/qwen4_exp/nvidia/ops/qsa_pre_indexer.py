@@ -39,6 +39,94 @@ def _has_cuda_pre_indexer() -> bool:
     return True
 
 
+# FlashInfer's compute dtypes: whatever its own dispatch admits for ``q``.
+_COMPUTE_DTYPES = frozenset({torch.bfloat16, torch.float16})
+
+
+@functools.cache
+def _pre_indexer_accepts_dtypes(
+    compute_dtype: torch.dtype, out_dtype: torch.dtype
+) -> bool:
+    """Whether the built pre-indexer dispatches this (compute, output) pair.
+
+    Asked of the compiled module rather than a constant here, because a cached build
+    can lag its source and only the binary knows which arms it was compiled with. The
+    pair is the key: the two arms are "the output is the compute dtype" and "the output
+    narrows to e4m3", so an answer for one says nothing about the other.
+    """
+    if compute_dtype not in _COMPUTE_DTYPES:
+        return False
+    if not _has_cuda_pre_indexer():
+        return False
+    try:
+        from flashinfer.sparse_pre_indexer import (
+            QSA_PRE_INDEXER_NARROW_E4M3,
+            QSA_PRE_INDEXER_SAME_AS_COMPUTE,
+            qsa_pre_indexer_dispatch_mask,
+        )
+    except ImportError:
+        # A FlashInfer without the query predates the narrowing arm. It still runs the
+        # same-dtype pre-indexer, so only the narrowing case gives up the CUDA path.
+        return out_dtype == compute_dtype
+    # Past here the module built and loaded and the query exists, so a failure is a
+    # real defect or an allocation failure. Reporting it as "unsupported" would bury
+    # it behind a silent fall back to Triton.
+    mask = qsa_pre_indexer_dispatch_mask()
+    if out_dtype == compute_dtype:
+        return bool(mask & QSA_PRE_INDEXER_SAME_AS_COMPUTE)
+    if out_dtype == torch.float8_e4m3fn:
+        return bool(mask & QSA_PRE_INDEXER_NARROW_E4M3)
+    return False
+
+
+# Triton compiles ``fp8e4nv`` only from sm_89 on; below that it offers e5m2 and the
+# e4b15 bias instead, neither of which is what the indexer stores. So the Triton path
+# is not a fallback for an e4m3 output on older hardware -- it is a compile error.
+_TRITON_E4M3_MIN_CAPABILITY = (8, 9)
+
+
+def _triton_can_write(out_dtype: torch.dtype) -> bool:
+    if out_dtype != torch.float8_e4m3fn:
+        return True
+    if not torch.cuda.is_available():
+        return False
+    return torch.cuda.get_device_capability() >= _TRITON_E4M3_MIN_CAPABILITY
+
+
+def warmup_pre_indexer_capability(
+    compute_dtype: torch.dtype,
+    out_dtype: torch.dtype,
+    cos_sin_cache: torch.Tensor | None = None,
+) -> None:
+    """Settle which path will run, while it is still safe to build and to fail.
+
+    Two things happen here rather than at the first forward. The capability query
+    builds FlashInfer's module on a cache miss, and that first forward may already be
+    a CUDA graph capture. And when neither path can write ``out_dtype``, this is where
+    that has to be said: the alternative is a compile error from Triton in the middle
+    of serving, naming a dtype the operator never chose by hand.
+
+    Call it from a run that is eager and on the real device -- the profiling run.
+    """
+    if _pre_indexer_accepts_dtypes(compute_dtype, out_dtype):
+        # The FlashInfer path also needs the pair-major rotary table, and that one
+        # refuses to be built under capture for the same reason the module does. The
+        # first kernel launch is itself a capture, so it cannot be what builds it.
+        if cos_sin_cache is not None:
+            _paired_cos_sin(cos_sin_cache)
+        return
+    if _triton_can_write(out_dtype):
+        return
+    raise RuntimeError(
+        f"The QSA pre-indexer cannot write {out_dtype}: this FlashInfer build does "
+        "not carry the narrowing arm (qsa_pre_indexer_dispatch_mask reports no e4m3), "
+        "and the Triton path cannot compile fp8e4nv below compute capability "
+        f"{_TRITON_E4M3_MIN_CAPABILITY[0]}.{_TRITON_E4M3_MIN_CAPABILITY[1]}. Install a "
+        "FlashInfer with pre-indexer e4m3 support, or serve with "
+        "--indexer-kv-dtype bf16."
+    )
+
+
 # Keyed on the tensor itself, not on where it happens to sit: an address is
 # only unique while the tensor holding it is alive, and a cache that does not
 # keep it alive can be handed a recycled one and answer with the wrong table.
@@ -516,7 +604,12 @@ def qsa_pre_indexer(
     section = mrope_section if mrope_section is not None else (0, 0, 0)
     assert len(section) == 3
 
-    if _has_cuda_pre_indexer() and head_dim in (128, 256) and q.is_cuda:
+    if (
+        _has_cuda_pre_indexer()
+        and _pre_indexer_accepts_dtypes(q.dtype, q_out.dtype)
+        and head_dim in (128, 256)
+        and q.is_cuda
+    ):
         import flashinfer
 
         flashinfer.qsa_pre_indexer(
