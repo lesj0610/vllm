@@ -23,6 +23,7 @@ except ImportError:
         )
 
 import torch
+from flashinfer import get_seq_lens
 
 from vllm.platforms.interface import DeviceCapability
 from vllm.v1.kv_cache_interface import (
@@ -1568,6 +1569,7 @@ def test_fast_plan_decode_accepts_nvfp4_kv_plan_dtype(dtype: torch.dtype) -> Non
         indptr_cpu=kv_indptr,
         indices=kv_indices,
         last_page_len_cpu=kv_last_page_lens,
+        seq_lens_cpu=get_seq_lens(kv_indptr, kv_last_page_lens, block_size),
         num_qo_heads=num_query_heads,
         num_kv_heads=num_kv_heads,
         head_dim=head_size,
