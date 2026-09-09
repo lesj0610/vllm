@@ -55,7 +55,10 @@ def test_uniproc_executor_starts_ple_worker_around_model_load(monkeypatch):
         "WorkerWrapperBase",
         MagicMock(return_value=driver_worker),
     )
-    monkeypatch.setattr(uniproc_executor_module.envs, "VLLM_PLE_CPU_OFFLOAD", True)
+    # Set the variable rather than the module attribute: monkeypatch
+    # restores a lazily computed envs attribute as a real one, which
+    # shadows the lookup for the rest of the session.
+    monkeypatch.setenv("VLLM_PLE_CPU_OFFLOAD", "1")
     monkeypatch.setattr(
         uniproc_executor_module.envs, "VLLM_ELASTIC_EP_SCALE_UP_LAUNCH", False
     )

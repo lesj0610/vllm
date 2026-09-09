@@ -2076,6 +2076,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Run n-gram PLE lookup in a dedicated CPU offload worker. The initial
     # implementation supports ModelRunner V1 and single-node TP only.
+    #
+    # Upstream reads the same variable as the legacy fallback for
+    # EngramConfig.cpu_offload, which keeps the table in pinned CPU memory and
+    # gathers its rows through UVA instead. Both cannot run at once, and this
+    # variable selects the offload worker; ask for the pinned-host table with
+    # an explicit --engram-config.cpu_offload and leave this unset.
     "VLLM_PLE_CPU_OFFLOAD": lambda: (
         os.getenv("VLLM_PLE_CPU_OFFLOAD", "False").lower() in ("true", "1")
     ),
