@@ -301,7 +301,10 @@ def test_ple_offload_requires_ple_layers(
     worker.model_config = SimpleNamespace(  # type: ignore[assignment]
         hf_text_config=SimpleNamespace(ple_layer_ids=ple_layer_ids)
     )
-    monkeypatch.setattr(envs, "VLLM_PLE_CPU_OFFLOAD", True)
+    # Set the variable rather than the module attribute: monkeypatch
+    # restores a lazily computed envs attribute as a real one, which
+    # shadows the lookup for the rest of the session.
+    monkeypatch.setenv("VLLM_PLE_CPU_OFFLOAD", "1")
 
     assert worker._has_ple_layers() is expected
 
@@ -1180,7 +1183,10 @@ def test_poll_semaphores_gives_up_instead_of_spinning_forever(monkeypatch):
         _sem=SimpleNamespace(flag_tensor=SimpleNamespace(item=lambda: 0))
     )
     connector._layers = {"layers.1.ple": never_done}
-    monkeypatch.setattr(envs, "VLLM_PLE_OFFLOAD_STEP_TIMEOUT", 0.05)
+    # Set the variable rather than the module attribute: monkeypatch
+    # restores a lazily computed envs attribute as a real one, which
+    # shadows the lookup for the rest of the session.
+    monkeypatch.setenv("VLLM_PLE_OFFLOAD_STEP_TIMEOUT", "0.05")
 
     with pytest.raises(RuntimeError, match="did not answer for layers.1.ple"):
         connector._poll_semaphores()
@@ -1356,7 +1362,9 @@ object.__setattr__(
     ),
 )
 object.__setattr__(config, "parallel_config", ParallelConfig())
-object.__setattr__(config, "engram_config", SimpleNamespace(cpu_offload=True))
+from vllm.config.engram import EngramConfig
+
+object.__setattr__(config, "engram_config", EngramConfig(cpu_offload=True))
 
 w._init_offload_distributed(config)
 
