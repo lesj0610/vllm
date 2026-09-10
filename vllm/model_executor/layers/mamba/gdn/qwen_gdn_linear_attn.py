@@ -60,6 +60,7 @@ from vllm.third_party.flash_linear_attention.ops.chunk import l2norm_fwd
 from vllm.third_party.flash_linear_attention.ops.utils import FLA_CHUNK_SIZE
 from vllm.transformers_utils.configs.qwen3_next import Qwen3NextConfig
 from vllm.triton_utils import tl, triton
+from vllm.utils.flashinfer import has_flashinfer_gdn_prefill_sm8x
 from vllm.utils.torch_utils import (
     LayerNameType,
     _encode_layer_name,
@@ -123,30 +124,70 @@ def _resolve_gdn_prefill_backend(
         vllm_config.model_config.hf_text_config, "linear_key_head_dim", None
     )
 
-    supports_flashinfer = False
-    supports_cutedsl = False
+    # Two different questions, and conflating them is what left the option
+    # unable to do its job. "Can it run here" decides whether a backend the
+    # caller named is honoured or refused; "is it the better default" decides
+    # what "auto" picks. A device can answer yes to the first and no to the
+    # second -- newly added architecture support is exactly that case, runnable
+    # before it has been measured against the fallback.
+    can_run_flashinfer = False
+    prefer_flashinfer = False
+    can_run_cutedsl = False
 
     if current_platform.is_device_capability(90):
-        supports_flashinfer = True
+        can_run_flashinfer = True
+        prefer_flashinfer = True
     elif (
         current_platform.is_device_capability_family(100)
         and head_k_dim == 128
         and current_platform.get_cuda_runtime_major() >= 13
     ):
-        supports_flashinfer = True
-        supports_cutedsl = True
+        can_run_flashinfer = True
+        prefer_flashinfer = True
+        can_run_cutedsl = True
     elif (
         current_platform.is_device_capability_family(120)
         and head_k_dim == 128
         and current_platform.get_cuda_runtime_major() >= 13
     ):
         # The in-tree CuteDSL kernel targets SM100 only, so it stays off here.
-        supports_flashinfer = True
+        can_run_flashinfer = True
+        prefer_flashinfer = True
+    elif (
+        current_platform.is_device_capability_family(80)
+        and head_k_dim == 128
+        and has_flashinfer_gdn_prefill_sm8x()
+    ):
+        # Runnable wherever the installed build carries the SM8x prefill, and
+        # asked of the module because the build is what decides. Not preferred:
+        # "auto" keeps the fallback until this path has been measured against
+        # it on this architecture.
+        can_run_flashinfer = True
 
-    if backend in ["flashinfer", "auto"] and supports_flashinfer:
+    if backend == "flashinfer":
+        if not can_run_flashinfer:
+            raise ValueError(
+                "GDN prefill backend 'flashinfer' was requested, but the "
+                f"installed FlashInfer has no path for compute capability "
+                f"{current_platform.get_device_capability()} with "
+                f"head_k_dim={head_k_dim}. Pass --gdn-prefill-backend triton, "
+                "or install a FlashInfer build that covers this device."
+            )
         return backend, "flashinfer"
-    if backend == "cutedsl" and supports_cutedsl:
+    if backend == "cutedsl":
+        if not can_run_cutedsl:
+            raise ValueError(
+                "GDN prefill backend 'cutedsl' was requested, but the in-tree "
+                "CuteDSL kernel targets SM100 with head_k_dim=128 and this is "
+                f"compute capability {current_platform.get_device_capability()} "
+                f"with head_k_dim={head_k_dim}. Pass --gdn-prefill-backend "
+                "triton or flashinfer."
+            )
         return backend, "cutedsl"
+    if backend == "triton":
+        return backend, "triton"
+    if prefer_flashinfer:
+        return backend, "flashinfer"
     return backend, "triton"
 
 
@@ -196,6 +237,7 @@ def fi_chunk_gated_delta_rule(
     output_final_state: bool,
     cu_seqlens: torch.Tensor | None = None,
     use_qk_l2norm_in_kernel: bool = True,
+    max_seq_len: int | None = None,
 ):
     from flashinfer.gdn_prefill import (
         chunk_gated_delta_rule as chunk_gated_delta_rule_fi,
@@ -226,6 +268,10 @@ def fi_chunk_gated_delta_rule(
         initial_state=fi_state,
         output_final_state=output_final_state,
         cu_seqlens=cu_seqlens,
+        # The longest sequence in this batch. Without it the chunk-parallel
+        # path is never offered, because the wrapper will not read cu_seqlens
+        # off the device to find out.
+        _max_seq_len=max_seq_len,
     )
     # FlashInfer returns (output, state) when output_final_state=True,
     # or just output when output_final_state=False.
@@ -244,13 +290,13 @@ class ChunkGatedDeltaRule(CustomOp):
         vllm_config = get_current_vllm_config()
         backend, active_backend = _resolve_gdn_prefill_backend(vllm_config)
         self.gdn_prefill_backend = active_backend
+        # Kept so warmup can tell an explicit choice from what "auto" landed
+        # on: a kernel the caller named has to fail loudly, not be reported as
+        # a slow first inference.
+        self.gdn_prefill_backend_requested = backend
 
-        if backend in ("flashinfer", "cutedsl") and active_backend != backend:
-            logger.warning_once(
-                "GDN prefill backend '%s' is selected but cannot use this "
-                "kernel on the current platform. Falling back to Triton/FLA.",
-                backend,
-            )
+        # A named backend now either runs or raises in the resolver, so there
+        # is no quiet substitution left to report here.
         _log_gdn_backend_decision(vllm_config, backend, active_backend)
 
         if active_backend == "flashinfer":
@@ -274,6 +320,7 @@ class ChunkGatedDeltaRule(CustomOp):
         chunk_offsets: torch.Tensor | None = None,
         use_qk_l2norm_in_kernel: bool = True,
         core_attn_out: torch.Tensor | None = None,
+        max_seq_len: int | None = None,
     ):
         o, final_state = fi_chunk_gated_delta_rule(
             q=q,
@@ -285,6 +332,7 @@ class ChunkGatedDeltaRule(CustomOp):
             output_final_state=output_final_state,
             cu_seqlens=cu_seqlens,
             use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            max_seq_len=max_seq_len,
         )
         if core_attn_out is not None:
             o_flat = o.squeeze(0).reshape(-1)
@@ -306,7 +354,10 @@ class ChunkGatedDeltaRule(CustomOp):
         chunk_offsets: torch.Tensor | None = None,
         use_qk_l2norm_in_kernel: bool = True,
         core_attn_out: torch.Tensor | None = None,
+        max_seq_len: int | None = None,
     ):
+        # Only the FlashInfer path sizes anything from this.
+        del max_seq_len
         return fla_chunk_gated_delta_rule(
             q=q,
             k=k,
@@ -336,7 +387,10 @@ class ChunkGatedDeltaRule(CustomOp):
         chunk_offsets: torch.Tensor | None = None,
         use_qk_l2norm_in_kernel: bool = True,
         core_attn_out: torch.Tensor | None = None,
+        max_seq_len: int | None = None,
     ):
+        # Only the FlashInfer path sizes anything from this.
+        del max_seq_len
         from vllm.model_executor.layers.mamba.ops.gdn_chunk_cutedsl import (
             chunk_gated_delta_rule_cutedsl,
         )
@@ -505,6 +559,12 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
 
         self.chunk_gated_delta_rule = ChunkGatedDeltaRule()
         self.gdn_prefill_backend = self.chunk_gated_delta_rule.gdn_prefill_backend
+        self.gdn_prefill_backend_requested = (
+            self.chunk_gated_delta_rule.gdn_prefill_backend_requested
+        )
+        self.max_prefill_tokens = (
+            get_current_vllm_config().scheduler_config.max_num_batched_tokens
+        )
         self._prefill_kernels_warmed_up = False
         self.enable_packed_recurrent_decode = (
             envs.VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE
@@ -1072,6 +1132,84 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         out, _ = self.out_proj(core_attn_out)
         return out
 
+    def _warmup_flashinfer_long_prefill(
+        self, qkv_or_qkvz: torch.Tensor, v_dim: int
+    ) -> None:
+        """Compile the FlashInfer path at the width real prefills reach.
+
+        FlashInfer chooses among its own architecture specializations from the
+        longest sequence in the batch, so the single-chunk warmup above only
+        reaches the general one. This runs the shape a full prefill batch has,
+        which is where the chunk-parallel kernel is picked.
+        """
+        from vllm.third_party.flash_linear_attention.ops.utils import FLA_CHUNK_SIZE
+
+        T = int(self.max_prefill_tokens)
+        if T <= FLA_CHUNK_SIZE:
+            return
+
+        device = qkv_or_qkvz.device
+        dtype = qkv_or_qkvz.dtype
+        num_v_heads = self.num_v_heads // self.tp_size
+        num_k_heads = self.num_k_heads // self.tp_size
+        state_dtype = self.ssm_state_dtype
+
+        dummy_mixed_qkv = torch.randn(
+            T, qkv_or_qkvz.shape[-1] - v_dim, device=device, dtype=dtype
+        )
+        q, k, v, g, beta = fused_post_conv_prep(
+            conv_output=dummy_mixed_qkv,
+            a=torch.randn(T, num_v_heads, device=device, dtype=dtype),
+            b=torch.randn(T, num_v_heads, device=device, dtype=dtype),
+            A_log=self.A_log,
+            dt_bias=self.dt_bias,
+            num_k_heads=num_k_heads,
+            head_k_dim=self.head_k_dim,
+            head_v_dim=self.head_v_dim,
+            apply_l2norm=True,
+            output_g_exp=False,
+        )
+        state = torch.zeros(
+            1,
+            num_v_heads,
+            self.head_v_dim,
+            self.head_k_dim,
+            device=device,
+            dtype=state_dtype,
+        )
+        try:
+            self.chunk_gated_delta_rule(
+                q=q.unsqueeze(0),
+                k=k.unsqueeze(0),
+                v=v.unsqueeze(0),
+                g=g.unsqueeze(0),
+                beta=beta.unsqueeze(0),
+                initial_state=state,
+                output_final_state=True,
+                cu_seqlens=torch.tensor([0, T], device=device, dtype=torch.int32),
+                use_qk_l2norm_in_kernel=False,
+                max_seq_len=T,
+            )
+        except Exception:
+            if self.gdn_prefill_backend_requested == self.gdn_prefill_backend:
+                raise
+            logger.warning(
+                "GDN FlashInfer long-prefill warmup (T=%d) failed for layer "
+                "%s. The first long prefill will compile it instead.",
+                T,
+                self.prefix,
+                exc_info=True,
+            )
+        else:
+            logger.debug(
+                "GDN FlashInfer long-prefill warmup (T=%d) completed for layer %s",
+                T,
+                self.prefix,
+            )
+        finally:
+            del dummy_mixed_qkv, q, k, v, g, beta, state
+            torch.accelerator.empty_cache()
+
     def _warmup_prefill_kernels(self, qkv_or_qkvz: torch.Tensor, v_dim: int) -> None:
         """Warm up GDN prefill kernels during V1 profiling.
 
@@ -1167,8 +1305,15 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 chunk_indices=chunk_indices,
                 chunk_offsets=chunk_offsets,
                 use_qk_l2norm_in_kernel=False,
+                max_seq_len=T,
             )
         except Exception:
+            if self.gdn_prefill_backend_requested == self.gdn_prefill_backend:
+                # The caller named this backend. A kernel that cannot compile
+                # is not a slow first inference, it is a broken configuration,
+                # and saying so here is the last chance to say it before a
+                # request depends on it.
+                raise
             logger.warning(
                 "GDN prefill kernel warmup (T=%d) failed for "
                 "layer %s. First inference may OOM due to "
@@ -1183,6 +1328,14 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 T,
                 self.prefix,
             )
+            if self.gdn_prefill_backend == "flashinfer":
+                # One chunk only reaches the general path. FlashInfer picks its
+                # chunk-parallel specialization from the longest sequence, so a
+                # single-chunk warmup leaves that one to be compiled by the
+                # first request that is long enough -- inside a capture, or
+                # under a request's latency budget. Warm it at the width real
+                # prefills are batched to.
+                self._warmup_flashinfer_long_prefill(qkv_or_qkvz, v_dim)
         finally:
             del (
                 dummy_mixed_qkv,
@@ -1540,6 +1693,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 chunk_indices=attn_metadata.chunk_indices,
                 chunk_offsets=attn_metadata.chunk_offsets,
                 use_qk_l2norm_in_kernel=False,
+                max_seq_len=attn_metadata.prefill_max_seq_len,
             )
             # Init cache
             ssm_state[prefill_state_indices] = last_recurrent_state.to(ssm_state.dtype)
