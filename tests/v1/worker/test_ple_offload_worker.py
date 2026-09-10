@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from contextlib import nullcontext
 from types import SimpleNamespace
 
@@ -434,10 +435,12 @@ def test_offload_distributed_sets_config_only_for_model_parallel(
     calls = []
 
     # The Offload subprocess may inherit DP environment variables from a GPU
-    # worker, but its isolated model-parallel world must always remain DP1.
-    monkeypatch.setattr(envs, "VLLM_DP_SIZE", 2)
-    monkeypatch.setattr(envs, "VLLM_DP_RANK", 1)
-    monkeypatch.setattr(envs, "VLLM_DP_RANK_LOCAL", 1)
+    # worker, but its isolated model-parallel world must always remain DP1. The
+    # process is spawned, so the environment is how those values actually reach
+    # it, and it is also what ParallelConfig reads back over its own arguments.
+    monkeypatch.setenv("VLLM_DP_SIZE", "2")
+    monkeypatch.setenv("VLLM_DP_RANK", "1")
+    monkeypatch.setenv("VLLM_DP_RANK_LOCAL", "1")
 
     monkeypatch.setattr(
         ple_offload_worker.dist,
@@ -464,13 +467,19 @@ def test_offload_distributed_sets_config_only_for_model_parallel(
         lambda **_: "/tmp/test-ple-offload",
     )
 
-    ple_offload_worker._init_offload_distributed()
+    ple_offload_worker._init_offload_distributed(vllm_config)
 
     offload_config = calls[1][1]
     assert offload_config is not vllm_config
     assert offload_config.parallel_config.data_parallel_size == 1
+    assert offload_config.parallel_config.data_parallel_rank == 0
+    assert offload_config.parallel_config.data_parallel_rank_local == 0
     assert offload_config.parallel_config.tensor_parallel_size == 1
     assert offload_config.parallel_config.pipeline_parallel_size == 1
+    # The inherited environment is left exactly as it was found.
+    assert os.environ["VLLM_DP_SIZE"] == "2"
+    assert os.environ["VLLM_DP_RANK"] == "1"
+    assert os.environ["VLLM_DP_RANK_LOCAL"] == "1"
     assert calls == [
         (
             "world",
@@ -1175,3 +1184,214 @@ def test_poll_semaphores_gives_up_instead_of_spinning_forever(monkeypatch):
 
     with pytest.raises(RuntimeError, match="did not answer for layers.1.ple"):
         connector._poll_semaphores()
+
+
+def _engram_capable_vllm_config() -> VllmConfig:
+    """A config the Engram validator accepts, with a DP2 rank-1 world on it.
+
+    The offload process inherits the GPU worker's environment, so the parallel
+    settings here are deliberately not the ones the isolated world needs.
+    """
+    from vllm.config.parallel import ParallelConfig
+
+    model_config = SimpleNamespace(
+        architecture="Qwen4ExpForCausalLM",
+        hf_text_config=SimpleNamespace(ple_layer_ids=[1]),
+    )
+    config = VllmConfig.__new__(VllmConfig)
+    object.__setattr__(config, "model_config", model_config)
+    object.__setattr__(
+        config,
+        "parallel_config",
+        ParallelConfig(
+            tensor_parallel_size=2,
+            data_parallel_size=2,
+            data_parallel_rank=1,
+            enable_expert_parallel=True,
+            enable_eplb=True,
+        ),
+    )
+    object.__setattr__(config, "engram_config", SimpleNamespace(cpu_offload=True))
+    return config
+
+
+def test_offload_parallel_config_is_a_single_isolated_rank() -> None:
+    """Every degree one, every rank zero, and the derived fields computed."""
+    parallel_config = ple_offload_worker._offload_parallel_config()
+
+    assert parallel_config.tensor_parallel_size == 1
+    assert parallel_config.pipeline_parallel_size == 1
+    assert parallel_config.prefill_context_parallel_size == 1
+    assert parallel_config.decode_context_parallel_size == 1
+    assert parallel_config.data_parallel_size == 1
+    assert parallel_config.data_parallel_size_local == 1
+    assert parallel_config.data_parallel_rank == 0
+    assert parallel_config.data_parallel_rank_local == 0
+    assert parallel_config.nnodes == 1
+    assert parallel_config.node_rank == 0
+    assert parallel_config.enable_elastic_ep is False
+    assert parallel_config.enable_eplb is False
+    # Derived rather than assigned.
+    assert parallel_config.world_size == 1
+    assert parallel_config.data_parallel_index == 0
+
+
+def test_offload_init_keeps_the_caller_config_and_replaces_only_parallel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The isolated world is a new parallel config on the caller's own config.
+
+    A bare ``VllmConfig()`` cannot be built while the offload is enabled -- the
+    Engram validator has no model to check -- and the caller's config is the one
+    that has already passed it.
+    """
+    monkeypatch.setattr(envs, "VLLM_PLE_CPU_OFFLOAD", True)
+
+    def refuse_bare_config(*args: object, **kwargs: object) -> None:
+        raise AssertionError("a bare VllmConfig() was constructed")
+
+    monkeypatch.setattr(ple_offload_worker, "VllmConfig", refuse_bare_config)
+
+    seen: list[VllmConfig] = []
+    monkeypatch.setattr(ple_offload_worker.dist, "is_initialized", lambda: False)
+    monkeypatch.setattr(
+        ple_offload_worker, "init_distributed_environment", lambda **kwargs: None
+    )
+
+    def capture_parallel(**kwargs: object) -> None:
+        seen.append(get_current_vllm_config_or_none())
+
+    monkeypatch.setattr(
+        ple_offload_worker, "ensure_model_parallel_initialized", capture_parallel
+    )
+
+    vllm_config = _engram_capable_vllm_config()
+    before_parallel = vllm_config.parallel_config
+
+    ple_offload_worker._init_offload_distributed(vllm_config)
+
+    assert len(seen) == 1
+    active = seen[0]
+    # The validated pieces come along.
+    assert active.model_config is vllm_config.model_config
+    assert active.engram_config is vllm_config.engram_config
+    # The parallel config is a fresh, isolated one.
+    assert active.parallel_config is not before_parallel
+    assert active.parallel_config.data_parallel_size == 1
+    assert active.parallel_config.data_parallel_rank == 0
+    assert active.parallel_config.tensor_parallel_size == 1
+    assert active.parallel_config.enable_elastic_ep is False
+    assert active.parallel_config.enable_eplb is False
+    # And an inherited DP2 rank-1 world does not follow it in.
+    assert before_parallel.data_parallel_size == 2
+    assert before_parallel.data_parallel_rank == 1
+    assert before_parallel.enable_eplb is True
+    # The caller's config is untouched, and so is the surrounding context.
+    assert vllm_config.parallel_config is before_parallel
+    assert get_current_vllm_config_or_none() is not active
+
+
+def test_offload_parallel_config_ignores_an_inherited_dp_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A DP2 rank-1 environment must not reach the isolated world.
+
+    ParallelConfig reads these back over its own arguments when data parallelism
+    is off, so passing DP1 is not by itself enough.
+    """
+    monkeypatch.setenv("VLLM_DP_SIZE", "2")
+    monkeypatch.setenv("VLLM_DP_RANK", "1")
+    monkeypatch.setenv("VLLM_DP_RANK_LOCAL", "1")
+
+    parallel_config = ple_offload_worker._offload_parallel_config()
+
+    assert parallel_config.data_parallel_size == 1
+    assert parallel_config.data_parallel_rank == 0
+    assert parallel_config.data_parallel_rank_local == 0
+    assert parallel_config.data_parallel_index == 0
+    # And the process keeps the environment it was handed.
+    assert os.environ["VLLM_DP_SIZE"] == "2"
+    assert os.environ["VLLM_DP_RANK"] == "1"
+    assert os.environ["VLLM_DP_RANK_LOCAL"] == "1"
+
+
+def test_offload_dp_environment_is_restored_when_construction_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The environment goes back even if ParallelConfig rejects the arguments."""
+    monkeypatch.setenv("VLLM_DP_SIZE", "2")
+    monkeypatch.delenv("VLLM_DP_RANK", raising=False)
+
+    def boom(**kwargs: object) -> None:
+        raise ValueError("kaboom")
+
+    monkeypatch.setattr(ple_offload_worker, "ParallelConfig", boom)
+
+    with pytest.raises(ValueError, match="kaboom"):
+        ple_offload_worker._offload_parallel_config()
+
+    assert os.environ["VLLM_DP_SIZE"] == "2"
+    assert "VLLM_DP_RANK" not in os.environ
+
+
+# Run in a subprocess: this initializes a real gloo process group, and the crash
+# it guards against happened at import-and-construct time under the legacy env.
+_LEGACY_ENV_INIT_PROBE = """
+import torch.distributed as dist
+
+from vllm.config import VllmConfig, get_current_vllm_config_or_none
+from vllm.config.parallel import ParallelConfig
+from vllm.v1.ple_offload import worker as w
+
+from types import SimpleNamespace
+
+config = VllmConfig.__new__(VllmConfig)
+object.__setattr__(
+    config,
+    "model_config",
+    SimpleNamespace(
+        architecture="Qwen4ExpForCausalLM",
+        hf_text_config=SimpleNamespace(ple_layer_ids=[1]),
+        is_moe=True,
+    ),
+)
+object.__setattr__(config, "parallel_config", ParallelConfig())
+object.__setattr__(config, "engram_config", SimpleNamespace(cpu_offload=True))
+
+w._init_offload_distributed(config)
+
+assert dist.is_initialized(), "the gloo world did not come up"
+assert dist.get_world_size() == 1
+assert dist.get_rank() == 0
+assert get_current_vllm_config_or_none() is not config
+print("OK")
+"""
+
+
+def test_offload_init_runs_under_the_legacy_offload_environment(tmp_path) -> None:
+    """The real init has to get through with VLLM_PLE_CPU_OFFLOAD set.
+
+    This is the configuration that failed: the legacy variable turns on the
+    Engram config, whose validator has no model to check when a bare VllmConfig
+    is built. Reaching READY for real needs a served model; what is pinned here
+    is that the step which raised no longer does.
+    """
+    import subprocess
+    import sys
+
+    env = dict(
+        os.environ,
+        VLLM_PLE_CPU_OFFLOAD="1",
+        VLLM_DP_SIZE="2",
+        VLLM_DP_RANK="1",
+        VLLM_DP_RANK_LOCAL="1",
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", _LEGACY_ENV_INIT_PROBE],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=600,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "OK" in result.stdout

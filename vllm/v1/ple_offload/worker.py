@@ -20,13 +20,14 @@ Class structure mirrors the GPU worker pattern in multiproc_executor.py:
 """
 
 import contextlib
+import copy
 import multiprocessing.process
 import os
 import pickle
 import signal
 import tempfile
 import threading
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
 from multiprocessing.connection import Connection
 from pathlib import Path
@@ -39,6 +40,7 @@ import zmq
 
 import vllm.envs as envs
 from vllm.config import VllmConfig, set_current_vllm_config
+from vllm.config.parallel import ParallelConfig
 from vllm.distributed.parallel_state import (
     ensure_model_parallel_initialized,
     init_distributed_environment,
@@ -200,7 +202,59 @@ class PleOffloadWorkerHandle:
             self.proc.join(timeout=5)
 
 
-def _init_offload_distributed() -> None:
+# The data parallel environment the isolated world runs in. ParallelConfig reads
+# these back over its own arguments whenever data parallelism is off (see the env
+# fallback in ParallelConfig.__post_init__), so a DP2 rank-1 environment inherited
+# from the GPU worker would otherwise land in a config asked for DP1 rank 0.
+_ISOLATED_DP_ENV = {
+    "VLLM_DP_SIZE": "1",
+    "VLLM_DP_RANK": "0",
+    "VLLM_DP_RANK_LOCAL": "0",
+}
+
+
+@contextlib.contextmanager
+def _isolated_dp_environment() -> Iterator[None]:
+    """Hold the DP environment at the isolated world's values, then restore it."""
+    previous = {name: os.environ.get(name) for name in _ISOLATED_DP_ENV}
+    os.environ.update(_ISOLATED_DP_ENV)
+    try:
+        yield
+    finally:
+        for name, value in previous.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
+def _offload_parallel_config() -> ParallelConfig:
+    """A parallel config for the isolated world, built rather than edited.
+
+    Every degree is one and every rank is zero: this process owns the whole
+    embedding table and joins none of the GPU workers' groups. Building it from
+    defaults rather than copying theirs keeps settings that only make sense out
+    there -- elastic EP, EPLB -- from leaking in, and lets the derived fields
+    (world_size, data_parallel_index) be computed instead of assigned.
+    """
+    with _isolated_dp_environment():
+        return ParallelConfig(
+            tensor_parallel_size=1,
+            pipeline_parallel_size=1,
+            prefill_context_parallel_size=1,
+            decode_context_parallel_size=1,
+            data_parallel_size=1,
+            data_parallel_size_local=1,
+            data_parallel_rank=0,
+            data_parallel_rank_local=0,
+            nnodes=1,
+            node_rank=0,
+            enable_elastic_ep=False,
+            enable_eplb=False,
+        )
+
+
+def _init_offload_distributed(vllm_config: VllmConfig) -> None:
     """Initialize the single-rank Gloo world required by TP-aware layers."""
     if dist.is_initialized():
         return
@@ -216,25 +270,15 @@ def _init_offload_distributed() -> None:
         local_rank=0,
         backend="gloo",
     )
-    # initialize_model_parallel reads the active VllmConfig in the current
-    # vLLM version. Explicitly configure DP1/TP1/PP1 to match the isolated
-    # world, regardless of any DP environment variables inherited from the GPU
-    # worker. The real DP/TP configuration is used later for model construction,
+    # initialize_model_parallel reads the active VllmConfig, and it has to see
+    # DP1/TP1/PP1 to match the isolated world however the GPU worker's DP
+    # environment was set. The rest of the caller's config comes along as it is:
+    # a bare VllmConfig() cannot be built here at all, because a validated one
+    # is what proves the model supports the offload this process exists for.
+    # The real DP/TP configuration is used later for model construction,
     # registration, and request routing.
-    offload_config = VllmConfig()
-    offload_parallel_config = offload_config.parallel_config
-    offload_parallel_config.data_parallel_size = 1
-    offload_parallel_config.data_parallel_size_local = 1
-    offload_parallel_config.data_parallel_rank = 0
-    offload_parallel_config.data_parallel_rank_local = 0
-    offload_parallel_config.data_parallel_index = 0
-    offload_parallel_config.tensor_parallel_size = 1
-    offload_parallel_config.pipeline_parallel_size = 1
-    offload_parallel_config.prefill_context_parallel_size = 1
-    offload_parallel_config.decode_context_parallel_size = 1
-    offload_parallel_config.world_size = 1
-    offload_parallel_config.nnodes = 1
-    offload_parallel_config.node_rank = 0
+    offload_config = copy.copy(vllm_config)
+    offload_config.parallel_config = _offload_parallel_config()
     with set_current_vllm_config(offload_config):
         ensure_model_parallel_initialized(
             tensor_model_parallel_size=1,
@@ -421,7 +465,7 @@ class PleOffloadWorker:
 
             # Initialize Gloo before installing the real VllmConfig. This keeps
             # the CPU process in an isolated rank-zero, world-size-one group.
-            _init_offload_distributed()
+            _init_offload_distributed(vllm_config)
 
             # Model components read the active VllmConfig while the meta model
             # is constructed, so keep the context around runner initialization.
