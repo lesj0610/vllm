@@ -1152,7 +1152,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         dtype = qkv_or_qkvz.dtype
         num_v_heads = self.num_v_heads // self.tp_size
         num_k_heads = self.num_k_heads // self.tp_size
-        state_dtype = self.ssm_state_dtype
+        _, state_dtype = self.get_state_dtype()
 
         dummy_mixed_qkv = torch.randn(
             T, qkv_or_qkvz.shape[-1] - v_dim, device=device, dtype=dtype
