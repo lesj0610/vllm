@@ -30,10 +30,13 @@ from collections import OrderedDict
 import torch
 
 import vllm.envs as envs
+from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.utils.math_utils import cdiv, round_up
 
 from .qsa_indexer import _TOPK_WORKSPACE_BYTES, _topk
+
+logger = init_logger(__name__)
 
 # The software E2M1 decode this path relies on is a pre-SM100 construct: from
 # SM100 the conversion is a single instruction and a different specialization
@@ -211,19 +214,26 @@ class QSAFlashInferRunner:
         self._plans: OrderedDict[tuple, _RoutePlan] = OrderedDict()
 
     def _plan_for(self, key, *args):
+        # A graph replays the route and mask buffers this plan holds, so a plan
+        # the capture reached can never be evicted: dropping it would leave the
+        # graph replaying freed device pointers. With capture warmups enabled,
+        # capture commonly reaches a plan through the hit path, so pin on use
+        # rather than only on creation. Pinning is monotonic: a plan a graph has
+        # seen stays pinned for the rest of the process.
+        capturing = torch.cuda.is_current_stream_capturing()
         plan = self._plans.get(key)
         if plan is not None:
             self._plans.move_to_end(key)
+            if capturing:
+                plan.pinned = True
             return plan
         plan = _RoutePlan(*args)
-        # A graph replays the route and mask buffers this plan holds, so a plan
-        # first built under capture can never be evicted: dropping it would
-        # leave the graph replaying freed device pointers.
-        plan.pinned = torch.cuda.is_current_stream_capturing()
+        plan.pinned = capturing
         self._plans[key] = plan
-        # Eviction walks from the least recent, skipping pinned plans. A step
-        # whose plans are all pinned keeps them all; capture happens once for a
-        # bounded set of shapes, so the cache stays bounded in practice.
+        # Eviction walks from the least recent. Pinned plans and the key this
+        # call just served are never candidates, so a step can end up over the
+        # limit with nothing safe to drop; capture happens once for a bounded
+        # set of shapes, so the cache stays bounded in practice.
         if len(self._plans) > _MAX_PLANS:
             for candidate in list(self._plans):
                 if len(self._plans) <= _MAX_PLANS:
@@ -231,6 +241,15 @@ class QSAFlashInferRunner:
                 if candidate == key or self._plans[candidate].pinned:
                     continue
                 del self._plans[candidate]
+            if len(self._plans) > _MAX_PLANS:
+                # Fixed message: logger.warning_once keys its cache on the
+                # arguments too, so a changing count would print once per value.
+                logger.warning_once(
+                    "QSA plan cache exceeded its soft limit because no eligible "
+                    "entry could be evicted (all eviction candidates are "
+                    "graph-pinned or currently in use); retaining plans for "
+                    "CUDA graph replay safety."
+                )
         return plan
 
     def run(
