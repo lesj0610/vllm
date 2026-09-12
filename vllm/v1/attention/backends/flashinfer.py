@@ -4197,6 +4197,11 @@ class FlashInferImpl(AttentionImpl):
                     out_prefill = output[num_decode_tokens:]
                     used_nvfp4_fa2_prefill = False
                     if self.is_kvcache_nvfp4:
+                        if key is None or value is None:
+                            raise NotImplementedError(
+                                "FlashInfer NVFP4 prefill does not support "
+                                "KV-sharing layers"
+                            )
                         assert nvfp4_kv_data is not None
                         assert nvfp4_kv_block_scales is not None
                         used_nvfp4_fa2_prefill = self._run_nvfp4_fa2_prefill(
