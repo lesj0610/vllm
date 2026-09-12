@@ -7,6 +7,7 @@ from collections.abc import Sequence
 import torch
 from torch import nn
 
+import vllm.envs as envs
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import CacheConfig, ModelConfig, VllmConfig, get_current_vllm_config
 from vllm.forward_context import get_forward_context
@@ -17,16 +18,28 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateShapeCalculator,
     is_conv_state_dim_first,
 )
+from vllm.model_executor.layers.ple_offload_layer import (
+    PleOffloadLayer,
+    is_offload_process,
+)
+from vllm.model_executor.layers.quantization.utils.fp8_utils import is_fp8
 from vllm.transformers_utils.configs.qwen4_exp import (
     Qwen4ExpTextConfig,
 )
+from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.attention.backends.short_conv_attn import (
     PleShortConvAttentionBackend,
     PleShortConvAttentionMetadata,
 )
 
-from .ngram_embedding import Qwen4ExpNGramEmbedding
+from .ngram_embedding import (
+    _NVFP4_BLOCK_SIZE,
+    Qwen4ExpNGramEmbedding,
+    Qwen4ExpPLEEmbeddingMethod,
+    Qwen4ExpPLENVFp4EmbeddingMethod,
+    _dequant_nvfp4_rows,
+)
 from .ops.ple import ple_conv, ple_gate
 
 
@@ -86,6 +99,14 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         )
         self.prefix = prefix
         self.hidden_size = int(config.hidden_size)
+        # NVFP4 dequantization unpacks lookup rows per head, so the outer layer
+        # keeps the head geometry even when the embedding lives in another
+        # process and its submodules were never constructed here.
+        self.ple_embedding_dim = int(config.ple_embed_dim)
+        self.ple_ngram_heads = (int(config.ngram_size) - 1) * int(
+            config.heads_per_ngram
+        )
+        self.ple_head_dim = self.ple_embedding_dim // self.ple_ngram_heads
         self.hc_count = config.hc_count
         self.hc_hidden_size = self.hidden_size * self.hc_count
         self.conv_kernel_size = int(config.ple_conv_kernel_size)
@@ -93,16 +114,31 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         self.conv_state_len = (self.conv_kernel_size - 1) * self.short_conv_dilation
         self.num_spec_tokens = vllm_config.num_speculative_tokens
         self.activation = "silu"
-        self.ple_embedding = Qwen4ExpNGramEmbedding(
-            config,
-            int(config.ple_embed_dim),
-            self.ple_dense_layer_id,
-            vllm_config.scheduler_config.max_num_batched_tokens,
-            data_parallel_rank=vllm_config.parallel_config.data_parallel_rank,
-            prefix=f"{prefix}.ple_embedding",
-            quant_config=quant_config,
-            params_dtype=model_config.dtype,
-        )
+        # The offload process builds the surrounding model on meta while this
+        # subtree must own real CPU storage. GPU workers skip the subclass
+        # constructor and retain only an empty IPC placeholder.
+        with torch.device(PleOffloadLayer.get_target_device()):
+            ple_embedding = Qwen4ExpNGramEmbedding(
+                config,
+                int(config.ple_embed_dim),
+                self.ple_dense_layer_id,
+                vllm_config.scheduler_config.max_num_batched_tokens,
+                data_parallel_rank=vllm_config.parallel_config.data_parallel_rank,
+                prefix=f"{prefix}.ple_embedding",
+                quant_config=quant_config,
+                params_dtype=model_config.dtype,
+            )
+        if envs.VLLM_PLE_CPU_OFFLOAD and not is_offload_process():
+            # The GPU placeholder never runs the subclass constructor, so the
+            # quant method has to be attached from out here.
+            ple_embedding._offload_quant_method = (
+                Qwen4ExpPLEEmbeddingMethod.from_quant_config(
+                    quant_config,
+                    f"{prefix}.ple_embedding.ngram_embedding",
+                    getattr(config, "ple_embedding_dtype", None),
+                )
+            )
+        self.ple_embedding: nn.Module = ple_embedding
         # The PLE cache is TP-replicated, so this merged projection is too.
         self.kv_proj = MergedColumnParallelLinear(
             int(config.ple_embed_dim),
@@ -140,6 +176,30 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
             raise ValueError(f"Duplicate layer name: {prefix}")
         compilation_config.static_forward_context[prefix] = self
 
+    def _get_embedding_weight_scale(self) -> torch.Tensor | None:
+        embedding = getattr(self.ple_embedding, "ngram_embedding", None)
+        weight_scale = getattr(embedding, "weight_scale", None)
+        if weight_scale is not None:
+            return weight_scale
+        # A GPU worker in offload mode has no embedding submodule; it keeps only
+        # the scale the loader retained.
+        return getattr(self.ple_embedding, "_offload_weight_scale", None)
+
+    def _dequantize_nvfp4_rows(
+        self,
+        embeddings: torch.Tensor,
+        output_dtype: torch.dtype,
+        scale_2: torch.Tensor,
+        lut: torch.Tensor,
+        packed_row_width: int,
+    ) -> torch.Tensor:
+        """Unpack ``[codes | block scales]`` rows into ``output_dtype``."""
+        packed_rows = embeddings.unflatten(-1, (self.ple_ngram_heads, packed_row_width))
+        dequantized = _dequant_nvfp4_rows(
+            packed_rows, self.ple_head_dim, scale_2, output_dtype, lut
+        )
+        return dequantized.flatten(-2)
+
     def _dequantize_embeddings(
         self,
         embeddings: torch.Tensor,
@@ -147,10 +207,36 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
     ) -> torch.Tensor:
         """Dequantize PLE lookup output."""
 
-        return self.ple_embedding.ngram_embedding.dequantize(
-            embeddings,
-            output_dtype,
+        offload_quant_method = getattr(
+            self.ple_embedding, "_offload_quant_method", None
         )
+        if isinstance(offload_quant_method, Qwen4ExpPLENVFp4EmbeddingMethod):
+            scale_2 = getattr(self.ple_embedding, "_offload_weight_scale_2", None)
+            if scale_2 is None:
+                raise RuntimeError("NVFP4 PLE offload is missing its global scale")
+            return self._dequantize_nvfp4_rows(
+                embeddings,
+                output_dtype,
+                scale_2,
+                self.ple_embedding._offload_nvfp4_lut,
+                self.ple_head_dim // 2 + self.ple_head_dim // _NVFP4_BLOCK_SIZE,
+            )
+
+        embedding = getattr(self.ple_embedding, "ngram_embedding", None)
+        if embedding is not None:
+            return embedding.dequantize(embeddings, output_dtype)
+
+        # A GPU worker in offload mode has no embedding submodule, so the
+        # method-owned conversion above is out of reach: the rows arrive
+        # already looked up, with only the retained scale to apply.
+        if not is_fp8(embeddings):
+            return embeddings
+        weight_scale = self._get_embedding_weight_scale()
+        if weight_scale is None:
+            raise RuntimeError("FP8 PLE embedding is missing its global scale")
+        if weight_scale.device != embeddings.device:
+            raise RuntimeError("FP8 PLE embedding scale must be on the output device")
+        return embeddings.to(output_dtype) * weight_scale.to(output_dtype)
 
     def start_prefetch(
         self,
@@ -386,11 +472,12 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
                 f"token length, got {input_ids.shape[0]} and "
                 f"{hidden_states.shape[0]}"
             )
-        embeddings = self.ple_embedding(
+        embeddings = torch.ops.vllm.qwen4_exp_ple_embed(
             hidden_states,
             input_ids,
             query_start_loc,
             ngram_context,
+            self.prefix,
         )
         embeddings = self._dequantize_embeddings(embeddings, hidden_states.dtype)
         kv, _ = self.kv_proj(embeddings)
@@ -408,7 +495,61 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         return gated_output
 
 
+# Keep data-dependent n-gram hashing and the large table gather out of the
+# compiled model graph, where Inductor can miscompile the embedding indices.
+
+
+# Keep data-dependent n-gram hashing and the large table gather out of the
+# compiled model graph, where Inductor can miscompile the embedding indices.
+def qwen4_exp_ple_embed(
+    hidden_states: torch.Tensor,
+    input_ids: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    ngram_context: torch.Tensor,
+    layer_name: str,
+) -> torch.Tensor:
+    """Run the PLE embedding lookup eagerly."""
+    layer = get_forward_context().no_compile_layers[layer_name]
+    return layer.ple_embedding(hidden_states, input_ids, query_start_loc, ngram_context)
+
+
+def qwen4_exp_ple_embed_fake(
+    hidden_states: torch.Tensor,
+    input_ids: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    ngram_context: torch.Tensor,
+    layer_name: str,
+) -> torch.Tensor:
+    """Return PLE lookup metadata while tracing the custom op.
+
+    The dtype and last dimension come from the same two accessors the offload
+    worker uses to size its cross-process buffer, so the traced metadata cannot
+    drift from the real allocation.
+    """
+    del query_start_loc, ngram_context
+    layer = get_forward_context().no_compile_layers[layer_name]
+    embedding = layer.ple_embedding
+    return torch.empty(
+        (
+            input_ids.shape[0],
+            embedding.get_offload_output_dim(layer.ple_embedding_dim),
+        ),
+        device=hidden_states.device,
+        dtype=embedding.get_offload_output_dtype(hidden_states.dtype),
+    )
+
+
+direct_register_custom_op(
+    op_name="qwen4_exp_ple_embed",
+    op_func=qwen4_exp_ple_embed,
+    mutates_args=[],
+    fake_impl=qwen4_exp_ple_embed_fake,
+)
+
+
 __all__ = [
+    "Qwen4ExpNGramEmbedding",
     "Qwen4ExpPLEGroupedNorm",
     "Qwen4ExpPLELayer",
+    "Qwen4ExpPLENVFp4EmbeddingMethod",
 ]

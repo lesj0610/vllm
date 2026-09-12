@@ -154,7 +154,6 @@ if TYPE_CHECKING:
     VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT: bool = False
     VLLM_ENABLE_V1_MULTIPROCESSING: bool = True
     VLLM_LOG_BATCHSIZE_INTERVAL: float = -1
-    VLLM_PLE_CPU_OFFLOAD: bool = False
     VLLM_DISABLE_COMPILE_CACHE: bool = False
     VLLM_REPLICATE_EMBED: bool = False
     VLLM_USE_LAYERNAME: bool = True
@@ -299,6 +298,9 @@ if TYPE_CHECKING:
     VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD: int = 1024
     VLLM_COMPILE_CACHE_SAVE_FORMAT: Literal["binary", "unpacked"] = "binary"
     VLLM_USE_V2_MODEL_RUNNER: bool | None = None
+    VLLM_PLE_CPU_OFFLOAD: bool = False
+    VLLM_PLE_OFFLOAD_READY_TIMEOUT: float = 600.0
+    VLLM_PLE_OFFLOAD_STEP_TIMEOUT: float = 60.0
     VLLM_LOG_MODEL_INSPECTION: bool = False
     VLLM_DEBUG_MFU_METRICS: bool = False
     VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY: bool = False
@@ -2053,17 +2055,33 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_USE_V2_MODEL_RUNNER": lambda: maybe_convert_bool(
         os.getenv("VLLM_USE_V2_MODEL_RUNNER", None)
     ),
+    # Run n-gram PLE lookup in a dedicated CPU offload worker. The initial
+    # implementation supports ModelRunner V1 and single-node TP only.
+    #
+    # Upstream reads the same variable as the legacy fallback for
+    # EngramConfig.cpu_offload, which keeps the table in pinned CPU memory and
+    # gathers its rows through UVA instead. Both cannot run at once, and this
+    # variable selects the offload worker; ask for the pinned-host table with
+    # an explicit --engram-config.cpu_offload and leave this unset.
+    "VLLM_PLE_CPU_OFFLOAD": lambda: (
+        os.getenv("VLLM_PLE_CPU_OFFLOAD", "False").lower() in ("true", "1")
+    ),
+    # Timeout for PLE weight loading and TP worker registration.
+    "VLLM_PLE_OFFLOAD_READY_TIMEOUT": lambda: float(
+        os.getenv("VLLM_PLE_OFFLOAD_READY_TIMEOUT", "600")
+    ),
+    # How long one forward step waits for the CPU offload worker to answer
+    # before the engine gives up. A step that never answers would otherwise
+    # spin a core forever with nothing reported.
+    "VLLM_PLE_OFFLOAD_STEP_TIMEOUT": lambda: float(
+        os.getenv("VLLM_PLE_OFFLOAD_STEP_TIMEOUT", "60")
+    ),
     # Log model inspection after loading.
     # If enabled, logs a transformers-style hierarchical view of the model
     # with quantization methods and attention backends.
     "VLLM_LOG_MODEL_INSPECTION": lambda: bool(
         int(os.getenv("VLLM_LOG_MODEL_INSPECTION", "0"))
     ),
-    # Keep Qwen4Exp PLE embedding tables in pinned CPU memory and gather their
-    # rows through UVA on a dedicated CUDA stream.
-    # Legacy fallback for EngramConfig.cpu_offload, which takes precedence.
-    # This environment variable may be removed in a future release.
-    "VLLM_PLE_CPU_OFFLOAD": lambda: bool(int(os.getenv("VLLM_PLE_CPU_OFFLOAD", "0"))),
     # Debug logging for --enable-mfu-metrics
     "VLLM_DEBUG_MFU_METRICS": lambda: bool(
         int(os.getenv("VLLM_DEBUG_MFU_METRICS", "0"))
