@@ -627,7 +627,7 @@ def test_flashinfer_workspace_routes_match_reachable_dispatches(
     builder = FlashInferMetadataBuilder.__new__(FlashInferMetadataBuilder)
     builder.use_trtllm_prefill_attention = trtllm_prefill
     builder.use_trtllm_decode_attention = trtllm_decode
-    builder.use_dedicated_xqa = dedicated_xqa
+    builder.use_xqa = dedicated_xqa
     builder.kv_cache_spec = SimpleNamespace(non_causal=non_causal)
     builder.model_config = SimpleNamespace(is_mm_prefix_lm=is_mm_prefix_lm)
 
