@@ -193,7 +193,7 @@ class QSAIndexer(nn.Module):
                 "ubatch slot only"
             )
 
-        # What the profiling run has to reserve for: the widest score row this
+        # What the selection scratch has to cover: the widest score row this
         # deployment's context can reach, by the same rule select_and_expand
         # sizes an actual batch by, and the most rows a batch can bring.
         self._max_selection_columns = max(
@@ -203,6 +203,25 @@ class QSAIndexer(nn.Module):
             ),
         )
         self._max_batched_tokens = vllm_config.scheduler_config.max_num_batched_tokens
+
+        # Reserve here rather than from the profiling run's pass through
+        # forward(): that pass only reaches this code when the run carries no
+        # attention metadata, which depends on whether a minimal KV cache was
+        # built for it. Where it is skipped nothing reserves, the arena locks at
+        # whatever another consumer happened to need, and the first request
+        # wider than that dies on the lock instead of resizing. The workspace
+        # manager is initialized in init_device, before the model is built, so
+        # this runs unconditionally and lands in the memory profiler's snapshot
+        # like any other startup allocation.
+        from .ops.qsa_flashinfer import (
+            reserve_selection_workspace,
+            supports_qsa_selection,
+        )
+
+        if supports_qsa_selection(self.index_head_dim, self.index_n_heads):
+            reserve_selection_workspace(
+                self._max_batched_tokens, self._max_selection_columns
+            )
 
     @property
     def output_width(self) -> int:
@@ -272,20 +291,10 @@ class QSAIndexer(nn.Module):
 
         metadata = self._metadata()
         if metadata is None:
-            # No attention metadata means the profiling run, which returns
-            # before selection executes. Reserve its scratch here or the KV
-            # cache is sized over memory the first real request then needs.
-            # The reservation has to cover the widest chunk the config allows,
-            # since the run that would have revealed it never happens.
-            from .ops.qsa_flashinfer import (
-                reserve_selection_workspace,
-                supports_qsa_selection,
-            )
-
-            if supports_qsa_selection(self.index_head_dim, self.index_n_heads):
-                reserve_selection_workspace(
-                    self._max_batched_tokens, self._max_selection_columns
-                )
+            # No attention metadata means the profiling run. The selection
+            # scratch is already reserved in __init__, which does not depend on
+            # this pass happening.
+            #
             # Preserve step-0 indices when later MTP steps reuse the buffer.
             if self.skip_topk and out is not None:
                 return out
