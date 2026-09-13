@@ -375,7 +375,7 @@ def _lookup_ple_embedding_from_pinned_kernel(
     values = tl.load(
         weight_ptr + local_idx * embedding_dim + offsets,
         mask=load_mask,
-        other=0.0,
+        other=0,
     )
     tl.store(
         output_ptr + row_id * embedding_dim + offsets,
@@ -467,10 +467,19 @@ class Qwen4ExpPLEPinnedHostEmbedding(Qwen4ExpPLEEmbedding):
 
         flat_ids = input_ids.reshape(-1).long()
         if flat_ids.numel():
+            # The kernel copies rows and does no arithmetic on them, so it runs
+            # over a byte view of both sides. Triton has no fp8e4nv below
+            # sm_89, and an fp8 pointer type is all it would take to refuse a
+            # table this kernel never looks inside.
+            weight_view = self._uva_weight
+            output_view = output
+            if weight_view.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+                weight_view = weight_view.view(torch.int8)
+                output_view = output_view.view(torch.int8)
             _lookup_ple_embedding_from_pinned_kernel[(flat_ids.numel(),)](
-                self._uva_weight,
+                weight_view,
                 flat_ids,
-                output,
+                output_view,
                 self.embedding_dim,
                 self.shard_indices.org_vocab_start_index,
                 self.shard_indices.org_vocab_end_index,
@@ -800,7 +809,13 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         columns = (positions - query_start_loc[request_indices]).clamp(
             0, packed.shape[1] - 1
         )
-        packed[request_indices, columns] = input_ids
+        # The model runner sends the CUDA-graph padded token count together with
+        # an unpadded query_start_loc. Stale padding must not enter the scatter:
+        # its clamped indices would overwrite the last real token.
+        num_valid_tokens = min(int(query_start_loc[-1].item()), num_tokens)
+        packed[request_indices[:num_valid_tokens], columns[:num_valid_tokens]] = (
+            input_ids[:num_valid_tokens]
+        )
         ngram_context = ngram_context[:num_reqs].to(
             device=input_ids.device, dtype=torch.long
         )
