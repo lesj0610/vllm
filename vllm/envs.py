@@ -2063,6 +2063,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # gathers its rows through UVA instead. Both cannot run at once, and this
     # variable selects the offload worker; ask for the pinned-host table with
     # an explicit --engram-config.cpu_offload and leave this unset.
+    #
+    # Upstream flipped its own default to 1 (2026-09-13). This branch keeps 0:
+    # the variable starts a worker process here, and a default-on worker would
+    # abort every model that has no PleOffloadLayer. The cost is that upstream's
+    # engram default-on tests fail on this branch; the durable fix is a separate
+    # variable for the worker, which is its own change.
     "VLLM_PLE_CPU_OFFLOAD": lambda: (
         os.getenv("VLLM_PLE_CPU_OFFLOAD", "False").lower() in ("true", "1")
     ),
