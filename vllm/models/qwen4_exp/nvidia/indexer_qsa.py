@@ -16,6 +16,7 @@ from vllm.model_executor.layers.rotary_embedding.mrope import triton_mrope
 from vllm.transformers_utils.configs.qwen4_exp import (
     Qwen4ExpTextConfig,
 )
+from vllm.utils.math_utils import cdiv, round_up
 
 from ..common.qsa_cache import (
     QSACompressedKeyCache,
@@ -180,6 +181,48 @@ class QSAIndexer(nn.Module):
             vllm_config=vllm_config,
         )
 
+        # The reservation below lands in whichever workspace ubatch slot the
+        # profiling run occupies, and that run has ubatching disabled, so it is
+        # always slot 0. A second slot would go to execution unreserved and
+        # then be locked, so refuse the combination rather than fail on the
+        # first full-width request that lands there.
+        if vllm_config.parallel_config.enable_dbo:
+            raise NotImplementedError(
+                "Qwen4Exp QSA selection does not support dual-batch overlap: "
+                "its scratch is reserved during profiling, which runs on one "
+                "ubatch slot only"
+            )
+
+        # What the selection scratch has to cover: the widest score row this
+        # deployment's context can reach, by the same rule select_and_expand
+        # sizes an actual batch by, and the most rows a batch can bring.
+        self._max_selection_columns = max(
+            64,
+            round_up(
+                cdiv(vllm_config.model_config.max_model_len, self.compress_ratio), 64
+            ),
+        )
+        self._max_batched_tokens = vllm_config.scheduler_config.max_num_batched_tokens
+
+        # Reserve here rather than from the profiling run's pass through
+        # forward(): that pass only reaches this code when the run carries no
+        # attention metadata, which depends on whether a minimal KV cache was
+        # built for it. Where it is skipped nothing reserves, the arena locks at
+        # whatever another consumer happened to need, and the first request
+        # wider than that dies on the lock instead of resizing. The workspace
+        # manager is initialized in init_device, before the model is built, so
+        # this runs unconditionally and lands in the memory profiler's snapshot
+        # like any other startup allocation.
+        from .ops.qsa_flashinfer import (
+            reserve_selection_workspace,
+            supports_qsa_selection,
+        )
+
+        if supports_qsa_selection(self.index_head_dim, self.index_n_heads):
+            reserve_selection_workspace(
+                self._max_batched_tokens, self._max_selection_columns
+            )
+
     @property
     def output_width(self) -> int:
         """Selection (index) columns per row."""
@@ -248,6 +291,10 @@ class QSAIndexer(nn.Module):
 
         metadata = self._metadata()
         if metadata is None:
+            # No attention metadata means the profiling run. The selection
+            # scratch is already reserved in __init__, which does not depend on
+            # this pass happening.
+            #
             # Preserve step-0 indices when later MTP steps reuse the buffer.
             if self.skip_topk and out is not None:
                 return out
@@ -265,6 +312,7 @@ class QSAIndexer(nn.Module):
             return result
 
         from .ops.qsa import qsa_compress_groups_with_ratio, qsa_store_cache_rows
+        from .ops.qsa_flashinfer import select_and_expand, supports_qsa_selection
         from .ops.qsa_indexer import (
             expand_qsa_block_indices,
             qsa_select_paged_decode,
@@ -408,6 +456,26 @@ class QSAIndexer(nn.Module):
             dtype=torch.int32,
             device=q.device,
         )
+
+        # FlashInfer serves scoring and expansion as one pair, so the choice is
+        # made for the whole batch rather than per decode/prefill split. Its
+        # ops take (token_to_req, query_positions, sequence_lengths), which only
+        # this caller holds; ops/qsa_indexer.py stays upstream-identical.
+        if supports_qsa_selection(q.shape[2], q.shape[1]):
+            select_and_expand(
+                q,
+                compressed_key_cache,
+                compressed_metadata.block_table,
+                compressed_metadata.token_to_req,
+                compressed_metadata.logical_positions[:num_tokens],
+                compressed_metadata.seq_lens,
+                self.compress_ratio,
+                self.token_topk,
+                compressed_metadata.max_seq_len,
+                block_indices,
+                out,
+            )
+            return out
 
         # Decode requests occupy the leading rows and share one query length.
         if num_decode_tokens:
