@@ -23,7 +23,10 @@ from ..common.qsa_cache import (
     QSAKeyStateCache,
     canonical_qsa_rope_positions,
 )
-from .ops.qsa_pre_indexer import qsa_pre_indexer
+from .ops.qsa_pre_indexer import (
+    qsa_pre_indexer,
+    warmup_pre_indexer_capability,
+)
 
 
 def apply_qsa_rope(
@@ -248,6 +251,16 @@ class QSAIndexer(nn.Module):
 
         metadata = self._metadata()
         if metadata is None:
+            # The profiling run is the last eager visit this code gets before graph
+            # capture, and asking FlashInfer whether it can write the indexer dtype
+            # builds its module on a cache miss. Settle it here so no build happens
+            # inside a capture: the fused path takes the answer from a cache.
+            if self.use_fused_pre_indexer:
+                warmup_pre_indexer_capability(
+                    projected_qk.dtype,
+                    self.indexer_dtype,
+                    self.rotary_emb.cos_sin_cache,
+                )
             # Preserve step-0 indices when later MTP steps reuse the buffer.
             if self.skip_topk and out is not None:
                 return out
