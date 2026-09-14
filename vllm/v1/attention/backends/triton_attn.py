@@ -29,6 +29,7 @@ from vllm.v1.attention.backend import (
     AttentionType,
     CommonAttentionMetadata,
     MultipleOf,
+    PersistentWorkspaceProfilingSupport,
 )
 from vllm.v1.attention.backends.utils import (
     compute_mm_prefix_range_tensor,
@@ -100,6 +101,18 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.ALWAYS
     # Step-dependent fields reference persistent input buffers directly.
     supports_draft_decode_metadata_update = True
+
+    @classmethod
+    def get_persistent_workspace_memory_profiling_support(
+        cls,
+        vllm_config: VllmConfig,
+        kv_cache_spec: AttentionSpec,
+    ) -> PersistentWorkspaceProfilingSupport:
+        # This builder holds no persistent workspace of its own, so the common
+        # lease can retain its state without a reserve/rebind contract. It has
+        # to say so explicitly: the fail-closed default would otherwise disable
+        # the lifecycle for any composite that wraps it.
+        return PersistentWorkspaceProfilingSupport.NEUTRAL
 
     def __init__(
         self,

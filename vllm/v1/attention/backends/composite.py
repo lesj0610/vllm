@@ -15,6 +15,7 @@ from vllm.v1.attention.backend import (
     AttentionImpl,
     AttentionMetadataBuilder,
     CommonAttentionMetadata,
+    PersistentWorkspaceProfilingSupport,
 )
 from vllm.v1.attention.backends.utils import get_supported_kv_cache_layouts
 from vllm.v1.kv_cache_interface import KVCacheSpec
@@ -341,6 +342,56 @@ def create_composite_attention_backend(
         @property
         def _builders(self):
             return self.general_builder, self.causal_builder
+
+        @classmethod
+        def get_persistent_workspace_memory_profiling_support(
+            cls, vllm_config, kv_cache_spec
+        ):
+            """Compose the two children's profiling support.
+
+            Both children can be selected at runtime, so the composite can only
+            promise what both can honour: one ``UNSUPPORTED`` child disables the
+            lifecycle for the pair, and one ``REQUIRED`` child makes the pair
+            ``REQUIRED`` because that child's workspace must exist before the
+            arena is locked.
+            """
+            supports = [
+                builder_cls.get_persistent_workspace_memory_profiling_support(
+                    vllm_config, kv_cache_spec
+                )
+                for builder_cls in (general_builder_cls, causal_builder_cls)
+            ]
+            if any(
+                support is PersistentWorkspaceProfilingSupport.UNSUPPORTED
+                for support in supports
+            ):
+                return PersistentWorkspaceProfilingSupport.UNSUPPORTED
+            if any(
+                support is PersistentWorkspaceProfilingSupport.REQUIRED
+                for support in supports
+            ):
+                return PersistentWorkspaceProfilingSupport.REQUIRED
+            return PersistentWorkspaceProfilingSupport.NEUTRAL
+
+        def reserve_workspace_for_memory_profiling(self) -> int:
+            # Either child can be routed to at runtime, so both reserve. They
+            # share one arena, so the sum reported here is what the children
+            # asked for, not what the allocator grew by -- the runner logs the
+            # measured delta alongside it.
+            return sum(
+                int(builder.reserve_workspace_for_memory_profiling() or 0)
+                for builder in self._builders
+            )
+
+        def reserve_workspace_for_cudagraph_capture(self) -> int:
+            return sum(
+                int(builder.reserve_workspace_for_cudagraph_capture() or 0)
+                for builder in self._builders
+            )
+
+        def rebind_workspace_after_reservation(self) -> None:
+            for builder in self._builders:
+                builder.rebind_workspace_after_reservation()
 
         # Forward the optional workspace protocol so that a wrapped builder
         # which allocates one (FlashInfer) still joins the runner's cross-group
