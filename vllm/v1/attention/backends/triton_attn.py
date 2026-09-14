@@ -108,10 +108,13 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
         vllm_config: VllmConfig,
         kv_cache_spec: AttentionSpec,
     ) -> PersistentWorkspaceProfilingSupport:
-        # This builder holds no persistent workspace of its own, so the common
-        # lease can retain its state without a reserve/rebind contract. It has
-        # to say so explicitly: the fail-closed default would otherwise disable
-        # the lifecycle for any composite that wraps it.
+        # The persistent tensors this builder holds -- the softmax segment
+        # buffers, and the R-SWA prefix lengths when that path is on -- are all
+        # allocated in the constructor and kept alive by the common lease. None
+        # of them is reserved lazily, so there is nothing to materialize before
+        # profiling and nothing to rebind afterwards. Saying so explicitly is
+        # required: the fail-closed default would otherwise disable the
+        # lifecycle for any composite that wraps this builder.
         return PersistentWorkspaceProfilingSupport.NEUTRAL
 
     def __init__(

@@ -361,7 +361,13 @@ def create_composite_attention_backend(
                 )
                 for builder_cls in (general_builder_cls, causal_builder_cls)
             ]
-            if any(
+            # Anything that is not one of the three declared values is treated
+            # as unsupported: the composite must not launder a child's bad
+            # return past the gate that would otherwise have caught it.
+            if not all(
+                isinstance(support, PersistentWorkspaceProfilingSupport)
+                for support in supports
+            ) or any(
                 support is PersistentWorkspaceProfilingSupport.UNSUPPORTED
                 for support in supports
             ):
@@ -396,6 +402,31 @@ def create_composite_attention_backend(
         # Forward the optional workspace protocol so that a wrapped builder
         # which allocates one (FlashInfer) still joins the runner's cross-group
         # sharing instead of allocating a second buffer behind the composite.
+        #
+        # The state API comes first because it carries the registered wrappers
+        # as well as the buffer: one state tracks every wrapper so they can all
+        # be rebound together when the arena grows. Sharing only the tensor
+        # would leave each child with its own state and break that. The bare
+        # buffer stays as the fallback for a backend with no state API.
+        def get_workspace_buffer_state(self):
+            for builder in self._builders:
+                if hasattr(builder, "get_workspace_buffer_state"):
+                    state = builder.get_workspace_buffer_state()
+                    # The runner only asks the group that provides the state,
+                    # so hand it to the sibling here.
+                    self.set_workspace_buffer_state(state)
+                    return state
+            return None
+
+        def set_workspace_buffer_state(self, workspace_state):
+            for builder in self._builders:
+                if hasattr(builder, "set_workspace_buffer_state"):
+                    builder.set_workspace_buffer_state(workspace_state)
+                elif hasattr(builder, "set_workspace_buffer"):
+                    buffer = getattr(workspace_state, "buffer", None)
+                    if buffer is not None:
+                        builder.set_workspace_buffer(buffer)
+
         def _get_workspace_buffer(self):
             for builder in self._builders:
                 if hasattr(builder, "_get_workspace_buffer"):

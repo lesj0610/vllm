@@ -442,7 +442,9 @@ def _nbytes(buffer: torch.Tensor | None) -> int:
     return 0 if buffer is None else buffer.numel() * buffer.element_size()
 
 
-def _reservation_builder(flashinfer_backend, *, default_float_bytes, is_mm_prefix_lm):
+def _reservation_builder(
+    flashinfer_backend, *, default_float_bytes, is_mm_prefix_lm=False
+):
     """Builder wired for the native-prefill reservation leg on CPU."""
     WorkspaceSizes = flashinfer_backend.WorkspaceSizes
     builder = flashinfer_backend.FlashInferMetadataBuilder.__new__(
@@ -2260,9 +2262,120 @@ def test_triton_flashinfer_composite_requires_profiling():
     )
 
 
-def test_composite_does_not_invent_an_mm_prefill_factory():
-    """The reservation must not depend on a builder attribute main lacks."""
-    pytest.importorskip("flashinfer")
-    from vllm.v1.attention.backends.flashinfer import FlashInferMetadataBuilder
+@pytest.mark.parametrize(
+    ("general", "causal"),
+    [
+        pytest.param(
+            "not-an-enum",
+            PersistentWorkspaceProfilingSupport.NEUTRAL,
+            id="invalid+neutral",
+        ),
+        pytest.param(
+            PersistentWorkspaceProfilingSupport.NEUTRAL,
+            "not-an-enum",
+            id="neutral+invalid",
+        ),
+        pytest.param(
+            None, PersistentWorkspaceProfilingSupport.REQUIRED, id="none+required"
+        ),
+        pytest.param(
+            PersistentWorkspaceProfilingSupport.REQUIRED, None, id="required+none"
+        ),
+    ],
+)
+def test_composite_profiling_support_is_fail_closed(monkeypatch, general, causal):
+    """A child's bad return must not be laundered into a usable value."""
+    builder_cls = _composite_builder_cls()
+    general_cls, causal_cls = _composite_child_clses()
+    for child_cls, support in ((general_cls, general), (causal_cls, causal)):
+        monkeypatch.setattr(
+            child_cls,
+            "get_persistent_workspace_memory_profiling_support",
+            classmethod(lambda cls, cfg, spec, _s=support: _s),
+        )
+    assert (
+        builder_cls.get_persistent_workspace_memory_profiling_support(
+            SimpleNamespace(), _attention_spec(128)
+        )
+        is PersistentWorkspaceProfilingSupport.UNSUPPORTED
+    )
 
-    assert not hasattr(FlashInferMetadataBuilder, "_get_mm_prefill_wrapper")
+
+def test_composite_shares_one_workspace_state_between_children():
+    """The state carries the registered wrappers, so both children need it.
+
+    Sharing only the buffer would leave each child with its own state, and a
+    wrapper registered on one would not be rebound when the other grows the
+    arena.
+    """
+    pytest.importorskip("flashinfer")
+    from vllm.v1.attention.backends import flashinfer as flashinfer_backend
+
+    builder_cls = _composite_builder_cls()
+    builder = builder_cls.__new__(builder_cls)
+    builder.general_builder = SimpleNamespace()  # no state API: the fallback
+    causal = flashinfer_backend.FlashInferMetadataBuilder.__new__(
+        flashinfer_backend.FlashInferMetadataBuilder
+    )
+    causal._workspace_buffer = None
+    causal._workspace_state = flashinfer_backend._FlashInferWorkspaceState()
+    builder.causal_builder = causal
+
+    state = builder.get_workspace_buffer_state()
+    assert state is causal.get_workspace_buffer_state()
+
+    # A second composite over the same arena must end up on the same object.
+    sibling = builder_cls.__new__(builder_cls)
+    sibling.general_builder = SimpleNamespace()
+    sibling_causal = flashinfer_backend.FlashInferMetadataBuilder.__new__(
+        flashinfer_backend.FlashInferMetadataBuilder
+    )
+    sibling_causal._workspace_buffer = None
+    sibling_causal._workspace_state = flashinfer_backend._FlashInferWorkspaceState()
+    sibling.causal_builder = sibling_causal
+    assert sibling_causal.get_workspace_buffer_state() is not state
+
+    sibling.set_workspace_buffer_state(state)
+    assert sibling_causal.get_workspace_buffer_state() is state
+
+
+def test_composite_reserve_keeps_one_arena_pointer_across_children(monkeypatch):
+    """Both children reserve from one arena, and the pointer survives the lock."""
+    pytest.importorskip("flashinfer")
+    from vllm.v1.attention.backends import flashinfer as flashinfer_backend
+
+    builder_cls = _composite_builder_cls()
+    builder = builder_cls.__new__(builder_cls)
+    children = [
+        _reservation_builder(flashinfer_backend, default_float_bytes=float_bytes)
+        for float_bytes in (2048, 4096)
+    ]
+    for child in children:
+        _install_prefill_factories(child, monkeypatch)
+    builder.general_builder, builder.causal_builder = children
+
+    # One state for the pair, the way the runner hands it across groups.
+    shared_state = children[0].get_workspace_buffer_state()
+    builder.set_workspace_buffer_state(shared_state)
+    assert all(child.get_workspace_buffer_state() is shared_state for child in children)
+
+    reset_workspace_manager()
+    init_workspace_manager(torch.device("cpu"))
+    try:
+        builder.reserve_workspace_for_memory_profiling()
+        builder.rebind_workspace_after_reservation()
+        arena = current_workspace_manager().get_workspace()
+        arena_bytes = _nbytes(arena)
+        arena_ptr = arena.data_ptr()
+        # The larger child's request is what the shared arena has to hold.
+        assert arena_bytes >= 4096
+
+        lock_workspace()
+        # Re-entering the same path after the lock must not move or grow it.
+        builder.reserve_workspace_for_memory_profiling()
+        builder.rebind_workspace_after_reservation()
+        arena_after = current_workspace_manager().get_workspace()
+        assert _nbytes(arena_after) == arena_bytes
+        assert arena_after.data_ptr() == arena_ptr
+    finally:
+        reset_workspace_manager()
