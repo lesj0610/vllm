@@ -447,6 +447,53 @@ def test_qsa_compressed_metadata_keeps_dummy_slots_inert() -> None:
 
 
 @requires_qsa_kernels
+def test_qsa_metadata_builder_rejects_a_mistyped_buffer() -> None:
+    """The op reads these through typed pointers, so a wrong width has to raise.
+
+    A narrower buffer than the kernel writes would otherwise be filled with half
+    of every value and no complaint from anyone.
+    """
+    device = torch.device("cuda")
+    query_start_loc = torch.tensor([0, 2], dtype=torch.int32, device=device)
+    args = dict(
+        query_start_loc=query_start_loc,
+        seq_lens=torch.tensor([8], dtype=torch.int32, device=device),
+        common_slot_mapping=torch.zeros(2, dtype=torch.int64, device=device),
+        block_table=torch.zeros((1, 1), dtype=torch.int32, device=device),
+        token_to_req=torch.empty(2, dtype=torch.int32, device=device),
+        logical_positions=torch.empty(2, dtype=torch.int64, device=device),
+        visible_blocks=torch.empty(2, dtype=torch.int32, device=device),
+        slot_mapping=torch.empty(2, dtype=torch.int64, device=device),
+    )
+
+    def call(**overrides):
+        merged = {**args, **overrides}
+        torch.ops._C.qsa_build_metadata(
+            merged["query_start_loc"],
+            merged["seq_lens"],
+            merged["common_slot_mapping"],
+            merged["block_table"],
+            merged["token_to_req"],
+            merged["logical_positions"],
+            merged["visible_blocks"],
+            merged["slot_mapping"],
+            None,
+            16,
+            4,
+            0,
+            2,
+        )
+
+    call()
+    for name in ("logical_positions", "slot_mapping"):
+        with pytest.raises(RuntimeError, match=name):
+            call(**{name: torch.empty(2, dtype=torch.int32, device=device)})
+    for name in ("token_to_req", "visible_blocks"):
+        with pytest.raises(RuntimeError, match=name):
+            call(**{name: torch.empty(2, dtype=torch.int64, device=device)})
+
+
+@requires_qsa_kernels
 @pytest.mark.usefixtures("default_vllm_config")
 def test_qsa_unfused_cache_update_ignores_padded_qk() -> None:
     """Padded projected Q/K rows must not affect either side cache."""
