@@ -1257,6 +1257,7 @@ class UniformTypeKVCacheSpecs(KVCacheSpec):
         else:
             return None
 
+    # Helpers for cache formats composed of repeated physical layer tuples.
     def get_max_layers_per_page_size(self) -> int:
         """Max number of layers sharing a page size. For a balanced bucket
         this equals the number of repetitions of the layer pattern."""
