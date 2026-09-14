@@ -442,7 +442,9 @@ def _nbytes(buffer: torch.Tensor | None) -> int:
     return 0 if buffer is None else buffer.numel() * buffer.element_size()
 
 
-def _reservation_builder(flashinfer_backend, *, default_float_bytes, is_mm_prefix_lm):
+def _reservation_builder(
+    flashinfer_backend, *, default_float_bytes, is_mm_prefix_lm=False
+):
     """Builder wired for the native-prefill reservation leg on CPU."""
     WorkspaceSizes = flashinfer_backend.WorkspaceSizes
     builder = flashinfer_backend.FlashInferMetadataBuilder.__new__(
@@ -484,7 +486,9 @@ def _reservation_builder(flashinfer_backend, *, default_float_bytes, is_mm_prefi
     return builder
 
 
-def _install_prefill_factories(builder, monkeypatch, mm_calls, *, mm_int_bytes=512):
+def _install_prefill_factories(
+    builder, monkeypatch, mm_calls=None, *, mm_int_bytes=512
+):
     causal_wrapper = _FakeFlashInferWrapper(int_workspace_bytes=64)
 
     def get_prefill_wrapper(causal=True):
@@ -498,7 +502,8 @@ def _install_prefill_factories(builder, monkeypatch, mm_calls, *, mm_int_bytes=5
         return builder._prefill_wrapper
 
     def get_mm_prefill_wrapper():
-        mm_calls.append(1)
+        if mm_calls is not None:
+            mm_calls.append(1)
         if builder._mm_prefill_wrapper is None:
             # Asks for the full default, the way the mm wrapper does.
             builder._mm_prefill_wrapper = _FakeFlashInferWrapper(
@@ -757,7 +762,7 @@ def test_flashinfer_prefill_reservation_uses_runtime_dispatch_contract(
         "trtllm_decode",
         "non_causal",
         "is_mm_prefix_lm",
-        "dedicated_xqa",
+        "use_xqa",
         "expected",
     ),
     [
@@ -813,7 +818,7 @@ def test_flashinfer_workspace_routes_match_reachable_dispatches(
     trtllm_decode,
     non_causal,
     is_mm_prefix_lm,
-    dedicated_xqa,
+    use_xqa,
     expected,
 ):
     pytest.importorskip("flashinfer")
@@ -822,7 +827,7 @@ def test_flashinfer_workspace_routes_match_reachable_dispatches(
     builder = FlashInferMetadataBuilder.__new__(FlashInferMetadataBuilder)
     builder.use_trtllm_prefill_attention = trtllm_prefill
     builder.use_trtllm_decode_attention = trtllm_decode
-    builder.use_xqa = dedicated_xqa
+    builder.use_xqa = use_xqa
     builder.kv_cache_spec = SimpleNamespace(non_causal=non_causal)
     builder.model_config = SimpleNamespace(is_mm_prefix_lm=is_mm_prefix_lm)
 
@@ -2053,6 +2058,9 @@ def test_v2_capture_reserves_workspace_before_measurement_and_locks(monkeypatch)
     runner.speculator = None
     runner.adaptive_verification = None
     runner.pcp_manager = None
+    # capture_model() resets the connector's capture state at the end; the
+    # real runner sets this in __init__, which this stub bypasses.
+    runner.kv_connector = SimpleNamespace(reset_capture_state=lambda: None)
 
     memory_reserved_values = iter([1_000, 1_000, 1_128, 1_128])
     memory_allocated_values = iter([500, 500, 628, 628])
@@ -2215,3 +2223,259 @@ def test_v2_attention_workspace_reserve_logs_breakdown(monkeypatch):
         )
         == 2
     )
+
+
+# --------------------------------------------------------------------------- #
+# Composite backends
+# --------------------------------------------------------------------------- #
+# A composite routes one batch to two child builders, either of which can be
+# chosen at runtime. The profiling lifecycle therefore has to reach both, and
+# the pair can only promise what both children can honour.
+
+
+def _composite_builder_cls():
+    pytest.importorskip("flashinfer")
+    from vllm.v1.attention.backends.triton_flashinfer import TritonFlashInferBackend
+
+    return TritonFlashInferBackend.get_builder_cls()
+
+
+def _composite_child_clses():
+    pytest.importorskip("flashinfer")
+    from vllm.v1.attention.backends.flashinfer import FlashInferBackend
+    from vllm.v1.attention.backends.triton_attn import TritonAttentionBackend
+
+    return TritonAttentionBackend.get_builder_cls(), FlashInferBackend.get_builder_cls()
+
+
+@pytest.mark.parametrize(
+    ("general", "causal", "expected"),
+    [
+        pytest.param(
+            PersistentWorkspaceProfilingSupport.REQUIRED,
+            PersistentWorkspaceProfilingSupport.NEUTRAL,
+            PersistentWorkspaceProfilingSupport.REQUIRED,
+            id="required+neutral",
+        ),
+        pytest.param(
+            PersistentWorkspaceProfilingSupport.NEUTRAL,
+            PersistentWorkspaceProfilingSupport.REQUIRED,
+            PersistentWorkspaceProfilingSupport.REQUIRED,
+            id="neutral+required",
+        ),
+        pytest.param(
+            PersistentWorkspaceProfilingSupport.NEUTRAL,
+            PersistentWorkspaceProfilingSupport.NEUTRAL,
+            PersistentWorkspaceProfilingSupport.NEUTRAL,
+            id="neutral+neutral",
+        ),
+        pytest.param(
+            PersistentWorkspaceProfilingSupport.UNSUPPORTED,
+            PersistentWorkspaceProfilingSupport.REQUIRED,
+            PersistentWorkspaceProfilingSupport.UNSUPPORTED,
+            id="unsupported+required",
+        ),
+        pytest.param(
+            PersistentWorkspaceProfilingSupport.REQUIRED,
+            PersistentWorkspaceProfilingSupport.UNSUPPORTED,
+            PersistentWorkspaceProfilingSupport.UNSUPPORTED,
+            id="required+unsupported",
+        ),
+    ],
+)
+def test_composite_profiling_support_composition(
+    monkeypatch, general, causal, expected
+):
+    """One UNSUPPORTED child disables the pair; one REQUIRED child requires it."""
+    builder_cls = _composite_builder_cls()
+    general_cls, causal_cls = _composite_child_clses()
+    for child_cls, support in ((general_cls, general), (causal_cls, causal)):
+        monkeypatch.setattr(
+            child_cls,
+            "get_persistent_workspace_memory_profiling_support",
+            classmethod(lambda cls, cfg, spec, _s=support: _s),
+        )
+    assert (
+        builder_cls.get_persistent_workspace_memory_profiling_support(
+            SimpleNamespace(), _attention_spec(128)
+        )
+        is expected
+    )
+
+
+def test_composite_reserve_reaches_both_children():
+    """Either child can be routed to, so both reserve and both rebind."""
+    builder_cls = _composite_builder_cls()
+
+    class _Child:
+        def __init__(self):
+            self.calls: list[str] = []
+
+        def reserve_workspace_for_memory_profiling(self) -> int:
+            self.calls.append("profiling")
+            return 16
+
+        def reserve_workspace_for_cudagraph_capture(self) -> int:
+            self.calls.append("capture")
+            return 32
+
+        def rebind_workspace_after_reservation(self) -> None:
+            self.calls.append("rebind")
+
+    builder = builder_cls.__new__(builder_cls)
+    builder.general_builder = _Child()
+    builder.causal_builder = _Child()
+
+    # Both children are asked; the sum is what they requested, not what the
+    # shared arena grew by.
+    assert builder.reserve_workspace_for_memory_profiling() == 32
+    assert builder.reserve_workspace_for_cudagraph_capture() == 64
+    builder.rebind_workspace_after_reservation()
+
+    for child in (builder.general_builder, builder.causal_builder):
+        assert child.calls == ["profiling", "capture", "rebind"]
+
+
+def test_triton_flashinfer_composite_requires_profiling():
+    """The real composite inherits REQUIRED from its FlashInfer child."""
+    pytest.importorskip("flashinfer")
+    from vllm.v1.attention.backends.flashinfer import FlashInferMetadataBuilder
+
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(is_mm_prefix_lm=True),
+        parallel_config=SimpleNamespace(decode_context_parallel_size=1),
+    )
+    spec = _attention_spec(128)
+
+    # Precondition: the FlashInfer child is the one that needs the reservation.
+    assert (
+        FlashInferMetadataBuilder.get_persistent_workspace_memory_profiling_support(
+            config, spec
+        )
+        is PersistentWorkspaceProfilingSupport.REQUIRED
+    )
+    assert (
+        _composite_builder_cls().get_persistent_workspace_memory_profiling_support(
+            config, spec
+        )
+        is PersistentWorkspaceProfilingSupport.REQUIRED
+    )
+
+
+@pytest.mark.parametrize(
+    ("general", "causal"),
+    [
+        pytest.param(
+            "not-an-enum",
+            PersistentWorkspaceProfilingSupport.NEUTRAL,
+            id="invalid+neutral",
+        ),
+        pytest.param(
+            PersistentWorkspaceProfilingSupport.NEUTRAL,
+            "not-an-enum",
+            id="neutral+invalid",
+        ),
+        pytest.param(
+            None, PersistentWorkspaceProfilingSupport.REQUIRED, id="none+required"
+        ),
+        pytest.param(
+            PersistentWorkspaceProfilingSupport.REQUIRED, None, id="required+none"
+        ),
+    ],
+)
+def test_composite_profiling_support_is_fail_closed(monkeypatch, general, causal):
+    """A child's bad return must not be laundered into a usable value."""
+    builder_cls = _composite_builder_cls()
+    general_cls, causal_cls = _composite_child_clses()
+    for child_cls, support in ((general_cls, general), (causal_cls, causal)):
+        monkeypatch.setattr(
+            child_cls,
+            "get_persistent_workspace_memory_profiling_support",
+            classmethod(lambda cls, cfg, spec, _s=support: _s),
+        )
+    assert (
+        builder_cls.get_persistent_workspace_memory_profiling_support(
+            SimpleNamespace(), _attention_spec(128)
+        )
+        is PersistentWorkspaceProfilingSupport.UNSUPPORTED
+    )
+
+
+def test_composite_shares_one_workspace_state_between_children():
+    """The state carries the registered wrappers, so both children need it.
+
+    Sharing only the buffer would leave each child with its own state, and a
+    wrapper registered on one would not be rebound when the other grows the
+    arena.
+    """
+    pytest.importorskip("flashinfer")
+    from vllm.v1.attention.backends import flashinfer as flashinfer_backend
+
+    builder_cls = _composite_builder_cls()
+    builder = builder_cls.__new__(builder_cls)
+    builder.general_builder = SimpleNamespace()  # no state API: the fallback
+    causal = flashinfer_backend.FlashInferMetadataBuilder.__new__(
+        flashinfer_backend.FlashInferMetadataBuilder
+    )
+    causal._workspace_buffer = None
+    causal._workspace_state = flashinfer_backend._FlashInferWorkspaceState()
+    builder.causal_builder = causal
+
+    state = builder.get_workspace_buffer_state()
+    assert state is causal.get_workspace_buffer_state()
+
+    # A second composite over the same arena must end up on the same object.
+    sibling = builder_cls.__new__(builder_cls)
+    sibling.general_builder = SimpleNamespace()
+    sibling_causal = flashinfer_backend.FlashInferMetadataBuilder.__new__(
+        flashinfer_backend.FlashInferMetadataBuilder
+    )
+    sibling_causal._workspace_buffer = None
+    sibling_causal._workspace_state = flashinfer_backend._FlashInferWorkspaceState()
+    sibling.causal_builder = sibling_causal
+    assert sibling_causal.get_workspace_buffer_state() is not state
+
+    sibling.set_workspace_buffer_state(state)
+    assert sibling_causal.get_workspace_buffer_state() is state
+
+
+def test_composite_reserve_keeps_one_arena_pointer_across_children(monkeypatch):
+    """Both children reserve from one arena, and the pointer survives the lock."""
+    pytest.importorskip("flashinfer")
+    from vllm.v1.attention.backends import flashinfer as flashinfer_backend
+
+    builder_cls = _composite_builder_cls()
+    builder = builder_cls.__new__(builder_cls)
+    children = [
+        _reservation_builder(flashinfer_backend, default_float_bytes=float_bytes)
+        for float_bytes in (2048, 4096)
+    ]
+    for child in children:
+        _install_prefill_factories(child, monkeypatch)
+    builder.general_builder, builder.causal_builder = children
+
+    # One state for the pair, the way the runner hands it across groups.
+    shared_state = children[0].get_workspace_buffer_state()
+    builder.set_workspace_buffer_state(shared_state)
+    assert all(child.get_workspace_buffer_state() is shared_state for child in children)
+
+    reset_workspace_manager()
+    init_workspace_manager(torch.device("cpu"))
+    try:
+        builder.reserve_workspace_for_memory_profiling()
+        builder.rebind_workspace_after_reservation()
+        arena = current_workspace_manager().get_workspace()
+        arena_bytes = _nbytes(arena)
+        arena_ptr = arena.data_ptr()
+        # The larger child's request is what the shared arena has to hold.
+        assert arena_bytes >= 4096
+
+        lock_workspace()
+        # Re-entering the same path after the lock must not move or grow it.
+        builder.reserve_workspace_for_memory_profiling()
+        builder.rebind_workspace_after_reservation()
+        arena_after = current_workspace_manager().get_workspace()
+        assert _nbytes(arena_after) == arena_bytes
+        assert arena_after.data_ptr() == arena_ptr
+    finally:
+        reset_workspace_manager()
