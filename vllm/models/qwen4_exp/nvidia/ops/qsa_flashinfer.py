@@ -1,0 +1,625 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""FlashInfer block-sparse backend for the Qwen4Exp QSA attention step.
+
+The QSA top-k route is a per-token list of logical KV positions padded with
+``-1``. FlashInfer's block-sparse prefill wrapper takes a BSR route of physical
+slots plus a packed validity mask, so this module owns the translation:
+
+    logical route (-1 padded)
+      -> validity: in-range logical page, mapped page in the cache
+      -> physical slot for the valid entries, slot 0 for the rest
+      -> packed little-endian mask, ceil(width/8) bytes per row
+
+The route names entries of the cache as it is allocated, so no layout change
+is needed: an NVFP4 QSA cache stays HND and an unquantized one stays NHD.
+
+Geometry is fixed at ``plan()`` time and cached per row bucket; only the route
+and mask contents change per forward, written in place into the buffers the
+wrapper already holds. Everything here runs inside the QSA custom op, so the
+ATen sequence never reaches Inductor and never becomes Triton.
+"""
+
+from __future__ import annotations
+
+import functools
+import inspect
+import math
+from collections import OrderedDict
+
+import torch
+
+import vllm.envs as envs
+from vllm.logger import init_logger
+from vllm.platforms import current_platform
+from vllm.utils.math_utils import cdiv, round_up
+from vllm.v1.worker.workspace import (
+    current_workspace_manager,
+    is_workspace_manager_initialized,
+)
+
+from .qsa_indexer import _TOPK_WORKSPACE_BYTES, _topk
+
+logger = init_logger(__name__)
+# Every index tensor of a FlashInfer call shares the block table's dtype, and
+# every vLLM block table is int32. The selection scratch is sized on that.
+_SELECTION_INDEX_DTYPE = torch.int32
+
+# The software E2M1 decode this path relies on is a pre-SM100 construct: from
+# SM100 the conversion is a single instruction and a different specialization
+# applies. See FlashInfer include/flashinfer/attention/prefill.cuh.
+_NATIVE_FP4_CAPABILITY = 100
+# Row buckets keep the number of distinct plans bounded: a step pads to the
+# next bucket and marks the padding rows invalid.
+_ROW_BUCKET = 128
+# Each retained plan owns its own wrapper workspaces, so the cache has to be
+# bounded or a long-running server accumulates them per geometry visited.
+_MAX_PLANS = 8
+
+
+@functools.cache
+def _sparse_wrapper_features() -> frozenset[str]:
+    """Which of the features this backend needs the installed FlashInfer has.
+
+    ``paged`` is a route over the cache as allocated; ``nvfp4`` is the packed
+    E2M1 path. Older releases serve neither, and reaching for one that is
+    missing would either raise or silently read the wrong bytes.
+    """
+    try:
+        from flashinfer import BlockSparseAttentionWrapper
+
+        run_params = inspect.signature(BlockSparseAttentionWrapper.run).parameters
+        plan_params = inspect.signature(BlockSparseAttentionWrapper.plan).parameters
+        init_params = inspect.signature(BlockSparseAttentionWrapper.__init__).parameters
+    except Exception:
+        # A missing wrapper, a C-level signature, or a partially initialized
+        # module all mean the same thing here: this backend cannot be used.
+        return frozenset()
+    found = {"sparse"}
+    if "kv_cache_sf" in run_params:
+        found.add("nvfp4")
+    if "kv_cache_page_size" in plan_params and "kv_layout" in init_params:
+        found.add("paged")
+    return frozenset(found)
+
+
+def supports_qsa_flashinfer(head_dim: int, kv_cache_dtype: str) -> bool:
+    """Gate: pre-SM100 CUDA, a head the scale groups divide, FlashInfer.
+
+    This route reads a quantized cache as raw bytes and rebuilds the values
+    before the dots, on every architecture -- the same thing the Triton kernel
+    it replaces does. From SM100 a packed NVFP4 cache converts in one
+    instruction and a different specialization applies, so the whole route
+    stops here rather than pretending the software decode is still the right
+    one.
+
+    NVFP4 additionally needs a FlashInfer whose block-sparse wrapper accepts
+    ``kv_cache_sf``; older releases only serve the unpacked path.
+    """
+    if not current_platform.is_cuda():
+        return False
+    if current_platform.has_device_capability(_NATIVE_FP4_CAPABILITY):
+        return False
+    # NVFP4 packs one E4M3 scale per 16 elements, so the head has to divide
+    # into scale groups.
+    if head_dim % 16:
+        return False
+    features = _sparse_wrapper_features()
+    if "paged" not in features:
+        return False
+    if kv_cache_dtype == "nvfp4":
+        return "nvfp4" in features
+    # FP8 rides the same route, its scale folded per tensor.
+    return kv_cache_dtype in ("auto", "bfloat16", "fp8", "fp8_e4m3")
+
+
+@functools.cache
+def _workspace_for(device_index: int, nbytes: int) -> torch.Tensor:
+    """One workspace per device, shared by every plan and every QSA layer.
+
+    Plans run sequentially inside a forward, so they can share it; giving each
+    layer its own would cost nbytes * layer_count of KV-cache headroom.
+    """
+    return torch.empty(
+        nbytes, dtype=torch.uint8, device=torch.device("cuda", device_index)
+    )
+
+
+class _RoutePlan:
+    """One wrapper plus its caller-owned route and mask buffers, per geometry."""
+
+    def __init__(
+        self,
+        rows,
+        width,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        num_slots,
+        page_size,
+        layout,
+        kv_dtype,
+        device,
+        workspace,
+    ):
+        import flashinfer
+
+        # Set by the owner when the plan is first built under CUDA graph
+        # capture; a pinned plan is never evicted.
+        self.pinned = False
+        self.rows = rows
+        self.width = width
+        self.nbytes = -(-width // 8)
+        # plan() validates indices.max(), so the buffer must hold a legal route
+        # before the first stage() call fills it.
+        self.route = torch.zeros(rows * width, dtype=torch.int32, device=device)
+        self._num_slots = num_slots
+        self._page_size = page_size
+
+        indptr = torch.arange(
+            0, (rows + 1) * width, width, dtype=torch.int32, device=device
+        )
+        self.wrapper = flashinfer.BlockSparseAttentionWrapper(
+            workspace, kv_layout=layout
+        )
+        # An all-true mask only fixes the geometry; contents are replaced below.
+        self.wrapper.plan(
+            indptr,
+            self.route,
+            rows,
+            num_slots,
+            1,
+            1,
+            num_qo_heads=num_qo_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            mask=torch.ones(rows * width, 1, 1, dtype=torch.bool, device=device),
+            q_data_type=torch.bfloat16,
+            kv_data_type=kv_dtype,
+            o_data_type=torch.bfloat16,
+            # The route addresses KV entries of a cache that stores whole
+            # pages, so the wrapper has to divide each index back into
+            # (page, entry) instead of treating it as a block id.
+            kv_cache_page_size=page_size,
+        )
+        # plan() may or may not alias the caller's tensor; bind whatever it kept
+        # so stage() always writes the buffer run() reads.
+        self._route_buf = self.wrapper._paged_kv_indices_buf
+        self._mask_buf = self.wrapper._packed_mask_buf
+
+    def stage(self, logical, block_table, token_to_req):
+        """Write this step's route and mask into the wrapper's buffers.
+
+        One kernel turns the logical route into physical slots and packs the
+        validity: every bound the Triton kernel checks -- a negative sentinel, a
+        logical page past the block table, an unmapped page, a slot outside the
+        cache -- clears the same bit, and a cleared entry still holds an in-range
+        slot because the kernel reads the slot before the mask applies.
+        """
+        import flashinfer
+
+        # A shorter step hands over its own rows: the kernel reads the logical
+        # route only below the live count and masks the rest of the buffer off.
+        flashinfer.qsa_route_from_logical(
+            logical,
+            token_to_req,
+            block_table,
+            self._route_buf.view(self.rows, self.width),
+            self._mask_buf,
+            logical.shape[0],
+            self._page_size,
+            self._num_slots,
+        )
+
+
+class QSAFlashInferRunner:
+    """Owns the bounded plan cache for one attention layer."""
+
+    def __init__(self, device: torch.device, workspace_bytes: int = 256 << 20):
+        self._device = device
+        self._workspace = _workspace_for(device.index or 0, workspace_bytes)
+        self._plans: OrderedDict[tuple, _RoutePlan] = OrderedDict()
+
+    def _plan_for(self, key, *args):
+        # A graph replays the route and mask buffers this plan holds, so a plan
+        # the capture reached can never be evicted: dropping it would leave the
+        # graph replaying freed device pointers. With capture warmups enabled,
+        # capture commonly reaches a plan through the hit path, so pin on use
+        # rather than only on creation. Pinning is monotonic: a plan a graph has
+        # seen stays pinned for the rest of the process.
+        capturing = torch.cuda.is_current_stream_capturing()
+        plan = self._plans.get(key)
+        if plan is not None:
+            self._plans.move_to_end(key)
+            if capturing:
+                plan.pinned = True
+            return plan
+        plan = _RoutePlan(*args)
+        plan.pinned = capturing
+        self._plans[key] = plan
+        # Eviction walks from the least recent. Pinned plans and the key this
+        # call just served are never candidates, so a step can end up over the
+        # limit with nothing safe to drop; capture happens once for a bounded
+        # set of shapes, so the cache stays bounded in practice.
+        if len(self._plans) > _MAX_PLANS:
+            for candidate in list(self._plans):
+                if len(self._plans) <= _MAX_PLANS:
+                    break
+                if candidate == key or self._plans[candidate].pinned:
+                    continue
+                del self._plans[candidate]
+            if len(self._plans) > _MAX_PLANS:
+                # Fixed message: logger.warning_once keys its cache on the
+                # arguments too, so a changing count would print once per value.
+                logger.warning_once(
+                    "QSA plan cache exceeded its soft limit because no eligible "
+                    "entry could be evicted (all eviction candidates are "
+                    "graph-pinned or currently in use); retaining plans for "
+                    "CUDA graph replay safety."
+                )
+        return plan
+
+    def run(
+        self,
+        query,
+        k_data,
+        v_data,
+        k_sf,
+        v_sf,
+        logical_indices,
+        block_table,
+        token_to_req,
+        out,
+        page_size,
+        layout,
+        k_scale,
+        v_scale,
+    ):
+        rows_in, num_qo_heads, head_dim = query.shape
+        width = logical_indices.shape[1]
+        rows = -(-rows_in // _ROW_BUCKET) * _ROW_BUCKET
+        num_kv_heads = k_data.shape[1 if layout == "HND" else 2]
+        num_slots = k_data.shape[0] * page_size
+        key = (
+            rows,
+            width,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim,
+            num_slots,
+            page_size,
+            layout,
+            k_data.dtype,
+        )
+        plan = self._plan_for(
+            key,
+            rows,
+            width,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim,
+            num_slots,
+            page_size,
+            layout,
+            k_data.dtype,
+            self._device,
+            self._workspace,
+        )
+        plan.stage(logical_indices, block_table, token_to_req)
+
+        q = query
+        if rows > rows_in:
+            q = torch.zeros(
+                rows, num_qo_heads, head_dim, dtype=query.dtype, device=query.device
+            )
+            q[:rows_in].copy_(query)
+        kwargs = {}
+        if k_sf is not None:
+            kwargs = {
+                "kv_cache_sf": (k_sf, v_sf),
+                "k_scale": k_scale,
+                "v_scale": v_scale,
+            }
+        elif k_data.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+            # QSA quantizes FP8 per tensor, which folds outside the dots the
+            # same way the packed NVFP4 scale does.
+            kwargs = {"k_scale": k_scale, "v_scale": v_scale}
+        result = plan.wrapper.run(q, k_data, v_data, **kwargs)
+        out.copy_(result[:rows_in])
+        return out
+
+
+# ---------------------------------------------------------------------------
+# Block selection
+#
+# Scoring the compressed cache and expanding the chosen blocks into a token
+# route are a separate FlashInfer surface from the attention wrapper above.
+# They live here rather than in ops/qsa_indexer.py so that module stays
+# byte-identical to upstream: it splits selection into a decode and a prefill
+# entry point that thread (visible_blocks, decode_query_len, query_start_loc),
+# while these ops want (token_to_req, query_positions, sequence_lengths). The
+# caller in indexer_qsa.py holds both sets, so the fork's routing decision is
+# made there and this module only owns the FlashInfer side of it.
+# ---------------------------------------------------------------------------
+
+
+@functools.cache
+def _selection_available() -> bool:
+    """Whether FlashInfer serves the scoring and expansion this path needs.
+
+    Both arrived together; a build with one but not the other is not something
+    this checks for beyond the import.
+    """
+    try:
+        import flashinfer
+
+        return hasattr(flashinfer, "sparse_paged_scores") and hasattr(
+            flashinfer, "expand_block_route"
+        )
+    except Exception:
+        return False
+
+
+# What the scorer has an instantiation for. Its mma tile fixes both: a head
+# dimension it was built with, and one n-tile of query heads. A shape outside
+# this is one FlashInfer cannot build, not one it is merely slower at.
+_SCORER_HEAD_DIMS = (64, 128, 192, 256)
+_SCORER_MAX_HEADS = 16
+
+
+def supports_qsa_selection(head_dim: int, num_heads: int) -> bool:
+    """Whether the FlashInfer selection path can serve this query shape."""
+    return (
+        _selection_available()
+        and head_dim in _SCORER_HEAD_DIMS
+        and num_heads <= _SCORER_MAX_HEADS
+    )
+
+
+def selection_chunk_rows(columns: int, max_rows: int) -> int:
+    """Rows one chunk covers at this score width.
+
+    The score budget bounds a chunk, so the width decides how many rows fit in
+    it. Never zero: a width past the whole budget still has to score its row,
+    which is what the reservation below has to be able to hold.
+
+    A zero width has no chunk to speak of; the caller skips the scoring loop
+    entirely rather than dividing by it.
+    """
+    if columns <= 0:
+        return 0
+    budget = envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024
+    return max(1, min(max_rows, budget // (columns * 4)))
+
+
+def selection_workspace_specs(
+    max_num_batched_tokens: int, max_columns: int
+) -> list[tuple[tuple[int, ...], torch.dtype]]:
+    """Shapes the selection scratch needs, worst case over the config.
+
+    Three buffers live at once inside a chunk: the FP32 scores, the per-row
+    visible-block counts the scorer writes beside them, and the top-k's own
+    workspace.
+
+    The scores are reserved flat, not as the widest chunk's rectangle. Chunk
+    elements are ``selection_chunk_rows(c) * c``, and that is not monotone in
+    ``c``: it peaks wherever the budget divides evenly by ``4c``, which is not
+    generally at ``max_columns``. Reserving the rectangle at ``max_columns``
+    therefore under-reserves for some narrower width the same deployment can
+    still produce -- and under a locked workspace that is a hard failure at
+    runtime, not a resize.
+
+    Bounding it instead of maximising over widths: a chunk that fits the budget
+    is capped by the budget, and a width so wide that not even one row fits is
+    capped by that single row. So the reservation is the larger of the two,
+    which no width can exceed, clamped to what the whole batch could ever be.
+    """
+    budget_elems = envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024 // 4
+    scores = min(max_num_batched_tokens * max_columns, max(budget_elems, max_columns))
+    return [
+        ((scores,), torch.float32),
+        # Counts are cut per chunk at execution, and a chunk never exceeds the
+        # batch, so the batch bound covers it.
+        ((max_num_batched_tokens,), _SELECTION_INDEX_DTYPE),
+        ((_TOPK_WORKSPACE_BYTES,), torch.uint8),
+    ]
+
+
+def reserve_selection_workspace(max_num_batched_tokens: int, max_columns: int) -> None:
+    """Size the shared workspace for selection before it is locked.
+
+    Called from the profiling run, which is the only place this path can be
+    sized from: the run returns before selection executes, so nothing else
+    would ever ask for these bytes until a real request did.
+
+    Where the KV cache is sized automatically, holding the buffer from here on
+    is what puts it outside that budget -- the initial snapshot predates model
+    load, so anything still held when profiling ends is inside the difference
+    the budget is computed from. Where ``kv_cache_memory_bytes`` is set instead,
+    memory profiling is skipped entirely (see gpu_worker's early return), the KV
+    size is whatever the operator asked for, and the benefit here is only that
+    the bytes are claimed once at startup and reused. A deployment that pins the
+    KV size has to leave room for this reservation itself.
+
+    The buffer belongs to the shared WorkspaceManager, so it follows the
+    engine's ubatch/lane slots and its teardown rather than outliving the model
+    in a module-level cache.
+    """
+    if not is_workspace_manager_initialized():
+        # No worker owns a workspace here -- a direct call from a test. There
+        # is nothing to reserve into, and _selection_views allocates per call.
+        return
+    current_workspace_manager().get_simultaneous(
+        *selection_workspace_specs(max_num_batched_tokens, max_columns)
+    )
+
+
+def _selection_views(
+    rows: int, columns: int, device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Scores, visible counts and top-k scratch, from one shared allocation.
+
+    Goes through the WorkspaceManager so the buffer is the engine's, sized
+    while it could still grow and locked before execution. A width the
+    reservation did not anticipate therefore fails at the lock rather than
+    quietly allocating beside it.
+
+    Outside a worker -- a direct call from a test -- there is no manager, and
+    the same shapes are allocated for the duration of the call instead.
+    """
+    specs: list[tuple[tuple[int, ...], torch.dtype]] = [
+        ((rows, columns), torch.float32),
+        ((rows,), _SELECTION_INDEX_DTYPE),
+        ((_TOPK_WORKSPACE_BYTES,), torch.uint8),
+    ]
+    if not is_workspace_manager_initialized():
+        return tuple(  # type: ignore[return-value]
+            torch.empty(shape, dtype=dtype, device=device) for shape, dtype in specs
+        )
+    return tuple(current_workspace_manager().get_simultaneous(*specs))  # type: ignore[return-value]
+
+
+def select_and_expand(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    token_to_req: torch.Tensor,
+    query_positions: torch.Tensor,
+    sequence_lengths: torch.Tensor,
+    compress_ratio: int,
+    token_topk: int,
+    max_seq_len: int,
+    block_indices: torch.Tensor,
+    out: torch.Tensor,
+) -> None:
+    """Score, select and expand one QSA batch entirely on FlashInfer.
+
+    Mirrors what ops/qsa_indexer.py does with its Triton kernels: score the
+    compressed cache, take the per-query top-k, then expand the chosen blocks
+    into the padded token route the sparse attention reads. The top-k itself
+    stays on the shared CUDA kernel that the Triton path also calls, so only
+    the scoring and the expansion move.
+
+    ``out`` is the packed selection buffer: ``token_topk + compress_ratio``
+    columns, of which the last holds the row's valid-entry count. FlashInfer
+    only writes the index region, so the count is computed here -- the Triton
+    expansion kernel writes it from the same two quantities.
+
+    The scratch comes from the shared workspace, reserved during the profiling
+    run by ``reserve_selection_workspace()`` and locked before execution.
+    """
+    import flashinfer
+
+    rows = q.shape[0]
+    block_topk = token_topk // compress_ratio
+    assert block_indices.shape == (rows, block_topk)
+    # No row scores beyond cdiv(max_seq_len, compress_ratio) compressed
+    # columns, so scoring the whole block table would size the FP32 logits off
+    # max_model_len rather than off the batch. Round up to 64 to keep the
+    # logits row stride cooperative_topk-compatible, and clamp to what the
+    # cache can actually address. ops/qsa_indexer.py sizes its own logits the
+    # same way.
+    capacity = page_table.shape[1] * k_cache.shape[1]
+    columns = min(
+        max(64, round_up(cdiv(max_seq_len, compress_ratio), 64)),
+        capacity,
+    )
+    # FlashInfer writes only the index region; the packed buffer is one column
+    # wider, and that column is the count this function fills in below.
+    route_width = block_topk * compress_ratio + compress_ratio - 1
+    if out.shape != (rows, route_width + 1):
+        raise ValueError(
+            "QSA packed selection buffer must be "
+            f"{(rows, route_width + 1)}, got {tuple(out.shape)}"
+        )
+
+    # Each of these calls reads its index tensors through a single pointer type,
+    # instantiated from the block table it is given: page_table for the scorer,
+    # block_indices for the expansion. So every index tensor of a call has to
+    # carry that one dtype. QSA metadata builds its positions in int64
+    # (common/qsa_cache.py) while vLLM block tables are int32, so narrow the
+    # positions once here instead of letting the mismatch reach the kernel.
+    index_dtype = page_table.dtype
+    if index_dtype is not _SELECTION_INDEX_DTYPE:
+        # The visible-block counts come out of a reservation cut for int32, and
+        # the scorer requires them to match the block table. A wider table would
+        # therefore fail inside the kernel on a dtype it cannot report usefully.
+        raise ValueError(
+            "QSA FlashInfer selection reserves its counts as "
+            f"{_SELECTION_INDEX_DTYPE}, so the block table must carry that "
+            f"dtype; got page_table={index_dtype}"
+        )
+    for name, tensor in (("block_indices", block_indices), ("out", out)):
+        if tensor.dtype != index_dtype:
+            raise ValueError(
+                "QSA FlashInfer selection needs one index dtype per batch, got "
+                f"page_table={index_dtype} and {name}={tensor.dtype}"
+            )
+    if query_positions.dtype != index_dtype:
+        query_positions = query_positions.to(index_dtype)
+
+    # The scores are the one large temporary here: FP32, as wide as the batch's
+    # own context above, clamped to the block table. The score budget bounds a
+    # chunk, so it decides how many rows one pass covers.
+    rows_per_chunk = selection_chunk_rows(columns, rows)
+
+    # Every chunk writes into the same reserved scratch. Letting each chunk
+    # allocate its own instead would hold two of them at the boundary -- the
+    # next allocation happens before the previous chunk's tensor is released --
+    # and none of it would be inside the reservation the memory profile saw.
+    logits_buf, counts_buf, topk_workspace = _selection_views(
+        rows_per_chunk, columns, q.device
+    )
+
+    for start in range(0, rows, rows_per_chunk):
+        end = min(start + rows_per_chunk, rows)
+        rows_slice = slice(start, end)
+        chunk_rows = end - start
+        logits = logits_buf[:chunk_rows]
+        visible_blocks = counts_buf[:chunk_rows]
+        # QSA holds the compressed keys as [pages, page_size, 1, head_dim]; the
+        # single KV head makes dropping that axis a view.
+        flashinfer.sparse_paged_scores(
+            q[rows_slice],
+            k_cache.squeeze(2),
+            page_table,
+            token_to_req[rows_slice],
+            query_positions[rows_slice],
+            sequence_lengths,
+            compress_ratio,
+            math.sqrt(q.shape[2]),
+            num_columns=columns,
+            logits=logits,
+            visible_blocks=visible_blocks,
+        )
+        _topk(
+            logits,
+            visible_blocks,
+            token_topk,
+            compress_ratio,
+            block_indices[rows_slice],
+            topk_workspace,
+        )
+        # Trailing count column: the complete blocks that get expanded, plus
+        # the causal tail of the query's own block. The Triton expansion
+        # kernel stores exactly this, from exactly these two quantities.
+        positions = query_positions[rows_slice]
+        tail_start = (
+            torch.div(positions + 1, compress_ratio, rounding_mode="floor")
+            * compress_ratio
+        )
+        out[rows_slice, route_width] = (
+            visible_blocks.clamp(max=block_topk) * compress_ratio
+            + (positions + 1)
+            - tail_start
+        )
+    # The index region only: the kernel takes out's strides, so the packed
+    # buffer's count column stays out of its reach without a copy.
+    flashinfer.expand_block_route(
+        block_indices,
+        query_positions,
+        sequence_lengths,
+        token_to_req,
+        compress_ratio,
+        out=out[:, :route_width],
+    )
