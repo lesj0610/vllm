@@ -10,7 +10,11 @@ import pytest
 import torch
 
 from vllm.v1.attention.backend import PersistentWorkspaceProfilingSupport
-from vllm.v1.kv_cache_interface import FullAttentionSpec, UniformTypeKVCacheSpecs
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    KVCacheLayout,
+    UniformTypeKVCacheSpecs,
+)
 from vllm.v1.worker.workspace import (
     PersistentWorkspaceLease,
     current_workspace_manager,
@@ -1781,9 +1785,7 @@ def _gpu_flashinfer_builder(flashinfer_backend, *, disable_cascade_attn):
     )
     builder._workspace_buffer = None
     builder._workspace_state = flashinfer_backend._FlashInferWorkspaceState()
-    builder._last_reserved_workspace_sizes = flashinfer_backend.WorkspaceSizes(0, 0)
     builder._last_reserved_trtllm_workspace_bytes = 0
-    builder._exact_float_workspace_bytes = None
     builder.device = torch.device("cuda")
     builder.use_dcp = False
     builder.use_xqa = False
@@ -1815,6 +1817,8 @@ def _gpu_flashinfer_builder(flashinfer_backend, *, disable_cascade_attn):
     builder.sm_scale = 0.125
     builder.logits_soft_cap = 0.0
     builder.is_kvcache_nvfp4 = False
+    # _default_workspace_buffer_size() sizes the fallback arena from these.
+    builder.max_num_batched_tokens = 64
     builder.q_data_type_prefill = torch.float16
     builder.q_data_type_decode = torch.float16
     builder.kv_cache_dtype = torch.float16
@@ -1822,7 +1826,10 @@ def _gpu_flashinfer_builder(flashinfer_backend, *, disable_cascade_attn):
     builder.decode_fixed_split_size = -1
     builder.disable_split_kv = False
     builder.has_sinks = False
-    builder.kv_cache_layout = "NHD"
+    # kv_cache_layout is a property reading the resolved cache config.
+    builder.cache_config = SimpleNamespace(
+        get_resolved_kv_cache_layout=lambda: KVCacheLayout.LBNHC
+    )
     builder._prefill_wrapper = None
     builder._noncausal_prefill_wrapper = None
     builder._decode_wrapper = None
@@ -1844,6 +1851,23 @@ def _gpu_paged_inputs(q_lens, pages_per_request, page_size, device="cuda"):
         (len(q_lens),), page_size, dtype=torch.int32, device=device
     )
     return qo_indptr, kv_indptr, kv_indices, last_page_len
+
+
+def _plan_decode(wrapper, batch_size, builder):
+    _, kv_indptr, kv_indices, last_page_len = _gpu_paged_inputs(
+        [1] * batch_size, 2, builder.page_size
+    )
+    wrapper.plan(
+        indptr=kv_indptr,
+        indices=kv_indices,
+        last_page_len=last_page_len,
+        num_qo_heads=builder.num_qo_heads,
+        num_kv_heads=builder.num_kv_heads,
+        head_dim=builder.head_dim,
+        page_size=builder.page_size,
+        q_data_type=builder.q_data_type_decode,
+        kv_data_type=builder.kv_cache_dtype,
+    )
 
 
 def _plan_prefill(wrapper, q_lens, builder):
@@ -1886,10 +1910,15 @@ def test_gpu_workspace_bounded_arena_survives_the_lock():
             for w in builder._live_workspace_wrappers()
         }
         assert builder._prefill_wrapper is not None
+        assert builder._decode_wrapper is not None
 
         lock_workspace()
         for q_lens in ([1], [1, 1], [8, 8, 8, 8], [61, 1, 1, 1]):
             _plan_prefill(builder._prefill_wrapper, q_lens, builder)
+        # The reservation shrank the decode wrapper's int workspace too, so it
+        # has to survive real decode plans across the reserved batch sizes.
+        for batch_size in (1, 2, 4):
+            _plan_decode(builder._decode_wrapper, batch_size, builder)
 
         arena = current_workspace_manager().get_workspace()
         assert _nbytes(arena) == size_before
@@ -1925,23 +1954,28 @@ def test_gpu_workspace_cascade_fallback_leaves_room_after_the_lock():
 
         lock_workspace()
         cascade_wrapper = builder._get_cascade_wrapper()
+        q_lens = [4, 4]
         qo_indptr, kv_indptr, kv_indices, last_page_len = _gpu_paged_inputs(
-            [4, 4], 2, builder.page_size
+            q_lens, 2, builder.page_size
         )
-        shared_indptr = torch.tensor([0, 2], dtype=torch.int32, device="cuda")
+        # The shared level covers the whole batch as one run over the prefix.
+        shared_qo_indptr = torch.tensor(
+            [0, sum(q_lens)], dtype=torch.int32, device="cuda"
+        )
+        shared_kv_indptr = torch.tensor([0, 2], dtype=torch.int32, device="cuda")
         shared_indices = torch.arange(2, dtype=torch.int32, device="cuda")
         shared_last_page_len = torch.tensor(
             [builder.page_size], dtype=torch.int32, device="cuda"
         )
         cascade_wrapper.plan(
-            [shared_indptr, kv_indptr],
-            [shared_indices, kv_indices],
-            [shared_last_page_len, last_page_len],
-            [torch.tensor([0, 8], dtype=torch.int32, device="cuda"), qo_indptr],
-            builder.num_qo_heads,
-            builder.num_kv_heads,
-            builder.head_dim,
-            builder.page_size,
+            qo_indptr_arr=[shared_qo_indptr, qo_indptr],
+            paged_kv_indptr_arr=[shared_kv_indptr, kv_indptr],
+            paged_kv_indices_arr=[shared_indices, kv_indices],
+            paged_kv_last_page_len=[shared_last_page_len, last_page_len],
+            num_qo_heads=builder.num_qo_heads,
+            num_kv_heads=builder.num_kv_heads,
+            head_dim=builder.head_dim,
+            page_size=builder.page_size,
             causal=True,
             q_data_type=builder.q_data_type_prefill,
             kv_data_type=builder.kv_cache_dtype,
