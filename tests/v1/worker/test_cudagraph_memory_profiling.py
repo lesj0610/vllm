@@ -258,6 +258,7 @@ def _reservation_builder(
         dtype=torch.float16,
         is_mm_prefix_lm=is_mm_prefix_lm,
         max_model_len=max_model_len,
+        disable_cascade_attn=True,
     )
     builder.vllm_config = SimpleNamespace(
         scheduler_config=SimpleNamespace(
@@ -1315,6 +1316,7 @@ def _bound_builder(
     builder.kv_cache_dtype = torch.float16
     builder.sm_scale = 0.125
     builder.logits_soft_cap = 0.0
+    builder._cascade_wrapper = None
 
     def scripted(answer):
         wrapper = _FakeFlashInferWrapper(
@@ -1587,8 +1589,21 @@ def test_workspace_upper_bound_is_not_asked_when_no_native_route(monkeypatch):
         assert builder._decode_wrapper is None
 
 
-def test_workspace_upper_bound_forwards_the_decode_split_settings(monkeypatch):
-    """A fixed split bypasses the scheduler ceiling, so the bound must see it."""
+@pytest.mark.parametrize(
+    ("fixed_split_size", "disable_split_kv"),
+    [
+        pytest.param(8, False, id="fixed-split"),
+        pytest.param(-1, True, id="split-disabled"),
+    ],
+)
+def test_workspace_upper_bound_forwards_the_decode_split_settings(
+    monkeypatch, fixed_split_size, disable_split_kv
+):
+    """A fixed split bypasses the scheduler ceiling, so the bound must see it.
+
+    The two settings are exercised apart: disabling the split would make a
+    fixed split size moot, so together they would not prove it is forwarded.
+    """
     pytest.importorskip("flashinfer")
     from vllm.v1.attention.backends import flashinfer as flashinfer_backend
 
@@ -1598,12 +1613,129 @@ def test_workspace_upper_bound_forwards_the_decode_split_settings(monkeypatch):
         prefill_answer=None,
         decode_answers=[(1024, 64)],
     )
-    builder.decode_fixed_split_size = 8
-    builder.disable_split_kv = True
+    builder.decode_fixed_split_size = fixed_split_size
+    builder.disable_split_kv = disable_split_kv
 
     with _managed_workspace():
         builder.reserve_workspace_for_memory_profiling()
 
     decode_kwargs = builder._decode_wrapper.bound_kwargs
-    assert decode_kwargs["fixed_split_size"] == 8
-    assert decode_kwargs["disable_split_kv"] is True
+    assert decode_kwargs["fixed_split_size"] == fixed_split_size
+    assert decode_kwargs["disable_split_kv"] is disable_split_kv
+
+
+def test_workspace_upper_bound_uses_the_whole_batched_token_budget(monkeypatch):
+    """The row bound is the batch's budget, not one request's length.
+
+    `max_model_len` caps a single request. Two requests can fill
+    `max_num_batched_tokens` between them, and a plan for that batch needs
+    more workspace than one capped at `max_model_len`.
+    """
+    pytest.importorskip("flashinfer")
+    from vllm.v1.attention.backends import flashinfer as flashinfer_backend
+
+    builder = _bound_builder(
+        flashinfer_backend,
+        monkeypatch,
+        prefill_answer=(1024, 64),
+        decode_answers=[],
+    )
+    builder.vllm_config.scheduler_config.max_num_batched_tokens = 8192
+    builder.vllm_config.scheduler_config.max_num_seqs = 4
+    builder.model_config.max_model_len = 4096
+
+    with _managed_workspace():
+        builder.reserve_workspace_for_memory_profiling()
+
+    prefill_kwargs = builder._prefill_wrapper.bound_kwargs
+    assert prefill_kwargs["max_total_num_rows"] == 8192
+    assert prefill_kwargs["max_batch_size"] == 4
+
+
+def test_workspace_upper_bound_stands_down_when_cascade_can_run(monkeypatch):
+    """A wrapper this reservation does not own keeps the default arena.
+
+    The cascade wrapper is built on the first batch with a common prefix and
+    asks for the default arena, so a bound applied without it would be grown
+    by it -- after the lock.
+    """
+    pytest.importorskip("flashinfer")
+    from vllm.v1.attention.backends import flashinfer as flashinfer_backend
+
+    builder = _bound_builder(
+        flashinfer_backend,
+        monkeypatch,
+        prefill_answer=(1024, 64),
+        decode_answers=[(1024, 64)],
+        initial_int_bytes=1 << 20,
+    )
+    builder.model_config.disable_cascade_attn = False
+
+    with _managed_workspace():
+        builder.reserve_workspace_for_memory_profiling()
+
+        # Every helper answered, and the arena still keeps the default.
+        assert _arena_bytes() == 4096
+        for wrapper in builder._live_workspace_wrappers():
+            assert wrapper._int_workspace_buffer.numel() == 1 << 20
+
+
+def test_cascade_wrapper_after_the_lock_does_not_move_the_arena(monkeypatch):
+    """The fallback leaves room for the cascade wrapper built after the lock."""
+    pytest.importorskip("flashinfer")
+    from vllm.v1.attention.backends import flashinfer as flashinfer_backend
+
+    builder = _bound_builder(
+        flashinfer_backend,
+        monkeypatch,
+        prefill_answer=(1024, 64),
+        decode_answers=[(1024, 64)],
+    )
+    builder.model_config.disable_cascade_attn = False
+
+    cascade_wrapper = _FakeFlashInferWrapper(int_workspace_bytes=64)
+
+    def get_cascade_wrapper():
+        if builder._cascade_wrapper is None:
+            # The real wrapper asks for the default arena with no argument.
+            cascade_wrapper._float_workspace_buffer = builder._get_workspace_buffer()
+            builder._cascade_wrapper = cascade_wrapper
+            builder._register_workspace_wrapper(cascade_wrapper)
+        return builder._cascade_wrapper
+
+    monkeypatch.setattr(builder, "_get_cascade_wrapper", get_cascade_wrapper)
+
+    with _managed_workspace():
+        builder.reserve_workspace_for_memory_profiling()
+        builder.rebind_workspace_after_reservation()
+        arena = current_workspace_manager().get_workspace()
+        size_before, pointer_before = _nbytes(arena), arena.data_ptr()
+
+        lock_workspace()
+        builder._get_cascade_wrapper()
+
+        arena = current_workspace_manager().get_workspace()
+        assert _nbytes(arena) == size_before
+        assert arena.data_ptr() == pointer_before
+        assert cascade_wrapper._float_workspace_buffer.data_ptr() == pointer_before
+
+
+def test_workspace_upper_bound_applies_when_cascade_is_disabled(monkeypatch):
+    """With cascade off, nothing else can grow the arena, so the bound stands."""
+    pytest.importorskip("flashinfer")
+    from vllm.v1.attention.backends import flashinfer as flashinfer_backend
+
+    builder = _bound_builder(
+        flashinfer_backend,
+        monkeypatch,
+        prefill_answer=(1024, 64),
+        decode_answers=[(2048, 128)],
+    )
+    assert builder.model_config.disable_cascade_attn is True
+
+    with _managed_workspace():
+        builder.reserve_workspace_for_memory_profiling()
+
+        assert _arena_bytes() == 2048
+        assert builder._prefill_wrapper._int_workspace_buffer.numel() == 64
+        assert builder._decode_wrapper._int_workspace_buffer.numel() == 128

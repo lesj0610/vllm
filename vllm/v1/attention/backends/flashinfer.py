@@ -1544,9 +1544,9 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         self,
     ) -> tuple[object, WorkspaceBound | None]:
         scheduler_config = self.vllm_config.scheduler_config
-        max_total_num_rows = min(
-            scheduler_config.max_num_batched_tokens, self.model_config.max_model_len
-        )
+        # max_model_len bounds one request, not the batch: two requests can
+        # fill max_num_batched_tokens between them.
+        max_total_num_rows = scheduler_config.max_num_batched_tokens
         max_batch_size = min(scheduler_config.max_num_seqs, max_total_num_rows)
         wrapper = self._get_prefill_wrapper(causal=True)
         if max_batch_size <= 0 or max_total_num_rows <= 0:
@@ -1618,17 +1618,30 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         if hasattr(wrapper, "reset_workspace_buffer"):
             wrapper.reset_workspace_buffer(float_workspace, int_workspace)
 
+    def _cascade_can_run(self) -> bool:
+        """Whether a cascade wrapper can be built after the arena is locked.
+
+        The cascade wrapper is created on the first batch with a common
+        prefix, and it asks for the default arena. Nothing reserves it here,
+        so a smaller arena would be grown by it -- after the lock.
+        """
+        return not self.model_config.disable_cascade_attn
+
     def _reserve_bounded_workspace(
         self, workspace_routes: FlashInferWorkspaceRoutes
     ) -> bool:
         """Materialize the active wrappers and size the arena from their bounds.
 
-        ``False`` means at least one of them could not be bounded and nothing
-        has been applied: the arena is shared and grow-only, so a bound that
-        covers only some of the wrappers is not a bound at all. The wrappers
-        are materialized either way, so the caller only has to settle the
-        arena.
+        ``False`` means the arena has to keep its default size and nothing has
+        been applied: at least one active wrapper could not be bounded, or a
+        wrapper that is not reserved here can still be built later. The arena
+        is shared and grow-only, so a bound that covers only some of the
+        wrappers is not a bound at all. The wrappers are materialized either
+        way, so the caller only has to settle the arena.
         """
+        if self._cascade_can_run():
+            return False
+
         materialized: list[tuple[object, WorkspaceBound | None]] = []
 
         if workspace_routes.native_prefill:
