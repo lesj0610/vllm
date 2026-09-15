@@ -1632,16 +1632,14 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
     ) -> bool:
         """Materialize the active wrappers and size the arena from their bounds.
 
-        ``False`` means the arena has to keep its default size and nothing has
-        been applied: at least one active wrapper could not be bounded, or a
+        The wrappers are materialized either way: that is the lifecycle
+        contract this builds on, and it holds whether or not a bound is
+        applied. ``False`` only means the arena has to keep its default size,
+        because at least one active wrapper could not be bounded or because a
         wrapper that is not reserved here can still be built later. The arena
         is shared and grow-only, so a bound that covers only some of the
-        wrappers is not a bound at all. The wrappers are materialized either
-        way, so the caller only has to settle the arena.
+        wrappers is not a bound at all.
         """
-        if self._cascade_can_run():
-            return False
-
         materialized: list[tuple[object, WorkspaceBound | None]] = []
 
         if workspace_routes.native_prefill:
@@ -1652,6 +1650,11 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 materialized.append(
                     self._decode_workspace_upper_bound(batch_size, use_cudagraph)
                 )
+
+        # Asked after the wrappers exist, so standing down costs the bound and
+        # nothing else.
+        if self._cascade_can_run():
+            return False
 
         if not materialized or any(bound is None for _, bound in materialized):
             return False

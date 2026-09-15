@@ -1653,31 +1653,51 @@ def test_workspace_upper_bound_uses_the_whole_batched_token_budget(monkeypatch):
 
 
 def test_workspace_upper_bound_stands_down_when_cascade_can_run(monkeypatch):
-    """A wrapper this reservation does not own keeps the default arena.
+    """Standing down costs the bound, not the reservation.
 
     The cascade wrapper is built on the first batch with a common prefix and
     asks for the default arena, so a bound applied without it would be grown
-    by it -- after the lock.
+    by it -- after the lock. The wrappers this reservation does own are still
+    materialized, and their int workspaces still land inside the profiling
+    window; only the arena keeps its default size.
     """
     pytest.importorskip("flashinfer")
     from vllm.v1.attention.backends import flashinfer as flashinfer_backend
 
+    initial_int_bytes = 1 << 20
     builder = _bound_builder(
         flashinfer_backend,
         monkeypatch,
         prefill_answer=(1024, 64),
         decode_answers=[(1024, 64)],
-        initial_int_bytes=1 << 20,
+        initial_int_bytes=initial_int_bytes,
     )
     builder.model_config.disable_cascade_attn = False
 
     with _managed_workspace():
-        builder.reserve_workspace_for_memory_profiling()
+        reserved = builder.reserve_workspace_for_memory_profiling()
 
-        # Every helper answered, and the arena still keeps the default.
+        # The reservation still owns both wrappers.
+        assert builder._prefill_wrapper is not None
+        assert builder._decode_wrapper is not None
+        wrappers = builder._live_workspace_wrappers()
+        assert len(wrappers) == 2
+        assert set(map(id, wrappers)) == {
+            id(builder._prefill_wrapper),
+            id(builder._decode_wrapper),
+        }
+
+        # Both were asked, and both answers were thrown away.
+        assert builder._prefill_wrapper.bound_kwargs is not None
+        assert builder._decode_wrapper.bound_kwargs is not None
         assert _arena_bytes() == 4096
-        for wrapper in builder._live_workspace_wrappers():
-            assert wrapper._int_workspace_buffer.numel() == 1 << 20
+        for wrapper in wrappers:
+            assert wrapper._int_workspace_buffer.numel() == initial_int_bytes
+            assert wrapper._float_workspace_buffer.numel() == 4096
+
+        # What profiling measures is the default arena plus the int workspace
+        # each wrapper kept.
+        assert reserved == 4096 + 2 * initial_int_bytes
 
 
 def test_cascade_wrapper_after_the_lock_does_not_move_the_arena(monkeypatch):
@@ -1739,3 +1759,196 @@ def test_workspace_upper_bound_applies_when_cascade_is_disabled(monkeypatch):
         assert _arena_bytes() == 2048
         assert builder._prefill_wrapper._int_workspace_buffer.numel() == 64
         assert builder._decode_wrapper._int_workspace_buffer.numel() == 128
+
+
+# ---------------------------------------------------------------------------
+# GPU tests. These drive the real FlashInfer wrappers and the real
+# WorkspaceManager through the whole lifecycle. Nothing here may be reached
+# through a fake wrapper or a scripted bound: the point is whether the arena a
+# real bound produces survives real plans made after the lock.
+# ---------------------------------------------------------------------------
+
+requires_cuda_workspace = pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="workspace lifecycle GPU tests require CUDA",
+)
+
+
+def _gpu_flashinfer_builder(flashinfer_backend, *, disable_cascade_attn):
+    """A builder wired for the real wrappers on the current device."""
+    builder = flashinfer_backend.FlashInferMetadataBuilder.__new__(
+        flashinfer_backend.FlashInferMetadataBuilder
+    )
+    builder._workspace_buffer = None
+    builder._workspace_state = flashinfer_backend._FlashInferWorkspaceState()
+    builder._last_reserved_workspace_sizes = flashinfer_backend.WorkspaceSizes(0, 0)
+    builder._last_reserved_trtllm_workspace_bytes = 0
+    builder._exact_float_workspace_bytes = None
+    builder.device = torch.device("cuda")
+    builder.use_dcp = False
+    builder.use_xqa = False
+    builder.use_trtllm_prefill_attention = False
+    builder.use_trtllm_decode_attention = False
+    builder.enable_cuda_graph = False
+    builder.compilation_config = SimpleNamespace(cudagraph_capture_sizes=None)
+    builder._decode_cudagraph_max_bs = 0
+    builder.kv_cache_spec = _attention_spec(128)
+    builder.model_config = SimpleNamespace(
+        dtype=torch.float16,
+        is_mm_prefix_lm=False,
+        max_model_len=1024,
+        disable_cascade_attn=disable_cascade_attn,
+    )
+    builder.vllm_config = SimpleNamespace(
+        scheduler_config=SimpleNamespace(
+            max_num_batched_tokens=64,
+            max_num_seqs=4,
+        ),
+        speculative_config=None,
+    )
+    builder.num_qo_heads = 8
+    builder.num_kv_heads = 2
+    builder.dcp_world_size = 1
+    builder.head_dim = 128
+    builder.page_size = 16
+    builder.window_left = -1
+    builder.sm_scale = 0.125
+    builder.logits_soft_cap = 0.0
+    builder.is_kvcache_nvfp4 = False
+    builder.q_data_type_prefill = torch.float16
+    builder.q_data_type_decode = torch.float16
+    builder.kv_cache_dtype = torch.float16
+    builder.prefill_fixed_split_size = -1
+    builder.decode_fixed_split_size = -1
+    builder.disable_split_kv = False
+    builder.has_sinks = False
+    builder.kv_cache_layout = "NHD"
+    builder._prefill_wrapper = None
+    builder._noncausal_prefill_wrapper = None
+    builder._decode_wrapper = None
+    builder._decode_wrappers_cudagraph = {}
+    builder._cascade_wrapper = None
+    return builder
+
+
+def _gpu_paged_inputs(q_lens, pages_per_request, page_size, device="cuda"):
+    qo_indptr = torch.tensor(
+        [0, *torch.tensor(q_lens).cumsum(0).tolist()], dtype=torch.int32, device=device
+    )
+    kv_indptr = (
+        torch.arange(len(q_lens) + 1, dtype=torch.int32, device=device)
+        * pages_per_request
+    )
+    kv_indices = torch.arange(int(kv_indptr[-1]), dtype=torch.int32, device=device)
+    last_page_len = torch.full(
+        (len(q_lens),), page_size, dtype=torch.int32, device=device
+    )
+    return qo_indptr, kv_indptr, kv_indices, last_page_len
+
+
+def _plan_prefill(wrapper, q_lens, builder):
+    qo_indptr, kv_indptr, kv_indices, last_page_len = _gpu_paged_inputs(
+        q_lens, 2, builder.page_size
+    )
+    wrapper.plan(
+        qo_indptr=qo_indptr,
+        paged_kv_indptr=kv_indptr,
+        paged_kv_indices=kv_indices,
+        paged_kv_last_page_len=last_page_len,
+        num_qo_heads=builder.num_qo_heads,
+        num_kv_heads=builder.num_kv_heads,
+        head_dim_qk=builder.head_dim,
+        page_size=builder.page_size,
+        causal=True,
+        q_data_type=builder.q_data_type_prefill,
+        kv_data_type=builder.kv_cache_dtype,
+    )
+
+
+@requires_cuda_workspace
+def test_gpu_workspace_bounded_arena_survives_the_lock():
+    """With cascade off, the bounded arena must hold across real plans."""
+    pytest.importorskip("flashinfer")
+    from vllm.v1.attention.backends import flashinfer as flashinfer_backend
+
+    builder = _gpu_flashinfer_builder(flashinfer_backend, disable_cascade_attn=True)
+
+    reset_workspace_manager()
+    init_workspace_manager(torch.device("cuda"))
+    try:
+        builder.reserve_workspace_for_memory_profiling()
+        builder.rebind_workspace_after_reservation()
+
+        arena = current_workspace_manager().get_workspace()
+        size_before, pointer_before = _nbytes(arena), arena.data_ptr()
+        int_before = {
+            id(w): (w._int_workspace_buffer.numel(), w._int_workspace_buffer.data_ptr())
+            for w in builder._live_workspace_wrappers()
+        }
+        assert builder._prefill_wrapper is not None
+
+        lock_workspace()
+        for q_lens in ([1], [1, 1], [8, 8, 8, 8], [61, 1, 1, 1]):
+            _plan_prefill(builder._prefill_wrapper, q_lens, builder)
+
+        arena = current_workspace_manager().get_workspace()
+        assert _nbytes(arena) == size_before
+        assert arena.data_ptr() == pointer_before
+        assert {
+            id(w): (w._int_workspace_buffer.numel(), w._int_workspace_buffer.data_ptr())
+            for w in builder._live_workspace_wrappers()
+        } == int_before
+    finally:
+        reset_workspace_manager()
+
+
+@requires_cuda_workspace
+def test_gpu_workspace_cascade_fallback_leaves_room_after_the_lock():
+    """With cascade on, the default arena must absorb a real cascade plan."""
+    pytest.importorskip("flashinfer")
+    from vllm.v1.attention.backends import flashinfer as flashinfer_backend
+
+    builder = _gpu_flashinfer_builder(flashinfer_backend, disable_cascade_attn=False)
+
+    reset_workspace_manager()
+    init_workspace_manager(torch.device("cuda"))
+    try:
+        builder.reserve_workspace_for_memory_profiling()
+        builder.rebind_workspace_after_reservation()
+
+        # Standing down costs the bound, not the reservation.
+        assert builder._prefill_wrapper is not None
+        assert builder._decode_wrapper is not None
+        arena = current_workspace_manager().get_workspace()
+        assert _nbytes(arena) == builder._default_workspace_buffer_size()
+        size_before, pointer_before = _nbytes(arena), arena.data_ptr()
+
+        lock_workspace()
+        cascade_wrapper = builder._get_cascade_wrapper()
+        qo_indptr, kv_indptr, kv_indices, last_page_len = _gpu_paged_inputs(
+            [4, 4], 2, builder.page_size
+        )
+        shared_indptr = torch.tensor([0, 2], dtype=torch.int32, device="cuda")
+        shared_indices = torch.arange(2, dtype=torch.int32, device="cuda")
+        shared_last_page_len = torch.tensor(
+            [builder.page_size], dtype=torch.int32, device="cuda"
+        )
+        cascade_wrapper.plan(
+            [shared_indptr, kv_indptr],
+            [shared_indices, kv_indices],
+            [shared_last_page_len, last_page_len],
+            [torch.tensor([0, 8], dtype=torch.int32, device="cuda"), qo_indptr],
+            builder.num_qo_heads,
+            builder.num_kv_heads,
+            builder.head_dim,
+            builder.page_size,
+            causal=True,
+            q_data_type=builder.q_data_type_prefill,
+            kv_data_type=builder.kv_cache_dtype,
+        )
+
+        arena = current_workspace_manager().get_workspace()
+        assert _nbytes(arena) == size_before
+        assert arena.data_ptr() == pointer_before
+    finally:
+        reset_workspace_manager()
