@@ -6,7 +6,7 @@ import weakref
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from functools import partial
-from typing import ClassVar, NamedTuple
+from typing import Any, ClassVar, NamedTuple
 
 import numpy as np
 import torch
@@ -119,6 +119,34 @@ class FlashInferWorkspaceRoutes(NamedTuple):
     trtllm_prefill: bool
     native_decode: bool
     trtllm_decode: bool
+
+
+class WorkspaceBound(NamedTuple):
+    """Workspace sizes no plan within a declared shape range can exceed."""
+
+    float_bytes: int
+    int_bytes: int
+
+
+def _usable_workspace_bound(result: object) -> WorkspaceBound | None:
+    """``None`` unless the helper answered with a pair of usable sizes."""
+    if isinstance(result, (str, bytes)):
+        return None
+    sizes: list[Any]
+    try:
+        sizes = list(result)  # type: ignore[call-overload]
+    except TypeError:
+        return None
+    if len(sizes) != 2:
+        return None
+    try:
+        float_bytes = int(sizes[0])
+        int_bytes = int(sizes[1])
+    except (TypeError, ValueError):
+        return None
+    if float_bytes < 0 or int_bytes < 0:
+        return None
+    return WorkspaceBound(float_bytes, int_bytes)
 
 
 @dataclass
@@ -1171,6 +1199,17 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             trtllm_decode=trtllm_decode,
         )
 
+    def _native_initial_workspace_buffer_size(self) -> int:
+        """The arena size a wrapper asks for at construction.
+
+        The reservation settles the arena after the wrappers exist, and the
+        arena only ever grows, so asking for the default here would put a
+        floor under a bound that could otherwise be smaller.
+        """
+        if envs.VLLM_BATCH_INVARIANT or self.use_dcp:
+            return self._default_workspace_buffer_size()
+        return 1
+
     def _allocate_workspace_buffer(self, buffer_size: int) -> torch.Tensor:
         buffer_size = max(int(buffer_size), 1)
         if self.use_vllm_workspace_manager_for_workspace_buffer():
@@ -1354,7 +1393,9 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 ):
                     self._noncausal_prefill_wrapper = (
                         BatchAttentionWithAttentionSinkWrapper(
-                            self._get_workspace_buffer(),
+                            self._get_workspace_buffer(
+                                self._native_initial_workspace_buffer_size()
+                            ),
                             get_flashinfer_layout_string(self.kv_cache_layout),
                             backend="auto",
                             q_data_type=self.q_data_type_prefill,
@@ -1367,7 +1408,9 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 else:
                     self._noncausal_prefill_wrapper = (
                         BatchPrefillWithPagedKVCacheWrapper(
-                            self._get_workspace_buffer(),
+                            self._get_workspace_buffer(
+                                self._native_initial_workspace_buffer_size()
+                            ),
                             get_flashinfer_layout_string(self.kv_cache_layout),
                             backend="auto",
                         )
@@ -1389,7 +1432,9 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 ):
                     assert not self.is_kvcache_nvfp4
                     self._prefill_wrapper = BatchAttentionWithAttentionSinkWrapper(
-                        self._get_workspace_buffer(),
+                        self._get_workspace_buffer(
+                            self._native_initial_workspace_buffer_size()
+                        ),
                         get_flashinfer_layout_string(self.kv_cache_layout),
                         backend="auto",
                         q_data_type=self.q_data_type_prefill,
@@ -1403,7 +1448,9 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     # the wrapper; fa2/fa3 do not support nvfp4.
                     backend = "trtllm-gen" if self.is_kvcache_nvfp4 else "auto"
                     self._prefill_wrapper = BatchPrefillWithPagedKVCacheWrapper(
-                        self._get_workspace_buffer(),
+                        self._get_workspace_buffer(
+                            self._native_initial_workspace_buffer_size()
+                        ),
                         get_flashinfer_layout_string(self.kv_cache_layout),
                         backend=backend,
                     )
@@ -1430,7 +1477,9 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             # the wrapper; fa2/fa3 do not support nvfp4.
             backend = "trtllm-gen" if self.is_kvcache_nvfp4 else "auto"
             decode_wrapper = BatchDecodeWithPagedKVCacheWrapper(
-                self._get_workspace_buffer(),
+                self._get_workspace_buffer(
+                    self._native_initial_workspace_buffer_size()
+                ),
                 get_flashinfer_layout_string(self.kv_cache_layout),
                 use_cuda_graph=use_cudagraph,
                 paged_kv_indptr_buffer=paged_kv_indptr,
@@ -1462,6 +1511,156 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             self._register_workspace_wrapper(self._cascade_wrapper)
         return self._cascade_wrapper
 
+    def _max_num_pages_per_request(self) -> int:
+        return cdiv(self.model_config.max_model_len, self.page_size)
+
+    @staticmethod
+    def _wrapper_workspace_upper_bound(
+        wrapper: object, **bounds
+    ) -> WorkspaceBound | None:
+        """Ask a wrapper what no plan inside ``bounds`` can exceed.
+
+        ``None`` means the question could not be answered -- the wrapper is on
+        a backend without the helper, the helper refused, or it returned
+        something unusable -- and the caller has to keep the default arena.
+        """
+        bound_fn = getattr(wrapper, "workspace_size_upper_bound", None)
+        if bound_fn is None:
+            return None
+        try:
+            result = bound_fn(**bounds)
+        except NotImplementedError:
+            return None
+        except Exception:
+            logger.debug("FlashInfer workspace upper bound unavailable.", exc_info=True)
+            return None
+        return _usable_workspace_bound(result)
+
+    def _prefill_workspace_upper_bound(
+        self,
+    ) -> tuple[object, WorkspaceBound | None]:
+        scheduler_config = self.vllm_config.scheduler_config
+        max_total_num_rows = min(
+            scheduler_config.max_num_batched_tokens, self.model_config.max_model_len
+        )
+        max_batch_size = min(scheduler_config.max_num_seqs, max_total_num_rows)
+        wrapper = self._get_prefill_wrapper(causal=True)
+        if max_batch_size <= 0 or max_total_num_rows <= 0:
+            return wrapper, None
+        if getattr(wrapper, "workspace_size_upper_bound", None) is None:
+            return wrapper, None
+        bound = self._wrapper_workspace_upper_bound(
+            wrapper,
+            max_batch_size=max_batch_size,
+            max_total_num_rows=max_total_num_rows,
+            max_num_pages_per_request=self._max_num_pages_per_request(),
+            num_qo_heads=self.num_qo_heads,
+            num_kv_heads=self.num_kv_heads,
+            head_dim_qk=self.head_dim,
+            page_size=self.page_size,
+            window_left=self.window_left,
+            logits_soft_cap=self.logits_soft_cap,
+            q_data_type=self.q_data_type_prefill,
+            kv_data_type=self.kv_cache_dtype,
+            # The wrapper's own trtllm-gen backend takes NVFP4 KV and only
+            # emits FP8, the same dtype build() gives plan().
+            o_data_type=(
+                FP8_DTYPE if self.is_kvcache_nvfp4 else self.model_config.dtype
+            ),
+            fixed_split_size=self.prefill_fixed_split_size,
+            disable_split_kv=self.disable_split_kv,
+        )
+        return wrapper, bound
+
+    def _decode_workspace_upper_bound(
+        self, batch_size: int, use_cudagraph: bool
+    ) -> tuple[object, WorkspaceBound | None]:
+        wrapper = self._get_decode_wrapper(batch_size, use_cudagraph=use_cudagraph)
+        if getattr(wrapper, "workspace_size_upper_bound", None) is None:
+            return wrapper, None
+        bound = self._wrapper_workspace_upper_bound(
+            wrapper,
+            max_batch_size=batch_size,
+            max_num_pages_per_request=self._max_num_pages_per_request(),
+            num_qo_heads=self.num_qo_heads * self.dcp_world_size,
+            num_kv_heads=self.num_kv_heads,
+            head_dim=self.head_dim,
+            page_size=self.page_size,
+            window_left=self.window_left,
+            logits_soft_cap=self.logits_soft_cap,
+            q_data_type=self.q_data_type_decode,
+            kv_data_type=self.kv_cache_dtype,
+            o_data_type=(
+                FP8_DTYPE if self.is_kvcache_nvfp4 else self.model_config.dtype
+            ),
+        )
+        return wrapper, bound
+
+    def _apply_workspace_bound(
+        self, wrapper: object, bound: WorkspaceBound, float_workspace: torch.Tensor
+    ) -> None:
+        """Give one wrapper the buffers its bound says are enough."""
+        int_workspace = getattr(wrapper, "_int_workspace_buffer", None)
+        if int_workspace is None:
+            return
+        target_int_bytes = max(bound.int_bytes, 1)
+        if _buffer_nbytes(int_workspace) != target_int_bytes:
+            int_workspace = torch.empty(
+                (target_int_bytes,), dtype=torch.uint8, device=self.device
+            )
+            object.__setattr__(wrapper, "_int_workspace_buffer", int_workspace)
+        if hasattr(wrapper, "reset_workspace_buffer"):
+            wrapper.reset_workspace_buffer(float_workspace, int_workspace)
+
+    def _reserve_bounded_workspace(
+        self, workspace_routes: FlashInferWorkspaceRoutes
+    ) -> bool:
+        """Materialize the active wrappers and size the arena from their bounds.
+
+        ``False`` means at least one of them could not be bounded and nothing
+        has been applied: the arena is shared and grow-only, so a bound that
+        covers only some of the wrappers is not a bound at all. The wrappers
+        are materialized either way, so the caller only has to settle the
+        arena.
+        """
+        materialized: list[tuple[object, WorkspaceBound | None]] = []
+
+        if workspace_routes.native_prefill:
+            materialized.append(self._prefill_workspace_upper_bound())
+
+        if workspace_routes.native_decode:
+            for batch_size, use_cudagraph in self._decode_reservation_batches():
+                materialized.append(
+                    self._decode_workspace_upper_bound(batch_size, use_cudagraph)
+                )
+
+        if not materialized or any(bound is None for _, bound in materialized):
+            return False
+
+        # The arena is shared, so it takes the largest float bound; each
+        # wrapper owns its int workspace, so each takes its own.
+        float_workspace = self._get_workspace_buffer(
+            max(bound.float_bytes for _, bound in materialized if bound is not None)
+        )
+        for wrapper, bound in materialized:
+            assert bound is not None
+            self._apply_workspace_bound(wrapper, bound, float_workspace)
+        return True
+
+    def _decode_reservation_batches(self):
+        """Every decode batch size the reservation has to cover."""
+        max_decode_tokens = min(
+            self.vllm_config.scheduler_config.max_num_seqs,
+            self.vllm_config.scheduler_config.max_num_batched_tokens,
+            self.model_config.max_model_len,
+        )
+        if max_decode_tokens > 0:
+            yield max_decode_tokens, False
+        if self.enable_cuda_graph:
+            for batch_size in self.compilation_config.cudagraph_capture_sizes or []:
+                if 0 < batch_size <= self._decode_cudagraph_max_bs:
+                    yield batch_size, True
+
     def _direct_trtllm_workspace_bytes(
         self, workspace_routes: FlashInferWorkspaceRoutes
     ) -> int:
@@ -1488,8 +1687,8 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
 
         workspace_routes = self._get_workspace_routes()
         if workspace_routes.native_decode and self.enable_cuda_graph:
-            for batch_size in self.compilation_config.cudagraph_capture_sizes or []:
-                if 0 < batch_size <= self._decode_cudagraph_max_bs:
+            for batch_size, use_cudagraph in self._decode_reservation_batches():
+                if use_cudagraph:
                     self._get_decode_wrapper(batch_size, use_cudagraph=True)
 
         return self._reserved_workspace_bytes(
@@ -1509,28 +1708,17 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             return 0
 
         workspace_routes = self._get_workspace_routes()
-        # Grow the shared float arena to its default before the wrappers below
-        # are built, so none of them can be the allocation that grows it after
-        # the lock. The arena only ever grows, so ordering does not change the
-        # final size.
-        if workspace_routes.native_prefill or workspace_routes.native_decode:
+        # Ask every wrapper the active routes need what no plan of theirs can
+        # exceed, and keep the arena at that. One wrapper that cannot answer
+        # takes the whole arena back to the default: it is shared and
+        # grow-only, so an answer that covers only part of it would leave the
+        # rest to grow after the lock.
+        native_routes = (
+            workspace_routes.native_prefill or workspace_routes.native_decode
+        )
+        if native_routes and not self._reserve_bounded_workspace(workspace_routes):
+            # The wrappers exist either way; growing the arena rebinds them.
             self._get_workspace_buffer(self._default_workspace_buffer_size())
-
-        if workspace_routes.native_prefill:
-            self._get_prefill_wrapper(causal=True)
-
-        if workspace_routes.native_decode:
-            max_decode_tokens = min(
-                self.vllm_config.scheduler_config.max_num_seqs,
-                self.vllm_config.scheduler_config.max_num_batched_tokens,
-                self.model_config.max_model_len,
-            )
-            if max_decode_tokens > 0:
-                self._get_decode_wrapper(max_decode_tokens, use_cudagraph=False)
-            if self.enable_cuda_graph:
-                for batch_size in self.compilation_config.cudagraph_capture_sizes or []:
-                    if 0 < batch_size <= self._decode_cudagraph_max_bs:
-                        self._get_decode_wrapper(batch_size, use_cudagraph=True)
 
         return self._reserved_workspace_bytes(
             self._direct_trtllm_workspace_bytes(workspace_routes)

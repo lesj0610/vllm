@@ -70,6 +70,8 @@ class _FakeFlashInferWrapper:
         self._vllm_flashinfer_int_workspace_finalized = False
         self.is_cuda_graph_enabled = False
         self.reset_calls = 0
+        self.bound_kwargs: dict | None = None
+        self.workspace_size_upper_bound: object | None = None
 
     def reset_workspace_buffer(
         self,
@@ -287,8 +289,14 @@ def _install_prefill_factories(builder, monkeypatch):
     return causal_wrapper
 
 
-def test_persistent_reserve_grows_arena_before_runtime_wrappers(monkeypatch):
-    """The runtime wrappers below the hoist never grow the arena themselves."""
+def test_persistent_reserve_settles_the_arena_after_the_runtime_wrappers(monkeypatch):
+    """The arena reaches its final size once, after the wrappers exist.
+
+    A wrapper is built against a minimal arena so that a workspace bound can
+    still settle it smaller than the default; the reservation then sizes it
+    once and every registered wrapper is rebound onto it. Nothing after that
+    can grow it.
+    """
     pytest.importorskip("flashinfer")
     from vllm.v1.attention.backends import flashinfer as flashinfer_backend
 
@@ -319,8 +327,16 @@ def test_persistent_reserve_grows_arena_before_runtime_wrappers(monkeypatch):
 
     with _managed_workspace():
         builder.reserve_workspace_for_memory_profiling()
-        assert arena_bytes_when_built == [default_float_bytes]
-        assert causal_wrapper._float_workspace_buffer is not None
+        # The wrapper is built before the arena is settled, so a bound would
+        # still have had room to size it below the default.
+        assert arena_bytes_when_built == [0]
+        # This wrapper cannot be bounded, so the arena falls back to the
+        # default and the wrapper is rebound onto it.
+        final_workspace = current_workspace_manager().get_workspace()
+        assert _nbytes(final_workspace) == default_float_bytes
+        assert causal_wrapper._float_workspace_buffer.data_ptr() == (
+            final_workspace.data_ptr()
+        )
 
 
 @pytest.mark.parametrize(
@@ -1253,3 +1269,315 @@ def test_v2_capture_reserves_workspace_before_measurement_and_locks(monkeypatch)
 # A composite routes one batch to two child builders, either of which can be
 # chosen at runtime. The profiling lifecycle therefore has to reach both, and
 # the pair can only promise what both children can honour.
+
+
+_NO_HELPER = object()
+
+
+def _bound_builder(
+    flashinfer_backend,
+    monkeypatch,
+    *,
+    prefill_answer,
+    decode_answers,
+    default_float_bytes=4096,
+    initial_int_bytes=8 << 20,
+):
+    """Builder whose wrappers answer `workspace_size_upper_bound` from a script.
+
+    `prefill_answer` and each entry of `decode_answers` is what that wrapper's
+    helper returns, an exception instance for a helper that raises, or
+    `_NO_HELPER` for a wrapper that does not expose the helper at all. `None`
+    for `prefill_answer` or an empty `decode_answers` means that route is not
+    active.
+    """
+    builder = _reservation_builder(
+        flashinfer_backend,
+        default_float_bytes=default_float_bytes,
+        use_trtllm_prefill_attention=prefill_answer is None,
+        use_trtllm_decode_attention=not decode_answers,
+        max_num_batched_tokens=4,
+        max_num_seqs=1,
+        max_model_len=4,
+    )
+    builder.num_qo_heads = 8
+    builder.num_kv_heads = 2
+    builder.dcp_world_size = 1
+    builder.head_dim = 128
+    builder.page_size = 16
+    builder.window_left = -1
+    builder.prefill_fixed_split_size = -1
+    builder.disable_split_kv = False
+    builder.is_kvcache_nvfp4 = False
+    builder.q_data_type_prefill = torch.float16
+    builder.q_data_type_decode = torch.float16
+    builder.kv_cache_dtype = torch.float16
+    builder.sm_scale = 0.125
+    builder.logits_soft_cap = 0.0
+
+    def scripted(answer):
+        wrapper = _FakeFlashInferWrapper(
+            builder._get_workspace_buffer(
+                builder._native_initial_workspace_buffer_size()
+            ),
+            int_workspace_bytes=initial_int_bytes,
+        )
+        if answer is _NO_HELPER:
+            return wrapper
+
+        def workspace_size_upper_bound(**kwargs):
+            wrapper.bound_kwargs = kwargs
+            if isinstance(answer, Exception):
+                raise answer
+            return answer
+
+        wrapper.workspace_size_upper_bound = workspace_size_upper_bound
+        return wrapper
+
+    decode_script = list(decode_answers)
+
+    def get_prefill_wrapper(causal=True):
+        if builder._prefill_wrapper is None:
+            builder._prefill_wrapper = scripted(prefill_answer)
+            builder._register_workspace_wrapper(builder._prefill_wrapper)
+        return builder._prefill_wrapper
+
+    def get_decode_wrapper(batch_size, use_cudagraph=False):
+        store = builder._decode_wrappers_cudagraph if use_cudagraph else None
+        if store is not None and batch_size in store:
+            return store[batch_size]
+        if store is None and builder._decode_wrapper is not None:
+            return builder._decode_wrapper
+        wrapper = scripted(decode_script.pop(0))
+        wrapper.is_cuda_graph_enabled = use_cudagraph
+        builder._register_workspace_wrapper(wrapper)
+        if store is not None:
+            store[batch_size] = wrapper
+        else:
+            builder._decode_wrapper = wrapper
+        return wrapper
+
+    monkeypatch.setattr(builder, "_get_prefill_wrapper", get_prefill_wrapper)
+    monkeypatch.setattr(builder, "_get_decode_wrapper", get_decode_wrapper)
+    monkeypatch.setattr(
+        flashinfer_backend, "_get_trtllm_workspace_buffer", lambda: None
+    )
+    return builder
+
+
+def _arena_bytes():
+    return _nbytes(current_workspace_manager().get_workspace())
+
+
+def test_workspace_upper_bound_success_shrinks_arena_and_int_workspace(monkeypatch):
+    """A bound that covers every active wrapper replaces the default arena."""
+    pytest.importorskip("flashinfer")
+    from vllm.v1.attention.backends import flashinfer as flashinfer_backend
+
+    builder = _bound_builder(
+        flashinfer_backend,
+        monkeypatch,
+        prefill_answer=(1024, 512),
+        decode_answers=[(2048, 256)],
+    )
+
+    with _managed_workspace():
+        builder.reserve_workspace_for_memory_profiling()
+
+        assert _arena_bytes() == 2048
+        assert builder._prefill_wrapper._int_workspace_buffer.numel() == 512
+        assert builder._decode_wrapper._int_workspace_buffer.numel() == 256
+        for wrapper in builder._live_workspace_wrappers():
+            assert wrapper._float_workspace_buffer.numel() == 2048
+
+
+def test_workspace_upper_bound_passes_plan_level_bounds(monkeypatch):
+    """The query carries plan-level bounds, not vLLM scheduler names."""
+    pytest.importorskip("flashinfer")
+    from vllm.v1.attention.backends import flashinfer as flashinfer_backend
+
+    builder = _bound_builder(
+        flashinfer_backend,
+        monkeypatch,
+        prefill_answer=(1024, 512),
+        decode_answers=[(1024, 256)],
+    )
+
+    with _managed_workspace():
+        builder.reserve_workspace_for_memory_profiling()
+
+    prefill_kwargs = builder._prefill_wrapper.bound_kwargs
+    assert prefill_kwargs["max_batch_size"] == 1
+    assert prefill_kwargs["max_total_num_rows"] == 4
+    assert prefill_kwargs["max_num_pages_per_request"] == 1
+    assert prefill_kwargs["num_qo_heads"] == 8
+    assert prefill_kwargs["num_kv_heads"] == 2
+    assert prefill_kwargs["head_dim_qk"] == 128
+    assert prefill_kwargs["o_data_type"] is torch.float16
+    assert "max_num_batched_tokens" not in prefill_kwargs
+    assert "max_num_seqs" not in prefill_kwargs
+    assert "max_model_len" not in prefill_kwargs
+
+    decode_kwargs = builder._decode_wrapper.bound_kwargs
+    assert decode_kwargs["max_batch_size"] == 1
+    assert decode_kwargs["max_num_pages_per_request"] == 1
+    assert "max_total_num_rows" not in decode_kwargs
+
+
+@pytest.mark.parametrize("is_kvcache_nvfp4", [False, True])
+def test_workspace_upper_bound_asks_about_the_plan_output_dtype(
+    monkeypatch, is_kvcache_nvfp4
+):
+    """The bound is queried for the dtype `plan()` will be given."""
+    pytest.importorskip("flashinfer")
+    from vllm.v1.attention.backends import flashinfer as flashinfer_backend
+
+    builder = _bound_builder(
+        flashinfer_backend,
+        monkeypatch,
+        prefill_answer=(1024, 512),
+        decode_answers=[],
+    )
+    builder.is_kvcache_nvfp4 = is_kvcache_nvfp4
+
+    with _managed_workspace():
+        builder.reserve_workspace_for_memory_profiling()
+
+    expected = flashinfer_backend.FP8_DTYPE if is_kvcache_nvfp4 else torch.float16
+    assert builder._prefill_wrapper.bound_kwargs["o_data_type"] == expected
+
+
+@pytest.mark.parametrize(
+    ("case", "prefill_answer", "decode_answers"),
+    [
+        pytest.param("no-helper", _NO_HELPER, [(1024, 64)], id="helper-missing"),
+        pytest.param(
+            "raises",
+            NotImplementedError("unsupported backend"),
+            [(1024, 64)],
+            id="unsupported-backend",
+        ),
+        pytest.param(
+            "raises", RuntimeError("no bound"), [(1024, 64)], id="helper-raises"
+        ),
+        pytest.param("negative", (-1, 64), [(1024, 64)], id="negative-result"),
+        pytest.param("malformed", (1024,), [(1024, 64)], id="malformed-result"),
+        pytest.param(
+            "decode-missing", (1024, 64), [_NO_HELPER], id="prefill-ok-decode-missing"
+        ),
+        pytest.param(
+            "int-unusable", (1024, -8), [(1024, 64)], id="float-ok-int-unusable"
+        ),
+    ],
+)
+def test_workspace_upper_bound_falls_back_to_the_default_arena(
+    monkeypatch, case, prefill_answer, decode_answers
+):
+    """Anything short of a bound for every active wrapper keeps the default.
+
+    A wrapper that could not be bounded may need more than the ones that
+    could, and the arena is shared and grow-only, so a partial answer is not
+    an answer.
+    """
+    pytest.importorskip("flashinfer")
+    from vllm.v1.attention.backends import flashinfer as flashinfer_backend
+
+    builder = _bound_builder(
+        flashinfer_backend,
+        monkeypatch,
+        prefill_answer=prefill_answer,
+        decode_answers=decode_answers,
+        default_float_bytes=4096,
+        initial_int_bytes=1 << 20,
+    )
+
+    with _managed_workspace():
+        builder.reserve_workspace_for_memory_profiling()
+
+        assert _arena_bytes() == 4096
+        # No bound was applied, so the wrappers keep the buffers they built.
+        for wrapper in builder._live_workspace_wrappers():
+            assert wrapper._int_workspace_buffer.numel() == 1 << 20
+
+
+def test_workspace_upper_bound_covers_every_cudagraph_decode_wrapper(monkeypatch):
+    """Each graph wrapper is bounded for its own batch size."""
+    pytest.importorskip("flashinfer")
+    from vllm.v1.attention.backends import flashinfer as flashinfer_backend
+
+    builder = _bound_builder(
+        flashinfer_backend,
+        monkeypatch,
+        prefill_answer=None,
+        decode_answers=[(512, 32), (1024, 64), (2048, 128)],
+    )
+    builder.enable_cuda_graph = True
+    builder.compilation_config = SimpleNamespace(cudagraph_capture_sizes=[0, 1, 2, 8])
+    builder._decode_cudagraph_max_bs = 2
+
+    with _managed_workspace():
+        builder.reserve_workspace_for_memory_profiling()
+
+        assert _arena_bytes() == 2048
+        graph_wrappers = builder._decode_wrappers_cudagraph
+        assert sorted(graph_wrappers) == [1, 2]
+        assert {w._int_workspace_buffer.numel() for w in graph_wrappers.values()} == {
+            64,
+            128,
+        }
+        assert all(w.is_cuda_graph_enabled for w in graph_wrappers.values())
+        assert builder._decode_wrapper._int_workspace_buffer.numel() == 32
+
+
+def test_workspace_upper_bound_result_is_stable_across_the_lock(monkeypatch):
+    """Re-entering the reservation after the lock must not move the arena."""
+    pytest.importorskip("flashinfer")
+    from vllm.v1.attention.backends import flashinfer as flashinfer_backend
+
+    builder = _bound_builder(
+        flashinfer_backend,
+        monkeypatch,
+        prefill_answer=(1024, 512),
+        decode_answers=[(2048, 256)],
+    )
+
+    with _managed_workspace():
+        builder.reserve_workspace_for_memory_profiling()
+        builder.rebind_workspace_after_reservation()
+        arena = current_workspace_manager().get_workspace()
+        size_before, pointer_before = _nbytes(arena), arena.data_ptr()
+        int_before = {
+            id(w): w._int_workspace_buffer.data_ptr()
+            for w in builder._live_workspace_wrappers()
+        }
+
+        lock_workspace()
+        builder.reserve_workspace_for_cudagraph_capture()
+
+        arena = current_workspace_manager().get_workspace()
+        assert _nbytes(arena) == size_before
+        assert arena.data_ptr() == pointer_before
+        assert {
+            id(w): w._int_workspace_buffer.data_ptr()
+            for w in builder._live_workspace_wrappers()
+        } == int_before
+
+
+def test_workspace_upper_bound_is_not_asked_when_no_native_route(monkeypatch):
+    """A model served entirely by direct trtllm-gen reserves no arena."""
+    pytest.importorskip("flashinfer")
+    from vllm.v1.attention.backends import flashinfer as flashinfer_backend
+
+    builder = _bound_builder(
+        flashinfer_backend,
+        monkeypatch,
+        prefill_answer=None,
+        decode_answers=[],
+    )
+
+    with _managed_workspace():
+        builder.reserve_workspace_for_memory_profiling()
+
+        assert current_workspace_manager().get_workspace() is None
+        assert builder._prefill_wrapper is None
+        assert builder._decode_wrapper is None
