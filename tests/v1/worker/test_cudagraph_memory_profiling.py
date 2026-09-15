@@ -1307,6 +1307,7 @@ def _bound_builder(
     builder.page_size = 16
     builder.window_left = -1
     builder.prefill_fixed_split_size = -1
+    builder.decode_fixed_split_size = -1
     builder.disable_split_kv = False
     builder.is_kvcache_nvfp4 = False
     builder.q_data_type_prefill = torch.float16
@@ -1462,6 +1463,9 @@ def test_workspace_upper_bound_asks_about_the_plan_output_dtype(
         ),
         pytest.param("negative", (-1, 64), [(1024, 64)], id="negative-result"),
         pytest.param("malformed", (1024,), [(1024, 64)], id="malformed-result"),
+        pytest.param("float-result", (1.5, 2), [(1024, 64)], id="float-result"),
+        pytest.param("str-result", ("4", 8), [(1024, 64)], id="str-result"),
+        pytest.param("bool-result", (True, 8), [(1024, 64)], id="bool-result"),
         pytest.param(
             "decode-missing", (1024, 64), [_NO_HELPER], id="prefill-ok-decode-missing"
         ),
@@ -1581,3 +1585,25 @@ def test_workspace_upper_bound_is_not_asked_when_no_native_route(monkeypatch):
         assert current_workspace_manager().get_workspace() is None
         assert builder._prefill_wrapper is None
         assert builder._decode_wrapper is None
+
+
+def test_workspace_upper_bound_forwards_the_decode_split_settings(monkeypatch):
+    """A fixed split bypasses the scheduler ceiling, so the bound must see it."""
+    pytest.importorskip("flashinfer")
+    from vllm.v1.attention.backends import flashinfer as flashinfer_backend
+
+    builder = _bound_builder(
+        flashinfer_backend,
+        monkeypatch,
+        prefill_answer=None,
+        decode_answers=[(1024, 64)],
+    )
+    builder.decode_fixed_split_size = 8
+    builder.disable_split_kv = True
+
+    with _managed_workspace():
+        builder.reserve_workspace_for_memory_profiling()
+
+    decode_kwargs = builder._decode_wrapper.bound_kwargs
+    assert decode_kwargs["fixed_split_size"] == 8
+    assert decode_kwargs["disable_split_kv"] is True

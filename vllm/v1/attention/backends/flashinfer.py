@@ -129,7 +129,13 @@ class WorkspaceBound(NamedTuple):
 
 
 def _usable_workspace_bound(result: object) -> WorkspaceBound | None:
-    """``None`` unless the helper answered with a pair of usable sizes."""
+    """``None`` unless the helper answered with a pair of usable sizes.
+
+    Only a pair of non-negative ``int`` is taken. A float, a string or a bool
+    is refused rather than coerced: ``int(1.9)`` and ``int("4")`` would turn a
+    wrong answer into a plausible one, and an arena sized from that would be
+    too small with nothing to say so.
+    """
     if isinstance(result, (str, bytes)):
         return None
     sizes: list[Any]
@@ -139,14 +145,12 @@ def _usable_workspace_bound(result: object) -> WorkspaceBound | None:
         return None
     if len(sizes) != 2:
         return None
-    try:
-        float_bytes = int(sizes[0])
-        int_bytes = int(sizes[1])
-    except (TypeError, ValueError):
+    if any(
+        not isinstance(size, int) or isinstance(size, bool) or size < 0
+        for size in sizes
+    ):
         return None
-    if float_bytes < 0 or int_bytes < 0:
-        return None
-    return WorkspaceBound(float_bytes, int_bytes)
+    return WorkspaceBound(sizes[0], sizes[1])
 
 
 @dataclass
@@ -1590,6 +1594,8 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             logits_soft_cap=self.logits_soft_cap,
             q_data_type=self.q_data_type_decode,
             kv_data_type=self.kv_cache_dtype,
+            fixed_split_size=self.decode_fixed_split_size,
+            disable_split_kv=self.disable_split_kv,
             o_data_type=(
                 FP8_DTYPE if self.is_kvcache_nvfp4 else self.model_config.dtype
             ),
