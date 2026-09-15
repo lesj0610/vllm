@@ -349,7 +349,7 @@ def test_persistent_reserve_settles_the_arena_after_the_runtime_wrappers(monkeyp
     [
         pytest.param(1, False, True, id="single-rank"),
         pytest.param(2, False, False, id="dcp-fallback"),
-        pytest.param(1, True, False, id="mm-prefix-fallback"),
+        pytest.param(1, True, True, id="mm-prefix-profiled"),
     ],
 )
 def test_flashinfer_persistent_workspace_profile_gate(
@@ -374,33 +374,54 @@ def test_flashinfer_persistent_workspace_profile_gate(
     )
 
 
-def test_flashinfer_mm_prefix_route_does_not_open_the_profile_gate():
-    """A native-prefill route is not on its own enough to opt in.
+def test_flashinfer_mm_prefix_keeps_the_conservative_arena(monkeypatch):
+    """The model flag alone does not close the lifecycle.
 
-    mm-prefix reaches the native prefill leg, but through a wrapper the
-    reservation does not own, so the gate has to stay closed until it does.
+    What the arena has to survive is a wrapper built after the lock asking
+    for it with no argument. The reservation settles it at the default size,
+    which is exactly that request, so such a wrapper finds the arena rather
+    than growing a locked one.
     """
     pytest.importorskip("flashinfer")
     from vllm.v1.attention.backends import flashinfer as flashinfer_backend
 
+    default_float_bytes = 4096
     builder = _reservation_builder(
-        flashinfer_backend, default_float_bytes=4096, is_mm_prefix_lm=True
+        flashinfer_backend,
+        default_float_bytes=default_float_bytes,
+        is_mm_prefix_lm=True,
     )
     builder.use_trtllm_prefill_attention = True
-
     assert builder._get_workspace_routes().native_prefill
 
     config = SimpleNamespace(
         model_config=SimpleNamespace(is_mm_prefix_lm=True),
         parallel_config=SimpleNamespace(decode_context_parallel_size=1),
     )
-    support = flashinfer_backend.FlashInferMetadataBuilder
     assert (
-        support.get_persistent_workspace_memory_profiling_support(
+        flashinfer_backend.FlashInferMetadataBuilder.get_persistent_workspace_memory_profiling_support(
             config, _attention_spec(128)
         )
-        is PersistentWorkspaceProfilingSupport.UNSUPPORTED
+        is PersistentWorkspaceProfilingSupport.REQUIRED
     )
+
+    _install_prefill_factories(builder, monkeypatch)
+    monkeypatch.setattr(
+        flashinfer_backend, "_get_trtllm_workspace_buffer", lambda: None
+    )
+
+    with _managed_workspace():
+        builder.reserve_workspace_for_memory_profiling()
+        arena = current_workspace_manager().get_workspace()
+        size_before, pointer_before = _nbytes(arena), arena.data_ptr()
+        assert size_before == default_float_bytes
+
+        lock_workspace()
+        # What a wrapper built after the lock asks for, with no argument.
+        late = builder._get_workspace_buffer()
+
+        assert _nbytes(late) == size_before
+        assert late.data_ptr() == pointer_before
 
 
 @pytest.mark.parametrize(
@@ -1656,14 +1677,24 @@ def test_workspace_upper_bound_uses_the_whole_batched_token_budget(monkeypatch):
     assert prefill_kwargs["max_batch_size"] == 4
 
 
-def test_workspace_upper_bound_stands_down_when_cascade_can_run(monkeypatch):
+@pytest.mark.parametrize(
+    "unreserved",
+    [
+        pytest.param("cascade", id="cascade-enabled"),
+        pytest.param("mm_prefix", id="mm-prefix-model"),
+    ],
+)
+def test_workspace_upper_bound_stands_down_for_an_unreserved_wrapper(
+    monkeypatch, unreserved
+):
     """Standing down costs the bound, not the reservation.
 
-    The cascade wrapper is built on the first batch with a common prefix and
-    asks for the default arena, so a bound applied without it would be grown
-    by it -- after the lock. The wrappers this reservation does own are still
-    materialized, and their int workspaces still land inside the profiling
-    window; only the arena keeps its default size.
+    A cascade wrapper on the first batch with a common prefix, and a
+    mm-prefix model's second prefill wrapper, are both built later and both
+    ask for the default arena. A smaller arena would be grown by them, after
+    the lock. The wrappers this reservation does own are still materialized,
+    and their int workspaces still land inside the profiling window; only the
+    arena keeps its default size.
     """
     pytest.importorskip("flashinfer")
     from vllm.v1.attention.backends import flashinfer as flashinfer_backend
@@ -1676,7 +1707,10 @@ def test_workspace_upper_bound_stands_down_when_cascade_can_run(monkeypatch):
         decode_answers=[(1024, 64)],
         initial_int_bytes=initial_int_bytes,
     )
-    builder.model_config.disable_cascade_attn = False
+    if unreserved == "cascade":
+        builder.model_config.disable_cascade_attn = False
+    else:
+        builder.model_config.is_mm_prefix_lm = True
 
     with _managed_workspace():
         reserved = builder.reserve_workspace_for_memory_profiling()
@@ -1986,3 +2020,33 @@ def test_gpu_workspace_cascade_fallback_leaves_room_after_the_lock():
         assert arena.data_ptr() == pointer_before
     finally:
         reset_workspace_manager()
+
+
+def test_mm_prefix_keeps_the_default_arena_across_the_lock(monkeypatch):
+    """A mm-prefix model keeps room for the wrapper built on its first batch."""
+    pytest.importorskip("flashinfer")
+    from vllm.v1.attention.backends import flashinfer as flashinfer_backend
+
+    builder = _bound_builder(
+        flashinfer_backend,
+        monkeypatch,
+        prefill_answer=(1024, 64),
+        decode_answers=[(1024, 64)],
+    )
+    builder.model_config.is_mm_prefix_lm = True
+
+    with _managed_workspace():
+        builder.reserve_workspace_for_memory_profiling()
+        builder.rebind_workspace_after_reservation()
+        arena = current_workspace_manager().get_workspace()
+        size_before, pointer_before = _nbytes(arena), arena.data_ptr()
+        assert size_before == 4096
+
+        lock_workspace()
+        # What a wrapper built later asks for, with no argument.
+        late = builder._get_workspace_buffer()
+
+        arena = current_workspace_manager().get_workspace()
+        assert _nbytes(arena) == size_before
+        assert arena.data_ptr() == pointer_before
+        assert late.data_ptr() == pointer_before

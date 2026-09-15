@@ -1133,12 +1133,6 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
     ) -> PersistentWorkspaceProfilingSupport:
         if vllm_config.parallel_config.decode_context_parallel_size > 1:
             return PersistentWorkspaceProfilingSupport.UNSUPPORTED
-        # The reservation below owns the causal prefill wrapper only. A
-        # mm-prefix model routes part of its prefill through a wrapper this
-        # builder does not reserve, so it has to opt in together with the
-        # change that gives the reservation ownership of that wrapper.
-        if vllm_config.model_config.is_mm_prefix_lm:
-            return PersistentWorkspaceProfilingSupport.UNSUPPORTED
         kv_specs = iter_layer_specs(kv_cache_spec)
         # Non-causal execution owns a separate prefill wrapper that is not
         # covered by the causal reservation contract below.
@@ -1618,14 +1612,18 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         if hasattr(wrapper, "reset_workspace_buffer"):
             wrapper.reset_workspace_buffer(float_workspace, int_workspace)
 
-    def _cascade_can_run(self) -> bool:
-        """Whether a cascade wrapper can be built after the arena is locked.
+    def _unreserved_wrapper_can_run(self) -> bool:
+        """Whether a wrapper this does not reserve can still be built later.
 
-        The cascade wrapper is created on the first batch with a common
-        prefix, and it asks for the default arena. Nothing reserves it here,
-        so a smaller arena would be grown by it -- after the lock.
+        A cascade wrapper is created on the first batch with a common prefix,
+        and a mm-prefix model has a second prefill wrapper for its mask. Both
+        ask for the default arena when they are built, and neither is reserved
+        here, so a smaller arena would be grown by them -- after the lock.
         """
-        return not self.model_config.disable_cascade_attn
+        return (
+            not self.model_config.disable_cascade_attn
+            or self.model_config.is_mm_prefix_lm
+        )
 
     def _reserve_bounded_workspace(
         self, workspace_routes: FlashInferWorkspaceRoutes
@@ -1653,7 +1651,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
 
         # Asked after the wrappers exist, so standing down costs the bound and
         # nothing else.
-        if self._cascade_can_run():
+        if self._unreserved_wrapper_can_run():
             return False
 
         if not materialized or any(bound is None for _, bound in materialized):
