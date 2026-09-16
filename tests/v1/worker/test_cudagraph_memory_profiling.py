@@ -2050,3 +2050,66 @@ def test_mm_prefix_keeps_the_default_arena_across_the_lock(monkeypatch):
         assert _nbytes(arena) == size_before
         assert arena.data_ptr() == pointer_before
         assert late.data_ptr() == pointer_before
+
+
+def test_wrapper_built_outside_a_reservation_gets_a_usable_arena():
+    """A builder nothing reserved for still has to be able to plan.
+
+    A wrapper may start from a minimal arena because the reservation settles
+    it afterwards, which only holds while the reservation is the thing
+    building it. `reserve_workspace_for_memory_profiling` answers 0 and
+    reserves nothing when there is no workspace manager, and a builder can be
+    driven without it in any case, so a wrapper built then has nothing coming
+    to grow the arena and its first plan would overflow.
+    """
+    pytest.importorskip("flashinfer")
+    from vllm.v1.attention.backends.flashinfer import FlashInferMetadataBuilder
+
+    builder = FlashInferMetadataBuilder.__new__(FlashInferMetadataBuilder)
+    builder.use_dcp = False
+    builder._reserving_workspace = False
+    builder._default_workspace_buffer_size = lambda: 4096
+
+    assert builder._native_initial_workspace_buffer_size() == 4096
+
+    builder._reserving_workspace = True
+    assert builder._native_initial_workspace_buffer_size() == 1
+
+
+def test_a_plan_succeeds_on_the_arena_an_unreserved_wrapper_is_given():
+    """The size above is what the wrapper actually plans against."""
+    import flashinfer
+    import torch
+
+    pytest.importorskip("flashinfer")
+    if not torch.cuda.is_available():
+        pytest.skip("needs CUDA")
+
+    from vllm.v1.attention.backends.flashinfer import FlashInferMetadataBuilder
+
+    builder = FlashInferMetadataBuilder.__new__(FlashInferMetadataBuilder)
+    builder.use_dcp = False
+    builder._reserving_workspace = False
+    builder._default_workspace_buffer_size = lambda: 256 * 1024 * 1024
+
+    buffer = torch.zeros(
+        builder._native_initial_workspace_buffer_size(),
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        buffer, "NHD", backend="auto"
+    )
+    wrapper.plan(
+        qo_indptr=torch.tensor([0, 512], dtype=torch.int32),
+        paged_kv_indptr=torch.tensor([0, 32], dtype=torch.int32),
+        paged_kv_indices=torch.arange(32, dtype=torch.int32),
+        paged_kv_last_page_len=torch.full((1,), 16, dtype=torch.int32),
+        num_qo_heads=8,
+        num_kv_heads=2,
+        head_dim_qk=128,
+        page_size=16,
+        causal=True,
+        q_data_type=torch.bfloat16,
+        kv_data_type=torch.bfloat16,
+    )

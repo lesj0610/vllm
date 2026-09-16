@@ -809,6 +809,11 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         self.attention_config = vllm_config.attention_config
         self._workspace_buffer = None
         self._workspace_state = _FlashInferWorkspaceState()
+        # True only while a reservation is building wrappers. It is what lets
+        # those wrappers start from a minimal arena that the reservation then
+        # settles; everywhere else a wrapper has to be given one it can plan
+        # against straight away.
+        self._reserving_workspace = False
         self._prefill_wrapper: (
             BatchPrefillWithPagedKVCacheWrapper | BatchDCPPrefillWrapper | None
         ) = None  # Wrapper for prefill/append
@@ -1203,8 +1208,17 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         The reservation settles the arena after the wrappers exist, and the
         arena only ever grows, so asking for the default here would put a
         floor under a bound that could otherwise be smaller.
+
+        That only holds while the reservation is the thing building them. The
+        reservation answers 0 and reserves nothing when there is no workspace
+        manager to reserve from, and a builder can be driven without it in any
+        case; a wrapper built then has nothing coming afterwards to grow the
+        arena, so it has to get one it can plan against or its first plan
+        overflows.
         """
         if envs.VLLM_BATCH_INVARIANT or self.use_dcp:
+            return self._default_workspace_buffer_size()
+        if not self._reserving_workspace:
             return self._default_workspace_buffer_size()
         return 1
 
@@ -1705,15 +1719,19 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         if self.use_dcp or not self.use_vllm_workspace_manager_for_workspace_buffer():
             return 0
 
-        workspace_routes = self._get_workspace_routes()
-        if workspace_routes.native_decode and self.enable_cuda_graph:
-            for batch_size, use_cudagraph in self._decode_reservation_batches():
-                if use_cudagraph:
-                    self._get_decode_wrapper(batch_size, use_cudagraph=True)
+        self._reserving_workspace = True
+        try:
+            workspace_routes = self._get_workspace_routes()
+            if workspace_routes.native_decode and self.enable_cuda_graph:
+                for batch_size, use_cudagraph in self._decode_reservation_batches():
+                    if use_cudagraph:
+                        self._get_decode_wrapper(batch_size, use_cudagraph=True)
 
-        return self._reserved_workspace_bytes(
-            self._direct_trtllm_workspace_bytes(workspace_routes)
-        )
+            return self._reserved_workspace_bytes(
+                self._direct_trtllm_workspace_bytes(workspace_routes)
+            )
+        finally:
+            self._reserving_workspace = False
 
     def reserve_workspace_for_memory_profiling(self) -> int:
         """Materialize every persistent wrapper the active routes will use.
@@ -1727,22 +1745,26 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         if self.use_dcp or not self.use_vllm_workspace_manager_for_workspace_buffer():
             return 0
 
-        workspace_routes = self._get_workspace_routes()
-        # Ask every wrapper the active routes need what no plan of theirs can
-        # exceed, and keep the arena at that. One wrapper that cannot answer
-        # takes the whole arena back to the default: it is shared and
-        # grow-only, so an answer that covers only part of it would leave the
-        # rest to grow after the lock.
-        native_routes = (
-            workspace_routes.native_prefill or workspace_routes.native_decode
-        )
-        if native_routes and not self._reserve_bounded_workspace(workspace_routes):
-            # The wrappers exist either way; growing the arena rebinds them.
-            self._get_workspace_buffer(self._default_workspace_buffer_size())
+        self._reserving_workspace = True
+        try:
+            workspace_routes = self._get_workspace_routes()
+            # Ask every wrapper the active routes need what no plan of theirs
+            # can exceed, and keep the arena at that. One wrapper that cannot
+            # answer takes the whole arena back to the default: it is shared
+            # and grow-only, so an answer that covers only part of it would
+            # leave the rest to grow after the lock.
+            native_routes = (
+                workspace_routes.native_prefill or workspace_routes.native_decode
+            )
+            if native_routes and not self._reserve_bounded_workspace(workspace_routes):
+                # The wrappers exist either way; growing the arena rebinds them.
+                self._get_workspace_buffer(self._default_workspace_buffer_size())
 
-        return self._reserved_workspace_bytes(
-            self._direct_trtllm_workspace_bytes(workspace_routes)
-        )
+            return self._reserved_workspace_bytes(
+                self._direct_trtllm_workspace_bytes(workspace_routes)
+            )
+        finally:
+            self._reserving_workspace = False
 
     def _compute_flashinfer_kv_metadata(
         self,
