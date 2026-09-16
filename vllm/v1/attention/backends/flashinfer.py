@@ -203,16 +203,6 @@ def _buffer_nbytes(buffer: torch.Tensor | None) -> int:
     return buffer.numel() * buffer.element_size()
 
 
-class WorkspaceSizes(NamedTuple):
-    float_bytes: int
-    int_bytes: int = 0
-    has_int_bytes: bool = False
-
-    @property
-    def total_bytes(self) -> int:
-        return self.float_bytes + self.int_bytes
-
-
 class FlashInferWorkspaceRoutes(NamedTuple):
     native_prefill: bool
     trtllm_prefill: bool
@@ -220,39 +210,36 @@ class FlashInferWorkspaceRoutes(NamedTuple):
     trtllm_decode: bool
 
 
-def _int_workspace_allocation_bytes(
-    required_bytes: int, *, round_up: bool = True
-) -> int:
-    required_bytes = max(int(required_bytes), 0)
-    if required_bytes == 0:
-        return 1
-    if not round_up:
-        return required_bytes
-    return cdiv(required_bytes, FLASHINFER_INT_WORKSPACE_GRANULARITY_BYTES) * (
-        FLASHINFER_INT_WORKSPACE_GRANULARITY_BYTES
-    )
+class WorkspaceBound(NamedTuple):
+    """Workspace sizes no plan within a declared shape range can exceed."""
+
+    float_bytes: int
+    int_bytes: int
 
 
-def _parse_workspace_sizes(workspace_size: Any) -> WorkspaceSizes:
-    if not isinstance(workspace_size, (str, bytes)):
-        try:
-            workspace_size_len = len(workspace_size)
-        except TypeError:
-            pass
-        else:
-            if workspace_size_len == 0:
-                raise ValueError("FlashInfer workspace_size returned an empty result")
-            if workspace_size_len > 2:
-                raise ValueError(
-                    "FlashInfer workspace_size must return a scalar or a "
-                    "(float_bytes, int_bytes) pair"
-                )
-            float_bytes = int(workspace_size[0])
-            if workspace_size_len == 2:
-                return WorkspaceSizes(float_bytes, int(workspace_size[1]), True)
-            return WorkspaceSizes(float_bytes, 0, False)
+def _usable_workspace_bound(result: object) -> WorkspaceBound | None:
+    """``None`` unless the helper answered with a pair of usable sizes.
 
-    return WorkspaceSizes(int(workspace_size), 0, False)
+    Only a pair of non-negative ``int`` is taken. A float, a string or a bool
+    is refused rather than coerced: ``int(1.9)`` and ``int("4")`` would turn a
+    wrong answer into a plausible one, and an arena sized from that would be
+    too small with nothing to say so.
+    """
+    if isinstance(result, (str, bytes)):
+        return None
+    sizes: list[Any]
+    try:
+        sizes = list(result)  # type: ignore[call-overload]
+    except TypeError:
+        return None
+    if len(sizes) != 2:
+        return None
+    if any(
+        not isinstance(size, int) or isinstance(size, bool) or size < 0
+        for size in sizes
+    ):
+        return None
+    return WorkspaceBound(sizes[0], sizes[1])
 
 
 @dataclass
@@ -1185,8 +1172,11 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         self.attention_config = vllm_config.attention_config
         self._workspace_buffer = None
         self._workspace_state = _FlashInferWorkspaceState()
-        self._last_reserved_workspace_sizes = WorkspaceSizes(0, 0)
-        self._last_reserved_trtllm_workspace_bytes = 0
+        # True only while a reservation is building wrappers. It is what lets
+        # those wrappers start from a minimal arena that the reservation then
+        # settles; everywhere else a wrapper has to be given one it can plan
+        # against straight away.
+        self._reserving_workspace = False
         self._prefill_wrapper: (
             BatchPrefillWithPagedKVCacheWrapper | BatchDCPPrefillWrapper | None
         ) = None  # Wrapper for prefill/append
@@ -1616,21 +1606,6 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             return AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
 
     @classmethod
-    def requires_separate_cudagraph_memory_profiling(
-        cls,
-        vllm_config: VllmConfig,
-        kv_cache_spec: KVCacheSpec,
-    ) -> bool:
-        kv_specs = iter_layer_specs(kv_cache_spec)
-        for spec in kv_specs:
-            if not isinstance(spec, AttentionSpec):
-                continue
-            head_size_v = getattr(spec, "head_size_v", None) or spec.head_size
-            if max(spec.head_size, head_size_v) >= 512:
-                return True
-        return False
-
-    @classmethod
     def get_persistent_workspace_memory_profiling_support(
         cls,
         vllm_config: VllmConfig,
@@ -1703,7 +1678,21 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         )
 
     def _native_initial_workspace_buffer_size(self) -> int:
+        """The arena size a wrapper asks for at construction.
+
+        The reservation settles the arena after the wrappers exist, and the
+        arena only ever grows, so asking for the default here would put a
+        floor under a bound that could otherwise be smaller.
+
+        That only holds while the reservation is the thing building them. A
+        wrapper built anywhere else -- the first batch of a model whose
+        builder never opted into the profiling lifecycle, or a builder driven
+        directly -- has nothing coming afterwards to grow the arena, so it has
+        to get one it can plan against or its first plan overflows.
+        """
         if envs.VLLM_BATCH_INVARIANT or self.use_dcp:
+            return self._default_workspace_buffer_size()
+        if not self._reserving_workspace:
             return self._default_workspace_buffer_size()
         return 1
 
@@ -1756,208 +1745,37 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         for inner in _workspace_rebindable_wrappers(wrapper):
             self._workspace_state.register_wrapper(inner)
 
-    def _normalize_workspace_sizes(
-        self, workspace_size: WorkspaceSizes | int | None
-    ) -> WorkspaceSizes:
-        if workspace_size is None:
-            return WorkspaceSizes(self._default_workspace_buffer_size(), 0, False)
-        if isinstance(workspace_size, WorkspaceSizes):
-            return workspace_size
-        return WorkspaceSizes(int(workspace_size), 0, False)
-
-    def _ensure_flashinfer_wrapper_int_workspace(
-        self,
-        wrapper: object,
-        required_bytes: int,
-        has_required_bytes: bool,
-    ) -> tuple[torch.Tensor | None, bool]:
-        int_workspace = getattr(wrapper, "_int_workspace_buffer", None)
-        if int_workspace is None:
-            return None, False
-
-        required_bytes = max(int(required_bytes), 0)
-        current_bytes = _buffer_nbytes(int_workspace)
-        finalized = getattr(wrapper, "_vllm_flashinfer_int_workspace_finalized", False)
-        prepared = getattr(wrapper, "_vllm_flashinfer_int_workspace_prepared", False)
-        # Reserve-time CUDA graph wrappers are still unplanned, so the
-        # constructor default int workspace can be replaced with the exact
-        # workspace_size() result. Once finalized, keep the buffer stable
-        # because plan data and graph replay addresses live in it.
-        exact_size = finalized or bool(getattr(wrapper, "is_cuda_graph_enabled", False))
-
-        if not has_required_bytes:
-            if current_bytes >= required_bytes:
-                return int_workspace, False
-            target_bytes = max(required_bytes, 1)
-        else:
-            target_bytes = _int_workspace_allocation_bytes(
-                required_bytes, round_up=not exact_size
+    def _live_workspace_wrappers(self) -> list[object]:
+        """Every wrapper this builder owns, de-duplicated."""
+        wrappers = [
+            getattr(self, name, None)
+            for name in (
+                "_prefill_wrapper",
+                "_noncausal_prefill_wrapper",
+                "_decode_wrapper",
+                "_cascade_wrapper",
             )
-            if finalized:
-                if current_bytes < required_bytes:
-                    raise AssertionError(
-                        "FlashInfer CUDA graph int workspace is finalized but a "
-                        f"larger buffer is required: {current_bytes} bytes "
-                        f"allocated, {required_bytes} bytes required."
-                    )
-                return int_workspace, False
-            if prepared and not exact_size and current_bytes >= required_bytes:
-                return int_workspace, False
-            if current_bytes == target_bytes:
-                return int_workspace, False
-
-        if finalized:
-            raise AssertionError(
-                "FlashInfer CUDA graph int workspace is finalized but a larger "
-                f"buffer is required: {current_bytes} bytes "
-                f"allocated, {required_bytes} bytes required."
-            )
-
-        if prepared and target_bytes > current_bytes:
-            logger.warning(
-                "Growing FlashInfer int workspace after initial preparation: "
-                "%.2f MiB -> %.2f MiB. This is allowed for non-captured "
-                "wrappers, but frequent growth means workspace reserve "
-                "candidates are too small.",
-                current_bytes / (1 << 20),
-                target_bytes / (1 << 20),
-            )
-
-        int_workspace = torch.empty(
-            (target_bytes,), dtype=torch.uint8, device=self.device
-        )
-        object.__setattr__(wrapper, "_int_workspace_buffer", int_workspace)
-        return int_workspace, True
-
-    def _flashinfer_wrapper_workspace_matches(
-        self,
-        wrapper: object,
-        float_workspace: torch.Tensor,
-        int_workspace: torch.Tensor | None,
-    ) -> bool:
-        current_float = getattr(wrapper, "_float_workspace_buffer", None)
-        if (
-            current_float is None
-            or current_float.data_ptr() != float_workspace.data_ptr()
-            or _buffer_nbytes(current_float) != _buffer_nbytes(float_workspace)
-        ):
-            return False
-
-        current_int = getattr(wrapper, "_int_workspace_buffer", None)
-        if current_int is None or int_workspace is None:
-            return current_int is int_workspace
-        return current_int.data_ptr() == int_workspace.data_ptr() and _buffer_nbytes(
-            current_int
-        ) == _buffer_nbytes(int_workspace)
-
-    def _ensure_flashinfer_wrapper_workspace(
-        self,
-        wrapper: object,
-        workspace_size: WorkspaceSizes | int | None,
-    ) -> None:
-        sizes = self._normalize_workspace_sizes(workspace_size)
-        int_workspace, int_workspace_changed = (
-            self._ensure_flashinfer_wrapper_int_workspace(
-                wrapper, sizes.int_bytes, sizes.has_int_bytes
-            )
-        )
-        float_workspace = self._get_workspace_buffer(sizes.float_bytes)
-        if (
-            hasattr(wrapper, "reset_workspace_buffer")
-            and (
-                int_workspace_changed
-                or not self._flashinfer_wrapper_workspace_matches(
-                    wrapper, float_workspace, int_workspace
-                )
-            )
-            and int_workspace is not None
-        ):
-            wrapper.reset_workspace_buffer(float_workspace, int_workspace)
-        object.__setattr__(wrapper, "_vllm_flashinfer_int_workspace_prepared", True)
-        self._register_workspace_wrapper(wrapper)
-
-    def _iter_workspace_wrappers(self) -> list[tuple[str, object]]:
-        wrappers: list[tuple[str, object]] = []
-
-        def add_wrapper(kind: str, wrapper: object | None) -> None:
+        ]
+        wrappers += list(getattr(self, "_decode_wrappers_cudagraph", {}).values())
+        unique: dict[int, object] = {}
+        for wrapper in wrappers:
             if wrapper is not None:
-                wrappers.append((kind, wrapper))
+                unique.setdefault(id(wrapper), wrapper)
+        return list(unique.values())
 
-        add_wrapper("prefill", getattr(self, "_prefill_wrapper", None))
-        add_wrapper(
-            "noncausal_prefill", getattr(self, "_noncausal_prefill_wrapper", None)
-        )
-        add_wrapper("mm_prefill", getattr(self, "_mm_prefill_wrapper", None))
-        add_wrapper("decode", getattr(self, "_decode_wrapper", None))
-        add_wrapper("cascade", getattr(self, "_cascade_wrapper", None))
+    def _actual_int_workspace_bytes(self) -> int:
+        """Int workspace the wrappers actually hold.
 
-        decode_wrappers_cudagraph = getattr(self, "_decode_wrappers_cudagraph", {})
-        for wrapper in decode_wrappers_cudagraph.values():
-            add_wrapper("decode_cudagraph", wrapper)
-
-        return wrappers
-
-    def get_workspace_reserve_debug_info(self) -> dict[str, int]:
-        wrappers = self._iter_workspace_wrappers()
-        unique_wrappers: dict[int, tuple[str, object]] = {}
-        for kind, wrapper in wrappers:
-            unique_wrappers.setdefault(id(wrapper), (kind, wrapper))
-
-        kind_counts: dict[str, int] = {}
-        actual_int_workspace_bytes = 0
-        default_int_workspace_wrappers = 0
-        unique_int_buffers: set[int] = set()
-        unique_float_buffers: dict[int, int] = {}
-
-        for kind, wrapper in unique_wrappers.values():
-            kind_counts[kind] = kind_counts.get(kind, 0) + 1
-
-            int_workspace = getattr(wrapper, "_int_workspace_buffer", None)
-            int_workspace_bytes = (
-                _buffer_nbytes(int_workspace)
-                if isinstance(int_workspace, torch.Tensor)
-                else 0
-            )
-            actual_int_workspace_bytes += int_workspace_bytes
-            if int_workspace_bytes >= FLASHINFER_DEFAULT_INT_WORKSPACE_BYTES:
-                default_int_workspace_wrappers += 1
-            if isinstance(int_workspace, torch.Tensor):
-                unique_int_buffers.add(int_workspace.data_ptr())
-
-            float_workspace = getattr(wrapper, "_float_workspace_buffer", None)
-            if isinstance(float_workspace, torch.Tensor):
-                unique_float_buffers[float_workspace.data_ptr()] = max(
-                    unique_float_buffers.get(float_workspace.data_ptr(), 0),
-                    _buffer_nbytes(float_workspace),
-                )
-
-        reserved_sizes = getattr(
-            self, "_last_reserved_workspace_sizes", WorkspaceSizes(0, 0)
-        )
-        workspace_state = getattr(self, "_workspace_state", None)
-        workspace_state_live_wrappers = (
-            len(workspace_state._live_wrappers()) if workspace_state is not None else 0
-        )
-
-        return {
-            "workspace_wrapper_count": len(unique_wrappers),
-            "prefill_wrappers": kind_counts.get("prefill", 0),
-            "noncausal_prefill_wrappers": kind_counts.get("noncausal_prefill", 0),
-            "mm_prefill_wrappers": kind_counts.get("mm_prefill", 0),
-            "decode_wrappers": kind_counts.get("decode", 0),
-            "decode_cudagraph_wrappers": kind_counts.get("decode_cudagraph", 0),
-            "cascade_wrappers": kind_counts.get("cascade", 0),
-            "workspace_state_live_wrappers": workspace_state_live_wrappers,
-            "actual_int_workspace_bytes": actual_int_workspace_bytes,
-            "reserved_int_workspace_bytes": reserved_sizes.int_bytes,
-            "int_workspace_over_reserved_bytes": max(
-                actual_int_workspace_bytes - reserved_sizes.int_bytes, 0
-            ),
-            "default_int_workspace_wrappers": default_int_workspace_wrappers,
-            "unique_int_workspace_buffers": len(unique_int_buffers),
-            "unique_float_workspace_buffers": len(unique_float_buffers),
-            "unique_float_workspace_bytes": sum(unique_float_buffers.values()),
-        }
+        FlashInfer allocates it lazily on the first plan rather than from the
+        shared arena, so it is not in the arena's size and has to be counted
+        here for the reservation to report what was really taken.
+        """
+        total = 0
+        for wrapper in self._live_workspace_wrappers():
+            buffer = getattr(wrapper, "_int_workspace_buffer", None)
+            if isinstance(buffer, torch.Tensor):
+                total += _buffer_nbytes(buffer)
+        return total
 
     @staticmethod
     def _get_flashinfer_trtllm_api_decode_kernel() -> FlashInferDecodeKernel:
@@ -2208,383 +2026,248 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             self._register_workspace_wrapper(self._cascade_wrapper)
         return self._cascade_wrapper
 
-    def _call_prefill_workspace_size(
-        self,
-        *,
-        prefill_wrapper: BatchPrefillWithPagedKVCacheWrapper,
-        qo_indptr_cpu: torch.Tensor,
-        paged_kv_indptr_cpu: torch.Tensor,
-        paged_kv_indices: torch.Tensor,
-        paged_kv_last_page_len_cpu: torch.Tensor,
-        causal: bool,
-        window_left: int,
-        use_custom_mask: bool,
-        fixed_split_size: int | None,
-        disable_split_kv: bool,
-    ) -> WorkspaceSizes | None:
-        workspace_size = getattr(prefill_wrapper, "workspace_size", None)
-        if workspace_size is None:
-            return None
-        try:
-            custom_mask = (
-                torch.empty(0, dtype=torch.bool, device=paged_kv_indices.device)
-                if use_custom_mask
-                else None
-            )
-            # Native FlashInfer wrappers (fa2/fa3) reject FP8 output; only the
-            # trtllm-gen kernels require it, and those bypass wrapper planning.
-            o_data_type = self.model_config.dtype
-            return _parse_workspace_sizes(
-                workspace_size(
-                    qo_indptr=qo_indptr_cpu,
-                    paged_kv_indptr=paged_kv_indptr_cpu,
-                    paged_kv_indices=paged_kv_indices,
-                    paged_kv_last_page_len=paged_kv_last_page_len_cpu,
-                    num_qo_heads=self.num_qo_heads,
-                    num_kv_heads=self.num_kv_heads,
-                    head_dim_qk=self.head_dim,
-                    head_dim_vo=self.head_dim,
-                    page_size=self.page_size,
-                    custom_mask=custom_mask,
-                    causal=causal,
-                    pos_encoding_mode="NONE",
-                    use_fp16_qk_reduction=False,
-                    sm_scale=self.sm_scale,
-                    window_left=window_left,
-                    logits_soft_cap=self.logits_soft_cap,
-                    q_data_type=self.q_data_type_prefill,
-                    kv_data_type=self.kv_cache_dtype,
-                    o_data_type=o_data_type,
-                    fixed_split_size=fixed_split_size,
-                    disable_split_kv=disable_split_kv,
-                )
-            )
-        except Exception:
-            logger.debug(
-                "Failed to calculate FlashInfer prefill workspace size.",
-                exc_info=True,
-            )
-            return None
-
-    def _get_prefill_workspace_size(
-        self,
-        *,
-        prefill_wrapper: BatchPrefillWithPagedKVCacheWrapper,
-        qo_indptr: torch.Tensor,
-        paged_kv_indptr: torch.Tensor,
-        paged_kv_indices: torch.Tensor,
-        paged_kv_last_page_len: torch.Tensor,
-        causal: bool,
-        window_left: int,
-        use_custom_mask: bool = False,
-        fixed_split_size: int | None = None,
-        disable_split_kv: bool = False,
-    ) -> WorkspaceSizes | None:
-        return self._call_prefill_workspace_size(
-            prefill_wrapper=prefill_wrapper,
-            qo_indptr_cpu=qo_indptr.to("cpu"),
-            paged_kv_indptr_cpu=paged_kv_indptr.to("cpu"),
-            paged_kv_indices=paged_kv_indices,
-            paged_kv_last_page_len_cpu=paged_kv_last_page_len.to("cpu"),
-            causal=causal,
-            window_left=window_left,
-            use_custom_mask=use_custom_mask,
-            fixed_split_size=fixed_split_size,
-            disable_split_kv=disable_split_kv,
-        )
+    def _max_num_pages_per_request(self) -> int:
+        return cdiv(self.model_config.max_model_len, self.page_size)
 
     @staticmethod
-    def _get_workspace_query_len_candidates(max_query_len: int) -> list[int]:
-        # FlashInfer split-K workspace can peak on short cached-prefill tails.
-        # Probe those densely, then sample larger chunks sparsely.
-        dense_limit = min(max_query_len, 256)
-        query_lens = list(range(1, dense_limit + 1))
-        if max_query_len > dense_limit:
-            query_len = 512
-            while query_len < max_query_len:
-                query_lens.append(query_len)
-                query_len *= 2
-            query_lens.append(max_query_len)
-        return query_lens
+    def _wrapper_workspace_upper_bound(
+        wrapper: object, **bounds
+    ) -> WorkspaceBound | None:
+        """Ask a wrapper what no plan inside ``bounds`` can exceed.
 
-    def _make_decode_workspace_inputs(
-        self,
-        *,
-        batch_size: int,
-        num_pages: int,
-        last_page_len: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        batch_arange = torch.arange(batch_size + 1, dtype=torch.int32, device="cpu")
-        indptr_cpu = batch_arange * num_pages
-        last_page_len_cpu = torch.full(
-            (batch_size,),
-            last_page_len,
-            dtype=torch.int32,
-            device="cpu",
-        )
-        return indptr_cpu, last_page_len_cpu
+        ``None`` means the question could not be answered -- the wrapper is on
+        a backend without the helper, the helper refused, or it returned
+        something unusable -- and the caller has to keep the default arena.
+        """
+        bound_fn = getattr(wrapper, "workspace_size_upper_bound", None)
+        if bound_fn is None:
+            return None
+        try:
+            result = bound_fn(**bounds)
+        except NotImplementedError:
+            return None
+        except Exception:
+            logger.debug("FlashInfer workspace upper bound unavailable.", exc_info=True)
+            return None
+        return _usable_workspace_bound(result)
 
-    def _reserve_decode_wrapper_workspace(
+    def _prefill_workspace_upper_bound(
         self,
-        *,
-        batch_size: int,
-        num_pages: int,
-        last_page_len: int,
-        use_cudagraph: bool,
-    ) -> WorkspaceSizes:
-        decode_wrapper = self._get_decode_wrapper(batch_size, use_cudagraph)
-        indptr_cpu, last_page_len_cpu = self._make_decode_workspace_inputs(
-            batch_size=batch_size,
-            num_pages=num_pages,
-            last_page_len=last_page_len,
-        )
-        workspace_sizes = self._get_decode_workspace_size(
-            decode_wrapper=decode_wrapper,
-            indptr_cpu=indptr_cpu,
-            indices=self.paged_kv_indices,
-            last_page_len_cpu=last_page_len_cpu,
-            fixed_split_size=self.decode_fixed_split_size,
+    ) -> tuple[object, WorkspaceBound | None]:
+        scheduler_config = self.vllm_config.scheduler_config
+        # max_model_len bounds one request, not the batch: two requests can
+        # fill max_num_batched_tokens between them.
+        max_total_num_rows = scheduler_config.max_num_batched_tokens
+        max_batch_size = min(scheduler_config.max_num_seqs, max_total_num_rows)
+        wrapper = self._get_prefill_wrapper(causal=True)
+        if max_batch_size <= 0 or max_total_num_rows <= 0:
+            return wrapper, None
+        if getattr(wrapper, "workspace_size_upper_bound", None) is None:
+            return wrapper, None
+        bound = self._wrapper_workspace_upper_bound(
+            wrapper,
+            max_batch_size=max_batch_size,
+            max_total_num_rows=max_total_num_rows,
+            max_num_pages_per_request=self._max_num_pages_per_request(),
+            num_qo_heads=self.num_qo_heads,
+            num_kv_heads=self.num_kv_heads,
+            head_dim_qk=self.head_dim,
+            page_size=self.page_size,
+            window_left=self.window_left,
+            logits_soft_cap=self.logits_soft_cap,
+            q_data_type=self.q_data_type_prefill,
+            kv_data_type=self.kv_cache_dtype,
+            # The wrapper's own trtllm-gen backend takes NVFP4 KV and only
+            # emits FP8, the same dtype build() gives plan().
+            o_data_type=(
+                FP8_DTYPE if self.is_kvcache_nvfp4 else self.model_config.dtype
+            ),
+            fixed_split_size=self.prefill_fixed_split_size,
             disable_split_kv=self.disable_split_kv,
         )
-        if workspace_sizes is None:
-            return WorkspaceSizes(0, 0)
-        self._ensure_flashinfer_wrapper_workspace(decode_wrapper, workspace_sizes)
-        if use_cudagraph:
-            decode_wrapper._vllm_flashinfer_int_workspace_finalized = True
-        return workspace_sizes
+        return wrapper, bound
 
-    def reserve_workspace_for_cudagraph_capture(self) -> int:
-        self._last_reserved_workspace_sizes = WorkspaceSizes(0, 0)
-        self._last_reserved_trtllm_workspace_bytes = 0
-        if self.use_dcp or not self.use_vllm_workspace_manager_for_workspace_buffer():
-            return 0
-
-        max_model_len = self.model_config.max_model_len
-        scheduler_config = self.vllm_config.scheduler_config
-        max_num_batched_tokens = min(
-            scheduler_config.max_num_batched_tokens,
-            max_model_len,
+    def _decode_workspace_upper_bound(
+        self, batch_size: int, use_cudagraph: bool
+    ) -> tuple[object, WorkspaceBound | None]:
+        wrapper = self._get_decode_wrapper(batch_size, use_cudagraph=use_cudagraph)
+        if getattr(wrapper, "workspace_size_upper_bound", None) is None:
+            return wrapper, None
+        bound = self._wrapper_workspace_upper_bound(
+            wrapper,
+            max_batch_size=batch_size,
+            max_num_pages_per_request=self._max_num_pages_per_request(),
+            num_qo_heads=self.num_qo_heads * self.dcp_world_size,
+            num_kv_heads=self.num_kv_heads,
+            head_dim=self.head_dim,
+            page_size=self.page_size,
+            window_left=self.window_left,
+            logits_soft_cap=self.logits_soft_cap,
+            q_data_type=self.q_data_type_decode,
+            kv_data_type=self.kv_cache_dtype,
+            fixed_split_size=self.decode_fixed_split_size,
+            disable_split_kv=self.disable_split_kv,
+            o_data_type=(
+                FP8_DTYPE if self.is_kvcache_nvfp4 else self.model_config.dtype
+            ),
         )
-        max_num_seqs = min(scheduler_config.max_num_seqs, max_num_batched_tokens)
-        if max_num_batched_tokens <= 0 or max_num_seqs <= 0:
-            return 0
+        return wrapper, bound
 
-        num_pages = cdiv(max_model_len, self.page_size)
-        last_page_len = max_model_len % self.page_size or self.page_size
-        reserved_sizes = WorkspaceSizes(0, 0)
-
-        workspace_routes = self._get_workspace_routes()
-        if workspace_routes.native_prefill:
-            prefill_wrapper = self._get_prefill_wrapper(causal=True)
-            if getattr(prefill_wrapper, "workspace_size", None) is not None:
-                max_prefill_workspace_size = WorkspaceSizes(0, 0)
-
-                for batch_size in range(1, max_num_seqs + 1):
-                    max_query_len = max_num_batched_tokens // batch_size
-                    if max_query_len <= 0:
-                        break
-                    batch_arange = torch.arange(
-                        batch_size + 1, dtype=torch.int32, device="cpu"
-                    )
-                    paged_kv_indptr_cpu = batch_arange * num_pages
-                    paged_kv_last_page_len_cpu = torch.full(
-                        (batch_size,),
-                        last_page_len,
-                        dtype=torch.int32,
-                        device="cpu",
-                    )
-                    query_lens = self._get_workspace_query_len_candidates(max_query_len)
-                    for query_len in query_lens:
-                        qo_indptr_cpu = batch_arange * query_len
-                        workspace_sizes = self._call_prefill_workspace_size(
-                            prefill_wrapper=prefill_wrapper,
-                            qo_indptr_cpu=qo_indptr_cpu,
-                            paged_kv_indptr_cpu=paged_kv_indptr_cpu,
-                            paged_kv_indices=self.paged_kv_indices,
-                            paged_kv_last_page_len_cpu=paged_kv_last_page_len_cpu,
-                            causal=True,
-                            window_left=self.window_left,
-                            use_custom_mask=False,
-                            fixed_split_size=self.prefill_fixed_split_size,
-                            disable_split_kv=self.disable_split_kv,
-                        )
-                        if workspace_sizes is None:
-                            continue
-                        max_prefill_workspace_size = WorkspaceSizes(
-                            max(
-                                max_prefill_workspace_size.float_bytes,
-                                workspace_sizes.float_bytes,
-                            ),
-                            max(
-                                max_prefill_workspace_size.int_bytes,
-                                workspace_sizes.int_bytes,
-                            ),
-                            (
-                                max_prefill_workspace_size.has_int_bytes
-                                or workspace_sizes.has_int_bytes
-                            ),
-                        )
-
-                reserved_sizes = max_prefill_workspace_size
-                if max_prefill_workspace_size.total_bytes > 0:
-                    self._ensure_flashinfer_wrapper_workspace(
-                        prefill_wrapper, max_prefill_workspace_size
-                    )
-
-        if workspace_routes.native_decode:
-            max_decode_tokens = max_num_seqs
-            speculative_config = self.vllm_config.speculative_config
-            if speculative_config is not None:
-                max_decode_tokens *= 1 + speculative_config.num_speculative_tokens
-            max_decode_tokens = min(max_decode_tokens, max_num_batched_tokens)
-
-            if max_decode_tokens > 0:
-                decode_sizes = self._reserve_decode_wrapper_workspace(
-                    batch_size=max_decode_tokens,
-                    num_pages=num_pages,
-                    last_page_len=last_page_len,
-                    use_cudagraph=False,
-                )
-                reserved_sizes = WorkspaceSizes(
-                    max(reserved_sizes.float_bytes, decode_sizes.float_bytes),
-                    reserved_sizes.int_bytes + decode_sizes.int_bytes,
-                    reserved_sizes.has_int_bytes or decode_sizes.has_int_bytes,
-                )
-
-            if self.enable_cuda_graph:
-                for batch_size in self.compilation_config.cudagraph_capture_sizes or []:
-                    if batch_size <= 0 or batch_size > self._decode_cudagraph_max_bs:
-                        continue
-                    decode_sizes = self._reserve_decode_wrapper_workspace(
-                        batch_size=batch_size,
-                        num_pages=num_pages,
-                        last_page_len=last_page_len,
-                        use_cudagraph=True,
-                    )
-                    reserved_sizes = WorkspaceSizes(
-                        max(reserved_sizes.float_bytes, decode_sizes.float_bytes),
-                        reserved_sizes.int_bytes + decode_sizes.int_bytes,
-                        reserved_sizes.has_int_bytes or decode_sizes.has_int_bytes,
-                    )
-
-        trtllm_workspace_bytes = 0
-        if workspace_routes.trtllm_prefill or workspace_routes.trtllm_decode:
-            trtllm_workspace_bytes = _buffer_nbytes(_get_trtllm_workspace_buffer())
-        self._last_reserved_trtllm_workspace_bytes = trtllm_workspace_bytes
-
-        if reserved_sizes.total_bytes + trtllm_workspace_bytes <= 0:
-            return 0
-
-        self._last_reserved_workspace_sizes = reserved_sizes
-        logger.debug(
-            "Reserved FlashInfer workspace before CUDA graph lock: "
-            "%.2f MiB float workspace, %.2f MiB dedicated int workspace, "
-            "%.2f MiB direct TRTLLM workspace",
-            reserved_sizes.float_bytes / (1 << 20),
-            reserved_sizes.int_bytes / (1 << 20),
-            trtllm_workspace_bytes / (1 << 20),
-        )
-        return reserved_sizes.total_bytes + trtllm_workspace_bytes
-
-    def reserve_workspace_for_memory_profiling(self) -> int:
-        """Materialize both runtime and CUDA graph persistent workspace."""
-        if self.use_dcp:
-            return self.reserve_workspace_for_cudagraph_capture()
-
-        self.reserve_workspace_for_cudagraph_capture()
-
-        # Sizing helpers can be unavailable or return no usable size for a
-        # supported runtime shape. Materialize every persistent runtime wrapper
-        # so its default dedicated int buffer is retained by the profiling
-        # lease; existing wrappers are reused when exact sizing succeeded.
-        workspace_routes = self._get_workspace_routes()
-        # The CUDA graph reservation above also materializes direct TRTLLM's
-        # module-global workspace. Reuse the measured size instead of touching
-        # the global allocator twice during one profiling reservation.
-        trtllm_workspace_bytes = self._last_reserved_trtllm_workspace_bytes
-        # Grow the shared float arena to its default before the runtime
-        # wrappers below are built. A wrapper that asks for the default at
-        # construction then finds it already there, so none of them can be the
-        # allocation that grows the arena after execution has locked it. The
-        # CUDA graph reservation above keeps its own ordering; the arena only
-        # ever grows, so hoisting this leaves the final size unchanged.
-        if workspace_routes.native_prefill or workspace_routes.native_decode:
-            self._get_workspace_buffer(self._default_workspace_buffer_size())
-
-        if workspace_routes.native_prefill:
-            self._get_prefill_wrapper(causal=True)
-            # mm-prefix batches are served by a second, mask-owning prefill
-            # wrapper. It is otherwise built on the first batch that carries
-            # bidirectional ranges, which is after the arena is locked, so it
-            # is materialized and registered here like every other persistent
-            # wrapper. The range buffers gate it the same way build() does.
-            if self.is_mm_prefix_lm and self.mm_prefix_query_ranges_np is not None:
-                self._register_workspace_wrapper(self._get_mm_prefill_wrapper())
-
-        if workspace_routes.native_decode:
-            max_decode_tokens = min(
-                self.vllm_config.scheduler_config.max_num_seqs,
-                self.vllm_config.scheduler_config.max_num_batched_tokens,
-                self.model_config.max_model_len,
+    def _apply_workspace_bound(
+        self, wrapper: object, bound: WorkspaceBound, float_workspace: torch.Tensor
+    ) -> None:
+        """Give one wrapper the buffers its bound says are enough."""
+        int_workspace = getattr(wrapper, "_int_workspace_buffer", None)
+        if int_workspace is None:
+            return
+        target_int_bytes = max(bound.int_bytes, 1)
+        if _buffer_nbytes(int_workspace) != target_int_bytes:
+            int_workspace = torch.empty(
+                (target_int_bytes,), dtype=torch.uint8, device=self.device
             )
-            if max_decode_tokens > 0:
-                self._get_decode_wrapper(max_decode_tokens, use_cudagraph=False)
-            if self.enable_cuda_graph:
-                for batch_size in self.compilation_config.cudagraph_capture_sizes or []:
-                    if 0 < batch_size <= self._decode_cudagraph_max_bs:
-                        self._get_decode_wrapper(batch_size, use_cudagraph=True)
+            object.__setattr__(wrapper, "_int_workspace_buffer", int_workspace)
+        if hasattr(wrapper, "reset_workspace_buffer"):
+            wrapper.reset_workspace_buffer(float_workspace, int_workspace)
 
-        debug_info = self.get_workspace_reserve_debug_info()
+    def _unreserved_wrapper_can_run(self) -> bool:
+        """Whether a wrapper this does not reserve can still be built later.
+
+        A cascade wrapper is created on the first batch with a common prefix,
+        and a mm-prefix model has a second prefill wrapper for its mask. Both
+        ask for the default arena when they are built, and neither is reserved
+        here, so a smaller arena would be grown by them -- after the lock.
+        """
+        return (
+            not self.model_config.disable_cascade_attn
+            or self.model_config.is_mm_prefix_lm
+        )
+
+    def _reserve_bounded_workspace(
+        self, workspace_routes: FlashInferWorkspaceRoutes
+    ) -> bool:
+        """Materialize the active wrappers and size the arena from their bounds.
+
+        The wrappers are materialized either way: that is the lifecycle
+        contract this builds on, and it holds whether or not a bound is
+        applied. ``False`` only means the arena has to keep its default size,
+        because at least one active wrapper could not be bounded or because a
+        wrapper that is not reserved here can still be built later. The arena
+        is shared and grow-only, so a bound that covers only some of the
+        wrappers is not a bound at all.
+        """
+        materialized: list[tuple[object, WorkspaceBound | None]] = []
+
+        if workspace_routes.native_prefill:
+            materialized.append(self._prefill_workspace_upper_bound())
+
+        if workspace_routes.native_decode:
+            for batch_size, use_cudagraph in self._decode_reservation_batches():
+                materialized.append(
+                    self._decode_workspace_upper_bound(batch_size, use_cudagraph)
+                )
+
+        # Asked after the wrappers exist, so standing down costs the bound and
+        # nothing else.
+        if self._unreserved_wrapper_can_run():
+            return False
+
+        if not materialized or any(bound is None for _, bound in materialized):
+            return False
+
+        # The arena is shared, so it takes the largest float bound; each
+        # wrapper owns its int workspace, so each takes its own.
+        float_workspace = self._get_workspace_buffer(
+            max(bound.float_bytes for _, bound in materialized if bound is not None)
+        )
+        for wrapper, bound in materialized:
+            assert bound is not None
+            self._apply_workspace_bound(wrapper, bound, float_workspace)
+        return True
+
+    def _decode_reservation_batches(self):
+        """Every decode batch size the reservation has to cover."""
+        max_decode_tokens = min(
+            self.vllm_config.scheduler_config.max_num_seqs,
+            self.vllm_config.scheduler_config.max_num_batched_tokens,
+            self.model_config.max_model_len,
+        )
+        if max_decode_tokens > 0:
+            yield max_decode_tokens, False
+        if self.enable_cuda_graph:
+            for batch_size in self.compilation_config.cudagraph_capture_sizes or []:
+                if 0 < batch_size <= self._decode_cudagraph_max_bs:
+                    yield batch_size, True
+
+    def _direct_trtllm_workspace_bytes(
+        self, workspace_routes: FlashInferWorkspaceRoutes
+    ) -> int:
+        """Materialize direct trtllm-gen's module-global workspace.
+
+        It is allocated outside the shared arena on first use, so the
+        reservation has to touch it here for memory profiling to see it.
+        """
+        if not (workspace_routes.trtllm_prefill or workspace_routes.trtllm_decode):
+            return 0
+        return _buffer_nbytes(_get_trtllm_workspace_buffer())
+
+    def _reserved_workspace_bytes(self, trtllm_workspace_bytes: int) -> int:
         return (
             _buffer_nbytes(self._workspace_state.buffer)
-            + int(debug_info["actual_int_workspace_bytes"])
+            + self._actual_int_workspace_bytes()
             + trtllm_workspace_bytes
         )
 
-    def _get_decode_workspace_size(
-        self,
-        *,
-        decode_wrapper: BatchDecodeWithPagedKVCacheWrapper,
-        indptr_cpu: torch.Tensor,
-        indices: torch.Tensor,
-        last_page_len_cpu: torch.Tensor,
-        fixed_split_size: int,
-        disable_split_kv: bool,
-    ) -> WorkspaceSizes | None:
-        workspace_size = getattr(decode_wrapper, "workspace_size", None)
-        if workspace_size is None:
-            return None
+    def reserve_workspace_for_cudagraph_capture(self) -> int:
+        """Materialize the CUDA graph decode wrappers before the arena locks."""
+        if self.use_dcp or not self.use_vllm_workspace_manager_for_workspace_buffer():
+            return 0
+
+        self._reserving_workspace = True
         try:
-            # Native FlashInfer wrappers (fa2/fa3) reject FP8 output; only the
-            # trtllm-gen kernels require it, and those bypass wrapper planning.
-            o_data_type = self.model_config.dtype
-            return _parse_workspace_sizes(
-                workspace_size(
-                    indptr=indptr_cpu,
-                    indices=indices,
-                    last_page_len=last_page_len_cpu,
-                    num_qo_heads=self.num_qo_heads * self.dcp_world_size,
-                    num_kv_heads=self.num_kv_heads,
-                    head_dim=self.head_dim,
-                    page_size=self.page_size,
-                    pos_encoding_mode="NONE",
-                    window_left=self.window_left,
-                    logits_soft_cap=self.logits_soft_cap,
-                    q_data_type=self.q_data_type_decode,
-                    kv_data_type=self.kv_cache_dtype,
-                    o_data_type=o_data_type,
-                    sm_scale=self.sm_scale,
-                    fixed_split_size=fixed_split_size,
-                    disable_split_kv=disable_split_kv,
-                    q_len_per_req=1,
-                )
+            workspace_routes = self._get_workspace_routes()
+            if workspace_routes.native_decode and self.enable_cuda_graph:
+                for batch_size, use_cudagraph in self._decode_reservation_batches():
+                    if use_cudagraph:
+                        self._get_decode_wrapper(batch_size, use_cudagraph=True)
+
+            return self._reserved_workspace_bytes(
+                self._direct_trtllm_workspace_bytes(workspace_routes)
             )
-        except Exception:
-            logger.debug(
-                "Failed to calculate FlashInfer decode workspace size.",
-                exc_info=True,
+        finally:
+            self._reserving_workspace = False
+
+    def reserve_workspace_for_memory_profiling(self) -> int:
+        """Materialize every persistent wrapper the active routes will use.
+
+        Each wrapper allocates a dedicated int workspace outside the shared
+        arena on construction, and the shared arena itself is grown lazily.
+        Doing both here puts them inside the window that memory profiling
+        measures, so KV cache sizing subtracts them instead of finding them
+        taken after execution has already locked the arena.
+        """
+        if self.use_dcp or not self.use_vllm_workspace_manager_for_workspace_buffer():
+            return 0
+
+        self._reserving_workspace = True
+        try:
+            workspace_routes = self._get_workspace_routes()
+            # Ask every wrapper the active routes need what no plan of theirs
+            # can exceed, and keep the arena at that. One wrapper that cannot
+            # answer takes the whole arena back to the default: it is shared
+            # and grow-only, so an answer that covers only part of it would
+            # leave the rest to grow after the lock.
+            native_routes = (
+                workspace_routes.native_prefill or workspace_routes.native_decode
             )
-            return None
+            if native_routes and not self._reserve_bounded_workspace(workspace_routes):
+                # The wrappers exist either way; growing the arena rebinds them.
+                self._get_workspace_buffer(self._default_workspace_buffer_size())
+
+            return self._reserved_workspace_bytes(
+                self._direct_trtllm_workspace_bytes(workspace_routes)
+            )
+        finally:
+            self._reserving_workspace = False
 
     def _compute_flashinfer_kv_metadata(
         self,
@@ -3021,20 +2704,6 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     # Native FlashInfer wrappers (fa2/fa3) reject FP8 output; only the
                     # trtllm-gen kernels require it, and those bypass wrapper planning.
                     o_dtype = self.model_config.dtype
-                    self._ensure_flashinfer_wrapper_workspace(
-                        prefill_wrapper,
-                        self._get_prefill_workspace_size(
-                            prefill_wrapper=prefill_wrapper,
-                            qo_indptr=qo_indptr_prefill_cpu,
-                            paged_kv_indptr=paged_kv_indptr_prefill_cpu,
-                            paged_kv_indices=paged_kv_indices,
-                            paged_kv_last_page_len=(paged_kv_last_page_len_prefill_cpu),
-                            causal=attn_metadata.causal,
-                            window_left=self.window_left,
-                            fixed_split_size=self.prefill_fixed_split_size,
-                            disable_split_kv=self.disable_split_kv,
-                        ),
-                    )
                     prefill_wrapper.plan(
                         qo_indptr=qo_indptr_prefill_cpu,
                         paged_kv_indptr=paged_kv_indptr_prefill_cpu,
@@ -3175,21 +2844,9 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 # plan() copies these to the GPU with non_blocking=True;
                 # stage them in pinned memory so the copies stay async
                 # (the reused buffers themselves are intentionally not pinned).
-                # The sizing probe below reads the same staged tensors.
                 if PIN_MEMORY:
                     paged_kv_indptr_cpu = paged_kv_indptr_cpu.pin_memory()
                     paged_kv_last_page_len_cpu = paged_kv_last_page_len_cpu.pin_memory()
-                self._ensure_flashinfer_wrapper_workspace(
-                    decode_wrapper,
-                    self._get_decode_workspace_size(
-                        decode_wrapper=decode_wrapper,
-                        indptr_cpu=paged_kv_indptr_cpu,
-                        indices=paged_kv_indices,
-                        last_page_len_cpu=paged_kv_last_page_len_cpu,
-                        fixed_split_size=self.decode_fixed_split_size,
-                        disable_split_kv=self.disable_split_kv,
-                    ),
-                )
                 # Use the persistent buffer with padding length,
                 # instead of the same address but chunked version
                 # in atten_metadata when using cudagraph.

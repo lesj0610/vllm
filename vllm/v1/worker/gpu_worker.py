@@ -584,18 +584,26 @@ class Worker(WorkerBase):
                 if profile_persistent_workspace:
                     workspace_lease = self.model_runner.prepare_profiling_workspace()
                 self.model_runner.profile_run()
-
-                # Release profiling-only owners before rebuilding the minimal KV
-                # state for CUDA graph-pool measurement; the global shared arenas
-                # stay live and are included in profile_result.total_consumed.
-                if workspace_lease is not None:
-                    workspace_lease.release()
-                    workspace_lease = None
-                    gc.collect()
-                    torch.accelerator.empty_cache()
+            # The lease has to outlive the block above. Only the shared arenas
+            # are held by the global manager; the dedicated workspace a builder
+            # allocates per wrapper is owned by that wrapper alone, so releasing
+            # it any earlier frees it before memory_profiling takes the closing
+            # measurement that total_consumed is derived from, and KV sizing
+            # goes back to not knowing about it.
         finally:
+            # Release profiling-only owners before rebuilding the minimal KV
+            # state for CUDA graph memory profiling. The shared arenas stay
+            # live and are already in profile_result.total_consumed.
+            released_workspace_lease = workspace_lease is not None
             if workspace_lease is not None:
                 workspace_lease.release()
+                workspace_lease = None
+        # Reclaiming what the lease held is only meaningful once profiling
+        # succeeded, and keeping it out of the finally above means a failure
+        # here cannot mask the error that got us there.
+        if released_workspace_lease:
+            gc.collect()
+            torch.accelerator.empty_cache()
 
         # Profile CUDA graph memory if graphs will be captured.
         # ROCm is included: #44825 moved the profiler to
@@ -645,12 +653,6 @@ class Worker(WorkerBase):
         self.total_consumed = profile_result.total_consumed
         self.peak_activation_memory = profile_result.transient_peak_headroom
         self.cudagraph_memory_estimate = cudagraph_memory_estimate
-        self.cudagraph_memory_persistent_estimate = getattr(
-            self.model_runner, "cudagraph_memory_persistent_estimate", 0
-        )
-        self.cudagraph_memory_graph_pool_estimate = getattr(
-            self.model_runner, "cudagraph_memory_graph_pool_estimate", 0
-        )
 
         self.available_kv_cache_memory_bytes = (
             self.requested_memory
@@ -864,23 +866,15 @@ class Worker(WorkerBase):
             and self.cudagraph_memory_estimate > 0
         ):
             GiB = lambda b: round(b / GiB_bytes, 2)
-            graph_pool_estimate = self.cudagraph_memory_graph_pool_estimate
-            if graph_pool_estimate == 0:
-                graph_pool_estimate = self.cudagraph_memory_estimate
-            diff = abs(cuda_graph_memory_bytes - graph_pool_estimate)
+            diff = abs(cuda_graph_memory_bytes - self.cudagraph_memory_estimate)
             logger.info(
                 "CUDA graph pool memory: %s GiB (actual), %s GiB (estimated), "
                 "difference: %s GiB (%.1f%%).",
                 GiB(cuda_graph_memory_bytes),
-                GiB(graph_pool_estimate),
+                GiB(self.cudagraph_memory_estimate),
                 GiB(diff),
                 100 * diff / max(cuda_graph_memory_bytes, 1),
             )
-            if self.cudagraph_memory_persistent_estimate > 0:
-                logger.info(
-                    "CUDA graph persistent memory: %s GiB (estimated).",
-                    GiB(self.cudagraph_memory_persistent_estimate),
-                )
 
         if self.cache_config.kv_cache_memory_bytes is None and hasattr(
             self, "peak_activation_memory"
@@ -975,7 +969,12 @@ class Worker(WorkerBase):
         # enforce_eager, so those paths would otherwise start serving with the
         # workspace still growable past the capacity KV sizing was told to
         # expect. Locking here keeps the sampler warmup above free to grow it.
-        if is_workspace_manager_initialized():
+        #
+        # Only for a model that opted into the profiling lifecycle. A builder
+        # that answered UNSUPPORTED never had its workspace reserved, so
+        # locking the arena for it would turn a later lazy allocation into a
+        # hard failure instead of leaving it on the legacy path.
+        if profile_persistent_workspace and is_workspace_manager_initialized():
             lock_workspace()
 
         # Reset the seed to ensure that the random state is not affected by
