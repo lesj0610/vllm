@@ -1684,11 +1684,12 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         arena only ever grows, so asking for the default here would put a
         floor under a bound that could otherwise be smaller.
 
-        That only holds while the reservation is the thing building them. A
-        wrapper built anywhere else -- the first batch of a model whose
-        builder never opted into the profiling lifecycle, or a builder driven
-        directly -- has nothing coming afterwards to grow the arena, so it has
-        to get one it can plan against or its first plan overflows.
+        That only holds while the reservation is the thing building them. The
+        reservation answers 0 and reserves nothing when there is no workspace
+        manager to reserve from, and a builder can be driven without it in any
+        case; a wrapper built then has nothing coming afterwards to grow the
+        arena, so it has to get one it can plan against or its first plan
+        overflows.
         """
         if envs.VLLM_BATCH_INVARIANT or self.use_dcp:
             return self._default_workspace_buffer_size()
