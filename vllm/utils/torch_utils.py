@@ -612,6 +612,9 @@ def _nvfp4_split_data_scale(
 
     Args:
         kv_side: 4D uint8 tensor ``(B, H, N, full_dim)``.
+        head_size: Unpacked head size. When ``None``, the data/scale split
+            is inferred from ``full_dim`` assuming the 8:1 NVFP4 packing
+            ratio.
 
     Returns:
         ``(data, scale)`` where *data* is uint8 and *scale* is

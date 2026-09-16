@@ -150,6 +150,9 @@ class WorkspaceManager:
 
         Args:
             *shapes_and_dtypes: One or more (shape, dtype) tuples.
+            ubatch_id: Target ubatch slot. When ``None``, it is resolved
+                from the workspace context variable, then from the current
+                DBO ubatch id.
 
         Returns:
             List of tensor views into the workspace buffer, one per shape/dtype pair.
@@ -214,6 +217,9 @@ class WorkspaceManager:
 
         Args:
             required_bytes: The number of bytes required.
+            ubatch_id: Target ubatch slot. When ``None``, it is resolved
+                from the workspace context variable, then from the current
+                DBO ubatch id.
 
         Returns:
             The current workspace tensor.
