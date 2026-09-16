@@ -956,6 +956,7 @@ def test_qsa_sparse_paged_attention_correctness(
     q = torch.randn(
         num_rows, num_query_heads, head_dim, device="cuda", dtype=torch.bfloat16
     )
+    output_gate = torch.randn_like(q)
     kv_cache = torch.randn(
         num_cache_blocks,
         page_size,
@@ -1035,6 +1036,7 @@ def test_qsa_sparse_paged_attention_correctness(
         block_table,
         token_to_req,
         use_prefill_config=use_prefill_config,
+        output_gate=output_gate,
     )
     expected = _qsa_sparse_paged_attention_reference(
         q,
@@ -1045,6 +1047,7 @@ def test_qsa_sparse_paged_attention_correctness(
         token_to_req,
         scale,
     )
+    expected = expected * torch.sigmoid(output_gate)
 
     torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
 
@@ -1364,6 +1367,9 @@ def test_qsa_sparse_paged_attention_fp8_matches_dequantized_reference() -> None:
     token_to_req = torch.zeros(num_rows, device="cuda", dtype=torch.int32)
     width = 8
     logical_indices = _packed_selection(width, num_rows)
+    # One gate for both calls: the gate multiplies each side identically, so
+    # what this compares is still the FP8 reader against the dequantized pages.
+    output_gate = torch.randn_like(q)
 
     quantized = qsa_ops.qsa_sparse_paged_attention(
         q,
@@ -1375,6 +1381,7 @@ def test_qsa_sparse_paged_attention_fp8_matches_dequantized_reference() -> None:
         use_prefill_config=False,
         k_scale=k_scale,
         v_scale=v_scale,
+        output_gate=output_gate,
     )
     reference = qsa_ops.qsa_sparse_paged_attention(
         q,
@@ -1384,6 +1391,7 @@ def test_qsa_sparse_paged_attention_fp8_matches_dequantized_reference() -> None:
         block_table,
         token_to_req,
         use_prefill_config=False,
+        output_gate=output_gate,
     )
     torch.testing.assert_close(
         quantized.float(), reference.float(), rtol=2e-2, atol=2e-2
@@ -1439,6 +1447,8 @@ def test_qsa_sparse_paged_attention_nvfp4_matches_dequantized_reference() -> Non
     )
     token_to_req = torch.zeros(num_rows, device="cuda", dtype=torch.int32)
     logical_indices = _packed_selection(8, num_rows)
+    # One gate for both calls, for the same reason as the FP8 test above.
+    output_gate = torch.randn_like(q)
 
     packed = qsa_ops.qsa_sparse_paged_attention(
         q,
@@ -1451,6 +1461,7 @@ def test_qsa_sparse_paged_attention_nvfp4_matches_dequantized_reference() -> Non
         k_scale=unit,
         v_scale=unit,
         nvfp4=True,
+        output_gate=output_gate,
     )
 
     def decode(slots: torch.Tensor) -> torch.Tensor:
@@ -1481,6 +1492,7 @@ def test_qsa_sparse_paged_attention_nvfp4_matches_dequantized_reference() -> Non
         block_table,
         token_to_req,
         use_prefill_config=False,
+        output_gate=output_gate,
     )
     torch.testing.assert_close(packed.float(), reference.float(), rtol=2e-2, atol=2e-2)
 
@@ -1615,6 +1627,9 @@ def test_qsa_unquantized_call_reuses_one_unit_scale(monkeypatch) -> None:
     if not current_platform.is_cuda():
         pytest.skip("CUDA is required")
     q = torch.randn(1, 8, 256, device="cuda", dtype=torch.bfloat16)
+    # Built before the torch.ones counter below is installed, and with randn
+    # rather than ones, so it cannot disturb what that counter measures.
+    output_gate = torch.randn_like(q)
     device = q.device
     qsa_ops._QSA_UNIT_SCALE_BY_DEVICE.pop(device, None)
     assert qsa_ops._QSA_UNIT_SCALE_BY_DEVICE.get(device) is None
@@ -1638,11 +1653,25 @@ def test_qsa_unquantized_call_reuses_one_unit_scale(monkeypatch) -> None:
     indices = _packed_selection(8, 1, device=device)
     for _ in range(2):
         qsa_ops.qsa_sparse_paged_attention(
-            q, k, v, indices, block_table, token_to_req, use_prefill_config=False
+            q,
+            k,
+            v,
+            indices,
+            block_table,
+            token_to_req,
+            use_prefill_config=False,
+            output_gate=output_gate,
         )
     cached = qsa_ops._QSA_UNIT_SCALE_BY_DEVICE[device]
     qsa_ops.qsa_sparse_paged_attention(
-        q, k, v, indices, block_table, token_to_req, use_prefill_config=False
+        q,
+        k,
+        v,
+        indices,
+        block_table,
+        token_to_req,
+        use_prefill_config=False,
+        output_gate=output_gate,
     )
     assert qsa_ops._QSA_UNIT_SCALE_BY_DEVICE[device] is cached
     assert len(builds) == 1, (
