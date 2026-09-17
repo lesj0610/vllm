@@ -1921,3 +1921,150 @@ def test_qsa_warmup_compiles_the_layout_it_is_given(
             kwargs["NUM_SPLITS"],
             kwargs["num_stages"],
         ) in expected_profiles
+
+
+class _ReachedQKVParallelLinear(Exception):
+    """Raised in place of the first heavy layer the QSA owner builds.
+
+    The dtype gates run before it, so reaching this is what says a cache dtype
+    was admitted -- without the test having to repeat the list of dtypes the
+    constructor accepts.
+    """
+
+
+def _qsa_owner_config() -> SimpleNamespace:
+    """The smallest text config the QSA owner's gates read."""
+    return SimpleNamespace(
+        hidden_size=512,
+        num_attention_heads=8,
+        num_key_value_heads=2,
+        head_dim=64,
+        rms_norm_eps=1e-6,
+        is_causal=True,
+        rope_theta=10000.0,
+        max_position_embeddings=4096,
+        indexer_n_heads=4,
+        partial_rotary_factor=1.0,
+    )
+
+
+def _qsa_owner_vllm_config(cache_dtype: str) -> SimpleNamespace:
+    return SimpleNamespace(
+        cache_config=SimpleNamespace(cache_dtype=cache_dtype, block_size=16),
+        model_config=SimpleNamespace(dtype=torch.bfloat16),
+        parallel_config=SimpleNamespace(
+            prefill_context_parallel_size=1,
+            decode_context_parallel_size=1,
+        ),
+        num_speculative_tokens=0,
+    )
+
+
+@pytest.mark.parametrize(
+    "cache_dtype", ["auto", "bfloat16", "fp8", "fp8_e4m3", "nvfp4"]
+)
+def test_qsa_owner_admits_every_kv_cache_dtype_the_backend_serves(
+    cache_dtype, monkeypatch
+) -> None:
+    """The layer owner's own gate must admit the dtypes the backend declares.
+
+    The backend advertises nvfp4 and the impl accepts it, but the owner keeps a
+    second gate on `cache_config.cache_dtype`. It was dropped in an upstream
+    merge and serving stopped at engine init with NotImplementedError while
+    every kernel test still passed, because no test ran this constructor.
+    """
+    from vllm.models.qwen4_exp.nvidia import qsa as qsa_mod
+
+    def reached(*args, **kwargs):
+        raise _ReachedQKVParallelLinear
+
+    monkeypatch.setattr(qsa_mod, "QKVParallelLinear", reached)
+    monkeypatch.setattr(qsa_mod, "get_tensor_model_parallel_world_size", lambda: 1)
+
+    with pytest.raises(_ReachedQKVParallelLinear):
+        qsa_mod.Qwen4ExpQSAAttention(
+            vllm_config=_qsa_owner_vllm_config(cache_dtype),
+            config=_qsa_owner_config(),
+            layer_id=0,
+            prefix="model.layers.0.self_attn",
+        )
+
+
+def test_qsa_owner_rejects_a_kv_cache_dtype_it_cannot_read(monkeypatch) -> None:
+    """And an unsupported dtype must stop at that gate, not somewhere later."""
+    from vllm.models.qwen4_exp.nvidia import qsa as qsa_mod
+
+    def reached(*args, **kwargs):
+        raise _ReachedQKVParallelLinear
+
+    monkeypatch.setattr(qsa_mod, "QKVParallelLinear", reached)
+    monkeypatch.setattr(qsa_mod, "get_tensor_model_parallel_world_size", lambda: 1)
+
+    with pytest.raises(NotImplementedError, match="main KV cache"):
+        qsa_mod.Qwen4ExpQSAAttention(
+            vllm_config=_qsa_owner_vllm_config("fp8_e5m2"),
+            config=_qsa_owner_config(),
+            layer_id=0,
+            prefix="model.layers.0.self_attn",
+        )
+
+
+def _qsa_owner_for_spec(kv_cache_dtype: str, torch_dtype: torch.dtype):
+    """A QSA owner carrying only what `get_kv_cache_spec` reads.
+
+    The constructor builds projections and an indexer, none of which the spec
+    depends on, so the four attributes it does read are set directly.
+    """
+    from torch import nn
+
+    from vllm.models.qwen4_exp.nvidia.qsa import Qwen4ExpQSAAttention
+
+    owner = Qwen4ExpQSAAttention.__new__(Qwen4ExpQSAAttention)
+    nn.Module.__init__(owner)
+    owner.num_kv_heads = 2
+    owner.head_dim = 128
+    owner.kv_cache_dtype = kv_cache_dtype
+    owner.kv_cache_torch_dtype = torch_dtype
+    return owner
+
+
+def test_qsa_nvfp4_kv_cache_spec_sizes_its_own_slots() -> None:
+    """NVFP4 keeps K and V in separate per-head slots of packed bytes.
+
+    The spec carries that as `num_head_slots` and `state_content_bytes`; a spec
+    that dropped them would size the allocation as a dense BF16 page and the
+    cache would be wrong without anything raising.
+    """
+    from vllm.utils.torch_utils import nvfp4_kv_cache_full_dim
+
+    vllm_config = SimpleNamespace(cache_config=SimpleNamespace(block_size=16))
+    owner = _qsa_owner_for_spec("nvfp4", torch.uint8)
+    spec = owner.get_kv_cache_spec(vllm_config)
+
+    assert spec.num_head_slots == 2 * owner.num_kv_heads
+    assert spec.state_content_bytes == nvfp4_kv_cache_full_dim(owner.head_dim)
+    # The overrides have to reach the sizes the allocator actually uses.
+    assert spec.num_heads == 2 * owner.num_kv_heads
+    assert spec.state_content_size_bytes == nvfp4_kv_cache_full_dim(owner.head_dim)
+    assert spec.page_size_bytes == (
+        spec.block_size * spec.num_heads * spec.state_content_size_bytes
+    )
+
+
+@pytest.mark.parametrize(
+    ("kv_cache_dtype", "torch_dtype"),
+    [("auto", torch.bfloat16), ("fp8_e4m3", torch.uint8)],
+)
+def test_qsa_dense_kv_cache_spec_keeps_its_sizing(kv_cache_dtype, torch_dtype) -> None:
+    """A BF16 or e4m3 cache must be sized exactly as it was before NVFP4."""
+    vllm_config = SimpleNamespace(cache_config=SimpleNamespace(block_size=16))
+    owner = _qsa_owner_for_spec(kv_cache_dtype, torch_dtype)
+    spec = owner.get_kv_cache_spec(vllm_config)
+
+    assert spec.num_head_slots is None
+    assert spec.state_content_bytes is None
+    # Dense pages hold K and V for every head at the element width.
+    assert spec.num_heads == owner.num_kv_heads
+    assert spec.page_size_bytes == (
+        2 * spec.block_size * owner.num_kv_heads * owner.head_dim * torch_dtype.itemsize
+    )
