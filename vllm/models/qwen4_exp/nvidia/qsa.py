@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
 from typing import ClassVar, cast
 
 import torch
@@ -25,6 +24,7 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import MRotaryEmbedding, get_rope
 from vllm.model_executor.models.qwen3_next import Qwen3NextAttention
 from vllm.platforms import current_platform
+from vllm.platforms.interface import DeviceCapability
 from vllm.transformers_utils.configs.qwen4_exp import (
     Qwen4ExpTextConfig,
 )
@@ -67,6 +67,10 @@ class Qwen4ExpQSAFlashAttentionBackend(FlashAttentionBackend):
     """FullAttentionSpec backend used by the merged QSA owner."""
 
     supported_dtypes: ClassVar[list[torch.dtype]] = [torch.bfloat16]
+    # fp8/fp8_e4m3: e4m3 bytes in a uint8 cache, written by reshape_and_cache
+    # with the layer's per-tensor scales and dequantized on load inside the QSA
+    # Triton kernel. flash-attn never runs over this cache, so its fp8 probe
+    # does not apply (see supports_kv_cache_dtype and the impl constructor).
     supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
         "auto",
         "bfloat16",
@@ -77,15 +81,25 @@ class Qwen4ExpQSAFlashAttentionBackend(FlashAttentionBackend):
 
     @classmethod
     def supports_kv_cache_dtype(cls, kv_cache_dtype: CacheDType | None) -> bool:
-        """QSA reads quantized pages with its own kernels.
+        return kv_cache_dtype is None or kv_cache_dtype in cls.supported_kv_cache_dtypes
 
-        The FlashAttention base class asks the flash-attn library whether it
-        can serve a quantized cache. QSA never calls into it, so the answer
-        would reject caches this backend does serve.
-        """
-        if kv_cache_dtype is None:
-            return True
-        return kv_cache_dtype in cls.supported_kv_cache_dtypes
+    @classmethod
+    def supports_combination(
+        cls,
+        head_size: int,
+        dtype: torch.dtype,
+        kv_cache_dtype: CacheDType | None,
+        block_size: int | None,
+        use_mla: bool,
+        has_sink: bool,
+        use_sparse: bool,
+        use_mm_prefix: bool,
+        device_capability: DeviceCapability,
+    ) -> str | None:
+        # QSA dequantizes the fp8 KV in its own Triton kernel and never runs
+        # flash-attn over the quantized cache, so the parent's fp8-KV rejection
+        # does not apply and every combination it is handed is accepted here.
+        return None
 
     @staticmethod
     def get_name() -> str:
@@ -119,31 +133,50 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
     supports_dcp: bool = False
     supports_pcp: bool = False
 
-    _SUPPORTED_KV_CACHE_DTYPES = ("auto", "bfloat16", "fp8", "fp8_e4m3", "nvfp4")
-
-    def __init__(self, *args, **kwargs) -> None:
-        # QSA never runs the FlashAttention kernels (its attention math lives
-        # in the QSA Triton kernels, which dequantize FP8 pages themselves),
-        # so bypass the parent's FA-centric quantized-KV support check.
-        arg_list = list(args)
-        requested_kv_cache_dtype = kwargs.get("kv_cache_dtype")
-        if requested_kv_cache_dtype is None and len(arg_list) > 6:
-            requested_kv_cache_dtype = arg_list[6]
-        if requested_kv_cache_dtype in ("fp8", "fp8_e4m3", "nvfp4"):
-            if "kv_cache_dtype" in kwargs:
-                kwargs["kv_cache_dtype"] = "auto"
-            else:
-                arg_list[6] = "auto"
-        super().__init__(*arg_list, **kwargs)
-        if requested_kv_cache_dtype is not None:
-            self.kv_cache_dtype = requested_kv_cache_dtype
+    def __init__(
+        self,
+        num_heads: int,
+        head_size: int,
+        scale: float,
+        num_kv_heads: int,
+        alibi_slopes: list[float] | None,
+        sliding_window: int | None,
+        kv_cache_dtype: str,
+        logits_soft_cap: float | None = None,
+        attn_type: AttentionType = AttentionType.DECODER,
+        kv_sharing_target_layer_name: str | None = None,
+        sinks: torch.Tensor | None = None,
+    ) -> None:
+        # The parent constructor probes flash-attn for quantized-KV support and
+        # raises where it is unavailable (sm120), but QSA dequantizes fp8 inside
+        # its own Triton kernel and never runs flash-attn over the cache. Hand
+        # the parent "auto" for that probe and restore the real dtype afterwards:
+        # the parent only uses it there, and do_kv_cache_update reads the
+        # attribute at call time.
+        real_kv_cache_dtype = kv_cache_dtype
+        if kv_cache_dtype in ("fp8", "fp8_e4m3", "nvfp4"):
+            kv_cache_dtype = "auto"
+        super().__init__(
+            num_heads,
+            head_size,
+            scale,
+            num_kv_heads,
+            alibi_slopes,
+            sliding_window,
+            kv_cache_dtype,
+            logits_soft_cap,
+            attn_type,
+            kv_sharing_target_layer_name,
+            sinks,
+        )
+        self.kv_cache_dtype = real_kv_cache_dtype
         if not is_flash_attn_varlen_func_available():
             raise NotImplementedError("Qwen4Exp QSA requires FlashAttention")
         if self.dcp_world_size != 1:
             raise NotImplementedError(
                 "Qwen4Exp QSA does not support decode context parallelism"
             )
-        if self.kv_cache_dtype not in self._SUPPORTED_KV_CACHE_DTYPES:
+        if self.kv_cache_dtype not in ("auto", "bfloat16", "fp8", "fp8_e4m3", "nvfp4"):
             raise NotImplementedError(
                 "Qwen4Exp QSA requires a BF16, per-tensor FP8, or NVFP4 main KV cache"
             )
@@ -169,9 +202,11 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
     def nvfp4_slot_views(
         kv_cache: torch.Tensor, head_size: int
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Split the canonical (pages, 2*H, page_size, full_dim) allocation
-        into interleaved K/V slot views: slot 2h holds K of head h, slot
-        2h+1 holds V. Each slot is [fp4 data | e4m3 block scales]."""
+        """Split the canonical (pages, 2*H, page_size, full_dim) allocation.
+
+        Slot ``2h`` holds K of head ``h`` and slot ``2h + 1`` holds V. Each
+        slot is [fp4 data | e4m3 block scales].
+        """
         if kv_cache.dtype != torch.uint8 or kv_cache.ndim != 4:
             raise ValueError("NVFP4 QSA cache must be a 4D uint8 allocation")
         if kv_cache.shape[3] != nvfp4_kv_cache_full_dim(head_size):
@@ -193,6 +228,8 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
         data_dim = self.head_size // 2
         writer = self._nvfp4_slot_writer
         assert writer is not None
+        # The writer stores each block scale as `amax / (6 * global_scale)`, so
+        # the reader still owes the global scale it is given here.
         writer(
             key,
             value,
@@ -240,22 +277,45 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             raise RuntimeError("QSA owner did not provide its top-k buffer")
         logical_indices = topk_buffer[:num_tokens]
         token_to_req = token_to_req[:num_tokens]
-        from .ops.qsa import qsa_sparse_paged_attention
-
+        k_scale = v_scale = None
         if self.is_kvcache_nvfp4:
+            # Slot views keep their own axis order; the reader is told so.
             key_cache, value_cache = self.nvfp4_slot_views(kv_cache, self.head_size)
-            kv_quantized = True
+            # The block scales the writer stored are relative to this global
+            # scale, so the reader owes it exactly as the e4m3 path does.
+            k_scale = layer._k_scale_float
+            v_scale = layer._v_scale_float
         else:
             key_cache, value_cache = kv_cache.transpose(1, 2).split(
                 self.head_size, dim=-1
             )
+            # A page of one head is a singleton dim in the split view; the
+            # kernel indexes it, so give it the stride it would have.
             key_cache = canonicalize_singleton_dim_strides(key_cache)
             value_cache = canonicalize_singleton_dim_strides(value_cache)
-            kv_quantized = self.kv_cache_dtype in ("fp8", "fp8_e4m3")
-            if key_cache.dtype != torch.bfloat16 and not kv_quantized:
-                raise NotImplementedError("Qwen4Exp QSA requires BF16 or FP8 K/V")
-        if query.dtype != torch.bfloat16:
-            raise NotImplementedError("Qwen4Exp QSA requires BF16 queries")
+            if self.kv_cache_dtype in ("fp8", "fp8_e4m3"):
+                # The cache is allocated as uint8. Where the platform reports
+                # FP8 the kernel takes an e4m3 pointer, so reinterpret the
+                # bytes (same itemsize, so shape and strides are preserved);
+                # below that it reads the bytes and decodes them itself.
+                if current_platform.supports_fp8():
+                    key_cache = key_cache.view(torch.float8_e4m3fn)
+                    value_cache = value_cache.view(torch.float8_e4m3fn)
+                # Host-side per-tensor dequant scales (Python floats), as used
+                # by other host-scale backends; folded into the kernel's
+                # scales.
+                k_scale = layer._k_scale_float
+                v_scale = layer._v_scale_float
+        if query.dtype != torch.bfloat16 or key_cache.dtype not in (
+            torch.bfloat16,
+            torch.float8_e4m3fn,
+            torch.uint8,
+        ):
+            raise NotImplementedError(
+                "Qwen4Exp QSA requires BF16 Q and BF16, FP8-e4m3 or NVFP4 K/V"
+            )
+
+        from .ops.qsa import qsa_sparse_paged_attention
 
         qsa_sparse_paged_attention(
             query[:num_tokens],
@@ -266,8 +326,8 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             token_to_req,
             use_prefill_config,
             output[:num_tokens],
-            k_scale=layer._k_scale if kv_quantized else None,
-            v_scale=layer._v_scale if kv_quantized else None,
+            k_scale=k_scale,
+            v_scale=v_scale,
             nvfp4=self.is_kvcache_nvfp4,
             output_gate=output_gate[:num_tokens],
         )
@@ -301,10 +361,9 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             "bfloat16",
             "fp8",
             "fp8_e4m3",
-            "nvfp4",
         ):
             raise NotImplementedError(
-                "Qwen4Exp QSA requires a BF16, per-tensor FP8, or NVFP4 main KV cache"
+                "Qwen4Exp QSA requires a BF16 or FP8-e4m3 main KV cache"
             )
         if getattr(quant_config, "kv_cache_scheme", None) is not None:
             raise NotImplementedError("Qwen4Exp QSA does not support KV quantization")
@@ -404,24 +463,13 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         self.kv_cache_torch_dtype = kv_cache_dtype_str_to_dtype(
             self.kv_cache_dtype, model_config
         )
-        # vLLM stores FP8 KV caches as uint8; the QSA kernels decode E4M3
-        # bytes themselves.
-        if self.kv_cache_torch_dtype not in (
-            torch.bfloat16,
-            torch.uint8,
-            current_platform.fp8_dtype(),
-        ):
-            raise NotImplementedError("Qwen4Exp QSA requires BF16 or FP8 cache storage")
+        if self.kv_cache_torch_dtype not in (torch.bfloat16, torch.uint8):
+            raise NotImplementedError(
+                "Qwen4Exp QSA requires BF16 or FP8-e4m3 (uint8) cache storage"
+            )
         self.kv_sharing_target_layer_name = None
         self.kv_cache = torch.tensor([])
         set_default_quant_scales(self, register_buffer=True)
-        # No Qwen4Exp checkpoint serializes KV scales, and dummy-weight
-        # initialization randomizes persistent buffers — which the strict
-        # NVFP4 slot writer rejects. Keep the defaults out of state_dict.
-        for scale_name in ("_k_scale", "_v_scale", "_q_scale", "_prob_scale"):
-            scale_value = getattr(self, scale_name)
-            delattr(self, scale_name)
-            self.register_buffer(scale_name, scale_value, persistent=False)
 
         self.attn_backend = Qwen4ExpQSAFlashAttentionBackend
         self.impl = Qwen4ExpQSAFlashAttentionImpl(
@@ -469,7 +517,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         return self.attn_backend
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
-        spec = FullAttentionSpec(
+        return FullAttentionSpec(
             block_size=vllm_config.cache_config.block_size,
             num_kv_heads=self.num_kv_heads,
             head_size=self.head_dim,
@@ -477,15 +525,6 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             dtype=self.kv_cache_torch_dtype,
             kv_quant_mode=get_kv_quant_mode(self.kv_cache_dtype),
         )
-        if spec.kv_quant_mode.is_nvfp4:
-            # K and V live in separate per-head slots holding packed fp4
-            # data plus fp8 block scales (see nvfp4_slot_views).
-            spec = replace(
-                spec,
-                num_head_slots=2 * self.num_kv_heads,
-                state_content_bytes=nvfp4_kv_cache_full_dim(self.head_dim),
-            )
-        return spec
 
     @eager_break_during_capture
     def _run_qsa(

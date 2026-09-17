@@ -215,7 +215,14 @@ def _qsa_sparse_paged_attention_reference(
     block_table: torch.Tensor,
     token_to_req: torch.Tensor,
     softmax_scale: float,
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
 ) -> torch.Tensor:
+    """Dense reference for QSA sparse paged attention.
+
+    Mirrors the kernel's dequant: fp8-e4m3 K/V caches are dequantized with the
+    per-tensor k_scale/v_scale host floats; bf16 caches use unit scales.
+    """
     output = torch.zeros_like(q)
     repeats = q.shape[1] // k_cache.shape[2]
     page_size = k_cache.shape[1]
@@ -227,13 +234,15 @@ def _qsa_sparse_paged_attention_reference(
         request = token_to_req[row].long()
         pages = block_table[request, logical // page_size].long()
         offsets = logical % page_size
-        keys = k_cache[pages, offsets].repeat_interleave(repeats, dim=1)
-        values = v_cache[pages, offsets].repeat_interleave(repeats, dim=1)
-        scores = torch.einsum("hd,khd->hk", q[row].float(), keys.float())
-        probabilities = torch.softmax(scores * softmax_scale, dim=-1)
-        output[row] = torch.einsum("hk,khd->hd", probabilities, values.float()).to(
-            q.dtype
+        keys = (k_cache[pages, offsets].float() * k_scale).repeat_interleave(
+            repeats, dim=1
         )
+        values = (v_cache[pages, offsets].float() * v_scale).repeat_interleave(
+            repeats, dim=1
+        )
+        scores = torch.einsum("hd,khd->hk", q[row].float(), keys)
+        probabilities = torch.softmax(scores * softmax_scale, dim=-1)
+        output[row] = torch.einsum("hk,khd->hd", probabilities, values).to(q.dtype)
     return output
 
 
@@ -918,22 +927,28 @@ def test_qsa_block_expansion_correctness() -> None:
         "page_size",
         "use_prefill_config",
         "num_requests",
+        "fp8",
     ),
     [
         # Production page sizes from hybrid-cache block alignment: 784/800
         # at TP4 and 1568/1600 at TP1/TP2 (no-MTP / MTP num_spec=3). Head
         # splits are per-rank TP1/TP2/TP4; the largest batch runs both
         # use_prefill_config variants.
-        pytest.param(1, 24, 2, 1600, True, 2, id="tp1_r1"),
-        pytest.param(16, 12, 1, 1600, True, 3, id="tp2_r16"),
-        pytest.param(32, 6, 1, 800, True, 5, id="tp4_r32"),
-        pytest.param(128, 24, 2, 1568, True, 7, id="tp1_r128"),
-        pytest.param(257, 6, 1, 800, True, 13, id="tp4_r257"),
-        pytest.param(513, 6, 1, 784, True, 17, id="tp4_r513"),
-        pytest.param(700, 6, 1, 800, True, 23, id="tp4_r700"),
-        pytest.param(1024, 24, 2, 1600, True, 33, id="tp1_r1024"),
-        pytest.param(2048, 24, 2, 1600, True, 63, id="tp1_r2048_prefill"),
-        pytest.param(2048, 24, 2, 1600, False, 63, id="tp1_r2048_uniform"),
+        pytest.param(1, 24, 2, 1600, True, 2, False, id="tp1_r1"),
+        pytest.param(16, 12, 1, 1600, True, 3, False, id="tp2_r16"),
+        pytest.param(32, 6, 1, 800, True, 5, False, id="tp4_r32"),
+        pytest.param(128, 24, 2, 1568, True, 7, False, id="tp1_r128"),
+        pytest.param(257, 6, 1, 800, True, 13, False, id="tp4_r257"),
+        pytest.param(513, 6, 1, 784, True, 17, False, id="tp4_r513"),
+        pytest.param(700, 6, 1, 800, True, 23, False, id="tp4_r700"),
+        pytest.param(1024, 24, 2, 1600, True, 33, False, id="tp1_r1024"),
+        pytest.param(2048, 24, 2, 1600, True, 63, False, id="tp1_r2048_prefill"),
+        pytest.param(2048, 24, 2, 1600, False, 63, False, id="tp1_r2048_uniform"),
+        # fp8_e4m3 K/V caches on the TP1 head split.
+        pytest.param(1, 24, 2, 1600, True, 2, True, id="tp1_r1_fp8"),
+        pytest.param(128, 24, 2, 1568, True, 7, True, id="tp1_r128_fp8"),
+        pytest.param(2048, 24, 2, 1600, True, 63, True, id="tp1_r2048_prefill_fp8"),
+        pytest.param(2048, 24, 2, 1600, False, 63, True, id="tp1_r2048_uniform_fp8"),
     ],
 )
 def test_qsa_sparse_paged_attention_correctness(
@@ -943,8 +958,18 @@ def test_qsa_sparse_paged_attention_correctness(
     page_size: int,
     use_prefill_config: bool,
     num_requests: int,
+    fp8: bool,
 ) -> None:
+    """QSA sparse paged attention matches the dense reference.
+
+    fp8 only changes the K/V cache dtype (e4m3 with a per-tensor scale pair) and
+    the scales; the reference dequantizes the same cache with those scales, so
+    both paths compare the production kernel against the reference on identical
+    inputs. fp8=True additionally covers the host-side scale folding.
+    """
     torch.manual_seed(2)
+    # One QSA attention problem: bf16 Q and paged K/V, a packed selection with
+    # the trailing count column, block table and row-to-request map.
     head_dim = 256
     num_selected_pages = 64
     # Keep the newest page outside the synthetic top-k as causal headroom.
@@ -1025,17 +1050,31 @@ def test_qsa_sparse_paged_attention_correctness(
         indexer_budget,
         logical_indices,
     )
-    assert logical_indices.shape == (num_rows, selection_width + 1)
-    scale = q.shape[-1] ** -0.5
+
+    scale = head_dim**-0.5
+
+    if fp8:
+        # A fixed non-unit pair (k != v) exercises the host-side scale folding
+        # and catches a k/v swap; scales are host floats, as the layer exposes
+        # them. Stored values are the scaled ones, as reshape_and_cache does.
+        k_scale, v_scale = 0.5, 2.0
+        k_cache = (k_cache / k_scale).to(torch.float8_e4m3fn)
+        v_cache = (v_cache / v_scale).to(torch.float8_e4m3fn)
+    else:
+        k_scale, v_scale = 1.0, 1.0
 
     actual = qsa_ops.qsa_sparse_paged_attention(
         q,
-        k_cache,
-        v_cache,
+        # Below compute capability 8.9 the kernel reads e4m3 pages as raw
+        # bytes; the torch reference below keeps the typed tensor either way.
+        _fp8_pages_as_dispatched(k_cache) if fp8 else k_cache,
+        _fp8_pages_as_dispatched(v_cache) if fp8 else v_cache,
         logical_indices,
         block_table,
         token_to_req,
         use_prefill_config=use_prefill_config,
+        k_scale=k_scale,
+        v_scale=v_scale,
         output_gate=output_gate,
     )
     expected = _qsa_sparse_paged_attention_reference(
@@ -1046,6 +1085,8 @@ def test_qsa_sparse_paged_attention_correctness(
         block_table,
         token_to_req,
         scale,
+        k_scale=k_scale,
+        v_scale=v_scale,
     )
     expected = expected * torch.sigmoid(output_gate)
 
@@ -1332,12 +1373,28 @@ def test_qsa_streaming_compression_and_compressor_state_store_match_reference() 
             )
 
 
-def _fp8_roundtrip(tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Quantize to per-tensor E4M3 and return the bytes plus the scale."""
+def _fp8_roundtrip(tensor: torch.Tensor) -> tuple[torch.Tensor, float]:
+    """Quantize to per-tensor E4M3 and return the bytes plus a host scale.
+
+    The reader takes its dequant scales as Python floats, the way the layer
+    hands over `_k_scale_float`, so the helper returns one rather than a
+    device tensor.
+    """
     finfo = torch.finfo(torch.float8_e4m3fn)
     scale = (tensor.abs().amax().float() / finfo.max).clamp_min(1e-12)
     quantized = (tensor.float() / scale).clamp(finfo.min, finfo.max)
-    return quantized.to(torch.float8_e4m3fn), scale.reshape(1)
+    return quantized.to(torch.float8_e4m3fn), float(scale)
+
+
+def _fp8_pages_as_dispatched(quantized: torch.Tensor) -> torch.Tensor:
+    """The view the forward builds for an e4m3 page on this device.
+
+    Below compute capability 8.9 Triton cannot type an fp8 pointer, so the
+    pages go in as raw bytes; from 8.9 on they go in as e4m3.
+    """
+    if current_platform.supports_fp8():
+        return quantized
+    return quantized.view(torch.uint8)
 
 
 @requires_qsa_kernels
@@ -1373,8 +1430,8 @@ def test_qsa_sparse_paged_attention_fp8_matches_dequantized_reference() -> None:
 
     quantized = qsa_ops.qsa_sparse_paged_attention(
         q,
-        k_bytes.view(torch.uint8),
-        v_bytes.view(torch.uint8),
+        _fp8_pages_as_dispatched(k_bytes),
+        _fp8_pages_as_dispatched(v_bytes),
         logical_indices,
         block_table,
         token_to_req,
@@ -1404,7 +1461,9 @@ def test_qsa_sparse_paged_attention_nvfp4_matches_dequantized_reference() -> Non
     from vllm.utils.torch_utils import nvfp4_kv_cache_full_dim
 
     torch.manual_seed(12)
-    num_rows, num_query_heads, num_kv_heads, page_size, head_dim = 2, 8, 1, 16, 256
+    # num_kv_heads != page_size on purpose: with them equal a grid axis or a
+    # token/head stride taken from the wrong dimension still lines up.
+    num_rows, num_query_heads, num_kv_heads, page_size, head_dim = 2, 8, 2, 16, 256
     num_pages = 4
     width_bytes = nvfp4_kv_cache_full_dim(head_dim)
     data_bytes = head_dim // 2
@@ -1440,7 +1499,11 @@ def test_qsa_sparse_paged_attention_nvfp4_matches_dequantized_reference() -> Non
 
     k_slots = make_slots()
     v_slots = make_slots()
-    unit = torch.ones(1, device="cuda", dtype=torch.float32)
+    # Distinct non-unit global scales: the writer stores each block scale
+    # relative to one, so a reader that drops it, applies it twice, or swaps K
+    # for V lands somewhere else. Equal or unit values would hide all three.
+    global_k_scale = 0.375
+    global_v_scale = 1.75
 
     block_table = torch.arange(num_pages, device="cuda", dtype=torch.int32).reshape(
         1, -1
@@ -1458,13 +1521,13 @@ def test_qsa_sparse_paged_attention_nvfp4_matches_dequantized_reference() -> Non
         block_table,
         token_to_req,
         use_prefill_config=False,
-        k_scale=unit,
-        v_scale=unit,
+        k_scale=global_k_scale,
+        v_scale=global_v_scale,
         nvfp4=True,
         output_gate=output_gate,
     )
 
-    def decode(slots: torch.Tensor) -> torch.Tensor:
+    def decode(slots: torch.Tensor, global_scale: float) -> torch.Tensor:
         data = slots[..., :data_bytes]
         scales = slots[..., data_bytes:].view(torch.float8_e4m3fn).float()
         low = (data & 0x0F).to(torch.int32)
@@ -1482,12 +1545,14 @@ def test_qsa_sparse_paged_attention_nvfp4_matches_dequantized_reference() -> Non
         block_scale = scales.repeat_interleave(16, dim=-1)
         # Slot views are [pages, heads, tokens, width]; pages are [pages,
         # tokens, heads, dim] for the BF16 path.
-        return (values * block_scale).to(torch.bfloat16).permute(0, 2, 1, 3)
+        return (
+            (values * block_scale * global_scale).to(torch.bfloat16).permute(0, 2, 1, 3)
+        )
 
     reference = qsa_ops.qsa_sparse_paged_attention(
         q,
-        decode(k_slots),
-        decode(v_slots),
+        decode(k_slots, global_k_scale),
+        decode(v_slots, global_v_scale),
         logical_indices,
         block_table,
         token_to_req,
@@ -1549,12 +1614,44 @@ def test_qsa_packed_decoders_match_their_arithmetic_definitions() -> None:
     assert_same_bits(decoded_scales, expected_scales)
 
 
-def _stub_capability(monkeypatch, supported: bool) -> None:
+@pytest.fixture(autouse=True)
+def _clear_capability_caches():
+    """Drop the capability caches around every test in this module.
+
+    `_stub_capability` fills them through a stubbed platform; left in place
+    they would answer for the real device in whatever test ran next.
+    """
+    qsa_ops._is_sm120.cache_clear()
+    qsa_ops._fp8_pages_are_raw_bytes.cache_clear()
+    yield
+    qsa_ops._is_sm120.cache_clear()
+    qsa_ops._fp8_pages_are_raw_bytes.cache_clear()
+
+
+def _stub_capability(monkeypatch, supported: bool, sm120: bool = False) -> None:
+    """Pin the two capability probes the profile reads.
+
+    `_select_config` dispatches to the sm_120 table through `_is_sm120()`, so
+    a stub that answers only `has_device_capability` leaves that call reaching
+    the real platform. Both are pinned, and the `lru_cache` in front of the
+    sm_120 probe is cleared so the stub is the one consulted.
+    """
+    # One real device per combination, so the three probes can never disagree:
+    # `supported` selects whether the tuned-table gate is met, which is SM100,
+    # and every answer below is derived from that one capability.
+    capability = (12, 0) if sm120 else ((10, 0) if supported else (8, 0))
+    packed = capability[0] * 10 + capability[1]
     monkeypatch.setattr(
         qsa_ops,
         "current_platform",
-        SimpleNamespace(has_device_capability=lambda capability: supported),
+        SimpleNamespace(
+            has_device_capability=lambda wanted: packed >= wanted,
+            get_device_capability=lambda: capability,
+            supports_fp8=lambda: capability >= (8, 9),
+        ),
     )
+    qsa_ops._is_sm120.cache_clear()
+    qsa_ops._fp8_pages_are_raw_bytes.cache_clear()
 
 
 @pytest.mark.parametrize("kv_quant", [1, 2])
@@ -1565,12 +1662,22 @@ def test_qsa_splitk_profile_only_narrows_tiles_that_cannot_stage(
     """Packed caches keep the tuned table until its KV tile stops fitting."""
     _stub_capability(monkeypatch, supported=False)
     head_dim, selection_width = 256, 2051
-    budget = qsa_ops._qsa_staged_block_n(head_dim, kv_quant)
+    # Only the paths that rebuild values from bytes stage: raw e4m3 and NVFP4.
+    raw_fp8 = kv_quant == 1
+    budget = qsa_ops._qsa_staged_block_n(head_dim, kv_quant, raw_fp8)
     assert budget == (16 if kv_quant == 2 else 32)
+    # A native fp8 pointer stages nothing, so it keeps the tuned tile.
+    assert qsa_ops._qsa_staged_block_n(head_dim, 1, False) is None
 
     def profile(num_rows, quant):
         return qsa_ops._qsa_splitk_profile(
-            num_rows, 1, use_prefill_config, selection_width, head_dim, quant
+            num_rows,
+            1,
+            use_prefill_config,
+            selection_width,
+            head_dim,
+            quant,
+            quant == 1,
         )
 
     # Keyed off the table rather than a fixed row list, so a retuned
@@ -1595,21 +1702,30 @@ def test_qsa_splitk_profile_keeps_the_tuned_table_where_it_was_measured(
     monkeypatch,
 ) -> None:
     """SM100 and unquantized caches must see the profile they were tuned with."""
-    tuned = qsa_ops._select_config(2048, 1, False, 2051)
-
     _stub_capability(monkeypatch, supported=True)
-    for kv_quant in (0, 1, 2):
-        assert qsa_ops._qsa_staged_block_n(256, kv_quant) is None
-        assert qsa_ops._qsa_splitk_profile(2048, 1, False, 2051, 256, kv_quant) == (
-            *tuned,
-            2,
-        )
+    for kv_quant, raw_fp8 in ((0, False), (1, True), (1, False), (2, False)):
+        tuned = qsa_ops._select_config(2048, 1, False, 2051, is_fp8=kv_quant == 1)
+        assert qsa_ops._qsa_staged_block_n(256, kv_quant, raw_fp8) is None
+        assert qsa_ops._qsa_splitk_profile(
+            2048, 1, False, 2051, 256, kv_quant, raw_fp8
+        ) == (*tuned, 2)
 
     _stub_capability(monkeypatch, supported=False)
-    # An unquantized cache reads BF16 pages straight into the dots, so it never
-    # takes the staging profile no matter how old the device is.
-    assert qsa_ops._qsa_staged_block_n(256, 0) is None
-    assert qsa_ops._qsa_splitk_profile(2048, 1, False, 2051, 256, 0) == (*tuned, 2)
+    # An unquantized cache reads BF16 pages straight into the dots, and a
+    # native fp8 pointer stages nothing either, so neither takes the staging
+    # profile no matter how old the device is.
+    bf16_tuned = qsa_ops._select_config(2048, 1, False, 2051, is_fp8=False)
+    assert qsa_ops._qsa_staged_block_n(256, 0, False) is None
+    assert qsa_ops._qsa_splitk_profile(2048, 1, False, 2051, 256, 0, False) == (
+        *bf16_tuned,
+        2,
+    )
+    fp8_tuned = qsa_ops._select_config(2048, 1, False, 2051, is_fp8=True)
+    assert qsa_ops._qsa_staged_block_n(256, 1, False) is None
+    assert qsa_ops._qsa_splitk_profile(2048, 1, False, 2051, 256, 1, False) == (
+        *fp8_tuned,
+        2,
+    )
 
 
 def test_qsa_backend_advertises_the_kv_cache_dtypes_it_serves() -> None:
@@ -1622,8 +1738,15 @@ def test_qsa_backend_advertises_the_kv_cache_dtypes_it_serves() -> None:
     assert not backend.supports_kv_cache_dtype("float16")
 
 
-def test_qsa_unquantized_call_reuses_one_unit_scale(monkeypatch) -> None:
-    """A BF16 call must not allocate a fresh scale tensor every time."""
+def test_qsa_unquantized_call_allocates_no_device_scale(monkeypatch) -> None:
+    """A BF16 call must not build a device scale tensor at all.
+
+    The kernel takes its dequant scales as host floats folded into
+    `softmax_scale` and `output_scale`, so an unquantized call has nothing to
+    allocate. The earlier contract cached one unit tensor per device; there is
+    no longer anything to cache, and this holds the allocation at zero rather
+    than at one.
+    """
     if not current_platform.is_cuda():
         pytest.skip("CUDA is required")
     q = torch.randn(1, 8, 256, device="cuda", dtype=torch.bfloat16)
@@ -1631,12 +1754,10 @@ def test_qsa_unquantized_call_reuses_one_unit_scale(monkeypatch) -> None:
     # rather than ones, so it cannot disturb what that counter measures.
     output_gate = torch.randn_like(q)
     device = q.device
-    qsa_ops._QSA_UNIT_SCALE_BY_DEVICE.pop(device, None)
-    assert qsa_ops._QSA_UNIT_SCALE_BY_DEVICE.get(device) is None
+    assert not hasattr(qsa_ops, "_QSA_UNIT_SCALE_BY_DEVICE"), (
+        "the device unit-scale cache is gone; host floats replaced it"
+    )
 
-    # Counting the builds is what catches the regression: dict.setdefault
-    # evaluates its default every call, so the cached object stays identical
-    # while a throwaway tensor is allocated each time.
     builds = []
     real_ones = torch.ones
 
@@ -1645,13 +1766,29 @@ def test_qsa_unquantized_call_reuses_one_unit_scale(monkeypatch) -> None:
             builds.append(1)
         return real_ones(*args, **kwargs)
 
+    seen: list[tuple[float, float]] = []
+    real_kernel = qsa_ops._qsa_sparse_paged_gqa_splitk_kernel
+
+    class _Recording:
+        def __getitem__(self, grid):
+            inner = real_kernel[grid]
+
+            def run(*args, **kwargs):
+                # softmax_scale and output_scale are positional, right after
+                # the output pointer.
+                seen.append((args[9], args[10]))
+                return inner(*args, **kwargs)
+
+            return run
+
     monkeypatch.setattr(torch, "ones", counting_ones)
+    monkeypatch.setattr(qsa_ops, "_qsa_sparse_paged_gqa_splitk_kernel", _Recording())
     k = torch.randn(2, 16, 1, 256, device=device, dtype=torch.bfloat16)
     v = torch.randn_like(k)
     block_table = torch.arange(2, device=device, dtype=torch.int32).reshape(1, 2)
     token_to_req = torch.zeros(1, device=device, dtype=torch.int32)
     indices = _packed_selection(8, 1, device=device)
-    for _ in range(2):
+    for _ in range(3):
         qsa_ops.qsa_sparse_paged_attention(
             q,
             k,
@@ -1662,21 +1799,10 @@ def test_qsa_unquantized_call_reuses_one_unit_scale(monkeypatch) -> None:
             use_prefill_config=False,
             output_gate=output_gate,
         )
-    cached = qsa_ops._QSA_UNIT_SCALE_BY_DEVICE[device]
-    qsa_ops.qsa_sparse_paged_attention(
-        q,
-        k,
-        v,
-        indices,
-        block_table,
-        token_to_req,
-        use_prefill_config=False,
-        output_gate=output_gate,
+    assert not builds, (
+        f"a BF16 call built {len(builds)} device tensor(s) with torch.ones"
     )
-    assert qsa_ops._QSA_UNIT_SCALE_BY_DEVICE[device] is cached
-    assert len(builds) == 1, (
-        f"the unit scale was built {len(builds)} times across three calls"
-    )
+    assert seen == [(256**-0.5, 1.0)] * 3, seen
 
 
 @requires_qsa_kernels
@@ -1710,11 +1836,11 @@ def test_qsa_warmup_compiles_the_layout_it_is_given(
         )
     block_table = torch.zeros(2, pages, dtype=torch.int32, device="cuda")
 
-    seen: list[dict] = []
+    seen: list[tuple[tuple, dict]] = []
     real_warmup = qsa_ops._qsa_sparse_paged_gqa_splitk_kernel.warmup
 
     def capture(*args, **kwargs):
-        seen.append(kwargs)
+        seen.append((args, kwargs))
         return real_warmup(*args, **kwargs)
 
     monkeypatch.setattr(qsa_ops._qsa_sparse_paged_gqa_splitk_kernel, "warmup", capture)
@@ -1730,7 +1856,68 @@ def test_qsa_warmup_compiles_the_layout_it_is_given(
     )
 
     assert seen, "warmup compiled no specialization"
-    for kwargs in seen:
+
+    # The views and the six (block, token, head) strides the forward builds
+    # for this layout. A warmup that derived them differently would compile a
+    # kernel the forward never calls.
+    if nvfp4:
+        key_view, value_view = kv_cache[:, 0::2], kv_cache[:, 1::2]
+        expected_strides = (
+            key_view.stride(0),
+            key_view.stride(2),
+            key_view.stride(1),
+            value_view.stride(0),
+            value_view.stride(2),
+            value_view.stride(1),
+        )
+    else:
+        key_view, value_view = kv_cache.transpose(1, 2).split(head_size, dim=-1)
+        expected_strides = (
+            key_view.stride(0),
+            key_view.stride(1),
+            key_view.stride(2),
+            value_view.stride(0),
+            value_view.stride(1),
+            value_view.stride(2),
+        )
+    expected_raw_fp8 = expected_quant == 1 and not current_platform.supports_fp8()
+    if expected_quant == 0:
+        expected_ptr_dtype = torch.bfloat16
+    elif expected_quant == 2 or expected_raw_fp8:
+        expected_ptr_dtype = torch.uint8
+    else:
+        expected_ptr_dtype = torch.float8_e4m3fn
+    # Every profile the forward can reach for this layout, so a warmup that
+    # compiled some other tile or stage count shows up here.
+    expected_profiles = {
+        qsa_ops._qsa_splitk_profile(
+            num_rows,
+            num_kv_heads,
+            use_prefill_config,
+            64,
+            head_size,
+            expected_quant,
+            expected_raw_fp8,
+        )
+        for num_rows in range(1, 8193)
+        for use_prefill_config in (False, True)
+    }
+
+    for args, kwargs in seen:
         assert kwargs["KV_QUANT"] == expected_quant
+        assert kwargs["RAW_FP8"] == expected_raw_fp8
         assert kwargs["PAGE_SIZE"] == page_size
         assert kwargs["HEAD_DIM"] == head_size
+        # q_ptr, k, v, indices, block_table, token_to_req, partial_out,
+        # partial_lse, out, softmax_scale, output_scale, gate, q row/head
+        # stride, then the six cache strides.
+        assert tuple(args[14:20]) == expected_strides
+        assert args[1].dtype == args[2].dtype == expected_ptr_dtype
+        assert kwargs["grid"] == (16, num_kv_heads, kwargs["NUM_SPLITS"])
+        assert (
+            kwargs["BLOCK_N"],
+            kwargs["num_warps"],
+            kwargs["NUM_TILES"],
+            kwargs["NUM_SPLITS"],
+            kwargs["num_stages"],
+        ) in expected_profiles
