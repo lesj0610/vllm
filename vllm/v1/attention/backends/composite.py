@@ -15,6 +15,7 @@ from vllm.v1.attention.backend import (
     AttentionImpl,
     AttentionMetadataBuilder,
     CommonAttentionMetadata,
+    PersistentWorkspaceProfilingSupport,
 )
 from vllm.v1.attention.backends.utils import get_supported_kv_cache_layouts
 from vllm.v1.kv_cache_interface import KVCacheSpec
@@ -342,9 +343,90 @@ def create_composite_attention_backend(
         def _builders(self):
             return self.general_builder, self.causal_builder
 
+        @classmethod
+        def get_persistent_workspace_memory_profiling_support(
+            cls, vllm_config, kv_cache_spec
+        ):
+            """Compose the two children's profiling support.
+
+            Both children can be selected at runtime, so the composite can only
+            promise what both can honour: one ``UNSUPPORTED`` child disables the
+            lifecycle for the pair, and one ``REQUIRED`` child makes the pair
+            ``REQUIRED`` because that child's workspace must exist before the
+            arena is locked.
+            """
+            supports = [
+                builder_cls.get_persistent_workspace_memory_profiling_support(
+                    vllm_config, kv_cache_spec
+                )
+                for builder_cls in (general_builder_cls, causal_builder_cls)
+            ]
+            # Anything that is not one of the three declared values is treated
+            # as unsupported: the composite must not launder a child's bad
+            # return past the gate that would otherwise have caught it.
+            if not all(
+                isinstance(support, PersistentWorkspaceProfilingSupport)
+                for support in supports
+            ) or any(
+                support is PersistentWorkspaceProfilingSupport.UNSUPPORTED
+                for support in supports
+            ):
+                return PersistentWorkspaceProfilingSupport.UNSUPPORTED
+            if any(
+                support is PersistentWorkspaceProfilingSupport.REQUIRED
+                for support in supports
+            ):
+                return PersistentWorkspaceProfilingSupport.REQUIRED
+            return PersistentWorkspaceProfilingSupport.NEUTRAL
+
+        def reserve_workspace_for_memory_profiling(self) -> int:
+            # Either child can be routed to at runtime, so both reserve. They
+            # share one arena, so the sum reported here is what the children
+            # asked for, not what the allocator grew by -- the runner logs the
+            # measured delta alongside it.
+            return sum(
+                int(builder.reserve_workspace_for_memory_profiling() or 0)
+                for builder in self._builders
+            )
+
+        def reserve_workspace_for_cudagraph_capture(self) -> int:
+            return sum(
+                int(builder.reserve_workspace_for_cudagraph_capture() or 0)
+                for builder in self._builders
+            )
+
+        def rebind_workspace_after_reservation(self) -> None:
+            for builder in self._builders:
+                builder.rebind_workspace_after_reservation()
+
         # Forward the optional workspace protocol so that a wrapped builder
         # which allocates one (FlashInfer) still joins the runner's cross-group
         # sharing instead of allocating a second buffer behind the composite.
+        #
+        # The state API comes first because it carries the registered wrappers
+        # as well as the buffer: one state tracks every wrapper so they can all
+        # be rebound together when the arena grows. Sharing only the tensor
+        # would leave each child with its own state and break that. The bare
+        # buffer stays as the fallback for a backend with no state API.
+        def get_workspace_buffer_state(self):
+            for builder in self._builders:
+                if hasattr(builder, "get_workspace_buffer_state"):
+                    state = builder.get_workspace_buffer_state()
+                    # The runner only asks the group that provides the state,
+                    # so hand it to the sibling here.
+                    self.set_workspace_buffer_state(state)
+                    return state
+            return None
+
+        def set_workspace_buffer_state(self, workspace_state):
+            for builder in self._builders:
+                if hasattr(builder, "set_workspace_buffer_state"):
+                    builder.set_workspace_buffer_state(workspace_state)
+                elif hasattr(builder, "set_workspace_buffer"):
+                    buffer = getattr(workspace_state, "buffer", None)
+                    if buffer is not None:
+                        builder.set_workspace_buffer(buffer)
+
         def _get_workspace_buffer(self):
             for builder in self._builders:
                 if hasattr(builder, "_get_workspace_buffer"):

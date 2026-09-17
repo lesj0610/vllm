@@ -29,6 +29,7 @@ from vllm.v1.attention.backend import (
     AttentionType,
     CommonAttentionMetadata,
     MultipleOf,
+    PersistentWorkspaceProfilingSupport,
 )
 from vllm.v1.attention.backends.utils import (
     compute_mm_prefix_range_tensor,
@@ -100,6 +101,21 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.ALWAYS
     # Step-dependent fields reference persistent input buffers directly.
     supports_draft_decode_metadata_update = True
+
+    @classmethod
+    def get_persistent_workspace_memory_profiling_support(
+        cls,
+        vllm_config: VllmConfig,
+        kv_cache_spec: AttentionSpec,
+    ) -> PersistentWorkspaceProfilingSupport:
+        # The persistent tensors this builder holds -- the softmax segment
+        # buffers, and the R-SWA prefix lengths when that path is on -- are all
+        # allocated in the constructor and kept alive by the common lease. None
+        # of them is reserved lazily, so there is nothing to materialize before
+        # profiling and nothing to rebind afterwards. Saying so explicitly is
+        # required: the fail-closed default would otherwise disable the
+        # lifecycle for any composite that wraps this builder.
+        return PersistentWorkspaceProfilingSupport.NEUTRAL
 
     def __init__(
         self,
