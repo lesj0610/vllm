@@ -2068,3 +2068,68 @@ def test_qsa_dense_kv_cache_spec_keeps_its_sizing(kv_cache_dtype, torch_dtype) -
     assert spec.page_size_bytes == (
         2 * spec.block_size * owner.num_kv_heads * owner.head_dim * torch_dtype.itemsize
     )
+
+
+class _ReachedIndexer(Exception):
+    """Raised in place of the indexer, after the owner registers its scales."""
+
+
+def test_qsa_owner_keeps_its_default_scales_out_of_the_state_dict(monkeypatch) -> None:
+    """No Qwen4Exp checkpoint carries KV scales, so the defaults stay private.
+
+    Persistent buffers are what dummy-weight initialization randomizes, and the
+    strict NVFP4 slot writer rejects a randomized global scale. The owner keeps
+    all four out of `state_dict` while leaving both the device tensors and the
+    host floats at one.
+    """
+    from torch import nn
+
+    from vllm.models.qwen4_exp.nvidia import qsa as qsa_mod
+
+    captured: dict[str, torch.nn.Module] = {}
+
+    class _Capturing(qsa_mod.Qwen4ExpQSAAttention):
+        def __init__(self, **kwargs):
+            captured["owner"] = self
+            super().__init__(**kwargs)
+
+    monkeypatch.setattr(qsa_mod, "get_tensor_model_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(qsa_mod, "QKVParallelLinear", lambda *a, **k: nn.Identity())
+    monkeypatch.setattr(qsa_mod, "RowParallelLinear", lambda *a, **k: nn.Identity())
+    monkeypatch.setattr(qsa_mod, "GemmaRMSNorm", lambda *a, **k: nn.Identity())
+    monkeypatch.setattr(qsa_mod, "get_rope", lambda *a, **k: nn.Identity())
+    monkeypatch.setattr(qsa_mod, "MRotaryEmbedding", object)
+    monkeypatch.setattr(
+        qsa_mod, "Qwen4ExpQSAFlashAttentionImpl", lambda *a, **k: SimpleNamespace()
+    )
+
+    def reached(*args, **kwargs):
+        raise _ReachedIndexer
+
+    monkeypatch.setattr(qsa_mod, "QSAIndexer", reached)
+
+    # The shared helpers stop at the projection, so the few fields the layers
+    # between it and the scale registration read are added here.
+    config = _qsa_owner_config()
+    config.max_position_embeddings = 4096
+    config.rope_parameters = {"rope_type": "default", "rope_theta": 10000.0}
+    config.rms_norm_eps = 1e-6
+    vllm_config = _qsa_owner_vllm_config("nvfp4")
+    vllm_config.model_config.multimodal_config = None
+
+    with pytest.raises(_ReachedIndexer):
+        _Capturing(
+            vllm_config=vllm_config,
+            config=config,
+            layer_id=0,
+            prefix="model.layers.0.self_attn",
+        )
+
+    owner = captured["owner"]
+    names = ("_k_scale", "_v_scale", "_q_scale", "_prob_scale")
+    state = owner.state_dict()
+    assert not [name for name in names if name in state], sorted(state)
+    for name in names:
+        assert float(getattr(owner, name)) == 1.0, name
+    for name in ("_k_scale_float", "_v_scale_float", "_q_scale_float"):
+        assert getattr(owner, name) == 1.0, name

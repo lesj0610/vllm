@@ -472,6 +472,13 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         self.kv_sharing_target_layer_name = None
         self.kv_cache = torch.tensor([])
         set_default_quant_scales(self, register_buffer=True)
+        # No Qwen4Exp checkpoint serializes KV scales, and dummy-weight
+        # initialization randomizes persistent buffers -- which the strict
+        # NVFP4 slot writer rejects. Keep the defaults out of state_dict.
+        for scale_name in ("_k_scale", "_v_scale", "_q_scale", "_prob_scale"):
+            scale_value = getattr(self, scale_name)
+            delattr(self, scale_name)
+            self.register_buffer(scale_name, scale_value, persistent=False)
 
         self.attn_backend = Qwen4ExpQSAFlashAttentionBackend
         self.impl = Qwen4ExpQSAFlashAttentionImpl(
