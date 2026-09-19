@@ -24,6 +24,18 @@ requires_qsa_kernels = pytest.mark.skipif(
 )
 
 
+def _packed_selection(width: int, num_rows: int, device: str = "cuda") -> torch.Tensor:
+    """Selection rows 0..width-1 in the packed layout the kernel reads.
+
+    The trailing column carries the row's valid-entry count, so a test that
+    hands the kernel a bare index range would lose its last column to it.
+    """
+    packed = torch.empty((num_rows, width + 1), device=device, dtype=torch.int32)
+    packed[:, :width] = torch.arange(width, device=device, dtype=torch.int32)
+    packed[:, width] = width
+    return packed
+
+
 def test_qsa_mtp_index_share_updates_cache_but_skips_selection(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1053,8 +1065,10 @@ def test_qsa_sparse_paged_attention_correctness(
 
     actual = qsa_ops.qsa_sparse_paged_attention(
         q,
-        k_cache,
-        v_cache,
+        # Below compute capability 8.9 the kernel reads e4m3 pages as raw
+        # bytes; the torch reference below keeps the typed tensor either way.
+        _fp8_pages_as_dispatched(k_cache) if fp8 else k_cache,
+        _fp8_pages_as_dispatched(v_cache) if fp8 else v_cache,
         logical_indices,
         block_table,
         token_to_req,
@@ -1357,3 +1371,765 @@ def test_qsa_streaming_compression_and_compressor_state_store_match_reference() 
                 rope_cache[block, position % 4, 0],
                 position_row(request, position).to("cuda"),
             )
+
+
+def _fp8_roundtrip(tensor: torch.Tensor) -> tuple[torch.Tensor, float]:
+    """Quantize to per-tensor E4M3 and return the bytes plus a host scale.
+
+    The reader takes its dequant scales as Python floats, the way the layer
+    hands over `_k_scale_float`, so the helper returns one rather than a
+    device tensor.
+    """
+    finfo = torch.finfo(torch.float8_e4m3fn)
+    scale = (tensor.abs().amax().float() / finfo.max).clamp_min(1e-12)
+    quantized = (tensor.float() / scale).clamp(finfo.min, finfo.max)
+    return quantized.to(torch.float8_e4m3fn), float(scale)
+
+
+def _fp8_pages_as_dispatched(quantized: torch.Tensor) -> torch.Tensor:
+    """The view the forward builds for an e4m3 page on this device.
+
+    Below compute capability 8.9 Triton cannot type an fp8 pointer, so the
+    pages go in as raw bytes; from 8.9 on they go in as e4m3.
+    """
+    if current_platform.supports_fp8():
+        return quantized
+    return quantized.view(torch.uint8)
+
+
+@requires_qsa_kernels
+def test_qsa_sparse_paged_attention_fp8_matches_dequantized_reference() -> None:
+    """The FP8 reader must agree with attention over the dequantized pages."""
+    torch.manual_seed(11)
+    num_rows, num_query_heads, num_kv_heads, page_size, head_dim = 3, 8, 1, 16, 256
+    num_pages = 6
+    q = torch.randn(
+        num_rows, num_query_heads, head_dim, device="cuda", dtype=torch.bfloat16
+    )
+    k_ref = torch.randn(
+        num_pages,
+        page_size,
+        num_kv_heads,
+        head_dim,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    v_ref = torch.randn_like(k_ref)
+    k_bytes, k_scale = _fp8_roundtrip(k_ref)
+    v_bytes, v_scale = _fp8_roundtrip(v_ref)
+
+    block_table = torch.arange(num_pages, device="cuda", dtype=torch.int32).reshape(
+        1, -1
+    )
+    token_to_req = torch.zeros(num_rows, device="cuda", dtype=torch.int32)
+    width = 8
+    logical_indices = _packed_selection(width, num_rows)
+    # One gate for both calls: the gate multiplies each side identically, so
+    # what this compares is still the FP8 reader against the dequantized pages.
+    output_gate = torch.randn_like(q)
+
+    quantized = qsa_ops.qsa_sparse_paged_attention(
+        q,
+        _fp8_pages_as_dispatched(k_bytes),
+        _fp8_pages_as_dispatched(v_bytes),
+        logical_indices,
+        block_table,
+        token_to_req,
+        use_prefill_config=False,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        output_gate=output_gate,
+    )
+    reference = qsa_ops.qsa_sparse_paged_attention(
+        q,
+        (k_bytes.to(torch.float32) * k_scale).to(torch.bfloat16),
+        (v_bytes.to(torch.float32) * v_scale).to(torch.bfloat16),
+        logical_indices,
+        block_table,
+        token_to_req,
+        use_prefill_config=False,
+        output_gate=output_gate,
+    )
+    torch.testing.assert_close(
+        quantized.float(), reference.float(), rtol=2e-2, atol=2e-2
+    )
+
+
+@requires_qsa_kernels
+def test_qsa_sparse_paged_attention_nvfp4_matches_dequantized_reference() -> None:
+    """The NVFP4 slot reader must agree with its own dequantized pages."""
+    from vllm.utils.torch_utils import nvfp4_kv_cache_full_dim
+
+    torch.manual_seed(12)
+    # num_kv_heads != page_size on purpose: with them equal a grid axis or a
+    # token/head stride taken from the wrong dimension still lines up.
+    num_rows, num_query_heads, num_kv_heads, page_size, head_dim = 2, 8, 2, 16, 256
+    num_pages = 4
+    width_bytes = nvfp4_kv_cache_full_dim(head_dim)
+    data_bytes = head_dim // 2
+
+    q = torch.randn(
+        num_rows, num_query_heads, head_dim, device="cuda", dtype=torch.bfloat16
+    )
+
+    # Random packed pages: the reader is checked against a torch decode of the
+    # very same bytes, so the values only have to be well-formed.
+    def make_slots() -> torch.Tensor:
+        slots = torch.randint(
+            0,
+            256,
+            (num_pages, num_kv_heads, page_size, width_bytes),
+            device="cuda",
+            dtype=torch.uint8,
+        )
+        # Random bytes in the scale tail would decode to E4M3 NaN, so write
+        # finite scales there instead.
+        scales = (
+            torch.rand(
+                num_pages,
+                num_kv_heads,
+                page_size,
+                width_bytes - data_bytes,
+                device="cuda",
+            )
+            + 0.5
+        )
+        slots[..., data_bytes:] = scales.to(torch.float8_e4m3fn).view(torch.uint8)
+        return slots
+
+    k_slots = make_slots()
+    v_slots = make_slots()
+    # Distinct non-unit global scales: the writer stores each block scale
+    # relative to one, so a reader that drops it, applies it twice, or swaps K
+    # for V lands somewhere else. Equal or unit values would hide all three.
+    global_k_scale = 0.375
+    global_v_scale = 1.75
+
+    block_table = torch.arange(num_pages, device="cuda", dtype=torch.int32).reshape(
+        1, -1
+    )
+    token_to_req = torch.zeros(num_rows, device="cuda", dtype=torch.int32)
+    logical_indices = _packed_selection(8, num_rows)
+    # One gate for both calls, for the same reason as the FP8 test above.
+    output_gate = torch.randn_like(q)
+
+    packed = qsa_ops.qsa_sparse_paged_attention(
+        q,
+        k_slots,
+        v_slots,
+        logical_indices,
+        block_table,
+        token_to_req,
+        use_prefill_config=False,
+        k_scale=global_k_scale,
+        v_scale=global_v_scale,
+        nvfp4=True,
+        output_gate=output_gate,
+    )
+
+    def decode(slots: torch.Tensor, global_scale: float) -> torch.Tensor:
+        data = slots[..., :data_bytes]
+        scales = slots[..., data_bytes:].view(torch.float8_e4m3fn).float()
+        low = (data & 0x0F).to(torch.int32)
+        high = (data >> 4).to(torch.int32)
+        nibbles = torch.stack((low, high), dim=-1).flatten(-2)
+        sign = torch.where(nibbles & 8 != 0, -1.0, 1.0)
+        exponent = (nibbles >> 1) & 3
+        mantissa = (nibbles & 1).float()
+        magnitude = torch.where(
+            exponent > 0,
+            torch.exp2(exponent.float() - 2.0) * (2.0 + mantissa),
+            mantissa * 0.5,
+        )
+        values = sign * magnitude
+        block_scale = scales.repeat_interleave(16, dim=-1)
+        # Slot views are [pages, heads, tokens, width]; pages are [pages,
+        # tokens, heads, dim] for the BF16 path.
+        return (
+            (values * block_scale * global_scale).to(torch.bfloat16).permute(0, 2, 1, 3)
+        )
+
+    reference = qsa_ops.qsa_sparse_paged_attention(
+        q,
+        decode(k_slots, global_k_scale),
+        decode(v_slots, global_v_scale),
+        logical_indices,
+        block_table,
+        token_to_req,
+        use_prefill_config=False,
+        output_gate=output_gate,
+    )
+    torch.testing.assert_close(packed.float(), reference.float(), rtol=2e-2, atol=2e-2)
+
+
+@requires_qsa_kernels
+def test_qsa_packed_decoders_match_their_arithmetic_definitions() -> None:
+    """Every encoding the branch-free decoders accept must land on its value."""
+    from vllm.triton_utils import tl, triton
+
+    @triton.jit
+    def probe(source_ptr, fp4_ptr, scale_ptr, WIDTH: tl.constexpr):
+        offsets = tl.arange(0, WIDTH)
+        raw = tl.load(source_ptr + offsets)
+        tl.store(fp4_ptr + offsets, qsa_ops._dequant_fp4_e2m1(raw.to(tl.int32) & 15))
+        tl.store(scale_ptr + offsets, qsa_ops._dequant_e4m3fn_block_scales(raw))
+
+    width = 256
+    source = torch.arange(width, device="cuda", dtype=torch.uint8)
+    decoded_fp4 = torch.empty(width, device="cuda", dtype=torch.bfloat16)
+    decoded_scales = torch.empty(width, device="cuda", dtype=torch.bfloat16)
+    probe[(1,)](source, decoded_fp4, decoded_scales, WIDTH=width)
+
+    def assert_same_bits(decoded: torch.Tensor, expected: torch.Tensor) -> None:
+        # Compare BF16 encodings, not values: these decoders assemble the bit
+        # pattern by hand, and a float comparison would call -0.0 equal to +0.0
+        # and miss a dropped sign on the zero encodings (FP4 0x8, E4M3 0x80).
+        assert torch.equal(
+            decoded.cpu().view(torch.uint16),
+            expected.to(torch.bfloat16).view(torch.uint16),
+        )
+
+    # Both formats keep at most four significant bits, so BF16 holds every
+    # value exactly and the comparison can demand equality rather than a
+    # tolerance. The right-hand sides restate the FP4 E2M1 and FP8 E4M3
+    # definitions the arithmetic decoders implement.
+    nibbles = (source.to(torch.int32) & 15).cpu()
+    exponent = (nibbles >> 1) & 3
+    mantissa = (nibbles & 1).double()
+    expected_fp4 = torch.where(nibbles & 8 != 0, -1.0, 1.0).double() * torch.where(
+        exponent > 0,
+        torch.exp2(exponent.double() - 2.0) * (2.0 + mantissa),
+        mantissa * 0.5,
+    )
+    assert_same_bits(decoded_fp4, expected_fp4)
+
+    byte = source.to(torch.int32).cpu()
+    exponent = (byte >> 3) & 15
+    mantissa = (byte & 7).double()
+    expected_scales = torch.where(byte & 128 != 0, -1.0, 1.0).double() * torch.where(
+        exponent > 0,
+        torch.exp2(exponent.double() - 10.0) * (8.0 + mantissa),
+        mantissa * 0.001953125,
+    )
+    assert_same_bits(decoded_scales, expected_scales)
+
+
+@pytest.fixture(autouse=True)
+def _clear_capability_caches():
+    """Drop the capability caches around every test in this module.
+
+    `_stub_capability` fills them through a stubbed platform; left in place
+    they would answer for the real device in whatever test ran next.
+    """
+    qsa_ops._is_sm120.cache_clear()
+    qsa_ops._fp8_pages_are_raw_bytes.cache_clear()
+    yield
+    qsa_ops._is_sm120.cache_clear()
+    qsa_ops._fp8_pages_are_raw_bytes.cache_clear()
+
+
+def _stub_capability(monkeypatch, supported: bool, sm120: bool = False) -> None:
+    """Pin the two capability probes the profile reads.
+
+    `_select_config` dispatches to the sm_120 table through `_is_sm120()`, so
+    a stub that answers only `has_device_capability` leaves that call reaching
+    the real platform. Both are pinned, and the `lru_cache` in front of the
+    sm_120 probe is cleared so the stub is the one consulted.
+    """
+    # One real device per combination, so the three probes can never disagree:
+    # `supported` selects whether the tuned-table gate is met, which is SM100,
+    # and every answer below is derived from that one capability.
+    capability = (12, 0) if sm120 else ((10, 0) if supported else (8, 0))
+    packed = capability[0] * 10 + capability[1]
+    monkeypatch.setattr(
+        qsa_ops,
+        "current_platform",
+        SimpleNamespace(
+            has_device_capability=lambda wanted: packed >= wanted,
+            get_device_capability=lambda: capability,
+            supports_fp8=lambda: capability >= (8, 9),
+        ),
+    )
+    qsa_ops._is_sm120.cache_clear()
+    qsa_ops._fp8_pages_are_raw_bytes.cache_clear()
+
+
+@pytest.mark.parametrize("kv_quant", [1, 2])
+@pytest.mark.parametrize("use_prefill_config", [False, True])
+def test_qsa_splitk_profile_only_narrows_tiles_that_cannot_stage(
+    kv_quant, use_prefill_config, monkeypatch
+) -> None:
+    """Packed caches keep the tuned table until its KV tile stops fitting."""
+    _stub_capability(monkeypatch, supported=False)
+    head_dim, selection_width = 256, 2051
+    # Only the paths that rebuild values from bytes stage: raw e4m3 and NVFP4.
+    raw_fp8 = kv_quant == 1
+    budget = qsa_ops._qsa_staged_block_n(head_dim, kv_quant, raw_fp8)
+    assert budget == (16 if kv_quant == 2 else 32)
+    # A native fp8 pointer stages nothing, so it keeps the tuned tile.
+    assert qsa_ops._qsa_staged_block_n(head_dim, 1, False) is None
+
+    def profile(num_rows, quant):
+        return qsa_ops._qsa_splitk_profile(
+            num_rows,
+            1,
+            use_prefill_config,
+            selection_width,
+            head_dim,
+            quant,
+            quant == 1,
+        )
+
+    # Keyed off the table rather than a fixed row list, so a retuned
+    # _select_config moves this test with it instead of pinning stale widths.
+    for num_rows in (1, 4, 16, 31, 32, 64, 128, 256, 512, 1024, 2048, 4096):
+        tuned = profile(num_rows, 0)
+        narrowed = profile(num_rows, kv_quant)
+        if tuned[0] <= budget:
+            # The table already picks a tile that stages, so nothing may move.
+            assert narrowed == tuned
+            continue
+        block_n, _, tiles, splits, _ = narrowed
+        assert block_n == budget
+        assert tiles == -(-selection_width // block_n)
+        # The narrow tile must not buy its parallelism with a bigger FP32
+        # partial workspace than the tuned profile already allocated.
+        assert 1 <= splits <= tuned[3]
+        assert splits <= max(1, tiles // qsa_ops._QSA_MIN_TILES_PER_SPLIT)
+
+
+def test_qsa_splitk_profile_keeps_the_tuned_table_where_it_was_measured(
+    monkeypatch,
+) -> None:
+    """SM100 and unquantized caches must see the profile they were tuned with."""
+    _stub_capability(monkeypatch, supported=True)
+    for kv_quant, raw_fp8 in ((0, False), (1, True), (1, False), (2, False)):
+        tuned = qsa_ops._select_config(2048, 1, False, 2051, is_fp8=kv_quant == 1)
+        assert qsa_ops._qsa_staged_block_n(256, kv_quant, raw_fp8) is None
+        assert qsa_ops._qsa_splitk_profile(
+            2048, 1, False, 2051, 256, kv_quant, raw_fp8
+        ) == (*tuned, 2)
+
+    _stub_capability(monkeypatch, supported=False)
+    # An unquantized cache reads BF16 pages straight into the dots, and a
+    # native fp8 pointer stages nothing either, so neither takes the staging
+    # profile no matter how old the device is.
+    bf16_tuned = qsa_ops._select_config(2048, 1, False, 2051, is_fp8=False)
+    assert qsa_ops._qsa_staged_block_n(256, 0, False) is None
+    assert qsa_ops._qsa_splitk_profile(2048, 1, False, 2051, 256, 0, False) == (
+        *bf16_tuned,
+        2,
+    )
+    fp8_tuned = qsa_ops._select_config(2048, 1, False, 2051, is_fp8=True)
+    assert qsa_ops._qsa_staged_block_n(256, 1, False) is None
+    assert qsa_ops._qsa_splitk_profile(2048, 1, False, 2051, 256, 1, False) == (
+        *fp8_tuned,
+        2,
+    )
+
+
+def test_qsa_backend_advertises_the_kv_cache_dtypes_it_serves() -> None:
+    """The declared contract must match the caches the impl actually reads."""
+    from vllm.models.qwen4_exp.nvidia.qsa import Qwen4ExpQSAFlashAttentionBackend
+
+    backend = Qwen4ExpQSAFlashAttentionBackend
+    for dtype in ("auto", "bfloat16", "fp8", "fp8_e4m3", "nvfp4"):
+        assert backend.supports_kv_cache_dtype(dtype), dtype
+    assert not backend.supports_kv_cache_dtype("float16")
+
+
+def test_qsa_unquantized_call_allocates_no_device_scale(monkeypatch) -> None:
+    """A BF16 call must not build a device scale tensor at all.
+
+    The kernel takes its dequant scales as host floats folded into
+    `softmax_scale` and `output_scale`, so an unquantized call has nothing to
+    allocate. The earlier contract cached one unit tensor per device; there is
+    no longer anything to cache, and this holds the allocation at zero rather
+    than at one.
+    """
+    if not current_platform.is_cuda():
+        pytest.skip("CUDA is required")
+    q = torch.randn(1, 8, 256, device="cuda", dtype=torch.bfloat16)
+    # Built before the torch.ones counter below is installed, and with randn
+    # rather than ones, so it cannot disturb what that counter measures.
+    output_gate = torch.randn_like(q)
+    device = q.device
+    assert not hasattr(qsa_ops, "_QSA_UNIT_SCALE_BY_DEVICE"), (
+        "the device unit-scale cache is gone; host floats replaced it"
+    )
+
+    builds = []
+    real_ones = torch.ones
+
+    def counting_ones(*args, **kwargs):
+        if kwargs.get("device") == device or device in args:
+            builds.append(1)
+        return real_ones(*args, **kwargs)
+
+    seen: list[tuple[float, float]] = []
+    real_kernel = qsa_ops._qsa_sparse_paged_gqa_splitk_kernel
+
+    class _Recording:
+        def __getitem__(self, grid):
+            inner = real_kernel[grid]
+
+            def run(*args, **kwargs):
+                # softmax_scale and output_scale are positional, right after
+                # the output pointer.
+                seen.append((args[9], args[10]))
+                return inner(*args, **kwargs)
+
+            return run
+
+    monkeypatch.setattr(torch, "ones", counting_ones)
+    monkeypatch.setattr(qsa_ops, "_qsa_sparse_paged_gqa_splitk_kernel", _Recording())
+    k = torch.randn(2, 16, 1, 256, device=device, dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    block_table = torch.arange(2, device=device, dtype=torch.int32).reshape(1, 2)
+    token_to_req = torch.zeros(1, device=device, dtype=torch.int32)
+    indices = _packed_selection(8, 1, device=device)
+    for _ in range(3):
+        qsa_ops.qsa_sparse_paged_attention(
+            q,
+            k,
+            v,
+            indices,
+            block_table,
+            token_to_req,
+            use_prefill_config=False,
+            output_gate=output_gate,
+        )
+    assert not builds, (
+        f"a BF16 call built {len(builds)} device tensor(s) with torch.ones"
+    )
+    assert seen == [(256**-0.5, 1.0)] * 3, seen
+
+
+@requires_qsa_kernels
+@pytest.mark.parametrize(
+    ("nvfp4", "kv_quantized", "expected_quant"),
+    [(False, False, 0), (False, True, 1), (True, False, 2)],
+)
+def test_qsa_warmup_compiles_the_layout_it_is_given(
+    nvfp4, kv_quantized, expected_quant, monkeypatch
+) -> None:
+    """Warmup must bind the same kernel signature the forward path calls.
+
+    It runs only at startup, so a signature that drifted from the kernel --
+    a missing scale pointer, a missing KV_QUANT -- surfaces as a TypeError
+    during engine init rather than in any forward test.
+    """
+    from vllm.utils.torch_utils import nvfp4_kv_cache_full_dim
+
+    head_size, num_kv_heads, pages, page_size = 256, 2, 4, 8
+    if nvfp4:
+        width = nvfp4_kv_cache_full_dim(head_size)
+        kv_cache = torch.zeros(
+            pages, 2 * num_kv_heads, page_size, width, dtype=torch.uint8, device="cuda"
+        )
+    else:
+        # The unquantized allocation is [pages, kv_heads, page_size, 2 * head]:
+        # the transpose in the warmup is what turns it into paged NHD.
+        dtype = torch.uint8 if kv_quantized else torch.bfloat16
+        kv_cache = torch.zeros(
+            pages, num_kv_heads, page_size, 2 * head_size, dtype=dtype, device="cuda"
+        )
+    block_table = torch.zeros(2, pages, dtype=torch.int32, device="cuda")
+
+    seen: list[tuple[tuple, dict]] = []
+    real_warmup = qsa_ops._qsa_sparse_paged_gqa_splitk_kernel.warmup
+
+    def capture(*args, **kwargs):
+        seen.append((args, kwargs))
+        return real_warmup(*args, **kwargs)
+
+    monkeypatch.setattr(qsa_ops._qsa_sparse_paged_gqa_splitk_kernel, "warmup", capture)
+
+    qsa_ops.warmup_qsa_sparse_paged_attention(
+        kv_cache,
+        block_table,
+        num_query_heads=num_kv_heads * 2,
+        selection_width=64,
+        head_size=head_size,
+        nvfp4=nvfp4,
+        kv_quantized=kv_quantized,
+    )
+
+    assert seen, "warmup compiled no specialization"
+
+    # The views and the six (block, token, head) strides the forward builds
+    # for this layout. A warmup that derived them differently would compile a
+    # kernel the forward never calls.
+    if nvfp4:
+        key_view, value_view = kv_cache[:, 0::2], kv_cache[:, 1::2]
+        expected_strides = (
+            key_view.stride(0),
+            key_view.stride(2),
+            key_view.stride(1),
+            value_view.stride(0),
+            value_view.stride(2),
+            value_view.stride(1),
+        )
+    else:
+        key_view, value_view = kv_cache.transpose(1, 2).split(head_size, dim=-1)
+        expected_strides = (
+            key_view.stride(0),
+            key_view.stride(1),
+            key_view.stride(2),
+            value_view.stride(0),
+            value_view.stride(1),
+            value_view.stride(2),
+        )
+    expected_raw_fp8 = expected_quant == 1 and not current_platform.supports_fp8()
+    if expected_quant == 0:
+        expected_ptr_dtype = torch.bfloat16
+    elif expected_quant == 2 or expected_raw_fp8:
+        expected_ptr_dtype = torch.uint8
+    else:
+        expected_ptr_dtype = torch.float8_e4m3fn
+    # Every profile the forward can reach for this layout, so a warmup that
+    # compiled some other tile or stage count shows up here.
+    expected_profiles = {
+        qsa_ops._qsa_splitk_profile(
+            num_rows,
+            num_kv_heads,
+            use_prefill_config,
+            64,
+            head_size,
+            expected_quant,
+            expected_raw_fp8,
+        )
+        for num_rows in range(1, 8193)
+        for use_prefill_config in (False, True)
+    }
+
+    for args, kwargs in seen:
+        assert kwargs["KV_QUANT"] == expected_quant
+        assert kwargs["RAW_FP8"] == expected_raw_fp8
+        assert kwargs["PAGE_SIZE"] == page_size
+        assert kwargs["HEAD_DIM"] == head_size
+        # q_ptr, k, v, indices, block_table, token_to_req, partial_out,
+        # partial_lse, out, softmax_scale, output_scale, gate, q row/head
+        # stride, then the six cache strides.
+        assert tuple(args[14:20]) == expected_strides
+        assert args[1].dtype == args[2].dtype == expected_ptr_dtype
+        assert kwargs["grid"] == (16, num_kv_heads, kwargs["NUM_SPLITS"])
+        assert (
+            kwargs["BLOCK_N"],
+            kwargs["num_warps"],
+            kwargs["NUM_TILES"],
+            kwargs["NUM_SPLITS"],
+            kwargs["num_stages"],
+        ) in expected_profiles
+
+
+class _ReachedQKVParallelLinear(Exception):
+    """Raised in place of the first heavy layer the QSA owner builds.
+
+    The dtype gates run before it, so reaching this is what says a cache dtype
+    was admitted -- without the test having to repeat the list of dtypes the
+    constructor accepts.
+    """
+
+
+def _qsa_owner_config() -> SimpleNamespace:
+    """The smallest text config the QSA owner's gates read."""
+    return SimpleNamespace(
+        hidden_size=512,
+        num_attention_heads=8,
+        num_key_value_heads=2,
+        head_dim=64,
+        rms_norm_eps=1e-6,
+        is_causal=True,
+        rope_theta=10000.0,
+        max_position_embeddings=4096,
+        indexer_n_heads=4,
+        partial_rotary_factor=1.0,
+    )
+
+
+def _qsa_owner_vllm_config(cache_dtype: str) -> SimpleNamespace:
+    return SimpleNamespace(
+        cache_config=SimpleNamespace(cache_dtype=cache_dtype, block_size=16),
+        model_config=SimpleNamespace(dtype=torch.bfloat16),
+        parallel_config=SimpleNamespace(
+            prefill_context_parallel_size=1,
+            decode_context_parallel_size=1,
+        ),
+        num_speculative_tokens=0,
+    )
+
+
+@pytest.mark.parametrize(
+    "cache_dtype", ["auto", "bfloat16", "fp8", "fp8_e4m3", "nvfp4"]
+)
+def test_qsa_owner_admits_every_kv_cache_dtype_the_backend_serves(
+    cache_dtype, monkeypatch
+) -> None:
+    """The layer owner's own gate must admit the dtypes the backend declares.
+
+    The backend advertises nvfp4 and the impl accepts it, but the owner keeps a
+    second gate on `cache_config.cache_dtype`. It was dropped in an upstream
+    merge and serving stopped at engine init with NotImplementedError while
+    every kernel test still passed, because no test ran this constructor.
+    """
+    from vllm.models.qwen4_exp.nvidia import qsa as qsa_mod
+
+    def reached(*args, **kwargs):
+        raise _ReachedQKVParallelLinear
+
+    monkeypatch.setattr(qsa_mod, "QKVParallelLinear", reached)
+    monkeypatch.setattr(qsa_mod, "get_tensor_model_parallel_world_size", lambda: 1)
+
+    with pytest.raises(_ReachedQKVParallelLinear):
+        qsa_mod.Qwen4ExpQSAAttention(
+            vllm_config=_qsa_owner_vllm_config(cache_dtype),
+            config=_qsa_owner_config(),
+            layer_id=0,
+            prefix="model.layers.0.self_attn",
+        )
+
+
+def test_qsa_owner_rejects_a_kv_cache_dtype_it_cannot_read(monkeypatch) -> None:
+    """And an unsupported dtype must stop at that gate, not somewhere later."""
+    from vllm.models.qwen4_exp.nvidia import qsa as qsa_mod
+
+    def reached(*args, **kwargs):
+        raise _ReachedQKVParallelLinear
+
+    monkeypatch.setattr(qsa_mod, "QKVParallelLinear", reached)
+    monkeypatch.setattr(qsa_mod, "get_tensor_model_parallel_world_size", lambda: 1)
+
+    with pytest.raises(NotImplementedError, match="main KV cache"):
+        qsa_mod.Qwen4ExpQSAAttention(
+            vllm_config=_qsa_owner_vllm_config("fp8_e5m2"),
+            config=_qsa_owner_config(),
+            layer_id=0,
+            prefix="model.layers.0.self_attn",
+        )
+
+
+def _qsa_owner_for_spec(kv_cache_dtype: str, torch_dtype: torch.dtype):
+    """A QSA owner carrying only what `get_kv_cache_spec` reads.
+
+    The constructor builds projections and an indexer, none of which the spec
+    depends on, so the four attributes it does read are set directly.
+    """
+    from torch import nn
+
+    from vllm.models.qwen4_exp.nvidia.qsa import Qwen4ExpQSAAttention
+
+    owner = Qwen4ExpQSAAttention.__new__(Qwen4ExpQSAAttention)
+    nn.Module.__init__(owner)
+    owner.num_kv_heads = 2
+    owner.head_dim = 128
+    owner.kv_cache_dtype = kv_cache_dtype
+    owner.kv_cache_torch_dtype = torch_dtype
+    return owner
+
+
+def test_qsa_nvfp4_kv_cache_spec_sizes_its_own_slots() -> None:
+    """NVFP4 keeps K and V in separate per-head slots of packed bytes.
+
+    The spec carries that as `num_head_slots` and `state_content_bytes`; a spec
+    that dropped them would size the allocation as a dense BF16 page and the
+    cache would be wrong without anything raising.
+    """
+    from vllm.utils.torch_utils import nvfp4_kv_cache_full_dim
+
+    vllm_config = SimpleNamespace(cache_config=SimpleNamespace(block_size=16))
+    owner = _qsa_owner_for_spec("nvfp4", torch.uint8)
+    spec = owner.get_kv_cache_spec(vllm_config)
+
+    assert spec.num_head_slots == 2 * owner.num_kv_heads
+    assert spec.state_content_bytes == nvfp4_kv_cache_full_dim(owner.head_dim)
+    # The overrides have to reach the sizes the allocator actually uses.
+    assert spec.num_heads == 2 * owner.num_kv_heads
+    assert spec.state_content_size_bytes == nvfp4_kv_cache_full_dim(owner.head_dim)
+    assert spec.page_size_bytes == (
+        spec.block_size * spec.num_heads * spec.state_content_size_bytes
+    )
+
+
+@pytest.mark.parametrize(
+    ("kv_cache_dtype", "torch_dtype"),
+    [("auto", torch.bfloat16), ("fp8_e4m3", torch.uint8)],
+)
+def test_qsa_dense_kv_cache_spec_keeps_its_sizing(kv_cache_dtype, torch_dtype) -> None:
+    """A BF16 or e4m3 cache must be sized exactly as it was before NVFP4."""
+    vllm_config = SimpleNamespace(cache_config=SimpleNamespace(block_size=16))
+    owner = _qsa_owner_for_spec(kv_cache_dtype, torch_dtype)
+    spec = owner.get_kv_cache_spec(vllm_config)
+
+    assert spec.num_head_slots is None
+    assert spec.state_content_bytes is None
+    # Dense pages hold K and V for every head at the element width.
+    assert spec.num_heads == owner.num_kv_heads
+    assert spec.page_size_bytes == (
+        2 * spec.block_size * owner.num_kv_heads * owner.head_dim * torch_dtype.itemsize
+    )
+
+
+class _ReachedIndexer(Exception):
+    """Raised in place of the indexer, after the owner registers its scales."""
+
+
+def test_qsa_owner_keeps_its_default_scales_out_of_the_state_dict(monkeypatch) -> None:
+    """No Qwen4Exp checkpoint carries KV scales, so the defaults stay private.
+
+    Persistent buffers are what dummy-weight initialization randomizes, and the
+    strict NVFP4 slot writer rejects a randomized global scale. The owner keeps
+    all four out of `state_dict` while leaving both the device tensors and the
+    host floats at one.
+    """
+    from torch import nn
+
+    from vllm.models.qwen4_exp.nvidia import qsa as qsa_mod
+
+    captured: dict[str, torch.nn.Module] = {}
+
+    class _Capturing(qsa_mod.Qwen4ExpQSAAttention):
+        def __init__(self, **kwargs):
+            captured["owner"] = self
+            super().__init__(**kwargs)
+
+    monkeypatch.setattr(qsa_mod, "get_tensor_model_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(qsa_mod, "QKVParallelLinear", lambda *a, **k: nn.Identity())
+    monkeypatch.setattr(qsa_mod, "RowParallelLinear", lambda *a, **k: nn.Identity())
+    monkeypatch.setattr(qsa_mod, "GemmaRMSNorm", lambda *a, **k: nn.Identity())
+    monkeypatch.setattr(qsa_mod, "get_rope", lambda *a, **k: nn.Identity())
+    monkeypatch.setattr(qsa_mod, "MRotaryEmbedding", object)
+    monkeypatch.setattr(
+        qsa_mod, "Qwen4ExpQSAFlashAttentionImpl", lambda *a, **k: SimpleNamespace()
+    )
+
+    def reached(*args, **kwargs):
+        raise _ReachedIndexer
+
+    monkeypatch.setattr(qsa_mod, "QSAIndexer", reached)
+
+    # The shared helpers stop at the projection, so the few fields the layers
+    # between it and the scale registration read are added here.
+    config = _qsa_owner_config()
+    config.max_position_embeddings = 4096
+    config.rope_parameters = {"rope_type": "default", "rope_theta": 10000.0}
+    config.rms_norm_eps = 1e-6
+    vllm_config = _qsa_owner_vllm_config("nvfp4")
+    vllm_config.model_config.multimodal_config = None
+
+    with pytest.raises(_ReachedIndexer):
+        _Capturing(
+            vllm_config=vllm_config,
+            config=config,
+            layer_id=0,
+            prefix="model.layers.0.self_attn",
+        )
+
+    owner = captured["owner"]
+    names = ("_k_scale", "_v_scale", "_q_scale", "_prob_scale")
+    state = owner.state_dict()
+    assert not [name for name in names if name in state], sorted(state)
+    for name in names:
+        assert float(getattr(owner, name)) == 1.0, name
+    for name in ("_k_scale_float", "_v_scale_float", "_q_scale_float"):
+        assert getattr(owner, name) == 1.0, name
