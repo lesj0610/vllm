@@ -16,6 +16,7 @@ from vllm.model_executor.layers.rotary_embedding.mrope import triton_mrope
 from vllm.transformers_utils.configs.qwen4_exp import (
     Qwen4ExpTextConfig,
 )
+from vllm.utils.math_utils import cdiv, round_up
 
 from ..common.qsa_cache import (
     QSACompressedKeyCache,
@@ -179,6 +180,41 @@ class QSAIndexer(nn.Module):
             vllm_config=vllm_config,
         )
 
+        # The reservation below lands in whichever workspace ubatch slot the
+        # profiling run occupies, and that run has ubatching disabled, so it is
+        # always slot 0. A second slot would go to execution unreserved and
+        # then be locked, so refuse the combination rather than fail on the
+        # first full-width request that lands there.
+        if vllm_config.parallel_config.enable_dbo:
+            raise NotImplementedError(
+                "Qwen4Exp QSA selection does not support dual-batch overlap: "
+                "its scratch is reserved during profiling, which runs on one "
+                "ubatch slot only"
+            )
+
+        # What the selection scratch has to cover: the widest score row this
+        # deployment's context can reach, by the same rule select_and_expand
+        # sizes an actual batch by, and the most rows a batch can bring.
+        self._max_selection_columns = max(
+            64,
+            round_up(
+                cdiv(vllm_config.model_config.max_model_len, self.compress_ratio), 64
+            ),
+        )
+        self._max_batched_tokens = vllm_config.scheduler_config.max_num_batched_tokens
+
+        # Nothing is reserved here. Both halves of a QSA step come out of one
+        # reservation, and the only object holding both geometries is the
+        # attention owner, so it makes it -- and the owner is also what says
+        # which backend serves the step, once, after the model is built.
+        self.qsa_backend = "triton"
+        self.qsa_runtime = None
+
+    @property
+    def max_selection_columns(self) -> int:
+        """The widest score row this deployment's context can reach."""
+        return self._max_selection_columns
+
     @property
     def output_width(self) -> int:
         """Selection (index) columns per row."""
@@ -246,6 +282,10 @@ class QSAIndexer(nn.Module):
         """
         metadata = self._metadata()
         if metadata is None:
+            # No attention metadata means the profiling run. The selection
+            # scratch is already reserved in __init__, which does not depend on
+            # this pass happening.
+            #
             # Preserve step-0 indices when later MTP steps reuse the buffer.
             if self.skip_topk and out is not None:
                 return out
@@ -385,6 +425,39 @@ class QSAIndexer(nn.Module):
         if self.skip_topk:
             if out is None:
                 raise RuntimeError("QSA top-k reuse requires an output buffer")
+            return out
+
+        # FlashInfer serves scoring and expansion as one pair, so the choice is
+        # made for the whole batch rather than per decode/prefill split. Its
+        # ops take (token_to_req, query_positions, sequence_lengths), which only
+        # this caller holds; ops/qsa_indexer.py stays upstream-identical.
+        #
+        # Before the packed buffer below, because the two backends have
+        # different route contracts: the Triton one carries a trailing count
+        # column for its tile loop and this one is indices only. Which buffer
+        # the layer allocated follows from the backend, decided once when the
+        # model was built. The library checks the shape it was handed, so
+        # there is no second check here.
+        if self.qsa_backend == "flashinfer":
+            from .ops.qsa_flashinfer import qsa_compressed_view
+
+            if out is None:
+                raise RuntimeError("QSA selection requires the owner's route buffer")
+            if self.qsa_runtime is None:
+                raise RuntimeError(
+                    "Qwen4Exp QSA selects on FlashInfer here and its runtime "
+                    "is not planned yet: a step reached the indexer before the "
+                    "KV cache was bound"
+                )
+            self.qsa_runtime.run_selection(
+                q,
+                qsa_compressed_view(compressed_key_cache),
+                compressed_metadata.block_table,
+                compressed_metadata.token_to_req,
+                compressed_metadata.logical_positions[:num_tokens],
+                compressed_metadata.seq_lens,
+                out_route=out,
+            )
             return out
 
         if out is None:
