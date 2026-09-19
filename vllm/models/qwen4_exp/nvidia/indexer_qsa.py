@@ -203,24 +203,17 @@ class QSAIndexer(nn.Module):
         )
         self._max_batched_tokens = vllm_config.scheduler_config.max_num_batched_tokens
 
-        # Reserve here rather than from the profiling run's pass through
-        # forward(): that pass only reaches this code when the run carries no
-        # attention metadata, which depends on whether a minimal KV cache was
-        # built for it. Where it is skipped nothing reserves, the arena locks at
-        # whatever another consumer happened to need, and the first request
-        # wider than that dies on the lock instead of resizing. The workspace
-        # manager is initialized in init_device, before the model is built, so
-        # this runs unconditionally and lands in the memory profiler's snapshot
-        # like any other startup allocation.
-        from .ops.qsa_flashinfer import (
-            reserve_selection_workspace,
-            supports_qsa_selection,
-        )
+        # Nothing is reserved here. Both halves of a QSA step come out of one
+        # reservation, and the only object holding both geometries is the
+        # attention owner, so it makes it -- and the owner is also what says
+        # which backend serves the step, once, after the model is built.
+        self.qsa_backend = "triton"
+        self.qsa_runtime = None
 
-        if supports_qsa_selection(self.index_head_dim, self.index_n_heads):
-            reserve_selection_workspace(
-                self._max_batched_tokens, self._max_selection_columns
-            )
+    @property
+    def max_selection_columns(self) -> int:
+        """The widest score row this deployment's context can reach."""
+        return self._max_selection_columns
 
     @property
     def output_width(self) -> int:
@@ -310,7 +303,6 @@ class QSAIndexer(nn.Module):
             return result
 
         from .ops.qsa import qsa_compress_groups_with_ratio, qsa_store_cache_rows
-        from .ops.qsa_flashinfer import select_and_expand, supports_qsa_selection
         from .ops.qsa_indexer import (
             expand_qsa_block_indices,
             qsa_select_paged_decode,
@@ -435,6 +427,39 @@ class QSAIndexer(nn.Module):
                 raise RuntimeError("QSA top-k reuse requires an output buffer")
             return out
 
+        # FlashInfer serves scoring and expansion as one pair, so the choice is
+        # made for the whole batch rather than per decode/prefill split. Its
+        # ops take (token_to_req, query_positions, sequence_lengths), which only
+        # this caller holds; ops/qsa_indexer.py stays upstream-identical.
+        #
+        # Before the packed buffer below, because the two backends have
+        # different route contracts: the Triton one carries a trailing count
+        # column for its tile loop and this one is indices only. Which buffer
+        # the layer allocated follows from the backend, decided once when the
+        # model was built. The library checks the shape it was handed, so
+        # there is no second check here.
+        if self.qsa_backend == "flashinfer":
+            from .ops.qsa_flashinfer import qsa_compressed_view
+
+            if out is None:
+                raise RuntimeError("QSA selection requires the owner's route buffer")
+            if self.qsa_runtime is None:
+                raise RuntimeError(
+                    "Qwen4Exp QSA selects on FlashInfer here and its runtime "
+                    "is not planned yet: a step reached the indexer before the "
+                    "KV cache was bound"
+                )
+            self.qsa_runtime.run_selection(
+                q,
+                qsa_compressed_view(compressed_key_cache),
+                compressed_metadata.block_table,
+                compressed_metadata.token_to_req,
+                compressed_metadata.logical_positions[:num_tokens],
+                compressed_metadata.seq_lens,
+                out_route=out,
+            )
+            return out
+
         if out is None:
             out = torch.empty(
                 num_tokens,
@@ -454,26 +479,6 @@ class QSAIndexer(nn.Module):
             dtype=torch.int32,
             device=q.device,
         )
-
-        # FlashInfer serves scoring and expansion as one pair, so the choice is
-        # made for the whole batch rather than per decode/prefill split. Its
-        # ops take (token_to_req, query_positions, sequence_lengths), which only
-        # this caller holds; ops/qsa_indexer.py stays upstream-identical.
-        if supports_qsa_selection(q.shape[2], q.shape[1]):
-            select_and_expand(
-                q,
-                compressed_key_cache,
-                compressed_metadata.block_table,
-                compressed_metadata.token_to_req,
-                compressed_metadata.logical_positions[:num_tokens],
-                compressed_metadata.seq_lens,
-                self.compress_ratio,
-                self.token_topk,
-                compressed_metadata.max_seq_len,
-                block_indices,
-                out,
-            )
-            return out
 
         # Decode requests occupy the leading rows and share one query length.
         if num_decode_tokens:

@@ -24,6 +24,53 @@ requires_qsa_kernels = pytest.mark.skipif(
 )
 
 
+# Triton cannot type an fp8e4m3 pointer below compute capability 8.9 -- it
+# offers fp8e4b15 and fp8e5 there and nothing that matches e4m3. An fp8 case is
+# therefore unrunnable on such a device, not failing, so it skips.
+requires_native_fp8 = pytest.mark.skipif(
+    not current_platform.is_cuda() or not current_platform.has_device_capability(89),
+    reason="Triton's fp8e4nv needs compute capability 8.9",
+)
+
+fp8_e4m3 = pytest.param(torch.float8_e4m3fn, marks=requires_native_fp8)
+
+
+def test_the_fp8_skip_covers_only_what_needs_a_native_fp8_pointer() -> None:
+    """What the marker is allowed to take out, and what it may not.
+
+    Two different things are called FP8 here. The selection kernels type an
+    ``e4m3`` pointer, which Triton cannot do below compute capability 8.9, so
+    those cases are unrunnable on such a device rather than failing. The paged
+    attention kernel reads the same pages as raw bytes and folds the host's
+    scales in afterwards, which any SM8 device does -- so it runs everywhere
+    and must never pick this marker up. Skipping it would quietly drop the FP8
+    cache support this backend is here for.
+    """
+    assert fp8_e4m3.values == (torch.float8_e4m3fn,)
+    assert fp8_e4m3.marks == (requires_native_fp8,)
+    assert "8.9" in requires_native_fp8.kwargs["reason"]
+
+    # The marker answers the architecture question and nothing else: on a
+    # device that has native FP8 it takes nothing out at all.
+    skipping = requires_native_fp8.args[0]
+    assert skipping == (
+        not current_platform.is_cuda() or not current_platform.has_device_capability(89)
+    )
+
+    # No paged-attention test carries this marker. Found by name rather than
+    # listed, because which of them this branch has depends on what else has
+    # landed, and a list would silently stop covering the ones it misses.
+    attention_tests = {
+        name: value
+        for name, value in globals().items()
+        if name.startswith("test_qsa_sparse_paged_attention")
+    }
+    assert attention_tests, "no paged-attention test to check the marker against"
+    for name, test in attention_tests.items():
+        marks = getattr(test, "pytestmark", [])
+        assert requires_native_fp8 not in marks, f"{name} was skipped by arch"
+
+
 def test_qsa_mtp_index_share_updates_cache_but_skips_selection(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -677,7 +724,7 @@ def test_qsa_fused_metadata_matches_pytorch_for_large_padded_prefill() -> None:
         (4, 33),
     ],
 )
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, fp8_e4m3])
 def test_qsa_decode_selection_correctness(
     decode_query_len: int, num_requests: int, dtype: torch.dtype
 ) -> None:
@@ -775,7 +822,7 @@ def test_qsa_decode_selection_correctness(
 
 
 @requires_qsa_kernels
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, fp8_e4m3])
 @pytest.mark.parametrize("seq_len_slack", [0, 1792])
 @pytest.mark.parametrize("force_chunk", [False, True])
 def test_qsa_prefill_selection_correctness(
