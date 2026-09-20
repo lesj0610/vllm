@@ -268,10 +268,12 @@ def fi_chunk_gated_delta_rule(
         initial_state=fi_state,
         output_final_state=output_final_state,
         cu_seqlens=cu_seqlens,
-        # The longest sequence in this batch. Without it the chunk-parallel
-        # path is never offered, because the wrapper will not read cu_seqlens
-        # off the device to find out.
-        _max_seq_len=max_seq_len,
+        # The batch's exact longest sequence. It enables the SM80 auto CP
+        # rule, which will not guess a maximum, and it avoids the conservative
+        # whole-batch grid the wrapper falls back to when the maximum is not
+        # stated -- the wrapper will not read cu_seqlens off the device to
+        # find out for itself.
+        max_seqlen=max_seq_len,
     )
     # FlashInfer returns (output, state) when output_final_state=True,
     # or just output when output_final_state=False.
