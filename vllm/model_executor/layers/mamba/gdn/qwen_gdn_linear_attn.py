@@ -208,6 +208,8 @@ def _log_gdn_backend_decision(
             head_k_dim,
         )
         return
+    elif current_platform.is_xpu():
+        return
 
     chosen = {
         "flashinfer": "FlashInfer",
@@ -586,6 +588,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 self.gdn_decode_kernel = "triton"
         elif current_platform.is_cpu():
             self.gdn_decode_kernel = "CPU"
+        elif current_platform.is_xpu():
+            self.gdn_decode_kernel = "XPU"
 
         self.enable_fused_gdn_decode = self.gdn_decode_kernel == "cuda"
         logger.info_once("GDN decode kernel: %s", self.gdn_decode_kernel)
