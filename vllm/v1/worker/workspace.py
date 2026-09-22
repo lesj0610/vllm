@@ -227,6 +227,24 @@ class WorkspaceManager:
             )
         return ubatch_id * self._num_lanes + lane
 
+    def assert_within(self, limits: tuple[int, ...], phase: str) -> None:
+        """Fail when any ubatch arena grew past what ``limits`` recorded."""
+        current = self.workspace_sizes_bytes()
+        if len(current) != len(limits) or any(
+            c > lim for c, lim in zip(current, limits)
+        ):
+            raise AssertionError(
+                f"Attention workspace arena exceeded its profiled size {phase}: "
+                f"profiled={limits}, current={current}."
+            )
+
+    def workspace_sizes_bytes(self) -> tuple[int, ...]:
+        """Return the allocated size of every ubatch workspace."""
+        return tuple(
+            self._workspace_size_bytes(workspace)
+            for workspace in self._current_workspaces
+        )
+
     def _ensure_workspace_size(self, required_bytes: int) -> torch.Tensor:
         """Ensure workspace is allocated and large enough, return current workspace.
 

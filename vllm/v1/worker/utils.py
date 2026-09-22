@@ -4,15 +4,18 @@ import math
 from collections import defaultdict
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
+from functools import partial
 from itertools import product as iprod
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 import torch
 
-from vllm.config import CacheConfig, VllmConfig
+from vllm.config import CacheConfig, VllmConfig, get_layers_from_vllm_config
+from vllm.config.vllm import set_current_vllm_config
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import Attention
+from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.mamba.mamba_mixer2 import share_replayssm_ring_trackers
 from vllm.model_executor.layers.utils import warmup_rocm_skinny_gemm_workspaces
 from vllm.model_executor.models.interfaces import MultiModalEmbeddings
@@ -42,6 +45,38 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.worker.block_table import get_block_table_width
 
 logger = init_logger(__name__)
+
+
+def requires_persistent_attention_workspace_profiling(
+    vllm_config: VllmConfig,
+) -> bool:
+    """Whether every relevant builder supports the reservation lifecycle.
+
+    A builder answering ``None`` vetoes the lifecycle for the whole model, so
+    a mixed-backend model stays on the legacy path. Elastic EP regrows the
+    shared arena during reconfiguration and draft-model builders own a
+    separate lifecycle, so both opt out up front.
+    """
+    if vllm_config.parallel_config.enable_elastic_ep:
+        return False
+    if vllm_config.speculative_config is not None:
+        return False
+    layer_type = cast(type[Any], AttentionLayerBase)
+    found_required = False
+    for attn_module in get_layers_from_vllm_config(vllm_config, layer_type).values():
+        kv_cache_spec = attn_module.get_kv_cache_spec(vllm_config)
+        if kv_cache_spec is None:
+            continue
+        builder_cls = attn_module.get_attn_backend().get_builder_cls()
+        support = builder_cls.persistent_workspace_profiling_support(
+            vllm_config, kv_cache_spec
+        )
+        if not isinstance(support, bool):
+            # ``None`` opts out; anything else is an unknown contract that a
+            # mixed-backend model must not be allowed to silently join.
+            return False
+        found_required = found_required or support
+    return found_required
 
 
 def raise_if_nan_logits(num_nans_in_logits: Mapping[str, int]) -> None:
@@ -828,3 +863,96 @@ class EncoderTimingStats:
             "encoder_forward_secs": self.encoder_forward_secs,
             "num_encoder_calls": self.num_encoder_calls,
         }
+
+
+from vllm.v1.worker.workspace import (  # noqa: E402
+    current_workspace_manager,
+    use_workspace_ubatch_id,
+)
+
+
+def _iter_attn_groups(runner) -> Iterable[Any]:
+    """Yield every attention group of either runner generation."""
+    group_iterator = getattr(runner, "_attn_group_iterator", None)
+    if group_iterator is not None:
+        yield from group_iterator()
+        return
+    for groups in runner.attn_groups:
+        yield from groups
+
+
+def reserve_attention_workspace(runner) -> list[Any]:
+    """Materialize every builder's persistent workspace; return their owners.
+
+    The returned list keeps the wrapper-owned int workspaces alive past the
+    profiling teardown; runtime callers discard it.
+    """
+    if not getattr(runner, "attn_groups", None):
+        return []
+
+    builders = [
+        (ubatch_id, builder)
+        for attn_group in _iter_attn_groups(runner)
+        for ubatch_id, builder in enumerate(attn_group.metadata_builders)
+    ]
+    # Arenas first, wrappers second: a wrapper caches its arena's size at
+    # construction, so none may exist while a later builder can still grow it.
+    for materialize in (False, True):
+        for ubatch_id, builder in builders:
+            with use_workspace_ubatch_id(ubatch_id):
+                builder.prepare_workspace_for_profiling(materialize)
+    # The closing memory_profiling snapshot reads free memory, so the
+    # allocations above have to be settled and freed segments returned first.
+    torch.accelerator.synchronize()
+    torch.accelerator.empty_cache()
+    return [builder for _, builder in builders]
+
+
+def reserve_persistent_attention_workspace(runner) -> None:
+    manager = current_workspace_manager()
+    profiled_sizes = getattr(runner, "_profiled_persistent_workspace_sizes", None)
+    if profiled_sizes is not None:
+        manager.assert_within(profiled_sizes, "before persistent finalization")
+    reserve_attention_workspace(runner)
+    if profiled_sizes is not None:
+        manager.assert_within(profiled_sizes, "during persistent finalization")
+    else:
+        runner._profiled_persistent_workspace_sizes = manager.workspace_sizes_bytes()
+
+
+def prepare_profiling_workspace(runner) -> list[Any]:
+    """Reserve persistent workspace inside the memory-profiling window."""
+    init_kv = getattr(runner, "_init_minimal_kv_cache_for_profiling", None)
+    if init_kv is not None:
+        cleanup_kv = runner._cleanup_profiling_kv_cache
+    else:
+        # V2 keeps the minimal-KV bootstrap and teardown as module helpers
+        # shared with graph profiling, imported at call time as it does.
+        from vllm.v1.worker.gpu import cudagraph_utils
+
+        init_kv = partial(cudagraph_utils._init_minimal_kv_cache_for_profiling, runner)
+        cleanup_kv = partial(cudagraph_utils._teardown_profiling_state, runner)
+    lease: list[Any] | None = None
+    try:
+        with set_current_vllm_config(runner.vllm_config):
+            init_kv()
+        lease = reserve_attention_workspace(runner)
+    except Exception:
+        try:
+            cleanup_kv()
+        except Exception:
+            logger.exception("Failed to clean up after workspace preparation")
+        raise
+    assert lease is not None
+    try:
+        cleanup_kv()
+    except Exception:
+        # Re-running a teardown that already ran part way is not safe, so the
+        # reservation is dropped and this error is the one that propagates.
+        lease.clear()
+        raise
+
+    # The reservation above is part of the activation peak the profiler is
+    # about to measure, not of it.
+    torch.accelerator.reset_peak_memory_stats(runner.device)
+    return lease
