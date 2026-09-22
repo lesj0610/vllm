@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from contextlib import contextmanager
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -13,6 +14,10 @@ from vllm.config import (
     ParallelConfig,
     VllmConfig,
     set_current_vllm_config,
+)
+from vllm.model_executor.models.config import (
+    DiffusionGemmaModelForBlockDiffusionConfig,
+    Gemma4Config,
 )
 from vllm.platforms import current_platform
 from vllm.platforms.cpu import CpuPlatform
@@ -28,13 +33,76 @@ if current_platform.is_rocm():
 else:
     RocmPlatform = None
 
-from vllm.v1.attention.backend import AttentionType
-from vllm.v1.attention.backends.registry import AttentionBackendEnum
+from vllm.v1.attention.backend import AttentionBackend, AttentionType
+from vllm.v1.attention.backends.registry import AttentionBackendEnum, register_backend
 from vllm.v1.attention.selector import (
     AttentionSelectorConfig,
     _cached_get_attn_backend,
     get_attn_backend,
 )
+
+
+class _FakeModelArchConfig(list):
+    """Stand-in for ModelArchitectureConfig's per-layer indexing."""
+
+    @property
+    def total_num_hidden_layers(self) -> int:
+        return len(self)
+
+
+def _make_gemma4_vllm_config(
+    *,
+    backend: AttentionBackendEnum | None = None,
+    head_dim: int = 256,
+    global_head_dim: int = 512,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_text_config=SimpleNamespace(
+                layer_types=["sliding_attention", "full_attention"],
+            ),
+            model_arch_config=_FakeModelArchConfig(
+                [
+                    SimpleNamespace(head_size=head_dim),
+                    SimpleNamespace(head_size=global_head_dim),
+                ]
+            ),
+            hf_config=SimpleNamespace(canvas_length=256),
+            override_generation_config={},
+        ),
+        diffusion_config=None,
+        scheduler_config=None,
+        attention_config=AttentionConfig(backend=backend),
+    )
+
+
+def _patch_fa_version_supported(
+    monkeypatch: pytest.MonkeyPatch,
+    is_supported,
+) -> None:
+    import vllm.v1.attention.backends.fa_utils as fa_utils
+    import vllm.v1.attention.backends.flash_attn as flash_attn
+
+    monkeypatch.setattr(fa_utils, "is_fa_version_supported", is_supported)
+    monkeypatch.setattr(flash_attn, "is_fa_version_supported", is_supported)
+
+
+class FakeFlashInferBackend(AttentionBackend):
+    @staticmethod
+    def get_name() -> str:
+        return "FLASHINFER"
+
+    @staticmethod
+    def get_impl_cls():
+        return None
+
+    @staticmethod
+    def get_builder_cls():
+        return None
+
+    @staticmethod
+    def get_kv_cache_shape(*args, **kwargs):
+        return ()
 
 
 @pytest.fixture(autouse=True)
@@ -447,6 +515,119 @@ def test_auto_backend_selection_behavior():
     assert backend_auto.get_name() == backend_none.get_name()
 
 
+def test_gemma4_keeps_auto_backend_when_fa4_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Gemma4 config should not bypass the normal backend selector."""
+    _patch_fa_version_supported(monkeypatch, lambda version: False)
+    vllm_config = _make_gemma4_vllm_config()
+
+    Gemma4Config.verify_and_update_config(vllm_config)
+
+    assert vllm_config.attention_config.backend is None
+    assert vllm_config.attention_config.flash_attn_version is None
+
+
+def test_gemma4_keeps_existing_fa4_selection(monkeypatch: pytest.MonkeyPatch):
+    _patch_fa_version_supported(monkeypatch, lambda version: version == 4)
+    vllm_config = _make_gemma4_vllm_config()
+
+    Gemma4Config.verify_and_update_config(vllm_config)
+
+    assert vllm_config.attention_config.backend is None
+    assert vllm_config.attention_config.flash_attn_version == 4
+
+
+def test_gemma4_keeps_explicit_flashinfer_when_fa4_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    _patch_fa_version_supported(monkeypatch, lambda version: False)
+    vllm_config = _make_gemma4_vllm_config(
+        backend=AttentionBackendEnum.FLASHINFER,
+    )
+
+    Gemma4Config.verify_and_update_config(vllm_config)
+
+    assert vllm_config.attention_config.backend == AttentionBackendEnum.FLASHINFER
+    assert vllm_config.attention_config.flash_attn_version is None
+
+
+def test_diffusion_gemma_keeps_flashinfer_blocker(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    _patch_fa_version_supported(monkeypatch, lambda version: False)
+    vllm_config = _make_gemma4_vllm_config(
+        backend=AttentionBackendEnum.FLASHINFER,
+    )
+
+    with pytest.raises(ValueError, match="mixed causal/bidirectional attention"):
+        DiffusionGemmaModelForBlockDiffusionConfig.verify_and_update_config(vllm_config)
+
+
+def test_diffusion_gemma_auto_uses_triton_when_fa4_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    _patch_fa_version_supported(monkeypatch, lambda version: False)
+    vllm_config = _make_gemma4_vllm_config()
+
+    DiffusionGemmaModelForBlockDiffusionConfig.verify_and_update_config(vllm_config)
+
+    assert vllm_config.attention_config.backend == AttentionBackendEnum.TRITON_ATTN
+    assert vllm_config.attention_config.flash_attn_version is None
+
+
+def test_diffusion_gemma_keeps_explicit_fa_version_when_fa4_available(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    _patch_fa_version_supported(monkeypatch, lambda version: version == 4)
+    vllm_config = _make_gemma4_vllm_config()
+    vllm_config.attention_config.flash_attn_version = 3
+
+    DiffusionGemmaModelForBlockDiffusionConfig.verify_and_update_config(vllm_config)
+
+    assert vllm_config.attention_config.backend is None
+    assert vllm_config.attention_config.flash_attn_version == 3
+
+
+@pytest.mark.skipif(CudaPlatform is None, reason="CudaPlatform not available")
+def test_cuda_auto_selects_flashinfer_for_gemma4_without_fa4(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(
+        CudaPlatform,
+        "get_device_capability",
+        classmethod(lambda cls, device_id=0: DeviceCapability(8, 6)),
+    )
+    register_backend(
+        AttentionBackendEnum.FLASHINFER,
+        f"{__name__}.FakeFlashInferBackend",
+    )
+    _patch_fa_version_supported(monkeypatch, lambda version: False)
+
+    try:
+        vllm_config = VllmConfig(
+            attention_config=AttentionConfig(backend=None),
+            cache_config=CacheConfig(block_size=16),
+        )
+        gemma4_config = _make_gemma4_vllm_config()
+        gemma4_config.attention_config = vllm_config.attention_config
+        Gemma4Config.verify_and_update_config(gemma4_config)
+
+        with (
+            set_current_vllm_config(vllm_config),
+            patch("vllm.platforms.current_platform", CudaPlatform()),
+        ):
+            backend = get_attn_backend(
+                head_size=512,
+                dtype=torch.bfloat16,
+                kv_cache_dtype="auto",
+            )
+    finally:
+        AttentionBackendEnum.FLASHINFER.clear_override()
+
+    assert backend.get_name() == "FLASHINFER"
+
+
 @pytest.mark.parametrize(
     "backend_name,flash_attn_version,should_succeed",
     [
@@ -819,7 +1000,9 @@ def blackwell_selection():
             return_value=DeviceCapability(10, 0),
         ),
         patch(
-            "vllm.v1.attention.backends.fa_utils.is_fa_version_supported",
+            # get_flash_attn_version() imports this inside the call, so the
+            # patch has to land on the defining module, not on fa_utils.
+            "vllm.vllm_flash_attn.flash_attn_interface.is_fa_version_supported",
             return_value=True,
         ),
     ):
@@ -835,7 +1018,9 @@ def hopper_selection():
             return_value=DeviceCapability(9, 0),
         ),
         patch(
-            "vllm.v1.attention.backends.fa_utils.is_fa_version_supported",
+            # get_flash_attn_version() imports this inside the call, so the
+            # patch has to land on the defining module, not on fa_utils.
+            "vllm.vllm_flash_attn.flash_attn_interface.is_fa_version_supported",
             return_value=True,
         ),
     ):
@@ -845,10 +1030,17 @@ def hopper_selection():
 @blackwell_only
 @pytest.mark.parametrize("use_mm_prefix", [False, True])
 @pytest.mark.parametrize("flash_attn_version", [None, 3, 4])
+@pytest.mark.parametrize("native_mm_prefix", [False, True])
 def test_hopper_mm_prefix_selects_triton_flash_attn(
-    use_mm_prefix, flash_attn_version, hopper_selection
+    use_mm_prefix, flash_attn_version, native_mm_prefix, hopper_selection
 ):
-    """Hopper selects the composite only when its causal route resolves FA4."""
+    """Hopper selects the composite only when its causal route resolves FA4.
+
+    Below the composite the order is FLASH_ATTN, FLASHINFER, TRITON_ATTN, so
+    once FlashInfer can serve an mm-prefix batch itself it answers before the
+    Triton fallback. Without FA4 and without that FlashInfer support, the
+    fallback is what is left.
+    """
     from vllm.engine.arg_utils import EngineArgs
 
     config = EngineArgs(
@@ -856,35 +1048,62 @@ def test_hopper_mm_prefix_selects_triton_flash_attn(
         dtype="bfloat16",
         attention_config=AttentionConfig(flash_attn_version=flash_attn_version),
     ).create_engine_config()
-    with set_current_vllm_config(config):
+    with (
+        patch(
+            "vllm.v1.attention.backends.flashinfer._mm_prefix_jit_available",
+            return_value=native_mm_prefix,
+        ),
+        set_current_vllm_config(config),
+    ):
         backend = get_attn_backend(
             256, torch.bfloat16, None, use_mm_prefix=use_mm_prefix
         )
     fa4_resolved = config.attention_config.flash_attn_version == 4
-    if use_mm_prefix:
-        expected = "TRITON_FLASH_ATTN" if fa4_resolved else "TRITON_ATTN"
-    else:
+    if not use_mm_prefix:
         expected = "FLASH_ATTN"
+    elif fa4_resolved:
+        expected = "TRITON_FLASH_ATTN"
+    elif native_mm_prefix:
+        expected = "FLASHINFER"
+    else:
+        expected = "TRITON_ATTN"
     assert backend.get_name() == expected
 
 
 @blackwell_only
 @pytest.mark.parametrize("use_mm_prefix", [False, True])
 @pytest.mark.parametrize("kv_cache_dtype", [None, "fp8_e4m3"])
-def test_mm_prefix_selects_composite_without_changing_causal_default(
-    use_mm_prefix, kv_cache_dtype, blackwell_selection
+@pytest.mark.parametrize("native_mm_prefix", [False, True])
+def test_mm_prefix_priority_without_changing_causal_default(
+    use_mm_prefix, kv_cache_dtype, native_mm_prefix, blackwell_selection
 ):
-    """The image-mask requirement must reach CUDA's automatic backend priority."""
+    """The image-mask requirement must reach CUDA's automatic backend priority.
+
+    FlashInfer serves an mm-prefix batch in one kernel when its own combination
+    validates, so it is offered before the composite; the composite is what the
+    priority falls back to otherwise. An fp8 cache is one such case: the
+    mm-prefix path rejects it whatever the JIT probe reports.
+    """
     from vllm.engine.arg_utils import EngineArgs
 
     config = EngineArgs(
         model="google/gemma-4-31B-it", dtype="bfloat16"
     ).create_engine_config()
-    with set_current_vllm_config(config):
+    with (
+        patch(
+            "vllm.v1.attention.backends.flashinfer._mm_prefix_jit_available",
+            return_value=native_mm_prefix,
+        ),
+        set_current_vllm_config(config),
+    ):
         backend = get_attn_backend(
             256, torch.bfloat16, kv_cache_dtype, use_mm_prefix=use_mm_prefix
         )
-    expected = "TRITON_FLASHINFER" if use_mm_prefix else "FLASHINFER"
+    native_serves_it = native_mm_prefix and kv_cache_dtype is None
+    if not use_mm_prefix or native_serves_it:
+        expected = "FLASHINFER"
+    else:
+        expected = "TRITON_FLASHINFER"
     assert backend.get_name() == expected
 
 
