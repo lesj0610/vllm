@@ -584,10 +584,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         slot_mapping_enabled = []
         for kv_cache_group in kv_cache_config.kv_cache_groups:
             spec = kv_cache_group.kv_cache_spec
+            if isinstance(spec, UniformTypeKVCacheSpecs):
+                spec = spec.first_spec
             block_sizes.append(spec.block_size)
             layer_spec = (
                 spec.first_spec if isinstance(spec, UniformTypeKVCacheSpecs) else spec
             )
+            # Custom-slot-mapping groups (e.g. QSA circular buffers) compute
+            # their own mappings; the shared kernel must emit PAD for them.
+            # uses_slot_mapping is False for exactly those specs.
             slot_mapping_enabled.append(layer_spec.uses_slot_mapping)
             # Let each cache type account for CP. Attention KV is DCP-sharded,
             # while Mamba/GDN recurrent state is replicated across DCP ranks.

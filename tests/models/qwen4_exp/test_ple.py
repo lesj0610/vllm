@@ -14,6 +14,7 @@ from torch.nn import functional as F
 import vllm.model_executor.layers.vocab_parallel_embedding as embedding_module
 import vllm.model_executor.parameter as parameter_module
 import vllm.models.qwen4_exp.nvidia.ngram_embedding as ngram_embedding_module
+import vllm.models.qwen4_exp.nvidia.ple_layer as ple_layer_module
 from vllm.model_executor.layers.quantization.fp8 import Fp8Config
 from vllm.model_executor.layers.quantization.modelopt import (
     ModelOptMixedPrecisionConfig,
@@ -1715,3 +1716,86 @@ def test_fused_gate_correctness(num_tokens: int, strided_kv: bool) -> None:
     expected_normed = grouped_norm(expected_gated, norm_conv)
     assert torch.equal(gated, expected_gated)
     torch.testing.assert_close(normed, expected_normed, atol=1e-2, rtol=1e-2)
+
+
+def test_ngram_cpu_offload_padding_does_not_overwrite_real_tokens(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    del monkeypatch
+    module = Qwen4ExpNGramEmbedding.__new__(Qwen4ExpNGramEmbedding)
+    nn.Module.__init__(module)
+    module.ngram_size = 2
+    module.heads_per_ngram = 1
+    module.ngram_heads = 1
+    module.eos_token_id = 99
+    module.register_buffer("layer_multipliers", torch.tensor([3, 5]))
+    module.register_buffer("ngram_heads_vocab_sizes", torch.tensor([101]))
+    module.register_buffer("ngram_heads_offsets", torch.tensor([0]))
+
+    # query_start_loc stays unpadded while the token count carries CUDA-graph
+    # padding, so the extra rows must not reach the scatter.
+    query_start_loc = torch.tensor([0, 2])
+    ngram_context = torch.full((1, 1), 99, dtype=torch.long)
+    expected = module.compute_ngram_ids(
+        torch.tensor([11, 13]), query_start_loc, ngram_context
+    )
+    actual = module.compute_ngram_ids(
+        torch.tensor([11, 13, 777, 888]), query_start_loc, ngram_context
+    )
+
+    assert torch.equal(actual[:2], expected)
+
+
+@pytest.mark.parametrize(
+    "attn_metadata",
+    [
+        pytest.param(None, id="no-metadata"),
+        pytest.param(
+            {"model.layers.0.self_attn": object()}, id="no-entry-for-this-layer"
+        ),
+    ],
+)
+def test_ple_short_conv_is_a_no_op_without_layer_metadata(
+    monkeypatch: pytest.MonkeyPatch, attn_metadata: object
+) -> None:
+    """The metadata-free profiling path leaves the gated residual untouched.
+
+    ``_short_conv`` writes into ``residual`` in place and the gating already
+    happened in ``ple_gate``, so skipping the convolution keeps a valid output.
+    The fork used to route this path through a stateless ``conv1d`` fallback,
+    which only existed because its ``_short_conv`` returned a tensor.
+    """
+    module = Qwen4ExpPLELayer.__new__(Qwen4ExpPLELayer)
+    nn.Module.__init__(module)
+    module.prefix = "model.layers.1.ple"
+    inputs = torch.arange(6, dtype=torch.float32).reshape(3, 2)
+    residual = torch.full((3, 2), 7.0)
+    expected = residual.clone()
+    monkeypatch.setattr(
+        ple_layer_module,
+        "get_forward_context",
+        lambda: SimpleNamespace(attn_metadata=attn_metadata),
+    )
+
+    assert module._short_conv(inputs, residual) is None
+    torch.testing.assert_close(residual, expected)
+
+
+def test_ple_state_shape_reserves_speculative_tokens() -> None:
+    module = Qwen4ExpPLELayer.__new__(Qwen4ExpPLELayer)
+    nn.Module.__init__(module)
+    module.hc_hidden_size = 32
+    module.conv_state_len = 9
+    module.num_spec_tokens = 3
+
+    assert module.get_state_shape()[0] in ((32, 12), (12, 32))
+
+
+def test_ngram_embedding_rejects_mismatched_checkpoint_shard() -> None:
+    module = _make_ngram_embedding_for_load_test()
+
+    with pytest.raises(
+        ValueError,
+        match=r"Shape mismatch for PLE embedding shard 0",
+    ):
+        module.load_weights([("ngram_embedding.shard_0.weight", torch.zeros(3, 2))])
