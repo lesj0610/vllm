@@ -29,6 +29,7 @@ from typing import ClassVar
 
 import torch
 from torch import nn
+from transformers.models.qwen3_vl import Qwen3VLProcessor
 
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
@@ -106,11 +107,19 @@ logger = init_logger(__name__)
 
 
 class Qwen3_5ProcessingInfo(Qwen3VLProcessingInfo):
+    def get_hf_processor(self, **kwargs: object) -> Qwen3VLProcessor:
+        # A top-level backend selector is also forwarded to the video processor.
+        # Let Transformers select Qwen's default image backend when none is given.
+        return self.ctx.get_hf_processor(Qwen3VLProcessor, **kwargs)
+
     def get_hf_config(self):
         return self.ctx.get_hf_config(Qwen3_5Config)
 
 
 class Qwen3_5MoeProcessingInfo(Qwen3VLProcessingInfo):
+    def get_hf_processor(self, **kwargs: object) -> Qwen3VLProcessor:
+        return self.ctx.get_hf_processor(Qwen3VLProcessor, **kwargs)
+
     def get_hf_config(self):
         # transformers 5.x renames the top-level Qwen3.5-MoE config class to
         # Qwen3_5MoeTextConfig for text-only models, while transformers ≤4.x
