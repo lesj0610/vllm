@@ -59,8 +59,10 @@ from vllm.third_party.flash_linear_attention.ops import (
 from vllm.third_party.flash_linear_attention.ops.chunk import l2norm_fwd
 from vllm.third_party.flash_linear_attention.ops.utils import FLA_CHUNK_SIZE
 from vllm.transformers_utils.configs.qwen3_next import Qwen3NextConfig
-from vllm.triton_utils import tl, triton
-from vllm.utils.flashinfer import has_flashinfer_gdn_prefill_sm8x
+from vllm.utils.flashinfer import (
+    flashinfer_gdn_prefill_takes_max_seqlen,
+    has_flashinfer_gdn_prefill_sm8x,
+)
 from vllm.utils.torch_utils import (
     LayerNameType,
     _encode_layer_name,
@@ -261,6 +263,16 @@ def fi_chunk_gated_delta_rule(
     fi_beta = beta.to(torch.float32)
     if cu_seqlens is not None:
         cu_seqlens = cu_seqlens.to(torch.int64)
+    # The batch's exact longest sequence. It enables the SM80 auto CP rule,
+    # which will not guess a maximum, and it avoids the conservative
+    # whole-batch grid the wrapper falls back to when the maximum is not
+    # stated -- the wrapper will not read cu_seqlens off the device to find
+    # out for itself. Only builds whose signature takes it are given it: a
+    # 0.7.0 without the argument serves every other architecture fine, and
+    # sizes its grids from the token total exactly as before.
+    batch_maximum: dict[str, int] = {}
+    if max_seq_len is not None and flashinfer_gdn_prefill_takes_max_seqlen():
+        batch_maximum["max_seqlen"] = max_seq_len
     result = chunk_gated_delta_rule_fi(
         q=q,
         k=k,
@@ -270,12 +282,8 @@ def fi_chunk_gated_delta_rule(
         initial_state=fi_state,
         output_final_state=output_final_state,
         cu_seqlens=cu_seqlens,
-        # The batch's exact longest sequence. It enables the SM80 auto CP
-        # rule, which will not guess a maximum, and it avoids the conservative
-        # whole-batch grid the wrapper falls back to when the maximum is not
-        # stated -- the wrapper will not read cu_seqlens off the device to
-        # find out for itself.
-        max_seqlen=max_seq_len,
+        backend="flashinfer",
+        **batch_maximum,
     )
     # FlashInfer returns (output, state) when output_final_state=True,
     # or just output when output_final_state=False.
@@ -2117,74 +2125,3 @@ direct_register_custom_op(
     op_func=qwen_gdn_attention_core_fused_norm_packed,
     mutates_args=["core_attn_out"],
 )
-
-
-@triton.jit
-def fused_gdn_gating_kernel(
-    g,
-    beta_output,
-    A_log,
-    a,
-    b,
-    dt_bias,
-    seq_len,
-    NUM_HEADS: tl.constexpr,
-    beta: tl.constexpr,
-    threshold: tl.constexpr,
-    BLK_HEADS: tl.constexpr,
-):
-    i_b, i_s, i_d = tl.program_id(0), tl.program_id(1), tl.program_id(2)
-    head_off = i_d * BLK_HEADS + tl.arange(0, BLK_HEADS)
-    off = i_b * seq_len * NUM_HEADS + i_s * NUM_HEADS + head_off
-    mask = head_off < NUM_HEADS
-    blk_A_log = tl.load(A_log + head_off, mask=mask)
-    blk_a = tl.load(a + off, mask=mask)
-    blk_b = tl.load(b + off, mask=mask)
-    blk_bias = tl.load(dt_bias + head_off, mask=mask)
-    # If the model is loaded in fp16, without the .float() here, A might be -inf
-    x = blk_a.to(tl.float32) + blk_bias.to(tl.float32)
-    softplus_x = tl.where(
-        beta * x <= threshold, (1 / beta) * tl.log(1 + tl.exp(beta * x)), x
-    )
-    blk_g = -tl.exp(blk_A_log.to(tl.float32)) * softplus_x
-    tl.store(g + off, blk_g.to(g.dtype.element_ty), mask=mask)
-    # compute beta_output = sigmoid(b)
-    blk_beta_output = tl.sigmoid(blk_b.to(tl.float32))
-    tl.store(
-        beta_output + off, blk_beta_output.to(beta_output.dtype.element_ty), mask=mask
-    )
-
-
-def fused_gdn_gating(
-    A_log: torch.Tensor,
-    a: torch.Tensor,
-    b: torch.Tensor,
-    dt_bias: torch.Tensor,
-    beta: float = 1.0,
-    threshold: float = 20.0,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Fused computation of g and beta for Gated Delta Net.
-    g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
-    beta_output = b.sigmoid()
-    TODO maybe use torch.compile to replace this triton kernel
-    """
-    batch, num_heads = a.shape
-    seq_len = 1
-    grid = (batch, seq_len, triton.cdiv(num_heads, 8))
-    g = torch.empty(1, batch, num_heads, dtype=torch.float32, device=a.device)
-    beta_output = torch.empty(1, batch, num_heads, dtype=b.dtype, device=b.device)
-    fused_gdn_gating_kernel[grid](
-        g,
-        beta_output,
-        A_log,
-        a,
-        b,
-        dt_bias,
-        seq_len,
-        num_heads,
-        beta,
-        threshold,
-        8,
-        num_warps=1,
-    )
-    return g, beta_output

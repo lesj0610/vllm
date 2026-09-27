@@ -9,6 +9,7 @@ import contextlib
 import functools
 import importlib
 import importlib.util
+import inspect
 import os
 import shutil
 from collections.abc import Callable, Iterator
@@ -450,6 +451,29 @@ def has_flashinfer_gdn_prefill_sm8x() -> bool:
     return mod is not None and callable(
         getattr(mod, "chunk_gated_delta_rule_sm80", None)
     )
+
+
+@functools.cache
+def flashinfer_gdn_prefill_takes_max_seqlen() -> bool:
+    """Return whether the GDN prefill accepts an explicit batch maximum.
+
+    0.7.0 sizes its per-sequence grids from the token total and keeps the
+    maximum internal; taking it from the caller is a later addition. The
+    parameter is what says which build this is -- the SM8x gate above cannot,
+    because a build may carry one and not the other. Passing the argument to a
+    build without it raises TypeError on every architecture, including the
+    ones that already worked.
+    """
+    if not has_flashinfer():
+        return False
+    mod = _get_submodule("flashinfer.gdn_prefill")
+    fn = getattr(mod, "chunk_gated_delta_rule", None) if mod is not None else None
+    if fn is None:
+        return False
+    try:
+        return "max_seqlen" in inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
 
 
 @functools.cache
