@@ -2,13 +2,17 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """What the GDN prefill selector answers, per request and per device."""
 
+import sys
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 import vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn as gdn_module
+import vllm.utils.flashinfer as flashinfer_utils
 from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
     _resolve_gdn_prefill_backend,
+    fi_chunk_gated_delta_rule,
 )
 from vllm.platforms.interface import DeviceCapability
 
@@ -123,3 +127,152 @@ def test_a_non_cuda_platform_resolves_to_triton(
         SimpleNamespace(is_cuda=lambda: False, is_cpu=lambda: True),
     )
     assert _resolve_gdn_prefill_backend(_config("flashinfer"))[1] == "triton"
+
+
+# --- what the prefill adapter hands FlashInfer -------------------------------
+#
+# The batch maximum is a later addition to chunk_gated_delta_rule; 0.7.0 keeps
+# it internal and derives the grids from the token total. The adapter has to
+# read the installed signature and leave the keyword out of the builds that do
+# not take it, or every architecture the base path already served raises
+# TypeError. These stubs declare their parameters explicitly: a **kwargs stub
+# would accept the keyword either way and prove nothing.
+
+
+def _stub_without_max_seqlen(seen: dict):
+    def chunk_gated_delta_rule(
+        q,
+        k,
+        v,
+        g=None,
+        beta=None,
+        initial_state=None,
+        output_final_state=False,
+        cu_seqlens=None,
+        use_qk_l2norm_in_kernel=False,
+        backend="auto",
+    ):
+        seen.update(backend=backend, has_max_seqlen=False, q_shape=tuple(q.shape))
+        return torch.zeros_like(q), initial_state
+
+    return chunk_gated_delta_rule
+
+
+def _stub_with_max_seqlen(seen: dict):
+    def chunk_gated_delta_rule(
+        q,
+        k,
+        v,
+        g=None,
+        beta=None,
+        initial_state=None,
+        output_final_state=False,
+        cu_seqlens=None,
+        use_qk_l2norm_in_kernel=False,
+        backend="auto",
+        max_seqlen=None,
+    ):
+        seen.update(
+            backend=backend,
+            has_max_seqlen=True,
+            max_seqlen=max_seqlen,
+            q_shape=tuple(q.shape),
+        )
+        return torch.zeros_like(q), initial_state
+
+    return chunk_gated_delta_rule
+
+
+def _install_stub(monkeypatch: pytest.MonkeyPatch, fn) -> SimpleNamespace:
+    """Publish `fn` as the installed GDN prefill and reset the cached probe."""
+    module = SimpleNamespace(chunk_gated_delta_rule=fn)
+    monkeypatch.setattr(flashinfer_utils, "has_flashinfer", lambda: True)
+    monkeypatch.setattr(
+        flashinfer_utils,
+        "_get_submodule",
+        lambda name: module if name == "flashinfer.gdn_prefill" else None,
+    )
+    monkeypatch.setitem(sys.modules, "flashinfer.gdn_prefill", module)
+    flashinfer_utils.flashinfer_gdn_prefill_takes_max_seqlen.cache_clear()
+    return module
+
+
+@pytest.fixture(autouse=True)
+def _forget_probe():
+    """The probe is cached for the process, so neither side may leak."""
+    flashinfer_utils.flashinfer_gdn_prefill_takes_max_seqlen.cache_clear()
+    yield
+    flashinfer_utils.flashinfer_gdn_prefill_takes_max_seqlen.cache_clear()
+
+
+def _adapter_inputs(seq_lens: list[int], num_heads: int = 2, head_dim: int = 4):
+    total = sum(seq_lens)
+    shape = (1, total, num_heads, head_dim)
+    starts = [0]
+    for length in seq_lens:
+        starts.append(starts[-1] + length)
+    return dict(
+        q=torch.zeros(shape),
+        k=torch.zeros(shape),
+        v=torch.zeros(shape),
+        g=torch.zeros(1, total, num_heads),
+        beta=torch.ones(1, total, num_heads),
+        initial_state=torch.zeros(len(seq_lens), num_heads, head_dim, head_dim),
+        output_final_state=True,
+        cu_seqlens=torch.tensor(starts, dtype=torch.int32),
+        use_qk_l2norm_in_kernel=False,
+    )
+
+
+@pytest.mark.parametrize(
+    ("seq_lens", "batch_maximum"),
+    [([1024, 1024, 1024, 1024], 1024), ([4096], 4096)],
+    ids=["four-equal", "one-long"],
+)
+def test_adapter_passes_the_batch_maximum_when_the_build_takes_it(
+    monkeypatch: pytest.MonkeyPatch, seq_lens: list[int], batch_maximum: int
+) -> None:
+    seen: dict = {}
+    _install_stub(monkeypatch, _stub_with_max_seqlen(seen))
+
+    inputs = _adapter_inputs(seq_lens)
+    output, final_state = fi_chunk_gated_delta_rule(**inputs, max_seq_len=batch_maximum)
+
+    assert seen["backend"] == "flashinfer"
+    assert seen["max_seqlen"] == batch_maximum
+    # The adapter squeezes the leading axis on the way in and restores it on
+    # the way out, and returns the state the callee reports.
+    assert seen["q_shape"] == (sum(seq_lens), 2, 4)
+    assert tuple(output.shape) == (1, sum(seq_lens), 2, 4)
+    assert final_state.shape == inputs["initial_state"].shape
+
+
+def test_adapter_omits_the_batch_maximum_when_the_build_lacks_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: dict = {}
+    _install_stub(monkeypatch, _stub_without_max_seqlen(seen))
+
+    output, final_state = fi_chunk_gated_delta_rule(
+        **_adapter_inputs([1024, 1024, 1024, 1024]), max_seq_len=1024
+    )
+
+    # No TypeError, and the backend still names the implementation to run.
+    assert seen["has_max_seqlen"] is False
+    assert seen["backend"] == "flashinfer"
+    assert tuple(output.shape) == (1, 4096, 2, 4)
+    assert final_state is not None
+
+
+def test_the_probe_answers_from_the_signature_not_the_sm8x_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A build may carry the SM8x entry point and not this argument."""
+    probe = flashinfer_utils.flashinfer_gdn_prefill_takes_max_seqlen
+
+    module = _install_stub(monkeypatch, _stub_without_max_seqlen({}))
+    module.chunk_gated_delta_rule_sm80 = lambda *a, **kw: None
+    assert probe() is False
+
+    _install_stub(monkeypatch, _stub_with_max_seqlen({}))
+    assert probe() is True
