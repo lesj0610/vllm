@@ -51,7 +51,9 @@ TOKEN_TOPK = 32
 MAX_ROWS = 64
 MAX_COLUMNS = 64
 NUM_LAYERS = 4
-ROUTE_WIDTH = flashinfer.selection_route_width(TOKEN_TOPK, COMPRESS_RATIO)
+ROUTE_WIDTH = flashinfer.qsa_ops.selection.selection_route_width(
+    TOKEN_TOPK, COMPRESS_RATIO
+)
 
 SUPPORTED_DTYPES = ("auto", "bfloat16", "fp8", "fp8_e4m3", "nvfp4")
 
@@ -117,7 +119,7 @@ def test_a_missing_capability_refuses_the_layer(monkeypatch):
     serve on it: falling through would change the kernel, the memory profile
     and the answer to why a step got slower, with nothing said.
     """
-    monkeypatch.setattr(flashinfer, "qsa_capabilities", lambda device: 0)
+    monkeypatch.setattr(flashinfer.qsa_ops, "qsa_capabilities", lambda device: 0)
     with pytest.raises(RuntimeError, match="requires FlashInfer"):
         qsa_flashinfer.require_qsa_flashinfer(HEAD_DIM, "nvfp4")
 
@@ -434,7 +436,7 @@ def test_both_halves_of_a_step_come_out_of_one_reservation(device):
     """
     manager = WorkspaceManager(device)
     config = _config()
-    need = flashinfer.QSA.workspace_requirements(config, device=device)
+    need = flashinfer.qsa_ops.QSA.workspace_requirements(config, device=device)
     persistent = torch.empty(need.persistent_bytes, dtype=torch.uint8, device=device)
     manager.get_simultaneous(((need.transient_bytes,), torch.uint8))
     manager.lock()
@@ -444,7 +446,7 @@ def test_both_halves_of_a_step_come_out_of_one_reservation(device):
     torch.accelerator.synchronize()
     mark = torch.accelerator.memory_allocated()
 
-    runtime = flashinfer.QSA(config, persistent)
+    runtime = flashinfer.qsa_ops.QSA(config, persistent)
     runtime.bind_transient_workspace(transient)
     torch.accelerator.synchronize()
     assert torch.accelerator.memory_allocated() == mark, (
@@ -494,7 +496,7 @@ def test_both_halves_of_a_step_come_out_of_one_reservation(device):
         v,
         route=route,
         block_table=block_table,
-        token_to_req=token_to_req,
+        token_to_request=token_to_req,
         output_gate=gate,
         out=out,
     )
@@ -667,7 +669,7 @@ def _step_once(device, owners):
             views.v_data,
             route=route,
             block_table=block_table,
-            token_to_req=token_to_req,
+            token_to_request=token_to_req,
             output_gate=gate,
             out=out,
         )
@@ -702,7 +704,7 @@ def _prepared_step(device, owners, caches, randomize_caches=False):
                 views.v_data,
                 route=route,
                 block_table=table,
-                token_to_req=token_to_req,
+                token_to_request=token_to_req,
                 output_gate=gate,
                 k_sf=views.k_sf,
                 v_sf=views.v_sf,
@@ -880,7 +882,7 @@ def test_a_step_builds_and_allocates_nothing(device, worker):
     A planner call, a JIT load or a tensor allocation inside a step is a thing
     a graph cannot contain and the memory profile cannot see.
     """
-    import flashinfer.qsa_attention as attention_module
+    import flashinfer.qsa_ops.attention as attention_module
     import flashinfer.topk as topk_module
 
     owners = _owners()
@@ -908,8 +910,8 @@ def test_a_step_builds_and_allocates_nothing(device, worker):
     watch(flashinfer.BlockSparseAttentionWrapper, "query_workspace_size", "sizing")
     watch(attention_module, "BlockSparseAttentionWrapper", "wrapper")
     watch(topk_module, "get_topk_module", "topk_module")
-    watch(flashinfer.QSA, "workspace_requirements", "sizing")
-    watch(flashinfer.QSA, "plan_cache", "planning")
+    watch(flashinfer.qsa_ops.QSA, "workspace_requirements", "sizing")
+    watch(flashinfer.qsa_ops.QSA, "plan_cache", "planning")
     try:
         gc.collect()
         torch.accelerator.synchronize()

@@ -29,7 +29,7 @@ from vllm.v1.worker.workspace import (
 )
 
 if TYPE_CHECKING:
-    import flashinfer
+    from flashinfer import qsa_ops
 
 logger = init_logger(__name__)
 
@@ -74,7 +74,7 @@ def require_qsa_flashinfer(head_dim: int, kv_cache_dtype: str) -> None:
             f"serves {sorted(_KV_CACHE_DTYPES)}"
         )
     try:
-        from flashinfer import (
+        from flashinfer.qsa_ops import (
             QSA_CAP_ATTENTION_PAGED,
             QSA_CAP_OUTPUT_GATE,
             QSA_CAP_SELECTION,
@@ -201,7 +201,7 @@ def qsa_config(
     token_topk: int,
     index_num_heads: int,
     index_head_dim: int,
-) -> flashinfer.QSAConfig:
+) -> qsa_ops.QSAConfig:
     """This deployment's QSA, in the library's terms.
 
     Assembled from the config alone, because it is needed before the cache is
@@ -211,10 +211,10 @@ def qsa_config(
     both are settled when the cache is allocated, which is later, and both
     belong to ``plan_cache``.
     """
-    import flashinfer
+    from flashinfer import qsa_ops
 
     kind, layout, kv_dtype = qsa_cache_kinds(kv_cache_dtype)
-    return flashinfer.QSAConfig(
+    return qsa_ops.QSAConfig(
         num_qo_heads=num_qo_heads,
         num_kv_heads=num_kv_heads,
         head_dim=head_dim,
@@ -233,8 +233,8 @@ def qsa_config(
 
 
 def qsa_workspace_needs(
-    config: flashinfer.QSAConfig, device: torch.device
-) -> flashinfer.QSAWorkspaceRequirements:
+    config: qsa_ops.QSAConfig, device: torch.device
+) -> qsa_ops.QSAWorkspaceRequirements:
     """What the library asks for: two byte counts with two lifetimes.
 
     The first has to be memory nobody else writes, because the plans are read
@@ -246,13 +246,13 @@ def qsa_workspace_needs(
     the alignment travels with them, and a caller that unpacks the counts is a
     caller that can forget it.
     """
-    import flashinfer
+    from flashinfer import qsa_ops
 
-    return flashinfer.QSA.workspace_requirements(config, device=device)
+    return qsa_ops.QSA.workspace_requirements(config, device=device)
 
 
 def allocate_qsa_persistent(
-    needs: flashinfer.QSAWorkspaceRequirements, device: torch.device
+    needs: qsa_ops.QSAWorkspaceRequirements, device: torch.device
 ) -> torch.Tensor:
     """The bytes the plans live in, which are this side's to keep alive.
 
@@ -284,7 +284,7 @@ def _manager():
     return current_workspace_manager()
 
 
-def reserve_qsa_transient(needs: flashinfer.QSAWorkspaceRequirements) -> None:
+def reserve_qsa_transient(needs: qsa_ops.QSAWorkspaceRequirements) -> None:
     """Claim the scratch while the workspace can still grow.
 
     Called from the owner's constructor, which is the only place this can
@@ -296,7 +296,7 @@ def reserve_qsa_transient(needs: flashinfer.QSAWorkspaceRequirements) -> None:
 
 
 def take_qsa_transient(
-    needs: flashinfer.QSAWorkspaceRequirements,
+    needs: qsa_ops.QSAWorkspaceRequirements,
 ) -> torch.Tensor:
     """The scratch view as the manager hands it out right now.
 
@@ -316,10 +316,10 @@ def take_qsa_transient(
 
 
 def build_qsa_runtime(
-    config: flashinfer.QSAConfig,
+    config: qsa_ops.QSAConfig,
     persistent: torch.Tensor,
     transient: torch.Tensor,
-) -> flashinfer.QSA:
+) -> qsa_ops.QSA:
     """Hand the library both buffers and let it lay them out.
 
     Called at a bind rather than once, because the first bind happens before
@@ -334,9 +334,9 @@ def build_qsa_runtime(
     buffer, a CUDA graph replays the pointers of both, and a plan built inside
     a capture is not a thing.
     """
-    import flashinfer
+    from flashinfer import qsa_ops
 
-    runtime = flashinfer.QSA(config, persistent)
+    runtime = qsa_ops.QSA(config, persistent)
     runtime.bind_transient_workspace(transient)
     return runtime
 

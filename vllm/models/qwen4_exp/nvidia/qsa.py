@@ -323,7 +323,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             views.v_data,
             route=logical_indices,
             block_table=block_table,
-            token_to_req=token_to_req,
+            token_to_request=token_to_req,
             output_gate=output_gate,
             k_sf=views.k_sf,
             v_sf=views.v_sf,
