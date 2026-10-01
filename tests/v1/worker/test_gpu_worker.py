@@ -671,7 +671,7 @@ def test_profiling_lease_is_held_across_the_closing_measurement(monkeypatch):
     worker.__dict__.update(_LEASE_STATE)
     worker.model_runner = SimpleNamespace(
         model_memory_usage=0,
-        profile_run=lambda: None,
+        profile_run=lambda randomize_inputs=False: None,
         profile_cudagraph_memory=lambda: _record(
             events, ("cudagraph_profiling", bool(held)), 0
         ),
