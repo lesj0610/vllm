@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Fused QSA pre-indexer kernel for Qwen4Exp."""
+"""Fused QSA prepare kernel for Qwen4Exp, and the FlashInfer pre-indexer."""
 
 import functools
+from typing import Literal
 
 import torch
 from torch.utils.weak import WeakTensorKeyDictionary
 
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.flashinfer import has_flashinfer
 
@@ -22,7 +24,7 @@ def _has_cuda_pre_indexer() -> bool:
     wheel install without ``flashinfer-cubin`` on a host without ``nvcc``
     exports the name and then raises on the first step. ``has_flashinfer()``
     owns that check, and the module is loaded here so a missing artifact keeps
-    the Triton path instead of failing mid-serve.
+    the layer off this path instead of failing mid-serve.
     """
     if not has_flashinfer():
         return False
@@ -63,13 +65,24 @@ def _pre_indexer_accepts_dtypes(
 
     # Past here the module built and loaded, so a failure is a real defect or an
     # allocation failure. Reporting it as "unsupported" would bury it behind a
-    # silent fall back to Triton.
+    # silent fall back to another path.
     mask = qsa_pre_indexer_dispatch_mask()
     if out_dtype == compute_dtype:
         return bool(mask & QSA_PRE_INDEXER_SAME_AS_COMPUTE)
     if out_dtype == torch.float8_e4m3fn:
         return bool(mask & QSA_PRE_INDEXER_NARROW_E4M3)
     return False
+
+
+def flashinfer_pre_indexer_supported(
+    compute_dtype: torch.dtype, out_dtype: torch.dtype, head_dim: int
+) -> bool:
+    """Whether FlashInfer's pre-indexer takes a layer of this head size and dtypes."""
+    return (
+        current_platform.is_cuda()
+        and head_dim in (128, 256)
+        and _pre_indexer_accepts_dtypes(compute_dtype, out_dtype)
+    )
 
 
 # Triton compiles ``fp8e4nv`` only from sm_89 on; below that it offers e5m2 and the
@@ -86,38 +99,65 @@ def _triton_can_write(out_dtype: torch.dtype) -> bool:
     return torch.cuda.get_device_capability() >= _TRITON_E4M3_MIN_CAPABILITY
 
 
-def warmup_pre_indexer_capability(
-    compute_dtype: torch.dtype,
-    out_dtype: torch.dtype,
-    cos_sin_cache: torch.Tensor | None = None,
-) -> None:
-    """Settle which path will run, while it is still safe to build and to fail.
+# What the fused prepare stores into the main K/V cache, per cache dtype. Any other
+# cache (a packed format, say) is not something it can write.
+_FUSED_MAIN_CACHE_DTYPES = {
+    "auto": torch.bfloat16,
+    "bfloat16": torch.bfloat16,
+    "fp8": torch.float8_e4m3fn,
+    "fp8_e4m3": torch.float8_e4m3fn,
+}
 
-    Two things happen here rather than at the first forward. The capability query
-    builds FlashInfer's module on a cache miss, and that first forward may already be
-    a CUDA graph capture. And when neither path can write ``out_dtype``, this is where
-    that has to be said: the alternative is a compile error from Triton in the middle
-    of serving, naming a dtype the operator never chose by hand.
 
-    Call it from a run that is eager and on the real device -- the profiling run.
-    """
-    if _pre_indexer_accepts_dtypes(compute_dtype, out_dtype):
-        # The FlashInfer path also needs the pair-major rotary table, and that one
-        # refuses to be built under capture for the same reason the module does. The
-        # first kernel launch is itself a capture, so it cannot be what builds it.
-        if cos_sin_cache is not None:
-            _paired_cos_sin(cos_sin_cache)
-        return
-    if _triton_can_write(out_dtype):
-        return
-    raise RuntimeError(
-        f"The QSA pre-indexer cannot write {out_dtype}: this FlashInfer build does "
-        "not carry the narrowing arm (qsa_pre_indexer_dispatch_mask reports no e4m3), "
-        "and the Triton path cannot compile fp8e4nv below compute capability "
-        f"{_TRITON_E4M3_MIN_CAPABILITY[0]}.{_TRITON_E4M3_MIN_CAPABILITY[1]}. Install a "
-        "FlashInfer with pre-indexer e4m3 support, or serve with "
-        "--indexer-kv-dtype bf16."
+def fused_prepare_supported(indexer_dtype: torch.dtype, kv_cache_dtype: str) -> bool:
+    """Whether the fused prepare can store both the indexer rows and the main K/V."""
+    main_dtype = _FUSED_MAIN_CACHE_DTYPES.get(kv_cache_dtype)
+    return (
+        main_dtype is not None
+        and _triton_can_write(indexer_dtype)
+        and _triton_can_write(main_dtype)
     )
+
+
+def select_pre_indexer(
+    compute_dtype: torch.dtype,
+    indexer_dtype: torch.dtype,
+    head_dim: int,
+    kv_cache_dtype: str,
+) -> Literal["flashinfer", "fused", "reference"]:
+    """Which path writes a layer's indexer rows: FlashInfer first.
+
+    FlashInfer's pre-indexer writes the indexer rows only, so a layer on it keeps
+    the main QK-norm/RoPE/gate and K/V write on their own kernels. The fused
+    prepare writes both, where Triton can store all of it. Anything else takes the
+    unfused reference path, which stores the indexer rows through Triton as well:
+    when Triton cannot, this is where that has to be said, rather than a compile
+    error in the middle of serving naming a dtype the operator never chose by hand.
+    """
+    if flashinfer_pre_indexer_supported(compute_dtype, indexer_dtype, head_dim):
+        return "flashinfer"
+    if not _triton_can_write(indexer_dtype):
+        raise RuntimeError(
+            f"The QSA pre-indexer cannot write {indexer_dtype}: this FlashInfer build "
+            "does not carry the narrowing arm (qsa_pre_indexer_dispatch_mask reports "
+            "no e4m3), and Triton cannot compile fp8e4nv below compute capability "
+            f"{_TRITON_E4M3_MIN_CAPABILITY[0]}.{_TRITON_E4M3_MIN_CAPABILITY[1]}. "
+            "Install a FlashInfer with pre-indexer e4m3 support, or serve with "
+            "--indexer-kv-dtype bf16."
+        )
+    if fused_prepare_supported(indexer_dtype, kv_cache_dtype):
+        return "fused"
+    return "reference"
+
+
+def warmup_flashinfer_pre_indexer(cos_sin_cache: torch.Tensor) -> None:
+    """Build the pair-major rotary table the FlashInfer pre-indexer reads.
+
+    The table refuses to be built under capture, and the first kernel launch may
+    itself be a capture. Call this from a run that is eager and on the real device
+    -- the profiling run.
+    """
+    _paired_cos_sin(cos_sin_cache)
 
 
 # Keyed on the tensor itself, not on where it happens to sit: an address is
@@ -226,6 +266,27 @@ def _norm_rope(
     return tl.reshape(result, (TILE_T, TILE_H, D))
 
 
+@triton.jit
+def _to_dst_dtype(x, dst, scale):
+    """Round to BF16 like the unfused path, then scale for an FP8 destination."""
+    out_ty = dst.dtype.element_ty
+    x = x.to(tl.bfloat16)
+    if out_ty == tl.float8e4nv:
+        x = x.to(tl.float32) / scale
+    return x.to(out_ty)
+
+
+@triton.jit
+def _store_rotated(dst, y, o1, o2, scale):
+    """Store a normalized head whose first ``2 * len(o1)`` dims are rotated."""
+    HALF: tl.constexpr = o1.shape[0]
+    dims = tl.arange(0, y.shape[0])
+    rot = tl.arange(0, HALF)
+    tl.store(dst + dims, _to_dst_dtype(y, dst, scale), mask=dims >= 2 * HALF)
+    tl.store(dst + rot, _to_dst_dtype(o1, dst, scale))
+    tl.store(dst + HALF + rot, _to_dst_dtype(o2, dst, scale))
+
+
 @triton.jit(
     do_not_specialize=[
         "num_tokens",
@@ -234,7 +295,7 @@ def _norm_rope(
         "num_k_work",
     ]
 )
-def _qsa_pre_indexer_kernel(
+def _qsa_prepare_kernel(
     q_ptr,
     q_stride_token,
     k_ptr,
@@ -278,8 +339,86 @@ def _qsa_pre_indexer_kernel(
     CACHE_HAS_ROPE_POS: tl.constexpr,
     MROPE_H: tl.constexpr,
     MROPE_W: tl.constexpr,
+    main_qkv_ptr,
+    main_q_norm_weight_ptr,
+    main_k_norm_weight_ptr,
+    main_eps,
+    main_q_out_ptr,
+    main_gate_out_ptr,
+    main_cache_ptr,
+    main_cache_stride_block,
+    main_cache_stride_token,
+    main_cache_stride_head,
+    main_slots_ptr,
+    main_k_scale,
+    main_v_scale,
+    MAIN_HQ: tl.constexpr,
+    MAIN_HK: tl.constexpr,
+    MAIN_D: tl.constexpr,
+    MAIN_PAGE_SIZE: tl.constexpr,
 ):
     pid = tl.program_id(0)
+    num_index_work = num_k_work + tl.cdiv(num_tokens, TILE_T_Q) * tl.cdiv(HQ, TILE_H_Q)
+    if pid >= num_index_work:
+        # Main attention: one program per (token, Q or KV head) after the
+        # indexer work. RoPE covers the first D // 2 dims, the width of the
+        # shared cos/sin table.
+        main_pid = pid - num_index_work
+        token = main_pid // (MAIN_HQ + MAIN_HK)
+        head = main_pid % (MAIN_HQ + MAIN_HK)
+        HALF: tl.constexpr = D // 4
+        dims = tl.arange(0, MAIN_D)
+        rot = tl.arange(0, HALF)
+        row = main_qkv_ptr + token * (2 * (MAIN_HQ + MAIN_HK) * MAIN_D)
+        is_k = head >= MAIN_HQ
+        kv_head = head - MAIN_HQ
+        if is_k:
+            src = row + (2 * MAIN_HQ + kv_head) * MAIN_D
+            weight_ptr = main_k_norm_weight_ptr
+        else:
+            src = row + 2 * head * MAIN_D
+            weight_ptr = main_q_norm_weight_ptr
+        x = tl.load(src + dims).to(tl.float32)
+        inv_rms = tl.rsqrt(tl.sum(x * x, axis=0) / MAIN_D + main_eps)
+        w = tl.load(weight_ptr + dims).to(tl.float32) + 1.0
+        y = x * inv_rms * w
+        x1 = tl.load(src + rot).to(tl.float32)
+        x2 = tl.load(src + HALF + rot).to(tl.float32)
+        w1 = tl.load(weight_ptr + rot).to(tl.float32) + 1.0
+        w2 = tl.load(weight_ptr + HALF + rot).to(tl.float32) + 1.0
+        x1 = (x1 * inv_rms * w1).to(tl.bfloat16).to(tl.float32)
+        x2 = (x2 * inv_rms * w2).to(tl.bfloat16).to(tl.float32)
+        pos = tl.load(pos_ptr + token * pos_stride_token).to(tl.int64)
+        if IS_2D_POSITIONS:
+            pos_h = tl.load(pos_ptr + pos_stride_axis + token * pos_stride_token)
+            pos_w = tl.load(pos_ptr + 2 * pos_stride_axis + token * pos_stride_token)
+            is_h = (rot % 3 == 1) & (rot < 3 * MROPE_H)
+            is_w = (rot % 3 == 2) & (rot < 3 * MROPE_W)
+            pos = tl.where(
+                is_h, pos_h.to(tl.int64), tl.where(is_w, pos_w.to(tl.int64), pos)
+            )
+        cos = tl.load(cos_sin_ptr + pos * (D // 2) + rot).to(tl.float32)
+        sin = tl.load(cos_sin_ptr + pos * (D // 2) + HALF + rot).to(tl.float32)
+        o1 = x1 * cos - x2 * sin
+        o2 = x2 * cos + x1 * sin
+        if is_k:
+            slot = tl.load(main_slots_ptr + token).to(tl.int64)
+            if slot >= 0:
+                dst = (
+                    main_cache_ptr
+                    + (slot // MAIN_PAGE_SIZE) * main_cache_stride_block
+                    + (slot % MAIN_PAGE_SIZE) * main_cache_stride_token
+                    + kv_head * main_cache_stride_head
+                )
+                _store_rotated(dst, y, o1, o2, main_k_scale)
+                v = tl.load(src + MAIN_HK * MAIN_D + dims)
+                tl.store(dst + MAIN_D + dims, _to_dst_dtype(v, dst, main_v_scale))
+        else:
+            out = (token * MAIN_HQ + head) * MAIN_D
+            _store_rotated(main_q_out_ptr + out, y, o1, o2, None)
+            gate = tl.load(src + MAIN_D + dims)
+            tl.store(main_gate_out_ptr + out + dims, gate)
+        return
     # K work occupies the first programs; the remaining programs tile Q. This
     # keeps both paths in one launch while leaving their register shapes
     # independent.
@@ -546,7 +685,7 @@ def _qsa_pre_indexer_kernel(
                     tl.store(tail + 2, pos_w.to(tl.int64), mask=valid_slot)
 
 
-def qsa_pre_indexer(
+def qsa_prepare(
     q: torch.Tensor,
     k: torch.Tensor,
     positions: torch.Tensor,
@@ -567,11 +706,28 @@ def qsa_pre_indexer(
     compress_ratio: int,
     mrope_section: tuple[int, int, int] | None,
     rope_pos_offset: int | None,
-) -> None:
-    """Normalize Q, compress K, then update the circular raw state."""
+    main_qkv: torch.Tensor,
+    main_q_norm_weight: torch.Tensor,
+    main_k_norm_weight: torch.Tensor,
+    main_eps: float,
+    main_kv_cache: torch.Tensor,
+    main_slot_mapping: torch.Tensor,
+    main_k_scale: float,
+    main_v_scale: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Normalize Q, compress K, then update the circular raw state.
+
+    Also prepares the main attention (QK-norm/RoPE, gate copy, K/V cache write)
+    and returns its Q and gate.
+    """
     num_tokens = q.shape[0]
+    main_head_dim = main_kv_cache.shape[-1] // 2
+    num_main_kv_heads = main_kv_cache.shape[2]
+    num_main_q_heads = main_qkv.shape[1] // (2 * main_head_dim) - num_main_kv_heads
+    main_q_out = main_qkv.new_empty(num_tokens, num_main_q_heads, main_head_dim)
+    main_gate_out = torch.empty_like(main_q_out)
     if num_tokens == 0:
-        return
+        return main_q_out, main_gate_out
     num_q_heads, head_dim = q_out.shape[1:]
     assert cos_sin_cache.shape[-1] * 2 == head_dim
     assert q.shape == (num_tokens, num_q_heads * head_dim)
@@ -596,39 +752,9 @@ def qsa_pre_indexer(
         pos_stride_axis, pos_stride_token = 0, positions.stride(0)
     section = mrope_section if mrope_section is not None else (0, 0, 0)
     assert len(section) == 3
-
-    if (
-        _has_cuda_pre_indexer()
-        and _pre_indexer_accepts_dtypes(q.dtype, q_out.dtype)
-        and head_dim in (128, 256)
-        and q.is_cuda
-    ):
-        from flashinfer.qsa_ops import qsa_pre_indexer
-
-        qsa_pre_indexer(
-            q,
-            k,
-            positions,
-            _paired_cos_sin(cos_sin_cache),
-            q_norm_weight,
-            k_norm_weight,
-            eps,
-            q_out,
-            state_cache,
-            state_slots,
-            state_block_table,
-            query_start_loc,
-            logical_positions,
-            compressed_cache,
-            compressed_slots,
-            k_work_metadata,
-            compress_ratio,
-            mrope_h=section[1],
-            mrope_w=section[2],
-            is_k_mrope=is_k_mrope,
-            cache_has_rope_pos=cache_has_rope_pos,
-        )
-        return
+    qkv_width = 2 * (num_main_q_heads + num_main_kv_heads) * main_head_dim
+    assert main_qkv.shape == (num_tokens, qkv_width) and main_qkv.is_contiguous()
+    assert main_slot_mapping.shape == (num_tokens,)
 
     if num_tokens <= 4096:
         TILE_T_Q, TILE_H_Q = 2, 2
@@ -636,7 +762,8 @@ def qsa_pre_indexer(
         TILE_T_Q, TILE_H_Q = 2, 4
     num_k_work = k_work_metadata.shape[0]
     num_q_work = triton.cdiv(num_tokens, TILE_T_Q) * triton.cdiv(num_q_heads, TILE_H_Q)
-    _qsa_pre_indexer_kernel[(num_k_work + num_q_work,)](
+    num_main_work = num_tokens * (num_main_q_heads + num_main_kv_heads)
+    _qsa_prepare_kernel[(num_k_work + num_q_work + num_main_work,)](
         q,
         q.stride(0),
         k,
@@ -680,8 +807,91 @@ def qsa_pre_indexer(
         CACHE_HAS_ROPE_POS=cache_has_rope_pos,
         MROPE_H=section[1],
         MROPE_W=section[2],
+        main_qkv_ptr=main_qkv,
+        main_q_norm_weight_ptr=main_q_norm_weight,
+        main_k_norm_weight_ptr=main_k_norm_weight,
+        main_eps=main_eps,
+        main_q_out_ptr=main_q_out,
+        main_gate_out_ptr=main_gate_out,
+        main_cache_ptr=main_kv_cache,
+        main_cache_stride_block=main_kv_cache.stride(0),
+        main_cache_stride_token=main_kv_cache.stride(1),
+        main_cache_stride_head=main_kv_cache.stride(2),
+        main_slots_ptr=main_slot_mapping,
+        main_k_scale=main_k_scale,
+        main_v_scale=main_v_scale,
+        MAIN_HQ=num_main_q_heads,
+        MAIN_HK=num_main_kv_heads,
+        MAIN_D=main_head_dim,
+        MAIN_PAGE_SIZE=main_kv_cache.shape[1],
         num_warps=1,
+    )
+    return main_q_out, main_gate_out
+
+
+def qsa_pre_indexer_flashinfer(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    q_norm_weight: torch.Tensor,
+    k_norm_weight: torch.Tensor,
+    eps: float,
+    q_out: torch.Tensor,
+    state_cache: torch.Tensor,
+    state_slots: torch.Tensor,
+    state_block_table: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    logical_positions: torch.Tensor,
+    compressed_cache: torch.Tensor,
+    compressed_slots: torch.Tensor,
+    k_work_metadata: torch.Tensor,
+    *,
+    compress_ratio: int,
+    mrope_section: tuple[int, int, int] | None,
+    rope_pos_offset: int | None,
+) -> None:
+    """The indexer half of ``qsa_prepare``, on FlashInfer.
+
+    Normalizes Q, compresses K and updates the circular raw state. The main
+    attention's QK-norm/RoPE/gate and K/V cache write are not part of it: a layer
+    on this path runs them on their own kernels.
+    """
+    num_tokens = q.shape[0]
+    if num_tokens == 0:
+        return
+    head_dim = q_out.shape[-1]
+    assert cos_sin_cache.shape[-1] * 2 == head_dim
+    assert rope_pos_offset is None or rope_pos_offset == head_dim
+    assert positions.ndim == 1 or (
+        positions.shape == (3, num_tokens) and bool(mrope_section)
+    )
+    section = mrope_section if mrope_section is not None else (0, 0, 0)
+    from flashinfer.qsa_ops import qsa_pre_indexer
+
+    qsa_pre_indexer(
+        q,
+        k,
+        positions,
+        _paired_cos_sin(cos_sin_cache),
+        q_norm_weight,
+        k_norm_weight,
+        eps,
+        q_out,
+        state_cache,
+        state_slots,
+        state_block_table,
+        query_start_loc,
+        logical_positions,
+        compressed_cache,
+        compressed_slots,
+        k_work_metadata,
+        compress_ratio,
+        mrope_h=section[1],
+        mrope_w=section[2],
+        is_k_mrope=bool(mrope_section),
+        cache_has_rope_pos=rope_pos_offset is not None,
     )
 
 
-__all__ = ["qsa_pre_indexer"]
+__all__ = ["qsa_prepare"]

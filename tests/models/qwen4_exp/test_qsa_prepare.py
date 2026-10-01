@@ -1,13 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Correctness tests for the fused QSA pre-indexer."""
+"""Correctness tests for the fused QSA prepare kernel and the FlashInfer pre-indexer."""
 
 import os
 
 import pytest
 import torch
 
-import vllm.models.qwen4_exp.nvidia.ops.qsa_pre_indexer as pre_indexer_module
+import vllm.models.qwen4_exp.nvidia.ops.qsa_prepare as prepare_module
 from vllm.models.qwen4_exp.common.qsa_cache import (
     canonical_qsa_rope_positions,
     circular_qsa_slot_mapping,
@@ -18,8 +18,9 @@ from vllm.models.qwen4_exp.nvidia.ops.qsa import (
     qsa_compress_groups_with_ratio,
     qsa_store_cache_rows,
 )
-from vllm.models.qwen4_exp.nvidia.ops.qsa_pre_indexer import (
-    qsa_pre_indexer,
+from vllm.models.qwen4_exp.nvidia.ops.qsa_prepare import (
+    qsa_pre_indexer_flashinfer,
+    qsa_prepare,
 )
 from vllm.platforms import current_platform
 from vllm.triton_utils import HAS_TRITON
@@ -39,6 +40,7 @@ ROPE_POS_OFFSET = D
 RTOL = 1.6e-2
 ATOL = 1e-2
 MIXED_BATCH = ([260, 259, 138], [1, 1, 37], [8, 8, 8])
+MAIN_HQ, MAIN_HK, MAIN_D, MAIN_PAGE = 6, 2, 256, 16
 
 
 def _make_block_table(block_counts):
@@ -64,8 +66,87 @@ def assert_fp8_within_one_ulp(actual: torch.Tensor, expected: torch.Tensor) -> N
     assert bool(((code_diff <= 1) | (abs_diff <= 2**-8)).all())
 
 
+def _make_main_inputs(num_tokens: int, fp8_cache: bool) -> dict:
+    """Random main-attention arguments with a paged cache in vLLM's layout."""
+    num_blocks = num_tokens // MAIN_PAGE + 2
+    cache = torch.zeros(
+        num_blocks,
+        MAIN_HK,
+        MAIN_PAGE,
+        2 * MAIN_D,
+        dtype=torch.uint8 if fp8_cache else torch.bfloat16,
+        device="cuda",
+    ).transpose(1, 2)
+    slots = torch.randperm(num_blocks * MAIN_PAGE, device="cuda")[:num_tokens]
+    slots[-1] = -1
+    norm_weights = torch.randn(2, MAIN_D, dtype=torch.bfloat16, device="cuda") * 0.2
+    return dict(
+        main_qkv=torch.randn(
+            num_tokens,
+            2 * (MAIN_HQ + MAIN_HK) * MAIN_D,
+            dtype=torch.bfloat16,
+            device="cuda",
+        ),
+        main_q_norm_weight=norm_weights[0],
+        main_k_norm_weight=norm_weights[1],
+        main_eps=EPS,
+        main_kv_cache=cache.view(torch.float8_e4m3fn) if fp8_cache else cache,
+        main_slot_mapping=slots,
+        main_k_scale=0.5,
+        main_v_scale=2.0,
+    )
+
+
+def _check_main_outputs(main: dict, q_out, gate_out, rope, positions) -> None:
+    """Compare with fused_qk_rmsnorm_rope_gate + reshape_and_cache_flash."""
+    from vllm._custom_ops import reshape_and_cache_flash
+    from vllm.model_executor.layers.fused_qk_norm_rope import (
+        fused_qk_rmsnorm_rope_gate,
+    )
+
+    q_gate, k, v = main["main_qkv"].split(
+        [2 * MAIN_HQ * MAIN_D, MAIN_HK * MAIN_D, MAIN_HK * MAIN_D], dim=-1
+    )
+    q, k, gate = fused_qk_rmsnorm_rope_gate(
+        q_gate,
+        k,
+        main["main_q_norm_weight"],
+        main["main_k_norm_weight"],
+        rope.cos_sin_cache,
+        positions,
+        EPS,
+        MAIN_HQ,
+        MAIN_HK,
+        MAIN_D,
+        rope.rotary_dim,
+        mrope_section=MROPE_SECTION if positions.ndim == 2 else None,
+        norm_beta=1.0,
+    )
+    kv_cache = main["main_kv_cache"]
+    fp8_cache = kv_cache.dtype == torch.float8_e4m3fn
+    cache = torch.zeros_like(kv_cache.view(torch.uint8) if fp8_cache else kv_cache)
+    key_cache, value_cache = cache.split(MAIN_D, dim=-1)
+    reshape_and_cache_flash(
+        k.view(-1, MAIN_HK, MAIN_D),
+        v.view(-1, MAIN_HK, MAIN_D),
+        key_cache,
+        value_cache,
+        main["main_slot_mapping"],
+        "fp8" if fp8_cache else "auto",
+        torch.tensor(main["main_k_scale"], device="cuda"),
+        torch.tensor(main["main_v_scale"], device="cuda"),
+    )
+    torch.testing.assert_close(q_out.flatten(1), q, rtol=RTOL, atol=ATOL)
+    assert torch.equal(gate_out.flatten(1), gate)
+    if fp8_cache:
+        assert_fp8_within_one_ulp(kv_cache, cache.view(torch.float8_e4m3fn))
+    else:
+        torch.testing.assert_close(kv_cache, cache, rtol=RTOL, atol=ATOL)
+
+
 @requires_qsa_kernels
 @pytest.mark.usefixtures("default_vllm_config")
+@pytest.mark.parametrize("pre_indexer", ["fused", "flashinfer"])
 @pytest.mark.parametrize("indexer_dtype", [torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize(
     "mrope,is_2d_positions,cache_rope_positions,state_size,seq_lens,query_lens,history_lens",
@@ -89,7 +170,8 @@ def assert_fp8_within_one_ulp(actual: torch.Tensor, expected: torch.Tensor) -> N
         pytest.param(True, True, True, 4, [4097], [4097], [0], id="tiled"),
     ],
 )
-def test_qsa_fused_pre_indexer_matches_unfused(
+def test_qsa_fused_prepare_matches_unfused(
+    pre_indexer,
     indexer_dtype,
     mrope,
     is_2d_positions,
@@ -99,6 +181,18 @@ def test_qsa_fused_pre_indexer_matches_unfused(
     query_lens,
     history_lens,
 ) -> None:
+    fp8 = indexer_dtype == torch.float8_e4m3fn
+    if not (
+        prepare_module.flashinfer_pre_indexer_supported(
+            torch.bfloat16, indexer_dtype, D
+        )
+        if pre_indexer == "flashinfer"
+        # The main-attention cache follows the recipe's pairing with the indexer.
+        else prepare_module.fused_prepare_supported(
+            indexer_dtype, "fp8" if fp8 else "auto"
+        )
+    ):
+        pytest.skip(f"the {pre_indexer} path cannot write {indexer_dtype} here")
     from flashinfer.norm import gemma_rmsnorm
 
     from vllm.model_executor.layers.rotary_embedding import get_rope
@@ -228,8 +322,8 @@ def test_qsa_fused_pre_indexer_matches_unfused(
                     )
                 )
     unfused_raw = fused_raw.clone()
-    # A second untouched copy: the fp8 branch reruns the fused call at the compute
-    # dtype, and the kernel writes the ring in place.
+    # A second untouched copy: the fp8 branch reruns the call at the compute dtype,
+    # and the kernel writes the ring in place.
     pre_call_raw = fused_raw.clone()
     compressed_page_elements = COMP_PAGE * D
     fused_compressed_storage = torch.zeros(
@@ -269,31 +363,43 @@ def test_qsa_fused_pre_indexer_matches_unfused(
     q_weight = torch.randn(D, dtype=torch.bfloat16, device=device) * 0.2
     k_weight = torch.randn(D, dtype=torch.bfloat16, device=device) * 0.2
 
+    def prepare(query, raw, compressed):
+        """Run the path under test; the fused one also checks the main side."""
+        args = (
+            projected_qk[:, : HQ * D],
+            projected_qk[:, HQ * D :],
+            positions,
+            rope.cos_sin_cache,
+            q_weight,
+            k_weight,
+            EPS,
+            query,
+            raw,
+            raw_slots,
+            raw_block_table,
+            query_start_loc,
+            logical_positions,
+            compressed,
+            compressed_slots,
+            k_work_metadata,
+        )
+        kwargs = dict(
+            compress_ratio=CR,
+            mrope_section=MROPE_SECTION if mrope else None,
+            rope_pos_offset=ROPE_POS_OFFSET if cache_rope_positions else None,
+        )
+        if pre_indexer == "flashinfer":
+            qsa_pre_indexer_flashinfer(*args, **kwargs)
+            return
+        main = _make_main_inputs(num_tokens, query.dtype == torch.float8_e4m3fn)
+        main_q_out, main_gate_out = qsa_prepare(*args, **kwargs, **main)
+        _check_main_outputs(main, main_q_out, main_gate_out, rope, positions)
+
     fused_query = torch.empty(num_tokens, HQ, D, dtype=indexer_dtype, device=device)
-    qsa_pre_indexer(
-        projected_qk[:, : HQ * D],
-        projected_qk[:, HQ * D :],
-        positions,
-        rope.cos_sin_cache,
-        q_weight,
-        k_weight,
-        EPS,
-        fused_query,
-        fused_raw,
-        raw_slots,
-        raw_block_table,
-        query_start_loc,
-        logical_positions,
-        fused_compressed,
-        compressed_slots,
-        k_work_metadata,
-        compress_ratio=CR,
-        mrope_section=MROPE_SECTION if mrope else None,
-        rope_pos_offset=ROPE_POS_OFFSET if cache_rope_positions else None,
-    )
+    prepare(fused_query, fused_raw, fused_compressed)
 
     def _rerun_fused_wide():
-        """The same fused call writing the compute dtype, on the same inputs.
+        """The same call writing the compute dtype, on the same inputs.
 
         The kernel mutates both caches, so the ring and the compressed pages are
         rebuilt from the pre-call state rather than reused.
@@ -308,27 +414,7 @@ def test_qsa_fused_pre_indexer_matches_unfused(
             (num_compressed_blocks, COMP_PAGE, 1, D),
             (compressed_page_elements + 16, D, D, 1),
         )
-        qsa_pre_indexer(
-            projected_qk[:, : HQ * D],
-            projected_qk[:, HQ * D :],
-            positions,
-            rope.cos_sin_cache,
-            q_weight,
-            k_weight,
-            EPS,
-            wide_query,
-            wide_raw,
-            raw_slots,
-            raw_block_table,
-            query_start_loc,
-            logical_positions,
-            wide_compressed,
-            compressed_slots,
-            k_work_metadata,
-            compress_ratio=CR,
-            mrope_section=MROPE_SECTION if mrope else None,
-            rope_pos_offset=ROPE_POS_OFFSET if cache_rope_positions else None,
-        )
+        prepare(wide_query, wide_raw, wide_compressed)
         return wide_query, wide_compressed
 
     unfused_query = projected_qk[:, : HQ * D].reshape(num_tokens, HQ, D)
@@ -367,7 +453,7 @@ def test_qsa_fused_pre_indexer_matches_unfused(
     if rope_positions is not None:
         qsa_store_cache_rows(rope_positions, raw_slots, position_rows)
 
-    if indexer_dtype == torch.float8_e4m3fn:
+    if fp8:
         # What the narrowing arm has to equal is the same kernel writing wide and then
         # rounded once, not the unfused path. Those two implementations already differ
         # by up to 2**-5 at bf16, which RTOL/ATOL absorbs and a code-step rule cannot,
@@ -396,7 +482,7 @@ def test_paired_cos_sin_is_not_keyed_on_an_address() -> None:
     """A freed table's address can come back under a different one."""
     import gc
 
-    from vllm.models.qwen4_exp.nvidia.ops.qsa_pre_indexer import (
+    from vllm.models.qwen4_exp.nvidia.ops.qsa_prepare import (
         _PAIRED_COS_SIN,
         _paired_cos_sin,
     )
@@ -432,7 +518,7 @@ def test_paired_cos_sin_is_not_keyed_on_an_address() -> None:
 )
 def test_paired_cos_sin_refuses_to_build_under_capture() -> None:
     """A table built under capture lives in the graph's pool, not the caller's."""
-    from vllm.models.qwen4_exp.nvidia.ops.qsa_pre_indexer import _paired_cos_sin
+    from vllm.models.qwen4_exp.nvidia.ops.qsa_prepare import _paired_cos_sin
 
     table = torch.arange(2 * 128, dtype=torch.bfloat16, device="cuda").reshape(2, 128)
     side = torch.cuda.Stream()
@@ -480,10 +566,10 @@ def _minimal_pre_indexer_args(out_dtype: torch.dtype, device="cuda"):
     )
 
 
-def _run_minimal_pre_indexer(out_dtype: torch.dtype):
+def _run_minimal_fused_prepare(out_dtype: torch.dtype):
     args = _minimal_pre_indexer_args(out_dtype)
     ratio = args.pop("compress_ratio")
-    pre_indexer_module.qsa_pre_indexer(
+    qsa_prepare(
         *[
             args[name]
             for name in (
@@ -508,6 +594,7 @@ def _run_minimal_pre_indexer(out_dtype: torch.dtype):
         compress_ratio=ratio,
         mrope_section=None,
         rope_pos_offset=None,
+        **_make_main_inputs(args["q"].shape[0], fp8_cache=False),
     )
     torch.accelerator.synchronize()
     return args["q_out"], args["compressed_cache"]
@@ -515,8 +602,8 @@ def _run_minimal_pre_indexer(out_dtype: torch.dtype):
 
 def _clear_pre_indexer_caches() -> None:
     """Both answers are cached, and a stale one passes these tests for free."""
-    pre_indexer_module._has_cuda_pre_indexer.cache_clear()
-    pre_indexer_module._pre_indexer_accepts_dtypes.cache_clear()
+    prepare_module._has_cuda_pre_indexer.cache_clear()
+    prepare_module._pre_indexer_accepts_dtypes.cache_clear()
 
 
 @pytest.fixture
@@ -533,12 +620,12 @@ def test_pre_indexer_capability_reads_the_compiled_module(
     """A mask without the narrowing bit keeps fp8 off the CUDA path."""
     import flashinfer.qsa_ops as fi
 
-    monkeypatch.setattr(pre_indexer_module, "_has_cuda_pre_indexer", lambda: True)
+    monkeypatch.setattr(prepare_module, "_has_cuda_pre_indexer", lambda: True)
     monkeypatch.setattr(
         fi, "qsa_pre_indexer_dispatch_mask", lambda: fi.QSA_PRE_INDEXER_SAME_AS_COMPUTE
     )
 
-    accepts = pre_indexer_module._pre_indexer_accepts_dtypes
+    accepts = prepare_module._pre_indexer_accepts_dtypes
     assert accepts(torch.bfloat16, torch.bfloat16)
     assert not accepts(torch.bfloat16, torch.float8_e4m3fn)
 
@@ -553,70 +640,81 @@ def test_pre_indexer_capability_propagates_a_query_failure(
     def boom() -> int:
         raise RuntimeError("kaboom")
 
-    monkeypatch.setattr(pre_indexer_module, "_has_cuda_pre_indexer", lambda: True)
+    monkeypatch.setattr(prepare_module, "_has_cuda_pre_indexer", lambda: True)
     monkeypatch.setattr(fi, "qsa_pre_indexer_dispatch_mask", boom)
 
     with pytest.raises(RuntimeError, match="kaboom"):
-        pre_indexer_module._pre_indexer_accepts_dtypes(
-            torch.bfloat16, torch.float8_e4m3fn
-        )
+        prepare_module._pre_indexer_accepts_dtypes(torch.bfloat16, torch.float8_e4m3fn)
 
 
-@pytest.mark.skipif(
-    not current_platform.is_cuda(), reason="the fallback question is a CUDA one"
+@pytest.mark.parametrize(
+    "flashinfer,triton_fp8,indexer_dtype,kv_cache_dtype,expected",
+    [
+        (True, True, torch.bfloat16, "auto", "flashinfer"),
+        (False, False, torch.bfloat16, "auto", "fused"),
+        (False, True, torch.float8_e4m3fn, "fp8", "fused"),
+        (False, False, torch.bfloat16, "fp8", "reference"),
+        (False, True, torch.float8_e4m3fn, "nvfp4", "reference"),
+        (False, False, torch.float8_e4m3fn, "fp8", None),
+    ],
 )
-@pytest.mark.usefixtures("clean_pre_indexer_caches")
-def test_warmup_refuses_fp8_when_no_path_can_write_it(
+def test_the_pre_indexer_is_chosen_flashinfer_first(
     monkeypatch: pytest.MonkeyPatch,
+    flashinfer,
+    triton_fp8,
+    indexer_dtype,
+    kv_cache_dtype,
+    expected,
 ) -> None:
-    """Without a capable FlashInfer, an e4m3 output has no working path here.
+    """FlashInfer wherever it takes the layer, even where the fused prepare could run.
 
-    Triton is not a fallback for it: ``tl.store`` into an fp8 pointer needs
-    ``fp8e4nv``, which Triton compiles only from sm_89 on. Letting the capability
-    query answer "no" and falling through would turn that into a compile error at the
-    first forward, so the warmup says it instead, while the message can still name a
-    remedy.
+    Otherwise the fused prepare, but only where Triton can store the indexer rows and
+    the main cache: ``fp8e4nv`` compiles from sm_89 on, and a packed cache is not
+    something it writes at all. Anything else is the unfused path, which stores the
+    indexer rows through Triton too, so an e4m3 indexer nothing here can write is
+    refused while the model is built rather than failing to compile mid-serve.
     """
     monkeypatch.setattr(
-        pre_indexer_module, "_pre_indexer_accepts_dtypes", lambda *_: False
+        prepare_module, "flashinfer_pre_indexer_supported", lambda *_: flashinfer
     )
-    if pre_indexer_module._triton_can_write(torch.float8_e4m3fn):
-        pytest.skip("this architecture's Triton compiles fp8e4nv")
+    monkeypatch.setattr(
+        prepare_module,
+        "_triton_can_write",
+        lambda dtype: triton_fp8 or dtype != torch.float8_e4m3fn,
+    )
 
-    with pytest.raises(RuntimeError, match="cannot write"):
-        pre_indexer_module.warmup_pre_indexer_capability(
-            torch.bfloat16, torch.float8_e4m3fn
+    def select():
+        return prepare_module.select_pre_indexer(
+            torch.bfloat16, indexer_dtype, D, kv_cache_dtype
         )
-    # bf16 has a working Triton path, so it must not be refused.
-    pre_indexer_module.warmup_pre_indexer_capability(torch.bfloat16, torch.bfloat16)
+
+    if expected is None:
+        with pytest.raises(RuntimeError, match="cannot write"):
+            select()
+    else:
+        assert select() == expected
 
 
 @requires_qsa_kernels
-@pytest.mark.usefixtures("clean_pre_indexer_caches")
-def test_triton_fallback_cannot_write_fp8_here(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Pin the fact the refusal above rests on, by running the fallback for real."""
-    if pre_indexer_module._triton_can_write(torch.float8_e4m3fn):
+def test_triton_cannot_write_fp8_here() -> None:
+    """Pin the fact the fused prepare's gate rests on, by running it for real."""
+    if prepare_module._triton_can_write(torch.float8_e4m3fn):
         pytest.skip("this architecture's Triton compiles fp8e4nv")
-    monkeypatch.setattr(pre_indexer_module, "_has_cuda_pre_indexer", lambda: False)
 
     from triton.compiler.errors import CompilationError
 
     with pytest.raises(CompilationError, match="fp8e4nv"):
-        _run_minimal_pre_indexer(torch.float8_e4m3fn)
+        _run_minimal_fused_prepare(torch.float8_e4m3fn)
 
     # The same call at the compute dtype goes through, so the failure is the dtype and
     # not the arguments.
-    _run_minimal_pre_indexer(torch.bfloat16)
+    _run_minimal_fused_prepare(torch.bfloat16)
 
 
 @pytest.mark.usefixtures("clean_pre_indexer_caches")
 def test_pre_indexer_capability_rejects_an_unbuildable_compute_dtype() -> None:
     """The compute axis is FlashInfer's own, and float32 is not on it."""
-    assert not pre_indexer_module._pre_indexer_accepts_dtypes(
-        torch.float32, torch.float32
-    )
+    assert not prepare_module._pre_indexer_accepts_dtypes(torch.float32, torch.float32)
 
 
 # Run in a subprocess: a fresh JIT directory is not a cold start on its own, because
@@ -626,7 +724,7 @@ _COLD_START_CAPTURE_PROBE = """
 import torch
 
 import flashinfer.qsa_ops.pre_indexer as fi
-import vllm.models.qwen4_exp.nvidia.ops.qsa_pre_indexer as m
+import vllm.models.qwen4_exp.nvidia.ops.qsa_prepare as m
 from flashinfer.jit.core import JitSpec
 from flashinfer.jit.qsa_ops import gen_qsa_pre_indexer_module
 
@@ -678,10 +776,10 @@ POSITIONAL = (
 )
 KEYWORDS = dict(compress_ratio=R, mrope_section=None, rope_pos_offset=None)
 
-# What the profiling run does, and all of it.
-m.warmup_pre_indexer_capability(CT, OUT_DTYPE, COS_SIN)
-assert m._pre_indexer_accepts_dtypes(CT, OUT_DTYPE), "FlashInfer arm missing"
-assert loads > 0, "the warmup did not reach build_and_load"
+# What building the model and the profiling run do, and all of it.
+assert m.select_pre_indexer(CT, OUT_DTYPE, D, "auto") == "flashinfer", "arm missing"
+m.warmup_flashinfer_pre_indexer(COS_SIN)
+assert loads > 0, "the selection did not reach build_and_load"
 assert builds > 0, "a cold cache should have compiled the module, not loaded it"
 
 
@@ -698,7 +796,7 @@ def counters():
 before = counters()
 
 # Production reaches the kernel for the first time inside a capture: the profiling run
-# returns before the fused branch, so the warmup above is all that precedes it. The
+# returns before the pre-indexer branch, so the above is all that precedes it. The
 # kernel is not run beforehand here either, or anything a first launch does would be
 # hidden.
 side = torch.cuda.Stream()
@@ -709,7 +807,7 @@ torch.cuda.current_stream().wait_stream(side)
 
 graph = torch.cuda.CUDAGraph()
 with torch.cuda.graph(graph):
-    m.qsa_pre_indexer(*POSITIONAL, **KEYWORDS)
+    m.qsa_pre_indexer_flashinfer(*POSITIONAL, **KEYWORDS)
 graph.replay()
 torch.accelerator.synchronize()
 
