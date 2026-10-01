@@ -484,7 +484,7 @@ class QSAIndexer(nn.Module):
                 compressed_metadata.seq_lens,
                 out_route=out,
             )
-            return out
+            return out, main_outputs
 
         if out is None:
             out = torch.empty(
