@@ -27,13 +27,10 @@ def _has_cuda_pre_indexer() -> bool:
     if not has_flashinfer():
         return False
     try:
-        import flashinfer
+        from flashinfer.qsa_ops import qsa_pre_indexer_dispatch_mask
 
-        if not hasattr(flashinfer, "qsa_pre_indexer"):
-            return False
-        from flashinfer.sparse_pre_indexer import get_sparse_pre_indexer_module
-
-        get_sparse_pre_indexer_module()
+        # Builds or loads the compiled module, and raises if it cannot.
+        qsa_pre_indexer_dispatch_mask()
     except Exception:
         return False
     return True
@@ -58,19 +55,15 @@ def _pre_indexer_accepts_dtypes(
         return False
     if not _has_cuda_pre_indexer():
         return False
-    try:
-        from flashinfer.sparse_pre_indexer import (
-            QSA_PRE_INDEXER_NARROW_E4M3,
-            QSA_PRE_INDEXER_SAME_AS_COMPUTE,
-            qsa_pre_indexer_dispatch_mask,
-        )
-    except ImportError:
-        # A FlashInfer without the query predates the narrowing arm. It still runs the
-        # same-dtype pre-indexer, so only the narrowing case gives up the CUDA path.
-        return out_dtype == compute_dtype
-    # Past here the module built and loaded and the query exists, so a failure is a
-    # real defect or an allocation failure. Reporting it as "unsupported" would bury
-    # it behind a silent fall back to Triton.
+    from flashinfer.qsa_ops import (
+        QSA_PRE_INDEXER_NARROW_E4M3,
+        QSA_PRE_INDEXER_SAME_AS_COMPUTE,
+        qsa_pre_indexer_dispatch_mask,
+    )
+
+    # Past here the module built and loaded, so a failure is a real defect or an
+    # allocation failure. Reporting it as "unsupported" would bury it behind a
+    # silent fall back to Triton.
     mask = qsa_pre_indexer_dispatch_mask()
     if out_dtype == compute_dtype:
         return bool(mask & QSA_PRE_INDEXER_SAME_AS_COMPUTE)
@@ -610,9 +603,9 @@ def qsa_pre_indexer(
         and head_dim in (128, 256)
         and q.is_cuda
     ):
-        import flashinfer
+        from flashinfer.qsa_ops import qsa_pre_indexer
 
-        flashinfer.qsa_pre_indexer(
+        qsa_pre_indexer(
             q,
             k,
             positions,

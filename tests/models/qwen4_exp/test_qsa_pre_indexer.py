@@ -3,7 +3,6 @@
 """Correctness tests for the fused QSA pre-indexer."""
 
 import os
-from types import SimpleNamespace
 
 import pytest
 import torch
@@ -532,7 +531,7 @@ def test_pre_indexer_capability_reads_the_compiled_module(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A mask without the narrowing bit keeps fp8 off the CUDA path."""
-    import flashinfer.sparse_pre_indexer as fi
+    import flashinfer.qsa_ops as fi
 
     monkeypatch.setattr(pre_indexer_module, "_has_cuda_pre_indexer", lambda: True)
     monkeypatch.setattr(
@@ -545,49 +544,11 @@ def test_pre_indexer_capability_reads_the_compiled_module(
 
 
 @pytest.mark.usefixtures("clean_pre_indexer_caches")
-def test_pre_indexer_capability_without_the_python_query(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """An older FlashInfer keeps bf16 on CUDA and sends only fp8 to Triton."""
-    import flashinfer.sparse_pre_indexer as fi
-
-    monkeypatch.setattr(pre_indexer_module, "_has_cuda_pre_indexer", lambda: True)
-    monkeypatch.delattr(fi, "qsa_pre_indexer_dispatch_mask")
-
-    accepts = pre_indexer_module._pre_indexer_accepts_dtypes
-    assert accepts(torch.bfloat16, torch.bfloat16)
-    assert not accepts(torch.bfloat16, torch.float8_e4m3fn)
-
-
-@pytest.mark.usefixtures("clean_pre_indexer_caches")
-def test_pre_indexer_capability_with_a_stale_compiled_module(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A current wrapper over a build that predates the arm reports the old set.
-
-    Distinct from the missing-wrapper case: here the Python side is new and it is the
-    binary that is behind, which is what a warm JIT or AOT cache produces.
-    """
-    import flashinfer.sparse_pre_indexer as fi
-
-    # A compiled module resolves its exports dynamically, so the way to stand in for
-    # one that lacks the symbol is to hand the wrapper a module that does not have it.
-    stale = SimpleNamespace(qsa_pre_indexer=lambda *args, **kwargs: None)
-    monkeypatch.setattr(fi, "get_sparse_pre_indexer_module", lambda: stale)
-    monkeypatch.setattr(pre_indexer_module, "_has_cuda_pre_indexer", lambda: True)
-
-    assert fi.qsa_pre_indexer_dispatch_mask() == fi.QSA_PRE_INDEXER_SAME_AS_COMPUTE
-    accepts = pre_indexer_module._pre_indexer_accepts_dtypes
-    assert accepts(torch.bfloat16, torch.bfloat16)
-    assert not accepts(torch.bfloat16, torch.float8_e4m3fn)
-
-
-@pytest.mark.usefixtures("clean_pre_indexer_caches")
 def test_pre_indexer_capability_propagates_a_query_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Once the module has built, a failing query is a defect, not a "no"."""
-    import flashinfer.sparse_pre_indexer as fi
+    import flashinfer.qsa_ops as fi
 
     def boom() -> int:
         raise RuntimeError("kaboom")
@@ -659,18 +620,18 @@ def test_pre_indexer_capability_rejects_an_unbuildable_compute_dtype() -> None:
 
 
 # Run in a subprocess: a fresh JIT directory is not a cold start on its own, because
-# ``get_sparse_pre_indexer_module`` is a module-level cache and FlashInfer reads its
+# ``get_qsa_pre_indexer_module`` is a module-level cache and FlashInfer reads its
 # workspace base at import time.
 _COLD_START_CAPTURE_PROBE = """
 import torch
 
-import flashinfer.sparse_pre_indexer as fi
+import flashinfer.qsa_ops.pre_indexer as fi
 import vllm.models.qwen4_exp.nvidia.ops.qsa_pre_indexer as m
 from flashinfer.jit.core import JitSpec
-from flashinfer.jit.sparse_pre_indexer import gen_sparse_pre_indexer_module
+from flashinfer.jit.qsa_ops import gen_qsa_pre_indexer_module
 
 # build() is overridden per backend, so count it on the class the spec actually is.
-SpecType = type(gen_sparse_pre_indexer_module())
+SpecType = type(gen_qsa_pre_indexer_module())
 
 loads = 0
 builds = 0
@@ -726,7 +687,7 @@ assert builds > 0, "a cold cache should have compiled the module, not loaded it"
 
 def counters():
     return (
-        fi.get_sparse_pre_indexer_module.cache_info().misses,
+        fi.get_qsa_pre_indexer_module.cache_info().misses,
         loads,
         builds,
         m._has_cuda_pre_indexer.cache_info().misses,
