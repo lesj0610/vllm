@@ -503,9 +503,12 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         )
         # One launch does the indexer prepare, the main QK-norm/RoPE/gate and
         # the main K/V cache write (see QSAIndexer.forward); otherwise all of
-        # them take the separate kernels.
+        # them take the separate kernels. The fused write stores bf16 or e4m3
+        # rows, so an NVFP4 cache stays on the impl's slot writer.
         self.use_fused_qsa_prepare = (
-            self.use_fused_qk_norm_rope_gate and self.indexer.use_fused_pre_indexer
+            self.use_fused_qk_norm_rope_gate
+            and self.indexer.use_fused_pre_indexer
+            and self.kv_cache_dtype != "nvfp4"
         )
         max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
         # PACKED selection buffer: the trailing column holds each row's
