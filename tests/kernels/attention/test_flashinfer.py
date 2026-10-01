@@ -265,7 +265,8 @@ def test_flashinfer_nvfp4_q_data_type(use_trtllm_gen, expected):
     builder.cache_dtype = "nvfp4"
     builder.model_config = SimpleNamespace(dtype=torch.bfloat16)
     builder.vllm_config = SimpleNamespace(
-        attention_config=SimpleNamespace(disable_flashinfer_q_quantization=False)
+        attention_config=SimpleNamespace(disable_flashinfer_q_quantization=False),
+        model_config=None,
     )
 
     q_dtype = builder.get_q_data_type(is_prefill=True, use_trtllm_gen=use_trtllm_gen)
