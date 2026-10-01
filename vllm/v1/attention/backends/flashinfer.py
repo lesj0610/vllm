@@ -2762,7 +2762,7 @@ class FlashInferImpl(AttentionImpl):
         prefill_wrapper.run(
             prefill_query,
             nvfp4_kv_data,
-            q_scale=layer._q_scale_float,
+            q_scale=self.query_scale(layer, prefill_query),
             k_scale=layer._k_scale_float,
             v_scale=layer._v_scale_float,
             out=output,
