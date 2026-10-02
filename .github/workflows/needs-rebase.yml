@@ -3,8 +3,11 @@ name: Label PRs with merge conflicts
 on:
   schedule:
     - cron: "*/15 * * * *"
+  # pull_request_target would read this file from the PR base (main), which
+  # mirrors upstream. Chain off the upstream PR workflows instead: they run
+  # (and skip) here on every PR push, label, or edit.
   workflow_run:
-    workflows: ["Sync main with upstream"]
+    workflows: ["Sync main with upstream", "PR title", "pre-commit"]
     types: [completed]
   workflow_dispatch:
 
