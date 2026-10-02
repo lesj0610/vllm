@@ -794,9 +794,8 @@ def test_flashinfer_fp8_query_dtype_and_trtllm_scales(
             trtllm_batch_decode_with_kv_cache=capture("decode"),
         ),
     ):
-        get_q = fi.FlashInferMetadataBuilder.get_q_data_type
-        q_dtype = get_q(builder, True, use_trtllm_gen=True)
-        assert get_q(builder, False, use_trtllm_gen=True) == q_dtype
+        q_dtype = fi.FlashInferMetadataBuilder.get_q_data_type(builder, True)
+        assert fi.FlashInferMetadataBuilder.get_q_data_type(builder, False) == q_dtype
         impl = fi.FlashInferImpl(8, HEAD_SIZE, scale, 2, None, None, cache_dtype)
         fused = impl.fused_output_quant_supported(fi.kFp8StaticTensorSym)
         if major == 10:
