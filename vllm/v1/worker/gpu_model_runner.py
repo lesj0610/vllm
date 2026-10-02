@@ -6515,6 +6515,9 @@ class GPUModelRunner(
         if hasattr(self, "kv_cache_config"):
             delattr(self, "kv_cache_config")
         self.cache_config.num_gpu_blocks = None
+        # Profiling may have rebuilt the InputBatch outside the worker's
+        # "runtime" pool; the real initialize_kv_cache rebuilds it.
+        self._init_block_sizes = []
 
         clear_layer_kv_caches(self.compilation_config.static_forward_context.values())
 
