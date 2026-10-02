@@ -1,0 +1,65 @@
+name: Label PRs with merge conflicts
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_run:
+    workflows: ["Sync main with upstream"]
+    types: [completed]
+  workflow_dispatch:
+
+permissions:
+  issues: write
+  pull-requests: write
+
+concurrency:
+  group: needs-rebase-label
+  cancel-in-progress: false
+
+jobs:
+  label:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Sync needs-rebase label with PR mergeability
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          LABEL: needs-rebase
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          fetch() {
+            gh api graphql --paginate \
+              -f owner="${REPO%/*}" -f name="${REPO#*/}" \
+              -f query='
+                query($owner: String!, $name: String!, $endCursor: String) {
+                  repository(owner: $owner, name: $name) {
+                    pullRequests(states: OPEN, first: 100, after: $endCursor) {
+                      pageInfo { hasNextPage endCursor }
+                      nodes { number mergeable labels(first: 100) { nodes { name } } }
+                    }
+                  }
+                }' \
+              --jq '.data.repository.pullRequests.nodes[]
+                | [.number, .mergeable, any(.labels.nodes[]; .name == $ENV.LABEL)]
+                | @tsv'
+          }
+
+          # GitHub computes mergeability lazily; querying starts the job, so
+          # poll until no PR is UNKNOWN. Leftovers are handled on the next run.
+          for attempt in 1 2 3 4 5 6; do
+            rows="$(fetch)"
+            grep -q $'\tUNKNOWN\t' <<<"${rows}" || break
+            sleep 20
+          done
+
+          while IFS=$'\t' read -r number mergeable labeled; do
+            if [[ "${mergeable}" == CONFLICTING && "${labeled}" == false ]]; then
+              gh api -X POST "repos/${REPO}/issues/${number}/labels" -f "labels[]=${LABEL}" >/dev/null
+              echo "#${number}: added ${LABEL}"
+            elif [[ "${mergeable}" == MERGEABLE && "${labeled}" == true ]]; then
+              gh api -X DELETE "repos/${REPO}/issues/${number}/labels/${LABEL}" >/dev/null
+              echo "#${number}: removed ${LABEL}"
+            fi
+          done <<<"${rows}"
