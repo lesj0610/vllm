@@ -10,6 +10,8 @@ from unittest.mock import patch
 
 import pytest
 import torch
+from huggingface_hub.errors import StrictDataclassClassValidationError
+from transformers import Qwen4ExpConfig, Qwen4ExpTextConfig
 
 from vllm.config.compilation import CompilationConfig
 from vllm.config.speculative import SpeculativeConfig
@@ -21,10 +23,6 @@ from vllm.model_executor.models.config import (
     Qwen4ExpMTPConfig,
 )
 from vllm.models.qwen4_exp.common.mtp import make_mtp_hidden_buffer
-from vllm.models.qwen4_exp.config import (
-    Qwen4ExpConfig,
-    Qwen4ExpTextConfig,
-)
 from vllm.models.qwen4_exp.nvidia.model_state import Qwen4ExpModelState
 from vllm.transformers_utils.config import get_config
 from vllm.v1.attention.backends.short_conv_attn import (
@@ -52,7 +50,10 @@ def _text_config(**kwargs) -> Qwen4ExpTextConfig:
         "linear_num_value_heads": 2,
         "linear_key_head_dim": 8,
         "linear_value_head_dim": 8,
-        "num_experts": 0,
+        "num_experts": 4,
+        "num_experts_per_tok": 2,
+        # `Qwen4ExpTextConfig` requires an EOS token whenever PLE is enabled.
+        "eos_token_id": 1,
         "hc_count": 2,
         "hc_lowrank": 4,
         "ple_layer_ids": [1],
@@ -67,7 +68,11 @@ def test_qwen4_exp_framework_defaults_enable_architecture_features() -> None:
     config = _text_config()
 
     assert config.hc_count == 2
-    assert config.output_gate_type == "sigmoid"
+    # transformers leaves the gate unset and lets hidden_act stand in, rather
+    # than injecting a default of its own. What has to survive is an explicit
+    # setting, which is what every checkpoint this model ships with carries.
+    assert config.output_gate_type is None
+    assert _text_config(output_gate_type="sigmoid").output_gate_type == "sigmoid"
 
 
 def test_qwen4_exp_mtp_returns_sample_and_multi_streams() -> None:
@@ -193,23 +198,36 @@ def test_qwen4_exp_qsa_preserves_indexer_config() -> None:
             },
             "must be divisible",
         ),
-        (
-            {
-                "indexer_n_heads": 2,
-                "indexer_kv_heads": 1,
-                "indexer_head_dim": 8,
-                "indexer_budget": 1024,
-                "indexer_compress_ratio": 4,
-            },
-            "512 or 2048",
-        ),
     ],
 )
 def test_qwen4_exp_rejects_invalid_qsa_config(
     overrides: dict[str, int], match: str
 ) -> None:
-    with pytest.raises(ValueError, match=match):
+    # transformers validates in a strict dataclass, which wraps the ValueError
+    # its validator raises rather than propagating it.
+    with pytest.raises(StrictDataclassClassValidationError, match=match):
         _text_config(**overrides)
+
+
+@pytest.mark.parametrize(
+    ("budget", "ratio", "accepted"),
+    [
+        (2048, 4, True),
+        (4096, 4, True),
+        (8192, 4, True),
+        # 1024 // 4 == 256, a width the CUDA top-k is not instantiated for.
+        (1024, 4, False),
+    ],
+)
+def test_cuda_qsa_rejects_a_block_topk_the_kernel_lacks(
+    budget: int, ratio: int, accepted: bool
+) -> None:
+    """csrc/libtorch_stable/topk.cu instantiates k=512, 1024 and 2048 only, and
+    the width it gets is indexer_budget // indexer_compress_ratio. Rejecting it
+    here names both fields; the kernel only ever sees the quotient."""
+    from vllm.models.qwen4_exp.nvidia.indexer_qsa import _SUPPORTED_BLOCK_TOPK
+
+    assert (budget // ratio in _SUPPORTED_BLOCK_TOPK) is accepted
 
 
 def test_qwen4_exp_qsa_is_split_from_piecewise_graphs() -> None:
@@ -231,10 +249,9 @@ def test_qwen4_exp_mtp_override_preserves_text_backbone_layout() -> None:
     assert draft_config.n_predict == 1
     assert draft_config.index_share_for_mtp_iteration is False
     assert draft_config.text_config.num_hidden_layers == 2
-    assert draft_config.text_config.layer_types == [
-        "linear_attention",
-        "full_attention",
-    ]
+    # The spelling is whatever the config canonicalizes to; what the override
+    # must not do is reorder or drop a layer.
+    assert draft_config.text_config.layer_types == config.text_config.layer_types
 
 
 def test_qwen4_exp_text_mtp_override_sets_hc_mult() -> None:
@@ -547,20 +564,6 @@ def test_qwen4_exp_ple_builder_receives_spec_decode_metadata() -> None:
     )
 
 
-def test_text_config_normalizes_transformers_sparse_attention_spelling():
-    """Checkpoints re-exported through transformers' Qwen4Exp config class
-    serialize "qwen_sparse_attention"; vLLM keys QSA off "full_attention"."""
-    from vllm.models.qwen4_exp.config import Qwen4ExpTextConfig
-
-    config = Qwen4ExpTextConfig(
-        hc_count=4,
-        layer_types=["linear_attention", "qwen_sparse_attention"],
-        num_hidden_layers=2,
-    )
-
-    assert config.layer_types == ["linear_attention", "full_attention"]
-
-
 @pytest.mark.parametrize("wrapped_config", [False, True])
 def test_qwen4_exp_mtp_override_sets_draft_config(
     wrapped_config: bool,
@@ -590,10 +593,10 @@ def test_qwen4_exp_mtp_override_sets_draft_config(
 @pytest.mark.parametrize(
     ("ple_layer_ids", "rejected"),
     [
-        # Decoder layer 0, inside the first stage's [0, 1) range: supported.
+        # Decoder layer 0, inside the first stage's [0, 2) range: supported.
         ([1], False),
-        # Decoder layer 1, on the second stage: it would never see input_ids.
-        ([2], True),
+        # Decoder layer 2, on the second stage: it would never see input_ids.
+        ([3], True),
         ([], False),
     ],
 )
@@ -603,9 +606,16 @@ def test_qwen4_exp_rejects_pipeline_parallel_only_for_offstage_ple(
     """PLE needs raw input_ids, which non-first pipeline ranks never see. Only
     a PLE layer outside the first stage is refused, and the refusal must land
     before the engine spends time loading weights."""
+    # PLE only sits on linear_attention layers, so the guard under test is
+    # reachable only from a layout with enough of them to span both stages.
+    text_config = _text_config(
+        num_hidden_layers=4,
+        layer_types=["linear_attention"] * 3 + ["full_attention"],
+        ple_layer_ids=ple_layer_ids,
+    )
     vllm_config = SimpleNamespace(
         model_config=SimpleNamespace(
-            hf_text_config=_text_config(ple_layer_ids=ple_layer_ids),
+            hf_text_config=text_config,
             multimodal_config=None,
         ),
         parallel_config=SimpleNamespace(

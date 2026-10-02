@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, cast
 
 import torch
 from torch import nn
+from transformers import Qwen4ExpTextConfig
 
 from vllm.config import VllmConfig
 from vllm.forward_context import get_forward_context
@@ -13,9 +14,6 @@ from vllm.model_executor.layers.layernorm import GemmaRMSNorm
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding.mrope import triton_mrope
-from vllm.transformers_utils.configs.qwen4_exp import (
-    Qwen4ExpTextConfig,
-)
 
 from ..common.qsa_cache import (
     QSACompressedKeyCache,
@@ -24,6 +22,10 @@ from ..common.qsa_cache import (
     canonical_qsa_rope_positions,
 )
 from .ops.qsa_prepare import qsa_prepare
+
+# The widths csrc/libtorch_stable/topk.cu instantiates; see the guard there.
+_SUPPORTED_BLOCK_TOPK = frozenset({512, 1024, 2048})
+
 
 if TYPE_CHECKING:
     from .qsa import Qwen4ExpQSAAttention
@@ -119,6 +121,19 @@ class QSAIndexer(nn.Module):
         self.index_head_dim = int(config.indexer_head_dim)
         self.token_topk = int(config.indexer_budget)
         self.compress_ratio = int(config.indexer_compress_ratio)
+        # The CUDA top-k is instantiated for three widths only, and the block
+        # count it selects comes from the budget divided by the compression
+        # ratio. Catching it here names the two config fields that produced the
+        # width; the kernel only sees the quotient, and only once a request is
+        # already in flight.
+        block_topk = self.token_topk // self.compress_ratio
+        if block_topk not in _SUPPORTED_BLOCK_TOPK:
+            raise ValueError(
+                "Qwen4Exp QSA on CUDA needs indexer_budget // "
+                "indexer_compress_ratio to be one of "
+                f"{sorted(_SUPPORTED_BLOCK_TOPK)}, got "
+                f"{self.token_topk} // {self.compress_ratio} = {block_topk}"
+            )
         self.rotary_emb = rotary_emb
         self.use_fused_pre_indexer = _supports_fused_pre_indexer(
             rotary_emb,
