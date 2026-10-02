@@ -535,6 +535,11 @@ def test_reservation_lifecycle(monkeypatch, accel, version, failure_phase):
 
     accel(ctx.module, reset_peak_memory_stats=reset_peak)
     steps = ["init", "reserve", "materialize"]
+    # The teardown error on the reserve path is logged with a traceback that
+    # reaches the builder's frame, and pytest's log capture keeps that record
+    # now that the vLLM logger propagates in tests. Keep only the message.
+    logged: list[str] = []
+    monkeypatch.setattr(worker_utils.logger, "exception", logged.append)
 
     with _ws():
         if failure_phase == "none":
@@ -547,6 +552,8 @@ def test_reservation_lifecycle(monkeypatch, accel, version, failure_phase):
             with pytest.raises(error) as exc_info:
                 worker_utils.prepare_profiling_workspace(ctx.runner)
             assert events == done + ["cleanup"]
+            teardown_log = ["Failed to clean up after workspace preparation"]
+            assert logged == (teardown_log if failure_phase == "reserve" else [])
             if failure_phase == "reserve":
                 del exc_info  # its traceback also holds the builder that raised
         gc.collect()
