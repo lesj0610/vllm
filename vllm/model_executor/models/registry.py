@@ -46,7 +46,6 @@ else:
 from .interfaces import (
     has_inner_state,
     has_noops,
-    has_sequence_bounded_mrope_positions,
     is_attention_free,
     is_hybrid,
     requires_raw_input_tokens,
@@ -877,7 +876,6 @@ class _ModelInfo:
     supports_transcription_only: bool
     supported_video_pruning_methods: tuple[str, ...]
     supports_mm_device_do_normalize: bool
-    mrope_positions_are_sequence_bounded: bool
 
     @staticmethod
     def from_model_cls(model: type[nn.Module]) -> "_ModelInfo":
@@ -913,9 +911,6 @@ class _ModelInfo:
             ),
             supports_mm_device_do_normalize=getattr(
                 model, "supports_mm_device_do_normalize", False
-            ),
-            mrope_positions_are_sequence_bounded=(
-                has_sequence_bounded_mrope_positions(model)
             ),
         )
 
