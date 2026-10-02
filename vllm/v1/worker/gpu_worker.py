@@ -912,8 +912,10 @@ class Worker(WorkerBase):
                 kv_cache_config,
                 kv_cache_allocation_context=mem_pool_context,
             )
-        if requires_persistent_attention_workspace_profiling(self.vllm_config):
-            reserve_persistent_attention_workspace(self.model_runner)
+            # The wrapper-owned buffers this builds are KV-init state too, and
+            # outside the pool they stay resident through sleep.
+            if requires_persistent_attention_workspace_profiling(self.vllm_config):
+                reserve_persistent_attention_workspace(self.model_runner)
 
         # Build KV-zero metadata outside the CuMem pool so the bookkeeping
         # GPU tensors (seg_addrs, block-id buffers) use the standard PyTorch

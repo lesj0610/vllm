@@ -35,7 +35,14 @@ def test_initialize_kv_cache_finalizes_persistent_workspace(
     worker.cache_config = SimpleNamespace(num_gpu_blocks=None)
     worker.vllm_config = object()
     worker.model_config = SimpleNamespace(enable_return_routed_experts=False)
-    worker._maybe_get_memory_pool_context = lambda **kwargs: nullcontext()
+
+    @contextmanager
+    def pool(tag):
+        events.append(f"enter {tag}")
+        yield
+        events.append(f"exit {tag}")
+
+    worker._maybe_get_memory_pool_context = pool
     worker.model_runner = SimpleNamespace(
         initialize_kv_cache=lambda config, **kw: events.append("initialize_kv_cache")
     )
@@ -53,10 +60,11 @@ def test_initialize_kv_cache_finalizes_persistent_workspace(
     worker.initialize_from_config(config)
 
     assert worker.cache_config.num_gpu_blocks == 8
-    expected = ["connector", "initialize_kv_cache"]
+    # The reservation is KV-init state, so it shares the runtime pool.
+    expected = ["connector", "enter runtime", "initialize_kv_cache"]
     if profile_persistent_workspace:
         expected.append("reserve")
-    assert events == expected
+    assert events == [*expected, "exit runtime"]
 
 
 def _record(sink, item, result=None):
