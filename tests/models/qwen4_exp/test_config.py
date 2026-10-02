@@ -209,6 +209,10 @@ def test_qwen4_exp_rejects_invalid_qsa_config(
         _text_config(**overrides)
 
 
+class _PastTheWidthCheck(Exception):
+    """Raised from the first call the indexer makes after the width check."""
+
+
 @pytest.mark.parametrize(
     ("budget", "ratio", "accepted"),
     [
@@ -224,10 +228,40 @@ def test_cuda_qsa_rejects_a_block_topk_the_kernel_lacks(
 ) -> None:
     """csrc/libtorch_stable/topk.cu instantiates k=512, 1024 and 2048 only, and
     the width it gets is indexer_budget // indexer_compress_ratio. Rejecting it
-    here names both fields; the kernel only ever sees the quotient."""
-    from vllm.models.qwen4_exp.nvidia.indexer_qsa import _SUPPORTED_BLOCK_TOPK
+    in the constructor names both fields; the kernel only ever sees the
+    quotient, and only once a request is already in flight."""
+    from vllm.models.qwen4_exp.nvidia import indexer_qsa
 
-    assert (budget // ratio in _SUPPORTED_BLOCK_TOPK) is accepted
+    vllm_config = SimpleNamespace(
+        cache_config=SimpleNamespace(),
+        model_config=SimpleNamespace(dtype=torch.bfloat16),
+    )
+    kwargs = dict(
+        vllm_config=vllm_config,
+        config=_text_config(
+            indexer_n_heads=2,
+            indexer_kv_heads=1,
+            indexer_head_dim=8,
+            indexer_budget=budget,
+            indexer_compress_ratio=ratio,
+        ),
+        layer_id=0,
+        rotary_emb=torch.nn.Module(),
+    )
+
+    def _stop(*args, **kwargs):
+        raise _PastTheWidthCheck
+
+    # Everything the constructor does after the check needs a real model; this
+    # stands in for the first of those calls, so an accepted width is the one
+    # that gets to raise it.
+    with patch.object(indexer_qsa, "_supports_fused_pre_indexer", _stop):
+        if accepted:
+            with pytest.raises(_PastTheWidthCheck):
+                indexer_qsa.QSAIndexer(**kwargs)
+        else:
+            with pytest.raises(ValueError, match="indexer_compress_ratio"):
+                indexer_qsa.QSAIndexer(**kwargs)
 
 
 def test_qwen4_exp_qsa_is_split_from_piecewise_graphs() -> None:
@@ -240,6 +274,10 @@ def test_qwen4_exp_mtp_override_preserves_text_backbone_layout() -> None:
         text_config=_text_config(),
     )
 
+    # hf_config_override edits the config in place and hands the same object
+    # back, so the layout has to be read off before the call to mean anything.
+    layout_before = tuple(config.text_config.layer_types)
+
     draft_config = SpeculativeConfig.hf_config_override(config)
 
     assert draft_config.model_type == "qwen4_exp_mtp"
@@ -251,7 +289,8 @@ def test_qwen4_exp_mtp_override_preserves_text_backbone_layout() -> None:
     assert draft_config.text_config.num_hidden_layers == 2
     # The spelling is whatever the config canonicalizes to; what the override
     # must not do is reorder or drop a layer.
-    assert draft_config.text_config.layer_types == config.text_config.layer_types
+    assert tuple(draft_config.text_config.layer_types) == layout_before
+    assert layout_before == ("linear_attention", "qwen_sparse_attention")
 
 
 def test_qwen4_exp_text_mtp_override_sets_hc_mult() -> None:
