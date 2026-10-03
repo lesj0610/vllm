@@ -77,7 +77,7 @@ from .hyperconnection import GatedResidual, HyperConnectionConfig
 from .low_latency_gemm import enable_qwen4_exp_low_latency_gemm
 from .ops.cute_dsl.hc_down_silu import request_hc_down_silu_warmup
 from .ple_layer import Qwen4ExpPLELayer
-from .qsa import Qwen4ExpQSAAttention
+from .qsa import Qwen4ExpQSAAttention, attach_qsa_runtime
 
 
 def without_modelopt_fp4(
@@ -389,6 +389,9 @@ class Qwen4ExpModel(nn.Module):
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers, get_layer, prefix=f"{prefix}.layers"
         )
+        # One QSA runtime for the rank, made here because the model is what
+        # owns every layer that would otherwise make its own.
+        self.qsa = attach_qsa_runtime(vllm_config, self.layers)
         self.is_fused_shared_expert_enabled = is_model_fused_shared_expert_compatible(
             self.layers,
             Qwen4ExpSparseMoeBlock,
