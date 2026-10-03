@@ -5,7 +5,7 @@
 from dataclasses import dataclass, replace
 from enum import Enum
 from functools import partial
-from typing import ClassVar
+from typing import ClassVar, NamedTuple
 
 import numpy as np
 import torch
@@ -16,6 +16,7 @@ from flashinfer import (
     BatchPrefillWithRaggedKVCacheWrapper,
     MultiLevelCascadeAttentionWrapper,
     get_seq_lens,
+    nvfp4_quantize_append_paged_kv_cache_with_slot_mapping,
 )
 from flashinfer.decode import fast_decode_plan, trtllm_batch_decode_with_kv_cache
 from flashinfer.prefill import trtllm_batch_context_with_kv_cache
@@ -73,6 +74,7 @@ from vllm.v1.attention.backend import (
     max_decode_query_len,
 )
 from vllm.v1.attention.backends.utils import (
+    fill_mm_prefix_query_ranges,
     get_dcp_local_seq_lens,
     get_flashinfer_layout_string,
     get_num_attention_heads_from_layers,
@@ -94,6 +96,10 @@ from vllm.v1.kv_cache_interface import (
     iter_layer_specs,
 )
 from vllm.v1.utils import CpuGpuBuffer
+from vllm.v1.worker.workspace import (
+    current_workspace_manager,
+    is_workspace_manager_initialized,
+)
 
 FLASHINFER_WORKSPACE_BUFFER_SIZE_BATCH_INVARIANT = 2048 * 1024 * 1024
 FLASHINFER_PREFILL_WORKSPACE_BYTES_PER_ELEM = 16
@@ -103,7 +109,95 @@ FP4_DTYPE = torch.uint8
 
 logger = init_logger(__name__)
 
+# mm-prefix (PrefixLM) batches are causal except inside per-request ranges
+# that attend bidirectionally. FlashInfer packages that mask as a batch-prefill
+# wrapper whose attention variant evaluates it on every KV tile from the
+# compact ``(N, 2)`` rows ``fill_mm_prefix_query_ranges`` already produces, so
+# no ``O(qo_len * kv_len)`` dense mask is materialized here or there.
+MM_PREFIX_WRAPPER_NAME = "BatchPrefillWithCausalBidirectionalRangesWrapper"
+
+
+def _mm_prefix_wrapper_cls() -> type | None:
+    """FlashInfer's mm-prefix wrapper, or ``None`` on a build without it."""
+    import flashinfer
+
+    return getattr(flashinfer, MM_PREFIX_WRAPPER_NAME, None)
+
+
+# KV cache dtypes the mm-prefix variant reads. An NVFP4 cache is read through
+# the variant's scale-factor tensors (kv_cache_sf).
+_MM_PREFIX_KV_CACHE_DTYPES = (
+    None,
+    "auto",
+    "float16",
+    "bfloat16",
+    "fp8",
+    "fp8_e4m3",
+    "nvfp4",
+)
+
+
+def _mm_prefix_keeps_model_dtype_query(
+    vllm_config: VllmConfig | None, cache_dtype: str
+) -> bool:
+    """Whether this FP8 cache is read with a query in the model dtype.
+
+    The mm-prefix wrapper runs on fa2, which has no FP8-query path. The query
+    dtype is fixed per layer rather than per batch, so a model that can take
+    the native mm-prefix path keeps it for prefill and decode alike.
+    """
+    return (
+        vllm_config is not None
+        and vllm_config.model_config is not None
+        and vllm_config.model_config.is_mm_prefix_lm
+        and cache_dtype.startswith("fp8")
+        and cache_dtype in _MM_PREFIX_KV_CACHE_DTYPES
+        and _mm_prefix_wrapper_cls() is not None
+    )
+
+
 trtllm_workspace_buffer = None
+
+
+def _nvfp4_kv_on_fa2() -> bool:
+    return current_platform.is_device_capability_family(
+        80
+    ) or current_platform.is_device_capability_family(120)
+
+
+_KVPair = tuple[torch.Tensor, torch.Tensor]
+
+
+def _nvfp4_kv_views(
+    kv_cache: torch.Tensor, num_kv_heads: int, head_size: int
+) -> tuple[_KVPair, _KVPair, str]:
+    """Views of NVFP4 pages laid out as [K data | K scale | V data | V scale]."""
+    num_blocks, num_slots, block_size, full_dim = kv_cache.shape
+    hnd = kv_cache.stride()[1:] == (block_size * full_dim, full_dim, 1)
+    if not hnd and kv_cache.stride()[1:] != (full_dim, num_slots * full_dim, 1):
+        raise ValueError(f"NVFP4 KV pages must be dense, got {kv_cache.stride()}")
+    dims = (num_kv_heads, block_size) if hnd else (block_size, num_kv_heads)
+    plane = num_kv_heads * block_size
+
+    def view(offset: int, dim: int) -> torch.Tensor:
+        return kv_cache.as_strided(
+            (num_blocks, *dims, dim),
+            (kv_cache.stride(0), dims[1] * dim, dim, 1),
+            kv_cache.storage_offset() + plane * offset,
+        )
+
+    data_dim, scale_dim = head_size // 2, head_size // 16
+    k_scale = view(data_dim, scale_dim).view(torch.float8_e4m3fn)
+    v_scale = view(full_dim + data_dim, scale_dim).view(torch.float8_e4m3fn)
+    data = (view(0, data_dim), view(full_dim, data_dim))
+    return data, (k_scale, v_scale), "HND" if hnd else "NHD"
+
+
+class FlashInferWorkspaceRoutes(NamedTuple):
+    native_prefill: bool
+    trtllm_prefill: bool
+    native_decode: bool
+    trtllm_decode: bool
 
 
 def _get_trtllm_workspace_buffer():
@@ -443,6 +537,9 @@ class FlashInferBackend(AttentionBackend):
                 and num_qo_heads // num_kv_heads > 1
                 and current_platform.is_device_capability_family(100)
                 and can_use_trtllm_attention(num_qo_heads, num_kv_heads)
+                # Page sizes >= 128 only run on trtllm-gen, which cannot
+                # serve fa2 mm-prefix attention.
+                and not mc.is_mm_prefix_lm
             )
         if not use_large_pages:
             return [16, 32, 64]
@@ -476,6 +573,104 @@ class FlashInferBackend(AttentionBackend):
     def supports_sliding_window(cls) -> bool:
         return True
 
+    @classmethod
+    def supports_mm_prefix(cls) -> bool:
+        """mm-prefix runs through FlashInfer's bidirectional-ranges prefill wrapper.
+
+        Advertised when the installed FlashInfer provides the wrapper and the KV
+        cache dtype is one the variant reads. FlashInfer builds the JIT module
+        itself when the wrapper is constructed.
+        """
+        vllm_config = get_current_vllm_config_or_none()
+        if vllm_config is None or vllm_config.model_config is None:
+            return False
+        return (
+            _mm_prefix_wrapper_cls() is not None
+            and vllm_config.cache_config.cache_dtype in _MM_PREFIX_KV_CACHE_DTYPES
+        )
+
+    @classmethod
+    def validate_configuration(
+        cls,
+        head_size: int,
+        dtype: torch.dtype,
+        kv_cache_dtype: "CacheDType | None",
+        block_size: int | None,
+        use_mla: bool,
+        has_sink: bool,
+        use_sparse: bool,
+        use_mm_prefix: bool,
+        use_per_head_quant_scales: bool,
+        device_capability: DeviceCapability,
+        attn_type: str,
+        has_sliding_window: bool = False,
+        use_non_causal: bool = False,
+        use_batch_invariant: bool = False,
+        use_kv_connector: bool = False,
+        use_pcp: bool = False,
+        use_adaptive_verification: bool = False,
+        use_dcp: bool = False,
+        use_rswa: bool = False,
+    ) -> list[str]:
+        invalid_reasons = super().validate_configuration(
+            head_size,
+            dtype,
+            kv_cache_dtype,
+            block_size,
+            use_mla,
+            has_sink,
+            use_sparse,
+            use_mm_prefix,
+            use_per_head_quant_scales,
+            device_capability,
+            attn_type,
+            has_sliding_window,
+            use_non_causal,
+            use_batch_invariant,
+            use_kv_connector,
+            use_pcp,
+            use_adaptive_verification,
+            use_dcp,
+            use_rswa,
+        )
+        if use_mm_prefix and use_dcp:
+            invalid_reasons.append(
+                "mm_prefix is not supported with DCP: the DCP prefill splits "
+                "into a context and a new-tokens pass, and the bidirectional "
+                "block breaks that decomposition"
+            )
+        return invalid_reasons
+
+    @classmethod
+    def supports_combination(
+        cls,
+        head_size: int,
+        dtype: torch.dtype,
+        kv_cache_dtype: "CacheDType | None",
+        block_size: int | None,
+        use_mla: bool,
+        has_sink: bool,
+        use_sparse: bool,
+        use_mm_prefix: bool,
+        device_capability: DeviceCapability,
+    ) -> str | None:
+        if use_mm_prefix:
+            if kv_cache_dtype not in _MM_PREFIX_KV_CACHE_DTYPES:
+                return f"mm_prefix is not supported with a {kv_cache_dtype} KV cache"
+            if kv_cache_dtype == "nvfp4" and device_capability.major == 10:
+                return (
+                    "mm_prefix is not supported with an NVFP4 KV cache on SM100, "
+                    "where trtllm-gen serves it and cannot run the mm-prefix variant"
+                )
+            if has_sink:
+                return "mm_prefix is not supported with sinks"
+            if block_size is not None and block_size >= 128:
+                return (
+                    f"mm_prefix requires the fa2 prefill path, but kernel "
+                    f"page size {block_size} only runs on trtllm-gen"
+                )
+        return None
+
     @staticmethod
     def get_impl_cls() -> type["FlashInferImpl"]:
         return FlashInferImpl
@@ -498,6 +693,9 @@ class FlashInferBackend(AttentionBackend):
     @classmethod
     def supports_kv_cache_dtype(cls, kv_cache_dtype: CacheDType | None) -> bool:
         if kv_cache_dtype is not None and kv_cache_dtype.startswith("nvfp4"):
+            if _nvfp4_kv_on_fa2():
+                # The slot-mapping writer has no scale search.
+                return kv_cache_dtype == "nvfp4"
             return (
                 current_platform.is_device_capability_family(100)
                 and supports_trtllm_attention(is_prefill=True)
@@ -560,6 +758,15 @@ class FIPrefill:
     """Metadata for the native FlashInfer prefill pathway (non-TRTLLM)."""
 
     wrapper: BatchPrefillWithPagedKVCacheWrapper | BatchDCPPrefillWrapper
+
+    mm_wrapper: BatchPrefillWithPagedKVCacheWrapper | None = None
+    """Planned mm-prefix JIT-variant wrapper for this batch's prefill rows,
+    or None when the batch carries no bidirectional ranges. Layers dispatch
+    on ``FlashInferMetadata.mm_prefix_query_range_tensor`` at forward time."""
+
+    mm_prefill_ranges: torch.Tensor | None = None
+    """Flat int32 view of the per-query ``[start, end]`` rows for the prefill
+    portion (already sliced by ``2 * num_decode_tokens`` elements)."""
 
 
 @dataclass
@@ -684,6 +891,15 @@ class FlashInferMetadata:
 
     cascade_wrapper: MultiLevelCascadeAttentionWrapper | None
 
+    mm_prefix_query_range_tensor: torch.Tensor | None = None
+    """Per scheduled query token: the inclusive absolute ``[start, end]``
+    bounds of the bidirectional multimodal range containing it, ``(-1, -1)``
+    when none. Present only when this batch has bidirectional ranges. The
+    field name is a contract: Gemma4 clears it on its full-attention layer
+    groups at forward time (outside the compile boundary), so layers must
+    read it at forward time to decide between the causal and the mm-prefix
+    wrapper."""
+
 
 class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
     kv_cache_spec: AttentionSpec
@@ -707,6 +923,9 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         ) = None  # Wrapper for prefill/append
         self._noncausal_prefill_wrapper: BatchPrefillWithPagedKVCacheWrapper | None = (
             None  # Wrapper for non-causal prefill (DFlash)
+        )
+        self._mm_prefill_wrapper: BatchPrefillWithPagedKVCacheWrapper | None = (
+            None  # FlashInfer's mm-prefix prefill wrapper
         )
         self._decode_wrapper = None  # Wrapper for decode (general shape)
 
@@ -777,7 +996,22 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             # Cannot use self.kv_cache_spec.dtype here because kv_cache_spec
             # storage dtype may not be the same as the op dtype (uint8 vs fp8_e4m3)
             self.is_kvcache_nvfp4 = self.cache_dtype.startswith("nvfp4")
-            if self.is_kvcache_nvfp4:
+            # fa2 plans NVFP4 by its uint8 storage dtype.
+            self.nvfp4_fa2 = self.is_kvcache_nvfp4 and _nvfp4_kv_on_fa2()
+            self.nvfp4_trtllm = self.is_kvcache_nvfp4 and not self.nvfp4_fa2
+            if self.nvfp4_fa2 and self.use_dcp:
+                raise NotImplementedError(
+                    "The DCP prefill wrapper cannot read NVFP4 block scales."
+                )
+            if (
+                self.nvfp4_fa2
+                and self.head_dim == 64
+                and current_platform.is_device_capability_family(120)
+            ):
+                raise NotImplementedError(
+                    "fa2 prefill misreads NVFP4 at head_size 64 on SM12x."
+                )
+            if self.nvfp4_trtllm:
                 if (
                     force_use_trtllm_attention() is False
                     or not supports_trtllm_attention(is_prefill=True)
@@ -798,6 +1032,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         else:
             self.cache_dtype = "auto"
             self.is_kvcache_nvfp4 = False
+            self.nvfp4_fa2 = self.nvfp4_trtllm = False
             assert self.kv_cache_spec.dtype == self.model_config.dtype
             self.kv_cache_dtype = self.kv_cache_spec.dtype
 
@@ -810,8 +1045,11 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
 
         # Prefer TRTLLM/XQA for decoding whenever supported. The decode kernel
         # must be selected statically for FULL cudagraph capture.
-        can_use_xqa_or_trtllm_gen_decode = can_use_trtllm_attention(
-            self.num_qo_heads, self.num_kv_heads, is_prefill=False
+        can_use_xqa_or_trtllm_gen_decode = (
+            can_use_trtllm_attention(
+                self.num_qo_heads, self.num_kv_heads, is_prefill=False
+            )
+            and not self.nvfp4_fa2
         )
         # Page sizes >= 128 require the trtllm-gen GQA/MQA path (guaranteed by
         # get_supported_kernel_block_sizes).
@@ -894,12 +1132,31 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         self.window_left = self.global_hyperparameters.window_left
         self.logits_soft_cap = self.global_hyperparameters.logits_soft_cap
         self.has_sinks = self.global_hyperparameters.has_sinks
-        if self.has_sinks and not FlashInferBackend.supports_sink():
+        if self.has_sinks and (self.nvfp4_fa2 or not FlashInferBackend.supports_sink()):
             raise NotImplementedError(
                 "FlashInfer backend currently does not support attention "
                 "sinks, please use trtllm on blackwell or flash attention on "
                 "earlier GPUs."
             )
+
+        self.is_mm_prefix_lm = bool(
+            self.model_config is not None and self.model_config.is_mm_prefix_lm
+        )
+        if self.is_mm_prefix_lm:
+            if self.logits_soft_cap is not None and self.logits_soft_cap > 0:
+                raise NotImplementedError(
+                    "FlashInfer mm-prefix does not support logits_soft_cap: "
+                    "the JIT mask variant does not implement soft-capping."
+                )
+            if self.attention_config.use_trtllm_attention:
+                raise NotImplementedError(
+                    "FlashInfer mm-prefix requires the fa2 JIT-variant prefill "
+                    "path; it cannot run with explicitly forced trtllm-gen "
+                    "attention."
+                )
+        # Reservation-time route only; the runtime dispatch above re-decides
+        # per batch. Worst-case shapes here never under-reserve.
+        self._reservation_trtllm_prefill = self._resolve_trtllm_prefill_attention()
         capability = current_platform.get_device_capability()
         arch = f"sm{capability.major}{capability.minor}" if capability else "unknown"
         decode_backend = (
@@ -917,6 +1174,24 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             arch,
         )
         # Preparing persistent buffers
+        # mm-prefix: persistent staging + device buffers owned by this
+        # builder, shaped by scheduled tokens (never by context length).
+        # Filled by fill_mm_prefix_query_ranges at build time; only the
+        # written rows are copied to the GPU.
+        self.mm_prefix_query_ranges_cpu: torch.Tensor | None = None
+        self.mm_prefix_query_ranges_np: np.ndarray | None = None
+        self.mm_prefix_query_ranges_gpu: torch.Tensor | None = None
+        if self.is_mm_prefix_lm:
+            self.mm_prefix_query_ranges_cpu = torch.empty(
+                (self.max_num_batched_tokens, 2),
+                dtype=torch.int32,
+                device="cpu",
+            )
+            self.mm_prefix_query_ranges_np = self.mm_prefix_query_ranges_cpu.numpy()
+            self.mm_prefix_query_ranges_gpu = torch.empty(
+                (self.max_num_batched_tokens, 2), dtype=torch.int32, device=device
+            )
+
         self.paged_kv_indptr = CpuGpuBuffer(
             max_num_reqs + 1, dtype=torch.int32, device=self.device, pin_memory=False
         )
@@ -942,6 +1217,9 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         # this group is unquantized (e.g. --kv-cache-dtype-skip-layers), even
         # if cache_config requests a quantized dtype globally.
         cache_dtype = self.cache_dtype
+
+        if _mm_prefix_keeps_model_dtype_query(self.vllm_config, cache_dtype):
+            return self.model_config.dtype
 
         # On SM90/SM12x, XQA decode requires BF16/FP16-Q even with FP8 KV cache.
         # FI native prefill on SM90 still uses FP8-Q in that case; SM12x prefill
@@ -970,6 +1248,8 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 return FlashInferBackend.get_dtype_for_flashinfer(cache_dtype)
             return self.model_config.dtype
         if cache_dtype.startswith("nvfp4"):
+            if self.nvfp4_fa2:
+                return self.model_config.dtype
             return FlashInferBackend.get_dtype_for_flashinfer("fp8_e4m3")
         return self.kv_cache_spec.dtype
 
@@ -1002,7 +1282,13 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 num_qo_heads=num_qo_heads,
                 num_kv_heads=spec.num_kv_heads,
                 is_prefill=False,
-            ) or (is_xqa_arch and not _is_xqa_head_dim_supported(spec.head_size)):
+            ) or (
+                is_xqa_arch
+                and (
+                    spec.kv_quant_mode.is_nvfp4
+                    or not _is_xqa_head_dim_supported(spec.head_size)
+                )
+            ):
                 has_uniform_batch_support = False
                 break
 
@@ -1037,28 +1323,82 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         # Longer requests are split off as prefills.
         return max_decode_query_len(vllm_config)
 
-    def _get_workspace_buffer(self):
+    def _default_workspace_buffer_size(self) -> int:
+        if envs.VLLM_BATCH_INVARIANT:
+            return FLASHINFER_WORKSPACE_BUFFER_SIZE_BATCH_INVARIANT
+        # FlashInfer prefill temp buffers scale with the prefill chunk and
+        # query-head footprint, rather than the context length.
+        estimated_prefill_size = (
+            self.max_num_batched_tokens
+            * self.num_qo_heads
+            * self.head_dim
+            * FLASHINFER_PREFILL_WORKSPACE_BYTES_PER_ELEM
+        )
+        return max(
+            envs.VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE,
+            estimated_prefill_size,
+        )
+
+    def _resolve_trtllm_prefill_attention(self) -> bool:
+        """Resolve the shape-invariant prefill backend once per builder."""
+        # Page sizes >= 128 must use trtllm-gen; force it for prefill too.
+        force_use_trtllm = (
+            self.page_size >= 128 or self.attention_config.use_trtllm_attention
+        )
+        return use_trtllm_attention(
+            self.num_qo_heads,
+            self.num_kv_heads,
+            self.max_num_batched_tokens,
+            self.model_config.max_model_len,
+            self.dcp_world_size,
+            self.cache_dtype,
+            self.q_data_type_prefill,
+            is_prefill=True,
+            force_use_trtllm=force_use_trtllm,
+            has_sinks=self.has_sinks,
+            has_spec=self.reorder_batch_threshold > 1,
+        )
+
+    def _get_workspace_routes(self) -> FlashInferWorkspaceRoutes:
+        non_causal = getattr(self.kv_cache_spec, "non_causal", False)
+        trtllm_prefill = self._reservation_trtllm_prefill and not non_causal
+        native_prefill = (
+            non_causal or self.model_config.is_mm_prefix_lm or not trtllm_prefill
+        )
+        # Dedicated XQA decode also serves non-causal batches, so its workspace
+        # must be reserved before the arena is locked.
+        trtllm_decode = self.use_trtllm_decode_attention and (
+            not non_causal or self.use_xqa
+        )
+        native_decode = not self.use_trtllm_decode_attention and not non_causal
+        return FlashInferWorkspaceRoutes(
+            native_prefill=native_prefill,
+            trtllm_prefill=trtllm_prefill,
+            native_decode=native_decode,
+            trtllm_decode=trtllm_decode,
+        )
+
+    def _allocate_workspace_buffer(self, buffer_size: int) -> torch.Tensor:
+        buffer_size = max(int(buffer_size), 1)
+        if is_workspace_manager_initialized():
+            manager = current_workspace_manager()
+            (workspace_buffer,) = manager.get_simultaneous(
+                ((buffer_size,), torch.uint8),
+            )
+            return workspace_buffer
+        return torch.zeros(buffer_size, dtype=torch.uint8, device=self.device)
+
+    def _get_workspace_buffer(self) -> torch.Tensor:
+        """The float arena this builder hands to every wrapper it creates.
+
+        Wrappers cache the buffer's size at construction and FlashInfer's
+        ``reset_workspace_buffer()`` does not refresh it, so the arena has to
+        reach its final size before any wrapper is built. The reservation
+        below does that in its own pass.
+        """
         if self._workspace_buffer is None:
-            buffer_size = envs.VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE
-            if envs.VLLM_BATCH_INVARIANT:
-                buffer_size = FLASHINFER_WORKSPACE_BUFFER_SIZE_BATCH_INVARIANT
-            else:
-                # FlashInfer prefill temp buffers (batch_prefill_tmp_v, ...)
-                # scale with the prefill chunk and query-head footprint, NOT
-                # context length. The fixed ~394 MiB default is too small for
-                # wide-head models at the default 8192-token chunk on some
-                # archs (e.g. sm_120), where FlashInfer hard-errors instead of
-                # growing. Size to the batch's head footprint; never shrink
-                # below the configured default.
-                est = (
-                    self.max_num_batched_tokens
-                    * self.num_qo_heads
-                    * self.head_dim
-                    * FLASHINFER_PREFILL_WORKSPACE_BYTES_PER_ELEM
-                )
-                buffer_size = max(buffer_size, est)
-            self._workspace_buffer = torch.zeros(
-                buffer_size, dtype=torch.uint8, device=self.device
+            self._workspace_buffer = self._allocate_workspace_buffer(
+                self._default_workspace_buffer_size()
             )
         return self._workspace_buffer
 
@@ -1230,8 +1570,8 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     )
                 else:
                     # NVFP4 KV cache requires the trtllm-gen backend inside
-                    # the wrapper; fa2/fa3 do not support nvfp4.
-                    backend = "trtllm-gen" if self.is_kvcache_nvfp4 else "auto"
+                    # the wrapper on SM100; SM8x and SM12x read it with fa2.
+                    backend = "trtllm-gen" if self.nvfp4_trtllm else "auto"
                     self._prefill_wrapper = BatchPrefillWithPagedKVCacheWrapper(
                         self._get_workspace_buffer(),
                         get_flashinfer_layout_string(self.kv_cache_layout),
@@ -1239,6 +1579,29 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     )
         assert self._prefill_wrapper is not None
         return self._prefill_wrapper
+
+    def _get_mm_prefill_wrapper(self) -> BatchPrefillWithPagedKVCacheWrapper:
+        """FlashInfer's prefill wrapper for the mm-prefix mask.
+
+        FlashInfer builds the JIT module for this combination on construction.
+        """
+        if self._mm_prefill_wrapper is None:
+            assert not self.use_dcp
+            dtype = self.model_config.dtype
+            wrapper_cls = _mm_prefix_wrapper_cls()
+            assert wrapper_cls is not None, (
+                f"mm-prefix advertised without FlashInfer's {MM_PREFIX_WRAPPER_NAME}"
+            )
+            self._mm_prefill_wrapper = wrapper_cls(
+                self._get_workspace_buffer(),
+                get_flashinfer_layout_string(self.kv_cache_layout),
+                q_data_type=self.q_data_type_prefill,
+                kv_data_type=self.kv_cache_dtype,
+                o_data_type=dtype,
+                head_dim_qk=self.head_dim,
+                head_dim_vo=self.head_dim,
+            )
+        return self._mm_prefill_wrapper
 
     def _get_decode_wrapper(self, batch_size: int, use_cudagraph: bool = False):
         if use_cudagraph:
@@ -1256,8 +1619,8 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 paged_kv_indices = None
                 paged_kv_last_page_len = None
             # NVFP4 KV cache requires the trtllm-gen backend inside
-            # the wrapper; fa2/fa3 do not support nvfp4.
-            backend = "trtllm-gen" if self.is_kvcache_nvfp4 else "auto"
+            # the wrapper on SM100; SM8x and SM12x read it with fa2.
+            backend = "trtllm-gen" if self.nvfp4_trtllm else "auto"
             decode_wrapper = BatchDecodeWithPagedKVCacheWrapper(
                 self._get_workspace_buffer(),
                 get_flashinfer_layout_string(self.kv_cache_layout),
@@ -1288,6 +1651,59 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 get_flashinfer_layout_string(self.kv_cache_layout),
             )
         return self._cascade_wrapper
+
+    @classmethod
+    def persistent_workspace_profiling_support(
+        cls, vllm_config: VllmConfig, kv_cache_spec: KVCacheSpec
+    ) -> bool | None:
+        if vllm_config.parallel_config.decode_context_parallel_size > 1:
+            return None
+        # Non-causal execution owns a separate prefill wrapper that is not
+        # covered by the causal reservation contract.
+        if any(
+            getattr(spec, "non_causal", False)
+            for spec in iter_layer_specs(kv_cache_spec)
+        ):
+            return None
+        return True
+
+    def prepare_workspace_for_profiling(self, materialize: bool) -> None:
+        """Size the shared arenas, then build the wrappers that will use them.
+
+        Called once per pass over every builder: the first pass only grows the
+        float arena and the module-global TRTLLM buffer, the second builds the
+        wrappers. A wrapper caches its arena's size at construction, so no
+        wrapper may exist while another builder can still grow the arena.
+        """
+        if self.use_dcp or not is_workspace_manager_initialized():
+            return
+
+        routes = self._get_workspace_routes()
+        if not materialize:
+            if routes.native_prefill or routes.native_decode:
+                # Grow the arena without caching the view: a later builder can
+                # still replace the backing tensor before wrappers are built.
+                self._allocate_workspace_buffer(self._default_workspace_buffer_size())
+            if routes.trtllm_prefill or routes.trtllm_decode:
+                # Allocated outside the shared arena on first use, so the
+                # reservation has to touch it for profiling to see it.
+                _get_trtllm_workspace_buffer()
+            return
+
+        if routes.native_prefill:
+            self._get_prefill_wrapper(causal=True)
+        if routes.native_decode:
+            max_decode_tokens = min(
+                self.vllm_config.scheduler_config.max_num_seqs,
+                self.vllm_config.scheduler_config.max_num_batched_tokens,
+                self.model_config.max_model_len,
+            )
+            if max_decode_tokens > 0:
+                self._get_decode_wrapper(max_decode_tokens, use_cudagraph=False)
+            if self.enable_cuda_graph:
+                for batch_size in self.compilation_config.cudagraph_capture_sizes or []:
+                    if 0 < batch_size <= self._decode_cudagraph_max_bs:
+                        self._get_decode_wrapper(batch_size, use_cudagraph=True)
 
     def _compute_flashinfer_kv_metadata(
         self,
@@ -1340,6 +1756,35 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         num_reqs = common_attn_metadata.num_reqs
         num_actual_tokens = common_attn_metadata.num_actual_tokens
         causal = common_attn_metadata.causal
+
+        # mm-prefix: map each scheduled query token to its bidirectional
+        # range before splitting the batch. Built for every FlashInfer group;
+        # Gemma4 nulls the metadata field for its full-attention groups at
+        # forward time. A zero fill count (text-only batch, or every range
+        # outside the scheduled chunk) keeps the plain causal path;
+        # `mm_req_doc_ranges is not None` alone must not select it, because
+        # text-only batches can carry `{req: []}`.
+        num_mm_tokens = 0
+        if (
+            self.is_mm_prefix_lm
+            and causal
+            and common_attn_metadata.mm_req_doc_ranges is not None
+            and self.mm_prefix_query_ranges_np is not None
+        ):
+            # The upper bound is exact for prefill rows, which is where
+            # mm_prefix ranges live; decode rows only ever get an optimistic
+            # (larger) context, moving them further past every range.
+            assert common_attn_metadata.seq_lens_cpu_upper_bound is not None, (
+                "mm_prefix requires seq_lens_cpu_upper_bound"
+            )
+            num_mm_tokens = fill_mm_prefix_query_ranges(
+                self.mm_prefix_query_ranges_np,
+                common_attn_metadata.mm_req_doc_ranges,
+                common_attn_metadata.query_start_loc_cpu,
+                common_attn_metadata.seq_lens_cpu_upper_bound,
+            )
+        use_mm_prefix = num_mm_tokens > 0
+
         route_decode = causal or self.use_xqa
         if route_decode:
             num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
@@ -1349,6 +1794,11 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     require_uniform=not (
                         self.use_xqa or self.use_trtllm_gen_varlen_decode
                     ),
+                    # A short chunked-prefill tail can sit inside a
+                    # bidirectional range; classified as a decode it would run
+                    # through the causal decode path and lose access to the
+                    # future tokens of its range.
+                    treat_short_extends_as_decodes=not use_mm_prefix,
                 )
             )
         else:
@@ -1369,23 +1819,36 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         # - Prefill (FI native or TRTLLM)
         # - Decode (FI native, XQA, or trtllm-gen)
         use_cascade = common_prefix_len > 0
+        assert not (use_cascade and use_mm_prefix), (
+            "cascade attention assumes plain causal semantics and cannot "
+            "serve a batch with bidirectional mm-prefix ranges"
+        )
         uses_spec_reorder = self.reorder_batch_threshold > 1
         # Page sizes >= 128 must use trtllm-gen; force it for prefill too.
         prefill_force_trtllm = (
             True if page_size >= 128 else self.attention_config.use_trtllm_attention
         )
-        prefill_use_trtllm = causal and use_trtllm_attention(
-            self.num_qo_heads,
-            self.num_kv_heads,
-            num_prefill_tokens,
-            max_seq_len,
-            self.dcp_world_size,
-            self.cache_dtype,
-            self.q_data_type_prefill,
-            is_prefill=True,
-            force_use_trtllm=prefill_force_trtllm,
-            has_sinks=self.has_sinks,
-            has_spec=uses_spec_reorder,
+        if use_mm_prefix and page_size >= 128:
+            raise NotImplementedError(
+                "FlashInfer mm-prefix requires the fa2 prefill path, but "
+                f"kernel page size {page_size} only runs on trtllm-gen."
+            )
+        prefill_use_trtllm = (
+            (not use_mm_prefix)
+            and causal
+            and use_trtllm_attention(
+                self.num_qo_heads,
+                self.num_kv_heads,
+                num_prefill_tokens,
+                max_seq_len,
+                self.dcp_world_size,
+                self.cache_dtype,
+                self.q_data_type_prefill,
+                is_prefill=True,
+                force_use_trtllm=prefill_force_trtllm,
+                has_sinks=self.has_sinks,
+                has_spec=uses_spec_reorder,
+            )
         )
         decode_with_flashinfer_trtllm_api = self.use_trtllm_decode_attention and (
             causal or self.use_xqa
@@ -1710,7 +2173,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     # use FP8 o_data_type so the wrapper matches the
                     # FP8 output buffer allocated in forward().
                     o_dtype = (
-                        FP8_DTYPE if self.is_kvcache_nvfp4 else self.model_config.dtype
+                        FP8_DTYPE if self.nvfp4_trtllm else self.model_config.dtype
                     )
                     prefill_wrapper.plan(
                         qo_indptr=qo_indptr_prefill_cpu,
@@ -1732,7 +2195,50 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                         fixed_split_size=self.prefill_fixed_split_size,
                         disable_split_kv=self.disable_split_kv,
                     )
-                attn_metadata.prefill = FIPrefill(wrapper=prefill_wrapper)
+                mm_wrapper = None
+                mm_prefill_ranges = None
+                if use_mm_prefix:
+                    # The causal wrapper above stays planned: layer groups
+                    # whose metadata field is cleared at forward time (Gemma4
+                    # full-attention groups) still run the plain causal path.
+                    assert self.mm_prefix_query_ranges_cpu is not None
+                    assert self.mm_prefix_query_ranges_gpu is not None
+                    mm_ranges_gpu = self.mm_prefix_query_ranges_gpu[:num_mm_tokens]
+                    mm_ranges_cpu = self.mm_prefix_query_ranges_cpu[:num_mm_tokens]
+                    if PIN_MEMORY:
+                        mm_ranges_cpu = mm_ranges_cpu.pin_memory()
+                    mm_ranges_gpu.copy_(mm_ranges_cpu, non_blocking=True)
+                    attn_metadata.mm_prefix_query_range_tensor = mm_ranges_gpu
+                    # The wrapper takes the (N, 2) rows and requires them
+                    # contiguous; a row slice of this row-major buffer is.
+                    mm_prefill_ranges = mm_ranges_gpu[num_decode_tokens:]
+                    mm_wrapper = self._get_mm_prefill_wrapper()
+                    mm_wrapper.plan(
+                        qo_indptr=qo_indptr_prefill_cpu,
+                        paged_kv_indptr=paged_kv_indptr_prefill_cpu,
+                        paged_kv_indices=paged_kv_indices,
+                        paged_kv_last_page_len=paged_kv_last_page_len_prefill_cpu,
+                        num_qo_heads=self.num_qo_heads,
+                        num_kv_heads=self.num_kv_heads,
+                        head_dim_qk=self.head_dim,
+                        page_size=self.page_size,
+                        # The wrapper's variant owns the whole mask,
+                        # including the causal term and both windows; the
+                        # windows are passed to run() instead.
+                        causal=False,
+                        sm_scale=self.sm_scale,
+                        window_left=-1,
+                        q_data_type=self.q_data_type_prefill,
+                        kv_data_type=self.kv_cache_dtype,
+                        o_data_type=self.model_config.dtype,
+                        fixed_split_size=self.prefill_fixed_split_size,
+                        disable_split_kv=self.disable_split_kv,
+                    )
+                attn_metadata.prefill = FIPrefill(
+                    wrapper=prefill_wrapper,
+                    mm_wrapper=mm_wrapper,
+                    mm_prefill_ranges=mm_prefill_ranges,
+                )
 
         ## DECODE PATHWAY
         if num_decodes > 0:
@@ -1797,9 +2303,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 # NVFP4 trtllm kernel only supports FP8 output;
                 # use FP8 o_data_type so the wrapper matches the
                 # FP8 output buffer allocated in forward().
-                o_dtype = (
-                    FP8_DTYPE if self.is_kvcache_nvfp4 else self.model_config.dtype
-                )
+                o_dtype = FP8_DTYPE if self.nvfp4_trtllm else self.model_config.dtype
                 paged_kv_indptr_cpu = self.paged_kv_indptr.cpu[: num_input_tokens + 1]
                 paged_kv_last_page_len_cpu = self.paged_kv_last_page_len.cpu[
                     :num_input_tokens
@@ -1891,6 +2395,8 @@ class FlashInferImpl(AttentionImpl):
         )
         self.cache_dtype = kv_cache_dtype
         self.is_kvcache_nvfp4 = kv_cache_dtype.startswith("nvfp4")
+        self.nvfp4_fa2 = self.is_kvcache_nvfp4 and _nvfp4_kv_on_fa2()
+        self.nvfp4_trtllm = self.is_kvcache_nvfp4 and not self.nvfp4_fa2
         self.kv_cache_dtype = "nvfp4" if self.is_kvcache_nvfp4 else kv_cache_dtype
         self.fp4_data_dim = head_size // 2 if self.is_kvcache_nvfp4 else 0
         self.logits_soft_cap = logits_soft_cap
@@ -1922,6 +2428,10 @@ class FlashInferImpl(AttentionImpl):
             num_heads, num_kv_heads, is_prefill=False
         )
         vllm_config = get_current_vllm_config_or_none()
+        # Must agree with the builder's get_q_data_type().
+        self.keeps_model_dtype_query = _mm_prefix_keeps_model_dtype_query(
+            vllm_config, self.kv_cache_dtype
+        )
         # Query pre-quantization needs a single dtype for the whole query tensor.
         # SM90 XQA needs BF16/FP16-Q for decode and FP8 for prefill,
         # so only enable this for SM100 trtllm-gen where both use FP8-Q.
@@ -1931,13 +2441,14 @@ class FlashInferImpl(AttentionImpl):
             and current_platform.is_device_capability_family(100)
             and vllm_config is not None
             and not vllm_config.attention_config.disable_flashinfer_q_quantization
+            and not self.keeps_model_dtype_query
         )
         self.bmm1_scale: float | None = None
         self.bmm2_scale: float | None = None
         self.o_sf_scale: float | None = None
 
         # Pre-allocated FP8 output buffer for NVFP4 without fused output quant.
-        if self.is_kvcache_nvfp4 and vllm_config is not None:
+        if self.nvfp4_trtllm and vllm_config is not None:
             max_num_tokens = vllm_config.scheduler_config.max_num_batched_tokens
             self._nvfp4_fp8_out = torch.empty(
                 (max_num_tokens, num_heads, head_size),
@@ -1968,11 +2479,13 @@ class FlashInferImpl(AttentionImpl):
             return False
         # XQA does not support FP8/NVFP4 output, so require trtllm-gen
         # (SM100+) here.  Without that we cannot fuse the output quant.
+        # The fusion also needs an FP8 query, which the mm-prefix path lacks.
         return (
             self.supports_xqa_or_trtllm_gen_decode
             and is_quantized_kv_cache(self.kv_cache_dtype)
             and current_platform.is_device_capability_family(100)
             and quant_key in (kFp8StaticTensorSym, kNvfp4Dynamic)
+            and not self.keeps_model_dtype_query
         )
 
     # FlashInfer requires attention sinks to be float32
@@ -1994,6 +2507,13 @@ class FlashInferImpl(AttentionImpl):
                 bmm1_scale *= layer._q_scale_float
             bmm1_scale *= layer._k_scale_float
         return bmm1_scale
+
+    @staticmethod
+    def query_scale(layer: torch.nn.Module, query: torch.Tensor) -> float:
+        """q_scale belongs to an FP8 query; a model-dtype one was never scaled."""
+        if query.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+            return layer._q_scale_float
+        return 1.0
 
     # SM90 may need FP8-Q for native prefill and BF16/FP16-Q for XQA decode,
     # so quantize only the slice whose target dtype differs.
@@ -2195,10 +2715,15 @@ class FlashInferImpl(AttentionImpl):
                 canonicalize_singleton_dim_strides(k_cache.permute(*stride_order)),
                 canonicalize_singleton_dim_strides(v_cache.permute(*stride_order)),
             )
-            k_data, k_sf = nvfp4_split_data_scale(kv_cache_tuple[0])
-            v_data, v_sf = nvfp4_split_data_scale(kv_cache_tuple[1])
-            nvfp4_kv_data = (k_data, v_data)
-            nvfp4_kv_block_scales = (k_sf, v_sf)
+            if self.nvfp4_fa2:
+                nvfp4_kv_data, nvfp4_kv_block_scales, _ = _nvfp4_kv_views(
+                    kv_cache, self.num_kv_heads, self.head_size
+                )
+            else:
+                k_data, k_sf = nvfp4_split_data_scale(kv_cache_tuple[0])
+                v_data, v_sf = nvfp4_split_data_scale(kv_cache_tuple[1])
+                nvfp4_kv_data = (k_data, v_data)
+                nvfp4_kv_block_scales = (k_sf, v_sf)
         else:
             kv_cache_tuple = kv_cache_permute.split(hs, dim=-1)
 
@@ -2221,12 +2746,71 @@ class FlashInferImpl(AttentionImpl):
                 attn_metadata.q_data_type_prefill,
                 layer._q_scale,
             )
+            prefill_q_scale = self.query_scale(layer, prefill_query)
 
             if not prefill_use_trtllm:
                 assert isinstance(attn_metadata.prefill, FIPrefill)
                 prefill_wrapper = attn_metadata.prefill.wrapper
                 assert prefill_wrapper is not None
-                if use_dcp:
+
+                # mm-prefix dispatch happens here, at forward time, on the
+                # metadata field: Gemma4 clears it for its full-attention
+                # layer groups after the metadata is built, so a build-time
+                # wrapper choice could not honor that. The mm wrapper owns
+                # the complete mask (causal, sliding window, bidirectional
+                # ranges), so none of the causal-wrapper hyperparameters
+                # apply to it.
+                mm_ranges = attn_metadata.mm_prefix_query_range_tensor
+                if (
+                    mm_ranges is not None
+                    and attn_metadata.prefill.mm_wrapper is not None
+                ):
+                    mm_wrapper = attn_metadata.prefill.mm_wrapper
+                    mm_prefill_ranges = attn_metadata.prefill.mm_prefill_ranges
+                    assert mm_prefill_ranges is not None
+                    # The causal window goes over as-is: causal_window_left
+                    # carries FlashInfer's own window_left contract, the same
+                    # one every other wrapper here is given self.window_left
+                    # for, so converting it would shift the window by a row.
+                    causal_sw = self.window_left
+                    # The range clamp is a separate contract of that wrapper:
+                    # it keeps a key when (q_abs - kv) < N, so it wants the
+                    # window as a count of keys rather than as a left bound,
+                    # and 0 leaves the spans unclamped. vLLM stores
+                    # window_left = sliding_window - 1, hence the + 1 here and
+                    # nowhere else.
+                    clamp_sw = (
+                        self.window_left + 1
+                        if self.window_left >= 0
+                        and getattr(layer, "mm_prefix_clamp_sliding_window", False)
+                        else 0
+                    )
+                    # A packed NVFP4 cache is handed over as the fp4 data
+                    # views, with the block scales as ``kv_cache_sf``; the
+                    # wrapper knows how its variant reads them.
+                    if self.is_kvcache_nvfp4:
+                        assert nvfp4_kv_data is not None
+                        assert nvfp4_kv_block_scales is not None
+                        mm_kv_cache: (
+                            torch.Tensor | tuple[torch.Tensor, torch.Tensor]
+                        ) = nvfp4_kv_data
+                        mm_kv_cache_sf = nvfp4_kv_block_scales
+                    else:
+                        mm_kv_cache = kv_cache_tuple
+                        mm_kv_cache_sf = None
+                    mm_wrapper.run(
+                        prefill_query,
+                        mm_kv_cache,
+                        mm_prefill_ranges,
+                        causal_window_left=causal_sw,
+                        range_window_left=clamp_sw,
+                        q_scale=prefill_q_scale,
+                        k_scale=layer._k_scale_float,
+                        v_scale=layer._v_scale_float,
+                        out=output[num_decode_tokens:],
+                        kv_cache_sf=mm_kv_cache_sf,
+                    )
+                elif use_dcp:
                     if key is None or value is None:
                         raise NotImplementedError(
                             "FlashInfer DCP prefill does not support KV-sharing layers"
@@ -2276,7 +2860,7 @@ class FlashInferImpl(AttentionImpl):
                     # Use a pre-allocated FP8 buffer and dequantize
                     # afterwards.
                     needs_fp8_out_prefill = (
-                        self.is_kvcache_nvfp4 and output.dtype != FP8_DTYPE
+                        self.nvfp4_trtllm and output.dtype != FP8_DTYPE
                     )
                     if needs_fp8_out_prefill:
                         out_prefill = self._nvfp4_fp8_out[:num_prefill_tokens]
@@ -2291,7 +2875,7 @@ class FlashInferImpl(AttentionImpl):
                             prefill_query,
                             kv_cache_for_fi,
                             self.sinks,
-                            self.scale * layer._q_scale_float * layer._k_scale_float,
+                            self.scale * prefill_q_scale * layer._k_scale_float,
                             v_scale=layer._v_scale_float,
                             out=out_prefill,
                         )
@@ -2299,7 +2883,7 @@ class FlashInferImpl(AttentionImpl):
                         prefill_wrapper.run(
                             prefill_query,
                             kv_cache_for_fi,
-                            q_scale=layer._q_scale_float,
+                            q_scale=prefill_q_scale,
                             k_scale=layer._k_scale_float,
                             v_scale=layer._v_scale_float,
                             out=out_prefill,
@@ -2348,6 +2932,7 @@ class FlashInferImpl(AttentionImpl):
                     out = self._nvfp4_fp8_out[:num_prefill_tokens]
 
                 prefill_kv_block_scales = None
+                bmm1_scale, bmm2_scale = self.bmm1_scale, self.bmm2_scale
                 if self.is_kvcache_nvfp4:
                     # NVFP4 trtllm-gen kernel requires FP8 query.
                     assert attn_metadata.q_data_type_prefill == FP8_DTYPE, (
@@ -2390,6 +2975,9 @@ class FlashInferImpl(AttentionImpl):
                         layer._v_scale,
                         attn_metadata.q_data_type_prefill,
                     )
+                    # The dequant kernel has applied the K/V scales, and the
+                    # query was not quantized.
+                    bmm1_scale, bmm2_scale = self.scale, 1.0
                 else:
                     mock_kv_cache = kv_cache_tuple
                     mock_block_table = block_tables_prefill
@@ -2402,8 +2990,8 @@ class FlashInferImpl(AttentionImpl):
                     seq_lens=seq_lens_prefill,
                     max_q_len=attn_metadata.prefill.max_q_len,
                     max_kv_len=attn_metadata.prefill.max_seq_len,
-                    bmm1_scale=self.bmm1_scale,
-                    bmm2_scale=self.bmm2_scale,
+                    bmm1_scale=bmm1_scale,
+                    bmm2_scale=bmm2_scale,
                     batch_size=attn_metadata.num_prefills,
                     cum_seq_lens_q=attn_metadata.prefill.cum_seq_lens_q,
                     cum_seq_lens_kv=attn_metadata.prefill.cum_seq_lens_kv,
@@ -2434,6 +3022,7 @@ class FlashInferImpl(AttentionImpl):
                 attn_metadata.q_data_type_decode,
                 layer._q_scale,
             )
+            decode_q_scale = self.query_scale(layer, decode_query)
 
             if not decode_with_flashinfer_trtllm_api:
                 assert isinstance(attn_metadata.decode, FIDecode)
@@ -2451,7 +3040,7 @@ class FlashInferImpl(AttentionImpl):
 
                 # NVFP4 kernel only supports FP8 output.
                 # Use a pre-allocated FP8 buffer and dequantize afterwards.
-                needs_fp8_out = self.is_kvcache_nvfp4 and output.dtype != FP8_DTYPE
+                needs_fp8_out = self.nvfp4_trtllm and output.dtype != FP8_DTYPE
                 if needs_fp8_out:
                     out_decode = self._nvfp4_fp8_out[:num_decode_tokens]
                 else:
@@ -2470,7 +3059,7 @@ class FlashInferImpl(AttentionImpl):
                     decode_wrapper.run(
                         decode_query,
                         kv_cache_for_fi,
-                        q_scale=layer._q_scale_float,
+                        q_scale=decode_q_scale,
                         k_scale=layer._k_scale_float,
                         v_scale=layer._v_scale_float,
                         out=output_tmp,
@@ -2488,7 +3077,7 @@ class FlashInferImpl(AttentionImpl):
                     decode_wrapper.run(
                         decode_query,
                         kv_cache_for_fi,
-                        q_scale=layer._q_scale_float,
+                        q_scale=decode_q_scale,
                         k_scale=layer._k_scale_float,
                         v_scale=layer._v_scale_float,
                         out=out_decode,
@@ -2611,6 +3200,11 @@ class FlashInferImpl(AttentionImpl):
                         device=decode_query.device,
                     )
 
+                bmm1_scale = self.bmm1_scale
+                if decode_query.dtype not in (torch.float8_e4m3fn, torch.float8_e5m2):
+                    # Same rule as XQA: q_scale only for a quantized query.
+                    bmm1_scale = self.get_xqa_bmm1_scale(layer, decode_query.dtype)
+
                 trtllm_batch_decode_with_kv_cache(
                     query=decode_query,
                     kv_cache=(
@@ -2620,7 +3214,7 @@ class FlashInferImpl(AttentionImpl):
                     block_tables=block_tables_decode,
                     seq_lens=seq_lens_decode,
                     max_seq_len=attn_metadata.decode.max_seq_len,
-                    bmm1_scale=self.bmm1_scale,
+                    bmm1_scale=bmm1_scale,
                     bmm2_scale=self.bmm2_scale,
                     window_left=self.window_left,
                     sinks=self.sinks,
@@ -2668,6 +3262,21 @@ class FlashInferImpl(AttentionImpl):
             # and value[:num_actual_tokens] because the reshape_and_cache_flash
             # op uses the slot_mapping's shape to determine the number of
             # actual tokens.
+            if self.nvfp4_fa2:
+                data, scales, kv_layout = _nvfp4_kv_views(
+                    kv_cache, self.num_kv_heads, self.head_size
+                )
+                nvfp4_quantize_append_paged_kv_cache_with_slot_mapping(
+                    key,
+                    value,
+                    slot_mapping,
+                    data,
+                    scales,
+                    layer._k_scale,
+                    layer._v_scale,
+                    kv_layout=kv_layout,
+                )
+                return
             if self.is_kvcache_nvfp4:
                 # (B, 2*H, N, full_dim) -> ((B, N, H, full_dim),
                 #                            (B, N, H, full_dim));
