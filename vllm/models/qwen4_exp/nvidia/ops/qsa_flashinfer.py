@@ -31,12 +31,20 @@ from vllm.v1.worker.workspace import (
 if TYPE_CHECKING:
     from flashinfer import qsa_ops
 
+    from vllm.config.cache import CacheDType
+
 logger = init_logger(__name__)
 
 # The software E2M1 decode this route relies on is a pre-SM100 construct.
 _NATIVE_FP4_CAPABILITY = 100
 # What qsa_cache_kinds has a format for.
-_KV_CACHE_DTYPES = ("auto", "bfloat16", "fp8", "fp8_e4m3", "nvfp4")
+QSA_KV_CACHE_DTYPES: tuple[CacheDType, ...] = (
+    "auto",
+    "bfloat16",
+    "fp8",
+    "fp8_e4m3",
+    "nvfp4",
+)
 
 
 def require_qsa_flashinfer(head_dim: int, kv_cache_dtype: str) -> None:
@@ -68,10 +76,10 @@ def require_qsa_flashinfer(head_dim: int, kv_cache_dtype: str) -> None:
             "Qwen4Exp QSA packs one NVFP4 scale per sixteen values, so "
             f"head_dim has to be a multiple of sixteen, got {head_dim}"
         )
-    if kv_cache_dtype not in _KV_CACHE_DTYPES:
+    if kv_cache_dtype not in QSA_KV_CACHE_DTYPES:
         raise RuntimeError(
             f"Qwen4Exp QSA has no cache format for {kv_cache_dtype!r}; it "
-            f"serves {sorted(_KV_CACHE_DTYPES)}"
+            f"serves {sorted(QSA_KV_CACHE_DTYPES)}"
         )
     try:
         from flashinfer.qsa_ops import (

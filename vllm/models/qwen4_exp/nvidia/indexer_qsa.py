@@ -25,7 +25,7 @@ from ..common.qsa_cache import (
 from .ops.qsa_prepare import qsa_prepare
 
 if TYPE_CHECKING:
-    from .qsa import Qwen4ExpQSAAttention
+    from .qsa import Qwen4ExpQSAAttention, Qwen4ExpQSAFlashAttentionImpl
 
 
 def apply_qsa_rope(
@@ -345,8 +345,21 @@ class QSAIndexer(nn.Module):
                 dtype=self.indexer_dtype,
             )
             main_kv_cache = attn.kv_cache.transpose(1, 2)
+            main_slots = slot_mapping[:num_tokens]
+            main_scales = (attn._k_scale_float, attn._v_scale_float)
+            nvfp4_main = attn.kv_cache_dtype == "nvfp4"
             if attn.kv_cache_dtype in ("fp8", "fp8_e4m3"):
                 main_kv_cache = main_kv_cache.view(torch.float8_e4m3fn)
+            elif nvfp4_main:
+                # Land the fused store in BF16 one token per page, then let the
+                # writer quantize it into the real pages: the store addresses a
+                # row as slot // page_size, so this is the same store. Scales
+                # stay at one here; the writer applies the layer's own.
+                runtime = attn.qsa
+                assert runtime is not None
+                main_kv_cache = runtime.nvfp4_staging[:num_tokens]
+                main_slots = runtime.nvfp4_staging_slots[:num_tokens]
+                main_scales = (1.0, 1.0)
             main_outputs = qsa_prepare(
                 projected_q,
                 raw_keys,
@@ -376,10 +389,19 @@ class QSAIndexer(nn.Module):
                 main_k_norm_weight=attn.k_norm.weight,
                 main_eps=attn.q_norm.variance_epsilon,
                 main_kv_cache=main_kv_cache,
-                main_slot_mapping=slot_mapping[:num_tokens],
-                main_k_scale=attn._k_scale_float,
-                main_v_scale=attn._v_scale_float,
+                main_slot_mapping=main_slots,
+                main_k_scale=main_scales[0],
+                main_v_scale=main_scales[1],
             )
+            if nvfp4_main:
+                staged = main_kv_cache[:, 0]
+                cast("Qwen4ExpQSAFlashAttentionImpl", attn.impl).do_kv_cache_update(
+                    attn,
+                    staged[..., : attn.head_dim],
+                    staged[..., attn.head_dim :],
+                    attn.kv_cache,
+                    slot_mapping[:num_tokens],
+                )
         else:
             # Unfused reference path
             from flashinfer.norm import gemma_rmsnorm
