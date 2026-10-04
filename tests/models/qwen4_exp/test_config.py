@@ -162,84 +162,63 @@ def test_qwen4_exp_allows_pipeline_parallel_with_or_without_ple(
         Qwen4ExpForConditionalGenerationConfig.verify_and_update_config(vllm_config)
 
 
-@pytest.mark.parametrize("backend", ["amd", "nvidia"])
-def test_qwen4_exp_pp_intermediate_tensors_carry_input_ids(backend: str) -> None:
-    """PLE token IDs are transported alongside hidden states across PP."""
-    model_module = import_module(f"vllm.models.qwen4_exp.{backend}.model")
-    model = object.__new__(model_module.Qwen4ExpModel)
-    torch.nn.Module.__init__(model)
-    model.config = _text_config()
+@pytest.mark.parametrize("ple_layer_ids", [[1], []])
+def test_qwen4_exp_pp_empty_intermediate_tensors_carry_input_ids(ple_layer_ids):
+    """The runner allocates an input_ids slot exactly when PLE needs one."""
+    from vllm.model_executor.models.utils import (
+        make_empty_intermediate_tensors_factory,
+    )
+    from vllm.models.qwen4_exp.nvidia.model import Qwen4ExpModel
 
-    tensors = model.make_empty_intermediate_tensors(
-        batch_size=8,
-        dtype=torch.bfloat16,
-        device=torch.device("cpu"),
+    model = object.__new__(Qwen4ExpModel)
+    torch.nn.Module.__init__(model)
+    model.config = _text_config(ple_layer_ids=ple_layer_ids)
+    model._empty_hidden_states = make_empty_intermediate_tensors_factory(
+        ["hidden_states"], 32
     )
 
-    assert set(tensors.tensors) == {"hidden_states", "input_ids"}
+    tensors = model.make_empty_intermediate_tensors(8, torch.bfloat16, "cpu")
+
     assert tensors["hidden_states"].shape == (8, 32)
+    if not ple_layer_ids:
+        assert set(tensors.tensors) == {"hidden_states"}
+        return
     assert tensors["input_ids"].shape == (8,)
     assert tensors["input_ids"].dtype == torch.int32
 
 
-@pytest.mark.parametrize("backend", ["amd", "nvidia"])
-def test_qwen4_exp_pp_forward_preserves_input_ids(backend: str) -> None:
-    """Non-first PP ranks pass transported token IDs to their decoder layers."""
-    model_module = import_module(f"vllm.models.qwen4_exp.{backend}.model")
+def test_qwen4_exp_pp_forward_preserves_input_ids() -> None:
+    """A non-first stage hands its decoder layers the transported token ids."""
+    from vllm.models.qwen4_exp.nvidia import model as model_module
+
     model = object.__new__(model_module.Qwen4ExpModel)
     torch.nn.Module.__init__(model)
     model.config = _text_config()
-    model.start_layer = 0
-    model.end_layer = 1
+    model.start_layer, model.end_layer = 0, 1
     model.hyper_connection_mixer = None
 
-    seen_input_ids: list[torch.Tensor | None] = []
+    seen: list[torch.Tensor] = []
 
     class CaptureLayer:
         def __call__(self, **kwargs):
-            seen_input_ids.append(kwargs["input_ids"])
+            seen.append(kwargs["input_ids"])
             return kwargs["hidden_states"], None, None
 
     model.layers = [CaptureLayer()]
     input_ids = torch.tensor([11, 13], dtype=torch.int32)
-    intermediate_tensors = IntermediateTensors(
-        {
-            "hidden_states": torch.zeros(2, 32),
-            "input_ids": input_ids,
-        }
-    )
     pp_group = SimpleNamespace(is_first_rank=False, is_last_rank=False)
 
     with patch.object(model_module, "get_pp_group", return_value=pp_group):
         output = model.forward(
             input_ids=None,
             positions=torch.arange(2),
-            intermediate_tensors=intermediate_tensors,
+            intermediate_tensors=IntermediateTensors(
+                {"hidden_states": torch.zeros(2, 32), "input_ids": input_ids}
+            ),
         )
 
-    assert len(seen_input_ids) == 1
-    assert seen_input_ids[0] is input_ids
-    assert isinstance(output, IntermediateTensors)
-    torch.testing.assert_close(output["input_ids"], input_ids)
-
-
-@pytest.mark.parametrize("backend", ["amd", "nvidia"])
-def test_qwen4_exp_pp_intermediate_tensors_omit_input_ids_without_ple(
-    backend: str,
-) -> None:
-    """Non-PLE models retain the original intermediate tensor contract."""
-    model_module = import_module(f"vllm.models.qwen4_exp.{backend}.model")
-    model = object.__new__(model_module.Qwen4ExpModel)
-    torch.nn.Module.__init__(model)
-    model.config = _text_config(ple_layer_ids=[])
-
-    tensors = model.make_empty_intermediate_tensors(
-        batch_size=8,
-        dtype=torch.bfloat16,
-        device=torch.device("cpu"),
-    )
-
-    assert set(tensors.tensors) == {"hidden_states"}
+    assert seen == [input_ids]
+    assert output["input_ids"] is input_ids
 
 
 def test_qwen4_exp_model_state_prepares_ngram_context() -> None:

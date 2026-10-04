@@ -61,6 +61,7 @@ from vllm.model_executor.models.utils import (
     WeightsMapper,
     _merge_multimodal_embeddings,
     extract_layer_index,
+    make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_fuse_shared_experts,
     maybe_prefix,
@@ -397,6 +398,10 @@ class Qwen4ExpModel(nn.Module):
             Qwen4ExpSparseMoeBlock,
             "mlp",
         )
+        self._empty_hidden_states = make_empty_intermediate_tensors_factory(
+            ["hidden_states"], config.hidden_size * config.hc_count
+        )
+
         self.hyper_connection_mixer: GatedResidual | None
         if get_pp_group().is_last_rank:
             hc_config = HyperConnectionConfig(
@@ -439,28 +444,16 @@ class Qwen4ExpModel(nn.Module):
         return self.embed_tokens(input_ids)
 
     def make_empty_intermediate_tensors(
-        self,
-        batch_size: int,
-        dtype: torch.dtype,
-        device: torch.device,
+        self, batch_size: int, dtype: torch.dtype, device: torch.device
     ) -> IntermediateTensors:
-        tensors = {
-            "hidden_states": torch.zeros(
-                (batch_size, self.config.hidden_size * self.config.hc_count),
-                dtype=dtype,
-                device=device,
-            )
-        }
+        tensors = self._empty_hidden_states(batch_size, dtype, device)
         if self.config.ple_layer_ids:
-            # PLE needs the raw token IDs on every pipeline stage. The model
-            # runner stores input IDs as int32, so preserve that compact dtype
-            # while transporting them through the PP intermediate tensors.
+            # PLE reads the raw token ids, which only the first stage is given;
+            # carry them along. The runner keeps them int32.
             tensors["input_ids"] = torch.zeros(
-                batch_size,
-                dtype=torch.int32,
-                device=device,
+                batch_size, dtype=torch.int32, device=device
             )
-        return IntermediateTensors(tensors)
+        return tensors
 
     @staticmethod
     def _start_layer_ple_prefetch(
@@ -571,11 +564,11 @@ class Qwen4ExpModel(nn.Module):
                 hidden_states = last_layer.mlp_hyper_connection.combine(
                     hidden_states, block_output, injection
                 )
-            intermediate = {"hidden_states": hidden_states}
+            tensors = IntermediateTensors({"hidden_states": hidden_states})
             if self.config.ple_layer_ids:
                 assert input_ids is not None
-                intermediate["input_ids"] = input_ids
-            return IntermediateTensors(intermediate)
+                tensors["input_ids"] = input_ids
+            return tensors
 
         # The final mixer consumes the last pending combine and returns both
         # the sampled single stream and the materialized multi-stream state.
