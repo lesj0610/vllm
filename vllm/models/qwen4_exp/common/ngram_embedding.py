@@ -477,10 +477,21 @@ class Qwen4ExpPLEPinnedHostEmbedding(Qwen4ExpPLEEmbedding):
 
         flat_ids = input_ids.reshape(-1).long()
         if flat_ids.numel():
+            # The kernel is a masked gather: it reads a row index, loads and
+            # stores. It does no arithmetic on the values, so it runs over a
+            # byte view of both sides, as _reduce_etp_embeddings does. Triton
+            # has no fp8e4nv below compute capability 8.9, and an fp8 pointer
+            # type is all it would take to refuse a table it never looks
+            # inside; FP8 is one byte wide, so the copy is byte identical.
+            weight_view = self._uva_weight
+            output_view = output
+            if weight_view.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+                weight_view = weight_view.view(torch.int8)
+                output_view = output_view.view(torch.int8)
             _lookup_ple_embedding_from_pinned_kernel[(flat_ids.numel(),)](
-                self._uva_weight,
+                weight_view,
                 flat_ids,
-                output,
+                output_view,
                 self.embedding_dim,
                 self.shard_indices.org_vocab_start_index,
                 self.shard_indices.org_vocab_end_index,
