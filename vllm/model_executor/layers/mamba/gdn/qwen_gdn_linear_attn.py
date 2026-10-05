@@ -477,7 +477,15 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             )
         )
 
-        set_weight_attrs(self.A_log, {"weight_loader": sharded_weight_loader(0)})
+        # Kept in fp32 whatever the checkpoint stores: the decay is
+        # exponentiated per step and the loader need not warn about it.
+        set_weight_attrs(
+            self.A_log,
+            {
+                "weight_loader": sharded_weight_loader(0),
+                "loaded_dtype_may_differ": True,
+            },
+        )
         set_weight_attrs(self.dt_bias, {"weight_loader": sharded_weight_loader(0)})
 
         output_gate_type = getattr(config, "output_gate_type", "silu")

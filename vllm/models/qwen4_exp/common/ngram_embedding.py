@@ -313,6 +313,9 @@ class Qwen4ExpPLEFp8EmbeddingMethod(Qwen4ExpPLEEmbeddingMethod):
             weight_loader,
             scale_dtype=torch.float32,
         )
+        # fp32 whatever the checkpoint serialized it as; the loader need not
+        # warn about a scale it was asked to keep wider.
+        set_weight_attrs(weight_scale, {"loaded_dtype_may_differ": True})
         layer.register_parameter("weight_scale", weight_scale)
 
     def process_weights_after_loading(self, layer: nn.Module) -> None:

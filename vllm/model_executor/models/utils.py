@@ -321,7 +321,9 @@ class AutoWeightsLoader:
                     f"into a single parameter {base_prefix!r}"
                 )
 
-            if param.dtype != weight_data.dtype:
+            if param.dtype != weight_data.dtype and not getattr(
+                param, "loaded_dtype_may_differ", False
+            ):
                 logger.warning(
                     "Attempted to load weight %s with dtype %s into "
                     "parameter with dtype %s",
