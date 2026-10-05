@@ -103,41 +103,18 @@ def _config(**overrides):
 
 
 @requires_cuda
-@pytest.mark.parametrize("kv_cache_dtype", SUPPORTED_DTYPES)
-def test_every_supported_configuration_is_served(kv_cache_dtype):
-    """The dtypes this backend has a cache format for are the ones it takes."""
-    if current_platform.has_device_capability(100):
-        pytest.skip("this route is pre-SM100")
-    qsa_flashinfer.require_qsa_flashinfer(HEAD_DIM, kv_cache_dtype)
-
-
-@requires_cuda
-def test_a_missing_capability_refuses_the_layer(monkeypatch):
-    """No silent Triton. A build without the kernels stops the deployment.
-
-    The Triton implementation is still in the tree and this deployment does not
-    serve on it: falling through would change the kernel, the memory profile
-    and the answer to why a step got slower, with nothing said.
-    """
-    monkeypatch.setattr(flashinfer.qsa_ops, "qsa_capabilities", lambda device: 0)
-    with pytest.raises(RuntimeError, match="requires FlashInfer"):
-        qsa_flashinfer.require_qsa_flashinfer(HEAD_DIM, "nvfp4")
-
-
-@requires_cuda
-def test_sm100_and_later_are_refused_rather_than_served_by_triton(monkeypatch):
-    """This route decodes packed NVFP4 in software; those do it in one op."""
-    monkeypatch.setattr(
-        current_platform, "has_device_capability", lambda capability: True
-    )
-    with pytest.raises(RuntimeError, match="SM100"):
-        qsa_flashinfer.require_qsa_flashinfer(HEAD_DIM, "nvfp4")
-
-
-@requires_cuda
 @pytest.mark.parametrize(
-    ("reason", "head_dim", "kv_cache_dtype", "config_overrides", "match"),
+    ("case", "head_dim", "kv_cache_dtype", "overrides", "match"),
     [
+        # Every dtype the backend has a cache format for is taken.
+        *[(d, HEAD_DIM, d, None, None) for d in SUPPORTED_DTYPES],
+        # No silent Triton: the reference kernels are still in the tree and
+        # this deployment does not serve on them, so a build without the
+        # library stops the deployment rather than changing the kernel, the
+        # memory profile and the answer to why a step got slower.
+        ("no kernels", HEAD_DIM, "nvfp4", None, "requires FlashInfer"),
+        # This route decodes packed NVFP4 in software; SM100 does it in one op.
+        ("sm100", HEAD_DIM, "nvfp4", None, "SM100"),
         # NVFP4 packs one scale per sixteen values; a head between two has none.
         ("head", 100, "nvfp4", None, "sixteen"),
         # The format is what the planner is instantiated for, not a guess.
@@ -149,16 +126,27 @@ def test_sm100_and_later_are_refused_rather_than_served_by_triton(monkeypatch):
         ("shape", None, None, {"index_num_heads": 64}, "scorer"),
     ],
 )
-def test_a_configuration_the_library_cannot_serve_is_refused(
-    device, worker, reason, head_dim, kv_cache_dtype, config_overrides, match
+def test_the_gate_takes_what_it_serves_and_refuses_the_rest(
+    device, worker, monkeypatch, case, head_dim, kv_cache_dtype, overrides, match
 ):
-    """Refused at startup, with the library's reason, not at the first step."""
-    if config_overrides is None:
-        with pytest.raises(RuntimeError, match=match):
-            qsa_flashinfer.require_qsa_flashinfer(head_dim, kv_cache_dtype)
-    else:
+    """Settled at startup, with the reason, rather than at the first step."""
+    if case == "no kernels":
+        monkeypatch.setattr(flashinfer.qsa_ops, "qsa_capabilities", lambda device: 0)
+    if case == "sm100":
+        monkeypatch.setattr(
+            current_platform, "has_device_capability", lambda capability: True
+        )
+    if overrides is not None:
         with pytest.raises(ValueError, match=match):
-            qsa_flashinfer.qsa_workspace_needs(_config(**config_overrides), device)
+            qsa_flashinfer.qsa_workspace_needs(_config(**overrides), device)
+        return
+    if match is None:
+        if current_platform.has_device_capability(100):
+            pytest.skip("this route is pre-SM100")
+        qsa_flashinfer.require_qsa_flashinfer(head_dim, kv_cache_dtype)
+        return
+    with pytest.raises(RuntimeError, match=match):
+        qsa_flashinfer.require_qsa_flashinfer(head_dim, kv_cache_dtype)
 
 
 # --- the cache ------------------------------------------------------------
@@ -215,18 +203,12 @@ def test_the_cache_views_say_what_the_bytes_are(
     assert (config.kv_cache_format, config.kv_layout) == (views.format, views.layout)
     assert config.kv_data_type == views.k_data.dtype
 
-
-@requires_cuda
-@pytest.mark.parametrize("kv_cache_dtype", SUPPORTED_DTYPES)
-def test_the_planes_are_views_and_not_copies(device, kv_cache_dtype):
-    """A copy would be a second cache, and a stale one after the first write."""
-    cache = _cache(device, kv_cache_dtype)
-    views = qsa_flashinfer.qsa_cache_views(cache, cache, kv_cache_dtype)
+    # Views, not copies: a copy would be a second cache, and a stale one after
+    # the first write.
     assert views.k_data.data_ptr() == cache.data_ptr()
     if views.k_sf is not None:
-        begin = cache.data_ptr()
-        end = begin + cache.numel() * cache.element_size()
-        assert begin < views.k_sf.data_ptr() < end
+        end = cache.data_ptr() + cache.numel() * cache.element_size()
+        assert cache.data_ptr() < views.k_sf.data_ptr() < end
 
 
 @requires_cuda
@@ -715,43 +697,6 @@ def _prepared_step(device, owners, caches, randomize_caches=False):
 
 
 @requires_cuda
-def test_every_qsa_layer_of_a_rank_binds(device, worker):
-    """The pass that binds them all, as the model runner runs it.
-
-    A model has one of these per decoder block and they are bound in one pass.
-    A runtime that a layer owns rather than leases makes the second layer fail,
-    and every kernel test still passes, because no kernel test has two layers.
-    """
-    owners = _owners()
-    caches = _caches(device)
-    context = {owner.layer_name: owner for owner in owners}
-
-    bind_kv_cache_to_layers(caches, context)
-
-    for owner in owners:
-        assert owner.qsa_runtime is not None
-        assert owner.indexer.qsa_runtime is not None
-
-
-@requires_cuda
-def test_the_layers_of_one_slot_share_one_runtime(device, worker):
-    """Not one each: one, shared.
-
-    The layers of a slot run one after another inside a step, so the route, the
-    mask and the padded buffers are the slot's and not the layer's. Two copies
-    would be two of everything the arena holds, once per decoder block.
-    """
-    owners = _owners()
-    bind_kv_cache_to_layers(_caches(device), {o.layer_name: o for o in owners})
-
-    attention = {id(owner.qsa_runtime) for owner in owners}
-    selection = {id(owner.indexer.qsa_runtime) for owner in owners}
-    assert len(attention) == 1, f"{len(attention)} runtimes for one rank"
-    assert len(selection) == 1, f"{len(selection)} selection handles for one rank"
-    assert attention == selection, "the two halves are not the same object"
-
-
-@requires_cuda
 def test_the_profiling_cache_is_replaced_by_the_production_one(device, worker):
     """The two binds the engine does, and what has to be true between them.
 
@@ -770,7 +715,11 @@ def test_the_profiling_cache_is_replaced_by_the_production_one(device, worker):
     bind_kv_cache_to_layers(_caches(device, pages=2), context)
     profiling = owners[0].qsa_runtime
     assert profiling.num_slots == 2 * PAGE_SIZE
-    assert all(owner.qsa_runtime is profiling for owner in owners)
+    # One pass binds every layer of the rank, and they lease one runtime
+    # rather than owning one each: two copies would be two of everything the
+    # arena holds, once per decoder block.
+    assert {id(o.qsa_runtime) for o in owners} == {id(profiling)}
+    assert {id(o.indexer.qsa_runtime) for o in owners} == {id(profiling)}
     _step_once(device, owners[:1])
     dead = weakref.ref(profiling)
     del profiling
@@ -933,20 +882,27 @@ def test_a_step_builds_and_allocates_nothing(device, worker):
 
 
 @requires_cuda
-def test_the_backend_is_settled_when_the_model_is_built(device, worker):
-    """Once, for the rank, and not re-decided by whether a runtime exists yet.
+def test_the_attacher_settles_the_backend_and_the_route_it_reads(device, worker):
+    """Once, for the rank, before anything is bound.
 
-    These are two different questions and conflating them is how a FlashInfer
-    deployment ends up quietly running a Triton kernel: at the moment the
-    memory profile captures its graphs the cache has only just been bound, and
-    a step that read "no runtime yet" as "use the other backend" would change
-    the kernel, the route's width and the memory profile, with nothing said.
+    Whether a runtime exists yet is a different question, and conflating the
+    two is how a FlashInfer deployment ends up quietly running a Triton
+    kernel: at the moment the memory profile captures its graphs the cache has
+    only just been bound, and a step that read "no runtime yet" as "use the
+    other backend" would change the kernel, the route's width and the memory
+    profile, with nothing said.
+
+    The width goes with the decision. The Triton route carries a trailing
+    count column that its tile loop reads as a bound; the FlashInfer route is
+    indices and nothing else, and a buffer sized for one and written by the
+    other runs off the end of it.
     """
     for owner in _owners():
         assert owner.qsa_backend == "flashinfer"
         assert owner.indexer.qsa_backend == "flashinfer"
-        # Decided before anything is bound: the runtime is still absent here.
         assert owner.qsa_runtime is None
+        assert owner.topk_indices_buffer.shape[1] == ROUTE_WIDTH
+        assert owner.indexer.packed_output_width == ROUTE_WIDTH + 1
 
 
 @requires_cuda
@@ -1067,17 +1023,3 @@ def test_the_route_the_profile_runs_on_is_zero_and_not_whatever_was_there(
     torch.accelerator.synchronize()
     assert not took_triton, "the profiling step fell through to Triton"
     assert bool(torch.isfinite(out.to(torch.float32)).all())
-
-
-@requires_cuda
-def test_each_backend_gets_the_route_width_it_reads(device, worker):
-    """One buffer per layer, at the width of the backend that will read it.
-
-    The Triton route carries a trailing count column that its tile loop reads
-    as a bound; the FlashInfer route is indices and nothing else. A buffer
-    sized for one and written by the other runs off the end of it.
-    """
-    for owner in _owners():
-        assert owner.qsa_backend == "flashinfer"
-        assert owner.topk_indices_buffer.shape[1] == ROUTE_WIDTH
-        assert owner.indexer.packed_output_width == ROUTE_WIDTH + 1
