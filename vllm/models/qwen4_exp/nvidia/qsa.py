@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
 from typing import ClassVar, cast
 
 import torch
@@ -46,6 +45,7 @@ from vllm.v1.attention.backends.flash_attn import (
     FlashAttentionMetadataBuilder,
 )
 from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
     FullAttentionSpec,
     KVCacheSpec,
     get_kv_quant_mode,
@@ -74,6 +74,17 @@ class Qwen4ExpQSAFlashAttentionBackend(FlashAttentionBackend):
     # Triton kernel. flash-attn never runs over this cache, so its fp8 probe
     # does not apply (see supports_kv_cache_dtype and the impl constructor).
     supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = list(QSA_KV_CACHE_DTYPES)
+
+    @classmethod
+    def customize_spec(cls, spec: AttentionSpec) -> AttentionSpec:
+        """An NVFP4 page is the one FlashInfer lays out, so take its geometry.
+
+        K and V get a head slot each holding packed fp4 data followed by its
+        e4m3 block scales, which is what nvfp4_slot_views reads back.
+        """
+        from vllm.v1.attention.backends.flashinfer import FlashInferBackend
+
+        return FlashInferBackend.customize_spec(spec)
 
     @classmethod
     def supports_kv_cache_dtype(cls, kv_cache_dtype: CacheDType | None) -> bool:
@@ -771,23 +782,13 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         return self.attn_backend
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
-        spec = FullAttentionSpec(
+        return FullAttentionSpec(
             block_size=vllm_config.cache_config.block_size,
             num_kv_heads=self.num_kv_heads,
             head_size=self.head_dim,
             head_size_v=self.head_dim,
             dtype=self.kv_cache_torch_dtype,
             kv_quant_mode=get_kv_quant_mode(self.kv_cache_dtype),
-        )
-        if not spec.kv_quant_mode.is_nvfp4:
-            return spec
-        # K and V take a head slot each, holding packed fp4 data followed by
-        # its e4m3 block scales; see nvfp4_slot_views.
-        return replace(
-            spec,
-            num_head_slots=2 * self.num_kv_heads,
-            head_size=nvfp4_kv_cache_full_dim(self.head_dim),
-            head_size_v=nvfp4_kv_cache_full_dim(self.head_dim),
         )
 
     @eager_break_during_capture
