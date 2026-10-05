@@ -224,6 +224,7 @@ from vllm.v1.worker.utils import (
     EncoderTimingStats,
     is_residual_scattered_for_sp,
     raise_if_nan_logits,
+    reserve_attention_workspace,
 )
 from vllm.v1.worker.workspace import lock_workspace
 
@@ -6799,6 +6800,7 @@ class GPUModelRunner(
             )
 
         with self._freeze_gc(), graph_capture(device=self.device):
+            reserve_attention_workspace(self)
             torch.accelerator.synchronize()
             torch.accelerator.empty_cache()
             start_free_gpu_memory = torch.accelerator.get_memory_info()[0]
