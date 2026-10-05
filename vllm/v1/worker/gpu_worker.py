@@ -109,7 +109,6 @@ from vllm.v1.worker.workspace import (
     current_workspace_manager,
     init_workspace_manager,
     is_workspace_manager_initialized,
-    lock_workspace,
     shares_attention_workspace,
 )
 
@@ -1046,12 +1045,11 @@ class Worker(WorkerBase):
             else:
                 self.model_runner._dummy_sampler_run(hidden_states=last_hidden_states)
 
-        # After every warmup that could still grow it, the arena is final.
+        # The warmups must not have grown the arena past what KV sizing saw.
         if shares_attention_workspace():
             runner: Any = self.model_runner
             sizes = runner._profiled_persistent_workspace_sizes
-            current_workspace_manager().assert_within(sizes, "before workspace lock")
-            lock_workspace()
+            current_workspace_manager().assert_within(sizes, "after warmup")
 
         # Reset the seed to ensure that the random state is not affected by
         # the model initialization and profiling.

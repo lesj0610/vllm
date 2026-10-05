@@ -530,11 +530,11 @@ _WARMUP_NOOPS = (
         pytest.param(False, True, False, True, id="opted-out-stays-growable"),
     ],
 )
-def test_warmup_locks_an_opted_in_workspace(
+def test_warmup_must_not_grow_an_opted_in_arena(
     monkeypatch, shared, grows, enforce_eager, use_v2
 ):
-    """The lock follows the last warmup that can size the arena, also when
-    capture_model() is skipped or returns early."""
+    """Checked after the last warmup that can size the arena, also when
+    capture_model() is skipped; eager stays unlocked as upstream has it."""
     events: list[str] = []
     arena = WorkspaceManager(torch.device("cpu"))
     arena.get_simultaneous(((1024,), torch.uint8))
@@ -565,7 +565,6 @@ def test_warmup_locks_an_opted_in_workspace(
         "current_workspace_manager": lambda: arena,
         "shares_attention_workspace": lambda: shared,
         "warmup_kernels": warmup("warmup_kernels"),
-        "lock_workspace": lambda: events.append("lock"),
         "get_pp_group": lambda: SimpleNamespace(is_last_rank=True),
         **dict.fromkeys(_WARMUP_NOOPS, lambda *a, **k: None),
     }
@@ -574,16 +573,11 @@ def test_warmup_locks_an_opted_in_workspace(
     monkeypatch.setattr(jit_monitor, "activate", lambda **kw: None)  # lazy import
 
     if shared and grows:
-        with pytest.raises(AssertionError, match="before workspace lock"):
+        with pytest.raises(AssertionError, match="after warmup"):
             worker.compile_or_warm_up_model()
-        assert "lock" not in events
         return
     worker.compile_or_warm_up_model()
     assert ("capture" in events) is not enforce_eager
-    if shared:
-        assert events[-1] == "lock"
-    else:
-        assert "lock" not in events
 
 
 _SHIPPED_SPEC = FullAttentionSpec(
