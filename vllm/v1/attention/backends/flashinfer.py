@@ -96,7 +96,7 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker.workspace import (
     current_workspace_manager,
-    is_workspace_manager_initialized,
+    shares_attention_workspace,
 )
 
 FLASHINFER_WORKSPACE_BUFFER_SIZE_BATCH_INVARIANT = 2048 * 1024 * 1024
@@ -1088,27 +1088,19 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         )
 
     def _get_workspace_routes(self) -> FlashInferWorkspaceRoutes:
-        non_causal = getattr(self.kv_cache_spec, "non_causal", False)
-        trtllm_prefill = self._reservation_trtllm_prefill and not non_causal
-        native_prefill = (
-            non_causal or self.model_config.is_mm_prefix_lm or not trtllm_prefill
-        )
-        # Dedicated XQA decode also serves non-causal batches, so its workspace
-        # must be reserved before the arena is locked.
-        trtllm_decode = self.use_trtllm_decode_attention and (
-            not non_causal or self.use_xqa
-        )
-        native_decode = not self.use_trtllm_decode_attention and not non_causal
+        # Non-causal models opt out of the reservation, so only causal routes.
+        trtllm_prefill = self._reservation_trtllm_prefill
+        trtllm_decode = self.use_trtllm_decode_attention
         return FlashInferWorkspaceRoutes(
-            native_prefill=native_prefill,
+            native_prefill=self.model_config.is_mm_prefix_lm or not trtllm_prefill,
             trtllm_prefill=trtllm_prefill,
-            native_decode=native_decode,
+            native_decode=not trtllm_decode,
             trtllm_decode=trtllm_decode,
         )
 
     def _allocate_workspace_buffer(self, buffer_size: int) -> torch.Tensor:
         buffer_size = max(int(buffer_size), 1)
-        if is_workspace_manager_initialized():
+        if shares_attention_workspace():
             manager = current_workspace_manager()
             (workspace_buffer,) = manager.get_simultaneous(
                 ((buffer_size,), torch.uint8),
@@ -1380,9 +1372,6 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         wrappers. A wrapper caches its arena's size at construction, so no
         wrapper may exist while another builder can still grow the arena.
         """
-        if self.use_dcp or not is_workspace_manager_initialized():
-            return
-
         routes = self._get_workspace_routes()
         if not materialize:
             if routes.native_prefill or routes.native_decode:

@@ -6651,6 +6651,8 @@ class GPUModelRunner(
         try:
             set_cudagraph_capturing_enabled(True)
             with self._freeze_gc(), graph_capture(device=self.device):
+                # Before the first sample, so graph memory excludes the wrappers.
+                reserve_attention_workspace(self)
                 torch.accelerator.synchronize()
                 torch.accelerator.empty_cache()
 
@@ -6800,7 +6802,6 @@ class GPUModelRunner(
             )
 
         with self._freeze_gc(), graph_capture(device=self.device):
-            reserve_attention_workspace(self)
             torch.accelerator.synchronize()
             torch.accelerator.empty_cache()
             start_free_gpu_memory = torch.accelerator.get_memory_info()[0]

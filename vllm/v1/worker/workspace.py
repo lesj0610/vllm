@@ -66,7 +66,7 @@ class WorkspaceManager:
         self._device = device
         self._alloc_context = alloc_context
         # Cache num ubatches at init based on configuration (default to 1)
-        self._num_ubatches = max(1, num_ubatches if num_ubatches is not None else 1)
+        self._num_ubatches = num_ubatches if num_ubatches is not None else 1
         if num_lanes < 1:
             raise ValueError(f"num_lanes must be at least one, got {num_lanes}.")
         self._num_lanes = num_lanes
@@ -77,6 +77,7 @@ class WorkspaceManager:
             {} for _ in self._current_workspaces
         ]
         self._locked: bool = False
+        self.shares_attention_workspace = False
 
     @staticmethod
     def _workspace_size_bytes(workspace: torch.Tensor | None) -> int:
@@ -124,12 +125,16 @@ class WorkspaceManager:
         return self._locked
 
     def _get_workspace_id(self) -> int:
-        # Same slot the scratch allocation resolves to. Reading the ubatch off
-        # dbo_current_ubatch_id() directly would ignore the override that
-        # use_workspace_ubatch_id sets, so a persistent resource created while
-        # reserving for one ubatch would be cached under another and go missing
-        # once the manager is locked.
-        return self._resolve_workspace_id()
+        lane = _workspace_lane.get()
+        if lane >= self._num_lanes:
+            raise RuntimeError(
+                f"Workspace lane {lane} is not configured; manager has "
+                f"{self._num_lanes} lane(s)."
+            )
+        ubatch_id = _workspace_ubatch_id.get()
+        if ubatch_id is None:
+            ubatch_id = dbo_current_ubatch_id()
+        return ubatch_id * self._num_lanes + lane
 
     def get_persistent_resource(self, key: Hashable, factory: Callable[[], T]) -> T:
         """Return the resource cached for ``key`` in the current ubatch and lane.
@@ -207,28 +212,6 @@ class WorkspaceManager:
             for i in range(len(shapes_and_dtypes))
         ]
 
-    def _resolve_workspace_id(self) -> int:
-        """The slot for the active ubatch and lane.
-
-        ``use_workspace_ubatch_id`` overrides the DBO ubatch so a resource
-        created while reserving for one ubatch is cached under that ubatch.
-        """
-        ubatch_id = _workspace_ubatch_id.get()
-        if ubatch_id is None:
-            ubatch_id = dbo_current_ubatch_id()
-        if not 0 <= ubatch_id < self._num_ubatches:
-            raise IndexError(
-                f"Workspace ubatch id {ubatch_id} is outside the configured "
-                f"range [0, {self._num_ubatches})."
-            )
-        lane = _workspace_lane.get()
-        if lane >= self._num_lanes:
-            raise RuntimeError(
-                f"Workspace lane {lane} is not configured; manager has "
-                f"{self._num_lanes} lane(s)."
-            )
-        return ubatch_id * self._num_lanes + lane
-
     def assert_within(self, limits: tuple[int, ...], phase: str) -> None:
         """Fail when any ubatch arena grew past what ``limits`` recorded."""
         current = self.workspace_sizes_bytes()
@@ -257,7 +240,7 @@ class WorkspaceManager:
             The current workspace tensor.
 
         """
-        workspace_id = self._resolve_workspace_id()
+        workspace_id = self._get_workspace_id()
         current_workspace = self._current_workspaces[workspace_id]
         current_size = self._workspace_size_bytes(current_workspace)
 
@@ -334,6 +317,11 @@ def is_workspace_manager_initialized() -> bool:
 
     """
     return _manager is not None
+
+
+def shares_attention_workspace() -> bool:
+    """Whether attention builders take their float workspace from the manager."""
+    return _manager is not None and _manager.shares_attention_workspace
 
 
 def current_workspace_manager() -> "WorkspaceManager":

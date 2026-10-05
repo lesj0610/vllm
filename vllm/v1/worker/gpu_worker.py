@@ -97,9 +97,10 @@ from vllm.v1.worker.startup_plan import (
     maybe_apply_startup_plan,
     maybe_save_startup_plan,
 )
+from vllm.v1.worker.ubatch_utils import get_num_ubatches
 from vllm.v1.worker.utils import (
     is_residual_scattered_for_sp,
-    prepare_profiling_workspace,
+    profile_persistent_attention_workspace,
     requires_persistent_attention_workspace_profiling,
     reserve_persistent_attention_workspace,
 )
@@ -109,6 +110,7 @@ from vllm.v1.worker.workspace import (
     init_workspace_manager,
     is_workspace_manager_initialized,
     lock_workspace,
+    shares_attention_workspace,
 )
 
 from ...model_executor.model_loader import TensorizerLoader
@@ -536,9 +538,8 @@ class Worker(WorkerBase):
 
     def _init_workspace_and_model_runner(self) -> None:
         """Set up the workspace manager, build the model runner, report usage."""
-        # Initialize workspace manager. DSpark target and draft CUDA graphs
-        # retain workspace views concurrently, so they need separate lanes.
-        num_ubatches = max(1, self.vllm_config.parallel_config.num_ubatches)
+        # DSpark target and draft CUDA graphs retain workspace views concurrently.
+        num_ubatches = get_num_ubatches(self.vllm_config.parallel_config)
         init_workspace_manager(
             self.device,
             num_ubatches,
@@ -600,6 +601,11 @@ class Worker(WorkerBase):
         # valid when requests arrive.
         set_torch_threads_for_runtime()
 
+        if is_workspace_manager_initialized():
+            current_workspace_manager().shares_attention_workspace = (
+                requires_persistent_attention_workspace_profiling(self.vllm_config)
+            )
+
     def update_config(self, overrides: dict[str, Any]) -> None:
         self.model_runner.update_config(overrides)
 
@@ -652,52 +658,28 @@ class Worker(WorkerBase):
 
         # Execute a forward pass with dummy inputs to profile the memory usage
         # of the model.
-        workspace_lease = None
-        profile_persistent_workspace = (
-            requires_persistent_attention_workspace_profiling(self.vllm_config)
+        with (
+            memory_profiling(
+                self.init_snapshot,
+                weights_memory=int(self.model_runner.model_memory_usage),
+            ) as profile_result,
+            # Workspaces (e.g. the MoE workspace) grow in steps during this pass,
+            # freeing each smaller buffer. Without a split limit, a later small
+            # allocation can be carved out of a freed multi-GiB block and pin the
+            # whole segment past the empty_cache() in memory_profiling, so it is
+            # counted as consumed and taken from the KV cache. Blocks above the
+            # limit are never split, so they stay releasable. Exits before
+            # memory_profiling measures, restoring the original limit.
+            self._scoped_allocator_max_split(max_split_size_mb=20),
+            set_current_vllm_config(self.vllm_config),
+        ):
+            self.model_runner.profile_run(randomize_inputs=self.randomize_dummy_inputs)
+        # After the profile, so the wrappers bind the arena the model grew.
+        persistent_workspace_bytes = (
+            profile_persistent_attention_workspace(self.model_runner)
+            if shares_attention_workspace()
+            else 0
         )
-        try:
-            with (
-                memory_profiling(
-                    self.init_snapshot,
-                    weights_memory=int(self.model_runner.model_memory_usage),
-                ) as profile_result,
-                # Workspaces (e.g. the MoE workspace) grow in steps during this
-                # pass, freeing each smaller buffer. Without a split limit, a
-                # later small allocation can be carved out of a freed multi-GiB
-                # block and pin the whole segment past the empty_cache() in
-                # memory_profiling, so it is counted as consumed and taken from
-                # the KV cache. Blocks above the limit are never split, so they
-                # stay releasable. Exits before memory_profiling measures,
-                # restoring the original limit.
-                self._scoped_allocator_max_split(max_split_size_mb=20),
-                set_current_vllm_config(self.vllm_config),
-            ):
-                if profile_persistent_workspace:
-                    workspace_lease = prepare_profiling_workspace(self.model_runner)
-                self.model_runner.profile_run(
-                    randomize_inputs=self.randomize_dummy_inputs
-                )
-            # The lease has to outlive the block above. Only the shared arenas
-            # are held by the global manager; the dedicated workspace a builder
-            # allocates per wrapper is owned by that wrapper alone, so releasing
-            # it any earlier frees it before memory_profiling takes the closing
-            # measurement that total_consumed is derived from, and KV sizing
-            # goes back to not knowing about it.
-        finally:
-            # Release profiling-only owners before rebuilding the minimal KV
-            # state for CUDA graph memory profiling. The shared arenas stay
-            # live and are already in profile_result.total_consumed.
-            released_workspace_lease = workspace_lease is not None
-            if workspace_lease is not None:
-                workspace_lease.clear()
-                workspace_lease = None
-        # Reclaiming what the lease held is only meaningful once profiling
-        # succeeded, and keeping it out of the finally above means a failure
-        # here cannot mask the error that got us there.
-        if released_workspace_lease:
-            gc.collect()
-            torch.accelerator.empty_cache()
 
         # Profile CUDA graph memory if graphs will be captured.
         # ROCm is included: #44825 moved the profiler to
@@ -708,28 +690,7 @@ class Worker(WorkerBase):
         if (
             current_platform.is_cuda_alike() or current_platform.is_xpu()
         ) and self.vllm_config.compilation_config.cudagraph_mode != CUDAGraphMode.NONE:
-            # The arenas the persistent workspace sized must survive CUDA
-            # graph profiling untouched; growth here escapes KV cache sizing.
-            check_arena = profile_persistent_workspace and (
-                is_workspace_manager_initialized()
-            )
-            arena_before = (
-                current_workspace_manager().workspace_sizes_bytes()
-                if check_arena
-                else ()
-            )
             cudagraph_memory_estimate = self.model_runner.profile_cudagraph_memory()
-            if check_arena:
-                current_workspace_manager().assert_within(
-                    arena_before, "during CUDA graph profiling"
-                )
-        if profile_persistent_workspace and is_workspace_manager_initialized():
-            # Recorded here, right after CUDA graph profiling, so the ceiling
-            # covers every arena the profiling window accounted for.
-            runner: Any = self.model_runner
-            runner._profiled_persistent_workspace_sizes = (
-                current_workspace_manager().workspace_sizes_bytes()
-            )
 
         # Respect the opt-in flag as originally designed.
         cudagraph_memory_estimate_applied = (
@@ -758,9 +719,13 @@ class Worker(WorkerBase):
             profile_result.non_kv_cache_memory = (
                 profile_result.total_consumed + profile_result.transient_peak_headroom
             )
+        profile_result.total_consumed += persistent_workspace_bytes
+        profile_result.non_kv_cache_memory += persistent_workspace_bytes
 
         self.total_consumed = profile_result.total_consumed
-        self.peak_activation_memory = profile_result.transient_peak_headroom
+        self.peak_activation_memory = (
+            profile_result.transient_peak_headroom + cudagraph_memory_estimate_applied
+        )
         self.cudagraph_memory_estimate = cudagraph_memory_estimate
 
         self.available_kv_cache_memory_bytes = (
@@ -916,9 +881,8 @@ class Worker(WorkerBase):
                 kv_cache_config,
                 kv_cache_allocation_context=mem_pool_context,
             )
-            # The wrapper-owned buffers this builds are KV-init state too, and
-            # outside the pool they stay resident through sleep.
-            if requires_persistent_attention_workspace_profiling(self.vllm_config):
+            # Inside the runtime pool, so sleep offloads the wrappers' buffers too.
+            if shares_attention_workspace():
                 reserve_persistent_attention_workspace(self.model_runner)
 
         # Build KV-zero metadata outside the CuMem pool so the bookkeeping
@@ -974,14 +938,6 @@ class Worker(WorkerBase):
         # cuda graph capture.
         kernel_warmup(self)
 
-        # Reserve first, so the kernel warmup below runs against the arena the
-        # profiling sized rather than growing one of its own.
-        profile_persistent_workspace = (
-            requires_persistent_attention_workspace_profiling(self.vllm_config)
-        )
-        if profile_persistent_workspace:
-            reserve_persistent_attention_workspace(self.model_runner)
-
         if self.use_v2_model_runner:  # noqa: SIM102
             if self.vllm_config.kernel_config.enable_jit_warmup:
                 # A workspace resize after capture frees what the graphs point at.
@@ -1025,17 +981,11 @@ class Worker(WorkerBase):
             # slightly underestimate the memory consumption.
             # So leave a small buffer (=150MiB) to avoid OOM.
             redundancy_buffer_memory = 150 * (1 << 20)
-            cuda_graph_memory_for_sizing = cuda_graph_memory_bytes
-            if envs.VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS:
-                cuda_graph_memory_for_sizing = max(
-                    cuda_graph_memory_for_sizing,
-                    self.cudagraph_memory_estimate,
-                )
 
             non_kv_cache_memory = (
                 self.total_consumed
                 + self.peak_activation_memory
-                + cuda_graph_memory_for_sizing
+                + cuda_graph_memory_bytes
             )
             kv_cache_memory_bytes_to_gpu_limit = (
                 self.init_snapshot.free_memory
@@ -1058,8 +1008,7 @@ class Worker(WorkerBase):
                 f"Actual usage is {format_gib(self.total_consumed)} "
                 f"GiB for consumed memory (weights + non-torch), "
                 f"{format_gib(self.peak_activation_memory)} GiB "
-                f"for peak activation, and "
-                f"{format_gib(cuda_graph_memory_for_sizing)} "
+                f"for peak activation, and {format_gib(cuda_graph_memory_bytes)} "
                 f"GiB for CUDAGraph memory. Replace gpu_memory_utilization "
                 f"config with `--kv-cache-memory="
                 f"{kv_cache_memory_bytes_to_requested_limit}` "
@@ -1097,9 +1046,8 @@ class Worker(WorkerBase):
             else:
                 self.model_runner._dummy_sampler_run(hidden_states=last_hidden_states)
 
-        # After all warmups, reject growth beyond the profiled ceiling and lock
-        # opted-in models. Unsupported backends keep the legacy growable arena.
-        if profile_persistent_workspace and is_workspace_manager_initialized():
+        # After every warmup that could still grow it, the arena is final.
+        if shares_attention_workspace():
             runner: Any = self.model_runner
             sizes = runner._profiled_persistent_workspace_sizes
             current_workspace_manager().assert_within(sizes, "before workspace lock")

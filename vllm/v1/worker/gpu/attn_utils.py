@@ -41,7 +41,7 @@ from vllm.v1.worker.utils import (
     bind_kv_cache_to_layers,
     prepare_kernel_block_sizes,
 )
-from vllm.v1.worker.workspace import is_workspace_manager_initialized
+from vllm.v1.worker.workspace import shares_attention_workspace
 
 if TYPE_CHECKING:
     from vllm.v1.worker.gpu.block_table import BlockTables
@@ -254,9 +254,8 @@ def init_attn_backend(
     kernel_block_sizes = prepare_kernel_block_sizes(kv_cache_config, attn_groups)
 
     # Phase 3: create metadata builders and determine cudagraph support.
-    # Each (ubatch, lane) draws its own arena from the WorkspaceManager, so
-    # the builders only share one buffer on the private fallback path.
-    share_workspace = not is_workspace_manager_initialized()
+    # Builders on the shared arena take their own slot; the rest share one buffer.
+    share_workspace = not shares_attention_workspace()
     attn_backend_workspace: torch.Tensor | None = None
     for kv_cache_group_id, groups in enumerate(attn_groups):
         kernel_block_size = None

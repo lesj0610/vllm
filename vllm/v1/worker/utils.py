@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import gc
 import math
 from collections import defaultdict
 from collections.abc import Iterable, Mapping, Sequence
@@ -880,6 +881,7 @@ class EncoderTimingStats:
 
 from vllm.v1.worker.workspace import (  # noqa: E402
     current_workspace_manager,
+    shares_attention_workspace,
     use_workspace_ubatch_id,
 )
 
@@ -900,7 +902,7 @@ def reserve_attention_workspace(runner) -> list[Any]:
     The returned list keeps the wrapper-owned int workspaces alive past the
     profiling teardown; runtime callers discard it.
     """
-    if not getattr(runner, "attn_groups", None):
+    if not shares_attention_workspace() or not getattr(runner, "attn_groups", None):
         return []
 
     builders = [
@@ -914,8 +916,7 @@ def reserve_attention_workspace(runner) -> list[Any]:
         for ubatch_id, builder in builders:
             with use_workspace_ubatch_id(ubatch_id):
                 builder.prepare_workspace_for_profiling(materialize)
-    # The closing memory_profiling snapshot reads free memory, so the
-    # allocations above have to be settled and freed segments returned first.
+    # Callers read free memory next, so settle the allocations above first.
     torch.accelerator.synchronize()
     torch.accelerator.empty_cache()
     return [builder for _, builder in builders]
@@ -933,8 +934,19 @@ def reserve_persistent_attention_workspace(runner) -> None:
         runner._profiled_persistent_workspace_sizes = manager.workspace_sizes_bytes()
 
 
-def prepare_profiling_workspace(runner) -> list[Any]:
-    """Reserve persistent workspace inside the memory-profiling window."""
+def _settled_free_memory() -> int:
+    gc.collect()
+    torch.accelerator.synchronize()
+    torch.accelerator.empty_cache()
+    return torch.accelerator.get_memory_info()[0]
+
+
+def profile_persistent_attention_workspace(runner) -> int:
+    """Build every builder's persistent workspace; return the bytes it keeps.
+
+    The minimal KV cache it is built against is torn down before the closing
+    reading, while the builders that own the int workspaces are still held.
+    """
     init_kv = getattr(runner, "_init_minimal_kv_cache_for_profiling", None)
     if init_kv is not None:
         cleanup_kv = runner._cleanup_profiling_kv_cache
@@ -945,6 +957,7 @@ def prepare_profiling_workspace(runner) -> list[Any]:
 
         init_kv = partial(cudagraph_utils._init_minimal_kv_cache_for_profiling, runner)
         cleanup_kv = partial(cudagraph_utils._teardown_profiling_state, runner)
+    free_before = _settled_free_memory()
     lease: list[Any] | None = None
     try:
         with set_current_vllm_config(runner.vllm_config):
@@ -964,8 +977,16 @@ def prepare_profiling_workspace(runner) -> list[Any]:
         # reservation is dropped and this error is the one that propagates.
         lease.clear()
         raise
-
-    # The reservation above is part of the activation peak the profiler is
-    # about to measure, not of it.
-    torch.accelerator.reset_peak_memory_stats(runner.device)
-    return lease
+    kept = free_before - _settled_free_memory()
+    runner._profiled_persistent_workspace_sizes = (
+        current_workspace_manager().workspace_sizes_bytes()
+    )
+    lease.clear()
+    gc.collect()
+    torch.accelerator.empty_cache()
+    if kept < 0:
+        raise RuntimeError(
+            f"Free GPU memory grew by {-kept} bytes while the attention workspace "
+            "was reserved; another process released memory during profiling."
+        )
+    return kept
