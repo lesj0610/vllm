@@ -210,20 +210,22 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             return
         from flashinfer import nvfp4_quantize_append_paged_kv_cache_with_slot_mapping
 
-        k_slot, v_slot = self.nvfp4_slot_views(kv_cache, self.head_size)
-        data = self.head_size // 2
+        from .ops.qsa_flashinfer import qsa_cache_views
+
+        # The planes the reader is handed, so the writer cannot split them
+        # differently from the kernel that reads them back.
+        views = qsa_cache_views(
+            *self.nvfp4_slot_views(kv_cache, self.head_size), self.kv_cache_dtype
+        )
         nvfp4_quantize_append_paged_kv_cache_with_slot_mapping(
             key,
             value,
             slot_mapping,
-            (k_slot[..., :data], v_slot[..., :data]),
-            (
-                k_slot[..., data:].view(torch.float8_e4m3fn),
-                v_slot[..., data:].view(torch.float8_e4m3fn),
-            ),
+            (views.k_data, views.v_data),
+            (views.k_sf, views.v_sf),
             layer._k_scale,
             layer._v_scale,
-            kv_layout="HND",
+            kv_layout=views.layout,
         )
 
     def forward_qsa(
