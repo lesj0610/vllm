@@ -733,25 +733,6 @@ class QSAStateBackend(AttentionBackend):
         "fp8_e4m3",
     ]
 
-    @classmethod
-    def customize_spec(cls, spec: AttentionSpec) -> AttentionSpec:
-        """Answer for the main cache when the platform asks this backend.
-
-        The side caches register before the QSA owner does, so the platform
-        picks this backend to size the block pool against the mamba page. It
-        must answer with the geometry the main cache will actually have, or
-        the chosen block leaves the attention page short of the mamba one.
-
-        Only an NVFP4 spec needs saying: every other format already has the
-        page the default formula gives. The import is deferred past that
-        check so the ROCm and BF16 paths take no FlashInfer dependency.
-        """
-        if not spec.kv_quant_mode.is_nvfp4:
-            return spec
-        from vllm.v1.attention.backends.flashinfer import FlashInferBackend
-
-        return FlashInferBackend.customize_spec(spec)
-
     @staticmethod
     def get_name() -> str:
         return "QWEN4_EXP_EXP_QSA_STATE"
