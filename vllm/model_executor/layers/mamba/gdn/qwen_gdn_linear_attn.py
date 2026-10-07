@@ -494,8 +494,11 @@ class ChunkGatedDeltaRule(CustomOp):
         chunk_offsets: torch.Tensor | None = None,
         use_qk_l2norm_in_kernel: bool = True,
         core_attn_out: torch.Tensor | None = None,
+        max_seq_len: int | None = None,
         aiter_prefill_metadata: object | None = None,
     ):
+        # Only the FlashInfer path sizes anything from this.
+        del max_seq_len
         o, final_state = rocm_aiter_ops.gdn_flydsl_prefill(
             q=q,
             k=k,

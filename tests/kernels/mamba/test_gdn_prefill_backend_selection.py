@@ -30,6 +30,7 @@ def _config(requested: str | None, head_k_dim: int = 128):
 def _platform(major: int, minor: int = 0, cuda_major: int = 13):
     return SimpleNamespace(
         is_cuda=lambda: True,
+        is_rocm=lambda: False,
         is_cpu=lambda: False,
         is_device_capability=lambda m: (major * 10 + minor) == m,
         is_device_capability_family=lambda m: major * 10 == m,
@@ -124,7 +125,9 @@ def test_a_non_cuda_platform_resolves_to_triton(
     monkeypatch.setattr(
         gdn_module,
         "current_platform",
-        SimpleNamespace(is_cuda=lambda: False, is_cpu=lambda: True),
+        SimpleNamespace(
+            is_cuda=lambda: False, is_cpu=lambda: True, is_rocm=lambda: False
+        ),
     )
     assert _resolve_gdn_prefill_backend(_config("flashinfer"))[1] == "triton"
 
