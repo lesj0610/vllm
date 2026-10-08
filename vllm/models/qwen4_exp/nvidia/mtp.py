@@ -55,6 +55,7 @@ from .model import (
     Qwen4ExpMixtureOfExperts,
     Qwen4ExpSparseMoeBlock,
 )
+from .qsa import attach_qsa_runtime
 
 
 def _remap_ignored_layers(
@@ -215,6 +216,7 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
                 )
                 for idx in range(self.num_mtp_layers)
             )
+            self.qsa = attach_qsa_runtime(draft_vllm_config, self.layers)
         self.is_fused_shared_expert_enabled = is_model_fused_shared_expert_compatible(
             self.layers,
             Qwen4ExpSparseMoeBlock,
