@@ -76,6 +76,12 @@ class GDNAttentionMetadata:
     # Pre-computed FLA chunk metadata (avoids GPU->CPU sync in prepare_chunk_indices)
     chunk_indices: torch.Tensor | None = None
     chunk_offsets: torch.Tensor | None = None
+
+    # The longest prefill sequence in this batch, taken from the host copy of
+    # query_start_loc. FlashInfer's GDN prefill sizes its per-sequence indexing
+    # from this and cannot read it off cu_seqlens without synchronising, so it
+    # has to come from here or its chunk-parallel path is never offered.
+    prefill_max_seq_len: int | None = None
     # Chunk-kernel inputs for prefill
     prefill_query_start_loc: torch.Tensor | None = None
     prefill_state_indices: torch.Tensor | None = None
@@ -459,6 +465,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
 
         chunk_indices: torch.Tensor | None = None
         chunk_offsets: torch.Tensor | None = None
+        prefill_max_seq_len: int | None = None
         prefill_query_start_loc: torch.Tensor | None = None
         prefill_state_indices: torch.Tensor | None = None
         prefill_has_initial_state: torch.Tensor | None = None
@@ -484,6 +491,10 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 prefill_query_start_loc_cpu = non_spec_query_start_loc_cpu
                 prefill_state_indices = non_spec_state_indices_tensor
 
+            # The host copy is already here, so the longest sequence costs a
+            # diff rather than the device-to-host sync the kernel would need.
+            assert prefill_query_start_loc_cpu is not None
+            prefill_max_seq_len = int(prefill_query_start_loc_cpu.diff().max().item())
             if self.gdn_prefill_backend == "aiter_flydsl":
                 # AITER carries its own reusable varlen metadata and has no use
                 # for FLA's chunk indices, so it replaces them rather than
@@ -609,6 +620,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             has_initial_state=has_initial_state,
             chunk_indices=chunk_indices,
             chunk_offsets=chunk_offsets,
+            prefill_max_seq_len=prefill_max_seq_len,
             prefill_query_start_loc=prefill_query_start_loc,
             prefill_state_indices=prefill_state_indices,
             prefill_has_initial_state=prefill_has_initial_state,
