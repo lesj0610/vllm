@@ -1643,7 +1643,7 @@ def get_kv_cache_config_from_groups(
     for group in kv_cache_groups:
         group_spec = group.kv_cache_spec
         layers_by_spec: defaultdict[KVCacheSpec, list[str]] = defaultdict(list)
-        if isinstance(group_spec, UniformTypeKVCacheSpecs):
+        if group.layer_names and isinstance(group_spec, UniformTypeKVCacheSpecs):
             for layer_name, spec in group_spec.kv_cache_specs.items():
                 layers_by_spec[spec].append(layer_name)
         elif group.layer_names:

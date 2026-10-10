@@ -15,6 +15,7 @@ from vllm.model_executor.models.config import (
     Qwen4ExpForConditionalGenerationConfig,
 )
 from vllm.models.qwen4_exp.nvidia.model_state import Qwen4ExpModelState
+from vllm.sequence import IntermediateTensors
 from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
 
 from ...utils import spawn_new_process_for_each_test
@@ -141,10 +142,10 @@ def test_qwen4_exp_mtp_override_sets_draft_config(
 
 
 @pytest.mark.parametrize("ple_layer_ids", [[1], []])
-def test_qwen4_exp_rejects_pipeline_parallel_only_with_ple(ple_layer_ids) -> None:
-    """PLE needs raw input_ids, which non-first pipeline ranks never see. The
-    rest of the architecture is PP-capable, so the refusal must be conditional
-    -- and must land before the engine spends time loading weights."""
+def test_qwen4_exp_allows_pipeline_parallel_with_or_without_ple(
+    ple_layer_ids,
+) -> None:
+    """Qwen4Exp PP supports both the PLE and non-PLE configurations."""
     vllm_config = SimpleNamespace(
         model_config=SimpleNamespace(
             hf_text_config=_text_config(ple_layer_ids=ple_layer_ids),
@@ -158,13 +159,66 @@ def test_qwen4_exp_rejects_pipeline_parallel_only_with_ple(ple_layer_ids) -> Non
     with patch.object(
         Qwen3_5ForConditionalGenerationConfig, "verify_and_update_config"
     ):
-        if ple_layer_ids:
-            with pytest.raises(NotImplementedError, match="pipeline_parallel_size=1"):
-                Qwen4ExpForConditionalGenerationConfig.verify_and_update_config(
-                    vllm_config
-                )
-        else:
-            Qwen4ExpForConditionalGenerationConfig.verify_and_update_config(vllm_config)
+        Qwen4ExpForConditionalGenerationConfig.verify_and_update_config(vllm_config)
+
+
+@pytest.mark.parametrize("ple_layer_ids", [[1], []])
+def test_qwen4_exp_pp_empty_intermediate_tensors_carry_input_ids(ple_layer_ids):
+    """The runner allocates an input_ids slot exactly when PLE needs one."""
+    from vllm.model_executor.models.utils import (
+        make_empty_intermediate_tensors_factory,
+    )
+    from vllm.models.qwen4_exp.nvidia.model import Qwen4ExpModel
+
+    model = object.__new__(Qwen4ExpModel)
+    torch.nn.Module.__init__(model)
+    model.config = _text_config(ple_layer_ids=ple_layer_ids)
+    model._empty_hidden_states = make_empty_intermediate_tensors_factory(
+        ["hidden_states"], 32
+    )
+
+    tensors = model.make_empty_intermediate_tensors(8, torch.bfloat16, "cpu")
+
+    assert tensors["hidden_states"].shape == (8, 32)
+    if not ple_layer_ids:
+        assert set(tensors.tensors) == {"hidden_states"}
+        return
+    assert tensors["input_ids"].shape == (8,)
+    assert tensors["input_ids"].dtype == torch.int32
+
+
+def test_qwen4_exp_pp_forward_preserves_input_ids() -> None:
+    """A non-first stage hands its decoder layers the transported token ids."""
+    from vllm.models.qwen4_exp.nvidia import model as model_module
+
+    model = object.__new__(model_module.Qwen4ExpModel)
+    torch.nn.Module.__init__(model)
+    model.config = _text_config()
+    model.start_layer, model.end_layer = 0, 1
+    model.hyper_connection_mixer = None
+
+    seen: list[torch.Tensor] = []
+
+    class CaptureLayer:
+        def __call__(self, **kwargs):
+            seen.append(kwargs["input_ids"])
+            return kwargs["hidden_states"], None, None
+
+    model.layers = [CaptureLayer()]
+    input_ids = torch.tensor([11, 13], dtype=torch.int32)
+    pp_group = SimpleNamespace(is_first_rank=False, is_last_rank=False)
+
+    with patch.object(model_module, "get_pp_group", return_value=pp_group):
+        output = model.forward(
+            input_ids=None,
+            positions=torch.arange(2),
+            intermediate_tensors=IntermediateTensors(
+                {"hidden_states": torch.zeros(2, 32), "input_ids": input_ids}
+            ),
+        )
+
+    assert seen == [input_ids]
+    assert output["input_ids"] is input_ids
 
 
 def test_qwen4_exp_model_state_prepares_ngram_context() -> None:

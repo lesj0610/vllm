@@ -764,3 +764,19 @@ class TestSWABoundedReplayGrouping:
         for single in manager.coordinator.single_type_managers:
             cached = single.num_cached_block.get(request.request_id, 0)
             assert cached == (2 if single.kv_cache_spec.prefix_cacheable else 0)
+
+
+def test_group_without_local_layers_allocates_nothing():
+    """A PP stage keeps the groups whose layers all sit on another stage. The
+    group's spec still names those layers, so building tensors from the spec
+    rather than from the group would address layers this stage never owns."""
+    absent = {f"absent.{i}": _full() for i in range(2)}
+    groups = [
+        KVCacheGroupSpec(
+            [], UniformTypeKVCacheSpecs(block_size=64, kv_cache_specs=absent)
+        ),
+        _uniform_group({"local.0": _full()}),
+    ]
+    config = get_kv_cache_config_from_groups(_mock_vllm_config("LBNHC"), groups, MEMORY)
+    caches = allocate_kv_cache(config, torch.device("cpu"), KVCacheLayout.LBNHC, None)
+    assert set(caches) == {"local.0"}
