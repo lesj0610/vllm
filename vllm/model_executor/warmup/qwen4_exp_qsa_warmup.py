@@ -32,6 +32,10 @@ def qwen4_exp_qsa_triton_warmup(worker: "Worker") -> None:
             owner = layer
     if indexer is None or owner is None:
         return
+    if owner.qsa_backend == "flashinfer":
+        # Both warmups below compile Triton kernels, and the FlashInfer route
+        # returns before either one -- in the owner and in the indexer alike.
+        return
 
     runner = worker.model_runner
 

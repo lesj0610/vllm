@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable
+from dataclasses import replace
 from typing import ClassVar, cast
 
 import torch
@@ -16,6 +17,7 @@ from vllm.config import VllmConfig
 from vllm.config.cache import CacheConfig, CacheDType
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.forward_context import get_forward_context
+from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.attention import (
     set_default_quant_scales,
 )
@@ -39,6 +41,7 @@ from vllm.platforms import current_platform
 from vllm.platforms.interface import DeviceCapability
 from vllm.utils.torch_utils import (
     kv_cache_dtype_str_to_dtype,
+    nvfp4_kv_cache_full_dim,
 )
 from vllm.v1.attention.backend import (
     AttentionBackend,
@@ -62,6 +65,9 @@ from vllm.v1.kv_cache_interface import (
 from ..common.qsa_cache import QSAForwardMetadata
 from . import model
 from .indexer_qsa import QSAIndexer
+from .ops.qsa_flashinfer import QSA_KV_CACHE_DTYPES
+
+logger = init_logger(__name__)
 
 
 class Qwen4ExpQSAQKVIndexerLinear(MergedColumnParallelLinear):
@@ -151,12 +157,7 @@ class Qwen4ExpQSAFlashAttentionBackend(FlashAttentionBackend):
     # with the layer's per-tensor scales and dequantized on load inside the QSA
     # Triton kernel. flash-attn never runs over this cache, so its fp8 probe
     # does not apply (see supports_kv_cache_dtype and the impl constructor).
-    supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
-        "auto",
-        "bfloat16",
-        "fp8",
-        "fp8_e4m3",
-    ]
+    supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = list(QSA_KV_CACHE_DTYPES)
 
     @classmethod
     def supports_kv_cache_dtype(cls, kv_cache_dtype: CacheDType | None) -> bool:
@@ -233,7 +234,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
         # the parent only uses it there, and do_kv_cache_update reads the
         # attribute at call time.
         real_kv_cache_dtype = kv_cache_dtype
-        if kv_cache_dtype in ("fp8", "fp8_e4m3"):
+        if kv_cache_dtype not in ("auto", "bfloat16"):
             kv_cache_dtype = "auto"
         super().__init__(
             num_heads,
@@ -255,11 +256,61 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             raise NotImplementedError(
                 "Qwen4Exp QSA does not support decode context parallelism"
             )
-        if self.kv_cache_dtype not in ("auto", "bfloat16", "fp8", "fp8_e4m3"):
+        if self.kv_cache_dtype not in QSA_KV_CACHE_DTYPES:
             raise NotImplementedError(
-                "Qwen4Exp QSA requires a BF16 or FP8-e4m3 main KV cache"
+                f"Qwen4Exp QSA has no cache format for {self.kv_cache_dtype!r}"
             )
+        self.is_kvcache_nvfp4 = self.kv_cache_dtype == "nvfp4"
         self.supports_quant_query_input = False
+
+    @staticmethod
+    def nvfp4_slot_views(
+        kv_cache: torch.Tensor, head_size: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """The K and V planes of an NVFP4 cache, as HND slot views.
+
+        The allocation gives K and V a head slot each: slot 2h holds K of head
+        h and slot 2h+1 holds V. Each slot is [fp4 data | e4m3 block scales],
+        which is the layout both the writer and qsa_cache_views read.
+        """
+        if kv_cache.shape[-1] != nvfp4_kv_cache_full_dim(head_size):
+            raise ValueError(
+                "Qwen4Exp QSA NVFP4 cache was not allocated at the packed width"
+            )
+        pages, slots, page_size, full = kv_cache.shape
+        slotted = kv_cache.view(pages, slots // 2, 2, page_size, full)
+        return slotted[:, :, 0], slotted[:, :, 1]
+
+    def do_kv_cache_update(
+        self,
+        layer: torch.nn.Module,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+    ) -> None:
+        if not self.is_kvcache_nvfp4:
+            super().do_kv_cache_update(layer, key, value, kv_cache, slot_mapping)
+            return
+        from flashinfer import nvfp4_quantize_append_paged_kv_cache_with_slot_mapping
+
+        from .ops.qsa_flashinfer import qsa_cache_views
+
+        # The planes the reader is handed, so the writer cannot split them
+        # differently from the kernel that reads them back.
+        views = qsa_cache_views(
+            *self.nvfp4_slot_views(kv_cache, self.head_size), self.kv_cache_dtype
+        )
+        nvfp4_quantize_append_paged_kv_cache_with_slot_mapping(
+            key,
+            value,
+            slot_mapping,
+            (views.k_data, views.v_data),
+            (views.k_sf, views.v_sf),
+            layer._k_scale,
+            layer._v_scale,
+            kv_layout=views.layout,
+        )
 
     def forward_qsa(
         self,
@@ -294,7 +345,12 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             raise RuntimeError("QSA owner did not provide its top-k buffer")
         logical_indices = topk_buffer[:num_tokens]
         token_to_req = token_to_req[:num_tokens]
-        key_cache, value_cache = kv_cache.transpose(1, 2).split(self.head_size, dim=-1)
+        if self.is_kvcache_nvfp4:
+            key_cache, value_cache = self.nvfp4_slot_views(kv_cache, self.head_size)
+        else:
+            key_cache, value_cache = kv_cache.transpose(1, 2).split(
+                self.head_size, dim=-1
+            )
         k_scale = v_scale = None
         if self.kv_cache_dtype in ("fp8", "fp8_e4m3"):
             # The cache is allocated as uint8; reinterpret the e4m3 bytes
@@ -308,10 +364,39 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
         if query.dtype != torch.bfloat16 or key_cache.dtype not in (
             torch.bfloat16,
             torch.float8_e4m3fn,
+            torch.uint8,
         ):
             raise NotImplementedError(
-                "Qwen4Exp QSA requires BF16 Q and BF16 or FP8-e4m3 K/V"
+                "Qwen4Exp QSA requires BF16 Q and a BF16, FP8-e4m3 or NVFP4 cache"
             )
+
+        # Which backend serves this layer was decided once, when the model was
+        # built. Whether its runtime is ready yet is a different question and
+        # not a reason to run the other one: a FlashInfer deployment that
+        # reaches a step without a runtime is outside its own lifecycle, and
+        # silently attending on Triton would hide that behind a different
+        # kernel and a different memory profile.
+        if layer.qsa_backend == "flashinfer":
+            runtime = layer.qsa_runtime
+            if runtime is None:
+                raise RuntimeError(
+                    "Qwen4Exp QSA runs on FlashInfer here and its runtime is "
+                    "not planned yet: a step reached the attention before the "
+                    "KV cache was bound"
+                )
+            self._run_flashinfer(
+                layer,
+                runtime,
+                query[:num_tokens],
+                key_cache,
+                value_cache,
+                logical_indices,
+                attn_metadata.block_table,
+                token_to_req,
+                output_gate[:num_tokens],
+                output[:num_tokens],
+            )
+            return output
 
         from .ops.qsa import qsa_sparse_paged_attention
 
@@ -329,6 +414,228 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             output_gate=output_gate[:num_tokens],
         )
         return output
+
+    def _resolved_scale(self, layer: torch.nn.Module, name: str) -> float:
+        """Read a KV scale once and keep the host value.
+
+        The scales are registered CUDA buffers fixed at load time. Reading one
+        per forward would be a device-to-host sync, which CUDA graph capture
+        rejects outright.
+        """
+        cache = self.__dict__.setdefault("_scale_cache", {})
+        value = cache.get(name)
+        if value is None:
+            value = float(getattr(layer, name))
+            cache[name] = value
+        return value
+
+    def _run_flashinfer(
+        self,
+        layer: torch.nn.Module,
+        runtime,
+        query: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        logical_indices: torch.Tensor,
+        block_table: torch.Tensor,
+        token_to_req: torch.Tensor,
+        output_gate: torch.Tensor,
+        output: torch.Tensor,
+    ) -> None:
+        """Split the cache into the planes the library reads and hand it over.
+
+        The split is this side's because this side allocated the cache; nothing
+        is permuted or flattened, and both formats stay in the layout they were
+        written in. The route is the owner's buffer, not the runtime's: a layer
+        reusing its selection across speculative steps reuses its own.
+        """
+        from .ops.qsa_flashinfer import qsa_cache_views
+
+        views = qsa_cache_views(key_cache, value_cache, self.kv_cache_dtype)
+        quantized = self.kv_cache_dtype not in ("auto", "bfloat16")
+        runtime.run_attention(
+            query,
+            views.k_data,
+            views.v_data,
+            route=logical_indices,
+            block_table=block_table,
+            token_to_request=token_to_req,
+            output_gate=output_gate,
+            k_sf=views.k_sf,
+            v_sf=views.v_sf,
+            k_scale=self._resolved_scale(layer, "_k_scale") if quantized else None,
+            v_scale=self._resolved_scale(layer, "_v_scale") if quantized else None,
+            out=output,
+        )
+
+
+class Qwen4ExpQSARuntime(nn.Module):
+    """The rank's one QSA runtime, and the two buffers it was promised.
+
+    Model-lifetime, not layer-lifetime. Every QSA layer of a rank runs the same
+    geometry and they take turns inside a step, so one runtime serves them all;
+    what each layer keeps for itself is its KV cache and its route.
+
+    Two buffers because the library asks for two lifetimes. The scratch comes
+    out of the worker's workspace, which every consumer of a step shares and
+    reuses from its first byte -- so nothing that is read back on a later call
+    may live there. That part is a small private allocation this object holds,
+    registered so the model owns it and the memory profile counts it.
+
+    The scratch is taken again at every bind rather than kept. The engine binds
+    the KV cache before it locks the workspace, so until then another consumer
+    asking for more room reallocates it; a runtime built on the old address
+    would be running out of memory the manager has since given away. After the
+    lock the address stops moving.
+    """
+
+    def __init__(self, config, device: torch.device) -> None:
+        super().__init__()
+        from .ops.qsa_flashinfer import (
+            allocate_qsa_persistent,
+            qsa_workspace_needs,
+            reserve_qsa_transient,
+        )
+
+        self._config = config
+        self._needs = qsa_workspace_needs(config, device)
+        # Not in state_dict: no checkpoint carries it and dummy-weight
+        # initialization would fill the plans with noise. Registered all the
+        # same, so it is the model that owns it rather than a closure.
+        self.register_buffer(
+            "qsa_persistent",
+            allocate_qsa_persistent(self._needs, device),
+            persistent=False,
+        )
+        reserve_qsa_transient(self._needs)
+        self._runtime = None
+        self._planned: tuple[int, int] | None = None
+        self._scratch: int | None = None
+
+    def planned(self, num_slots: int, page_size: int):
+        """The runtime for this cache, built the first time it is asked for.
+
+        Every layer of the rank comes through here in one pass with the same
+        cache, so the first builds and plans and the rest find it done --
+        planning for a cache already planned for is a no-op in the library.
+
+        A *different* cache gets a new runtime rather than a replan. The engine
+        binds twice: once to the minimal cache the memory profile runs and
+        captures against, then to the real one, and it drops those graphs in
+        between. The library refuses to replan a runtime that has run, because
+        it cannot see that the graphs are gone -- and this side can, so it
+        builds a fresh one on the same two buffers.
+
+        A moved scratch buffer does the same. The first bind happens before the
+        workspace is locked, so another consumer asking for more room between
+        the two binds reallocates it, and a runtime holding the old view would
+        be reading memory the manager has given away.
+        """
+        from .ops.qsa_flashinfer import build_qsa_runtime, take_qsa_transient
+
+        cache = (num_slots, page_size)
+        # Asked every time, because an unlocked workspace grows by reallocating
+        # and the first bind happens before the lock: what the manager hands
+        # out now may not be what the runtime is holding.
+        transient = take_qsa_transient(self._needs)
+        moved = self._scratch is not None and transient.data_ptr() != self._scratch
+        runtime = self._runtime
+        if runtime is None or cache != self._planned or moved:
+            runtime = build_qsa_runtime(self._config, self.qsa_persistent, transient)
+            self._runtime = runtime
+            self._planned = cache
+            self._scratch = transient.data_ptr()
+        runtime.plan_cache(num_slots, page_size)
+        return runtime
+
+
+def attach_qsa_runtime(vllm_config: VllmConfig, layers) -> Qwen4ExpQSARuntime | None:
+    """Give every QSA layer of this model the same runtime. Called by the model.
+
+    Here rather than in a layer, and by the model rather than by a registry
+    keyed on something global: the sharing is a fact about one model on one
+    rank, and a process-wide table of runtimes would outlive the model that
+    needed them.
+    """
+    from .ops.qsa_flashinfer import qsa_config, require_qsa_flashinfer
+
+    owners = [
+        layer.self_attn
+        for layer in layers
+        if isinstance(getattr(layer, "self_attn", None), Qwen4ExpQSAAttention)
+    ]
+    if not owners:
+        return None
+
+    first = owners[0]
+    require_qsa_flashinfer(first.head_dim, first.kv_cache_dtype)
+    indexer = first.indexer
+    config = qsa_config(
+        num_qo_heads=first.num_heads,
+        num_kv_heads=first.num_kv_heads,
+        head_dim=first.head_dim,
+        max_rows=vllm_config.scheduler_config.max_num_batched_tokens,
+        kv_cache_dtype=first.kv_cache_dtype,
+        max_columns=indexer.max_selection_columns,
+        compress_ratio=indexer.compress_ratio,
+        token_topk=indexer.token_topk,
+        index_num_heads=indexer.index_n_heads,
+        index_head_dim=indexer.index_head_dim,
+    )
+    runtime = Qwen4ExpQSARuntime(config, torch.accelerator.current_accelerator())
+    max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
+    if first.kv_cache_dtype == "nvfp4":
+        # The fused prepare stores a plain row per slot, which an NVFP4 page is
+        # not. It addresses that row as slot // page_size, so a cache of
+        # one-token pages turns the same store into a contiguous BF16 landing
+        # buffer; the writer quantizes it into the real pages afterwards. One
+        # per model, as the runtime is, and a fixed address for graph capture.
+        runtime.register_buffer(
+            "nvfp4_staging",
+            torch.empty(
+                max_tokens,
+                1,
+                first.num_kv_heads,
+                2 * first.head_dim,
+                dtype=vllm_config.model_config.dtype,
+                device=first.kv_cache.device,
+            ),
+            persistent=False,
+        )
+        runtime.register_buffer(
+            "nvfp4_staging_slots",
+            torch.arange(max_tokens, dtype=torch.int32, device=first.kv_cache.device),
+            persistent=False,
+        )
+    for owner in owners:
+        owner.qsa = runtime
+        owner.qsa_backend = "flashinfer"
+        owner.indexer.qsa_backend = "flashinfer"
+        # The route this path takes is indices and nothing else. The Triton
+        # one carries a trailing count column for its tile loop, so the layer
+        # allocates that width; a buffer one column wider can only be handed
+        # over as a slice of each row, and that is not contiguous. Give it the
+        # width the library reads instead, which is the only width it accepts.
+        # Zeroed, not empty. Profiling can reach the attention half before
+        # the selection half has written a route, so this buffer's contents
+        # are what that step routes on. Zero makes it valid and deterministic:
+        # every element names slot 0. Not an all -1 route -- that is the
+        # library's invalid sentinel and would profile a fully masked step,
+        # which is not the shape of a real one -- and not uninitialised
+        # memory, whose in-range leftovers route somewhere different on every
+        # run.
+        owner.register_buffer(
+            "topk_indices_buffer",
+            torch.zeros(
+                max_tokens,
+                config.route_width,
+                dtype=owner.topk_indices_buffer.dtype,
+                device=owner.topk_indices_buffer.device,
+            ),
+            persistent=False,
+        )
+    logger.info_once("Qwen4Exp QSA attention backend: FlashInfer block-sparse")
+    return runtime
 
 
 class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
@@ -353,14 +660,9 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             raise ValueError("Qwen4Exp QSA requires a paged KV cache")
         if model_config.dtype != torch.bfloat16:
             raise NotImplementedError("Qwen4Exp QSA currently requires BF16")
-        if cache_config.cache_dtype not in (
-            "auto",
-            "bfloat16",
-            "fp8",
-            "fp8_e4m3",
-        ):
+        if cache_config.cache_dtype not in QSA_KV_CACHE_DTYPES:
             raise NotImplementedError(
-                "Qwen4Exp QSA requires a BF16 or FP8-e4m3 main KV cache"
+                f"Qwen4Exp QSA has no cache format for {cache_config.cache_dtype!r}"
             )
         if getattr(quant_config, "kv_cache_scheme", None) is not None:
             raise NotImplementedError("Qwen4Exp QSA does not support KV quantization")
@@ -468,7 +770,20 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         self.kv_sharing_target_layer_name = None
         self.kv_cache = torch.tensor([])
         set_default_quant_scales(self, register_buffer=True)
+        # No Qwen4Exp checkpoint serializes KV scales, and dummy-weight
+        # initialization randomizes persistent buffers -- which the strict
+        # NVFP4 slot writer rejects. Keep the defaults out of state_dict.
+        for scale_name in ("_k_scale", "_v_scale", "_q_scale", "_prob_scale"):
+            scale_value = getattr(self, scale_name)
+            delattr(self, scale_name)
+            self.register_buffer(scale_name, scale_value, persistent=False)
 
+        # Which backend serves QSA. The model settles it once, after every
+        # layer is built, through attach_qsa_runtime; until then this is what
+        # the tree has always done.
+        self.qsa_backend = "triton"
+        self.qsa_runtime = None
+        self.qsa: Qwen4ExpQSARuntime | None = None
         self.attn_backend = Qwen4ExpQSAFlashAttentionBackend
         self.impl = Qwen4ExpQSAFlashAttentionImpl(
             self.num_heads,
@@ -527,6 +842,26 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             raise ValueError(f"Duplicate layer name: {self.layer_name}")
         static_context[self.layer_name] = self
 
+    def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
+        """Take the cache, then plan for it.
+
+        Here because this is the one moment that satisfies both: the cache
+        exists, and the workspace has stopped growing and no graph is being
+        captured. A plan made later would compile inside a forward, and one
+        made earlier would be for a cache that is not there.
+        """
+        super().bind_kv_cache(kv_cache)
+        runtime = getattr(self, "qsa", None)
+        if runtime is None:
+            return
+        # The allocation is (pages, head slots, slots per page, content) in
+        # both formats. How many slots a page holds is not the block size this
+        # layer was configured with -- vLLM settles that against the memory
+        # budget after the model is built -- so it is read from the cache.
+        pages, _slots, page_size, _content = kv_cache.shape
+        self.qsa_runtime = runtime.planned(pages * page_size, page_size)
+        self.indexer.qsa_runtime = self.qsa_runtime
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         mapper = None
         if self.fuse_indexer_projection:
@@ -541,13 +876,23 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         return self.attn_backend
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
-        return FullAttentionSpec(
+        spec = FullAttentionSpec(
             block_size=vllm_config.cache_config.block_size,
             num_kv_heads=self.num_kv_heads,
             head_size=self.head_dim,
             head_size_v=self.head_dim,
             dtype=self.kv_cache_torch_dtype,
             kv_quant_mode=get_kv_quant_mode(self.kv_cache_dtype),
+        )
+        if not spec.kv_quant_mode.is_nvfp4:
+            return spec
+        # K and V take a head slot each, holding packed fp4 data followed by
+        # its e4m3 block scales; see nvfp4_slot_views. Carried as the cell's
+        # width rather than in head_size, which the page formula doubles.
+        return replace(
+            spec,
+            num_head_slots=2 * self.num_kv_heads,
+            state_content_bytes=nvfp4_kv_cache_full_dim(self.head_dim),
         )
 
     @eager_break_during_capture
@@ -589,7 +934,11 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             qkv=qkv,
             slot_mapping=main_metadata.slot_mapping,
         )
-        if selected.shape != (num_tokens, self.indexer.packed_output_width):
+        # Against the buffer this layer allocated rather than a width named
+        # twice: the two routes are different widths -- the Triton one carries
+        # a trailing count column for its tile loop and the FlashInfer one is
+        # indices only -- and the buffer is what the indexer was handed.
+        if selected.shape != (num_tokens, self.topk_indices_buffer.shape[1]):
             raise RuntimeError("QSA indexer returned an invalid selection shape")
         impl = cast(Qwen4ExpQSAFlashAttentionImpl, self.impl)
         if main_outputs is None:

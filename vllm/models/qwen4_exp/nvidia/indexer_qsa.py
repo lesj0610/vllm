@@ -14,6 +14,7 @@ from vllm.model_executor.layers.layernorm import GemmaRMSNorm
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding.mrope import triton_mrope
+from vllm.utils.math_utils import cdiv, round_up
 
 from ..common.qsa_cache import (
     QSACompressedKeyCache,
@@ -24,7 +25,7 @@ from ..common.qsa_cache import (
 from .ops.qsa_prepare import qsa_prepare
 
 if TYPE_CHECKING:
-    from .qsa import Qwen4ExpQSAAttention
+    from .qsa import Qwen4ExpQSAAttention, Qwen4ExpQSAFlashAttentionImpl
 
 
 def apply_qsa_rope(
@@ -180,6 +181,41 @@ class QSAIndexer(nn.Module):
             vllm_config=vllm_config,
         )
 
+        # The reservation below lands in whichever workspace ubatch slot the
+        # profiling run occupies, and that run has ubatching disabled, so it is
+        # always slot 0. A second slot would go to execution unreserved and
+        # then be locked, so refuse the combination rather than fail on the
+        # first full-width request that lands there.
+        if vllm_config.parallel_config.enable_dbo:
+            raise NotImplementedError(
+                "Qwen4Exp QSA selection does not support dual-batch overlap: "
+                "its scratch is reserved during profiling, which runs on one "
+                "ubatch slot only"
+            )
+
+        # What the selection scratch has to cover: the widest score row this
+        # deployment's context can reach, by the same rule select_and_expand
+        # sizes an actual batch by, and the most rows a batch can bring.
+        self._max_selection_columns = max(
+            64,
+            round_up(
+                cdiv(vllm_config.model_config.max_model_len, self.compress_ratio), 64
+            ),
+        )
+        self._max_batched_tokens = vllm_config.scheduler_config.max_num_batched_tokens
+
+        # Nothing is reserved here. Both halves of a QSA step come out of one
+        # reservation, and the only object holding both geometries is the
+        # attention owner, so it makes it -- and the owner is also what says
+        # which backend serves the step, once, after the model is built.
+        self.qsa_backend = "triton"
+        self.qsa_runtime = None
+
+    @property
+    def max_selection_columns(self) -> int:
+        """The widest score row this deployment's context can reach."""
+        return self._max_selection_columns
+
     @property
     def output_width(self) -> int:
         """Selection (index) columns per row."""
@@ -256,6 +292,10 @@ class QSAIndexer(nn.Module):
         """
         metadata = self._metadata()
         if metadata is None:
+            # No attention metadata means the profiling run. The selection
+            # scratch is already reserved in __init__, which does not depend on
+            # this pass happening.
+            #
             # Preserve step-0 indices when later MTP steps reuse the buffer.
             if self.skip_topk and out is not None:
                 return out, None
@@ -305,8 +345,21 @@ class QSAIndexer(nn.Module):
                 dtype=self.indexer_dtype,
             )
             main_kv_cache = attn.kv_cache.transpose(1, 2)
+            main_slots = slot_mapping[:num_tokens]
+            main_scales = (attn._k_scale_float, attn._v_scale_float)
+            nvfp4_main = attn.kv_cache_dtype == "nvfp4"
             if attn.kv_cache_dtype in ("fp8", "fp8_e4m3"):
                 main_kv_cache = main_kv_cache.view(torch.float8_e4m3fn)
+            elif nvfp4_main:
+                # Land the fused store in BF16 one token per page, then let the
+                # writer quantize it into the real pages: the store addresses a
+                # row as slot // page_size, so this is the same store. Scales
+                # stay at one here; the writer applies the layer's own.
+                runtime = attn.qsa
+                assert runtime is not None
+                main_kv_cache = runtime.nvfp4_staging[:num_tokens]
+                main_slots = runtime.nvfp4_staging_slots[:num_tokens]
+                main_scales = (1.0, 1.0)
             main_outputs = qsa_prepare(
                 projected_q,
                 raw_keys,
@@ -336,10 +389,19 @@ class QSAIndexer(nn.Module):
                 main_k_norm_weight=attn.k_norm.weight,
                 main_eps=attn.q_norm.variance_epsilon,
                 main_kv_cache=main_kv_cache,
-                main_slot_mapping=slot_mapping[:num_tokens],
-                main_k_scale=attn._k_scale_float,
-                main_v_scale=attn._v_scale_float,
+                main_slot_mapping=main_slots,
+                main_k_scale=main_scales[0],
+                main_v_scale=main_scales[1],
             )
+            if nvfp4_main:
+                staged = main_kv_cache[:, 0]
+                cast("Qwen4ExpQSAFlashAttentionImpl", attn.impl).do_kv_cache_update(
+                    attn,
+                    staged[..., : attn.head_dim],
+                    staged[..., attn.head_dim :],
+                    attn.kv_cache,
+                    slot_mapping[:num_tokens],
+                )
         else:
             # Unfused reference path
             from flashinfer.norm import gemma_rmsnorm
@@ -409,6 +471,39 @@ class QSAIndexer(nn.Module):
         if self.skip_topk:
             if out is None:
                 raise RuntimeError("QSA top-k reuse requires an output buffer")
+            return out, main_outputs
+
+        # FlashInfer serves scoring and expansion as one pair, so the choice is
+        # made for the whole batch rather than per decode/prefill split. Its
+        # ops take (token_to_req, query_positions, sequence_lengths), which only
+        # this caller holds; ops/qsa_indexer.py stays upstream-identical.
+        #
+        # Before the packed buffer below, because the two backends have
+        # different route contracts: the Triton one carries a trailing count
+        # column for its tile loop and this one is indices only. Which buffer
+        # the layer allocated follows from the backend, decided once when the
+        # model was built. The library checks the shape it was handed, so
+        # there is no second check here.
+        if self.qsa_backend == "flashinfer":
+            from .ops.qsa_flashinfer import qsa_compressed_view
+
+            if out is None:
+                raise RuntimeError("QSA selection requires the owner's route buffer")
+            if self.qsa_runtime is None:
+                raise RuntimeError(
+                    "Qwen4Exp QSA selects on FlashInfer here and its runtime "
+                    "is not planned yet: a step reached the indexer before the "
+                    "KV cache was bound"
+                )
+            self.qsa_runtime.run_selection(
+                q,
+                qsa_compressed_view(compressed_key_cache),
+                compressed_metadata.block_table,
+                compressed_metadata.token_to_req,
+                compressed_metadata.logical_positions[:num_tokens],
+                compressed_metadata.seq_lens,
+                out_route=out,
+            )
             return out, main_outputs
 
         if out is None:
