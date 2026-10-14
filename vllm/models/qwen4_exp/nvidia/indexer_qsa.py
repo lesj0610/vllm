@@ -21,7 +21,12 @@ from ..common.qsa_cache import (
     QSAKeyStateCache,
     canonical_qsa_rope_positions,
 )
-from .ops.qsa_prepare import qsa_prepare
+from .ops.qsa_prepare import (
+    qsa_pre_indexer_flashinfer,
+    qsa_prepare,
+    select_pre_indexer,
+    warmup_flashinfer_pre_indexer,
+)
 
 if TYPE_CHECKING:
     from .qsa import Qwen4ExpQSAAttention
@@ -118,12 +123,6 @@ class QSAIndexer(nn.Module):
         self.token_topk = int(config.indexer_budget)
         self.compress_ratio = int(config.indexer_compress_ratio)
         self.rotary_emb = rotary_emb
-        self.use_fused_pre_indexer = _supports_fused_pre_indexer(
-            rotary_emb,
-            self.index_head_dim,
-            self.index_kv_heads,
-            self.compress_ratio,
-        )
         self.prefix = prefix
         # MTP step 0 selects the target-aligned rows; later steps reuse them
         # while continuing to update the QSA side cache.
@@ -162,6 +161,27 @@ class QSAIndexer(nn.Module):
                 "by the Qwen4Exp QSA indexer (only 'bf16' or 'fp8')."
             )
         self.indexer_dtype = indexer_dtype
+        # Settled while the model is built: that is eager and on the serving
+        # device, so a FlashInfer module build cannot land inside a graph capture.
+        pre_indexer = (
+            select_pre_indexer(
+                vllm_config.model_config.dtype,
+                indexer_dtype,
+                self.index_head_dim,
+                cache_config.cache_dtype,
+            )
+            if _supports_fused_pre_indexer(
+                rotary_emb,
+                self.index_head_dim,
+                self.index_kv_heads,
+                self.compress_ratio,
+            )
+            else "reference"
+        )
+        # The attention takes the fused prepare only with use_fused_pre_indexer,
+        # so on FlashInfer it prepares its own Q/gate and writes its own K/V.
+        self.use_flashinfer_pre_indexer = pre_indexer == "flashinfer"
+        self.use_fused_pre_indexer = pre_indexer == "fused"
         self.raw_key_cache = QSAKeyStateCache(
             head_size=self.index_head_dim,
             dtype=torch.bfloat16,
@@ -256,6 +276,11 @@ class QSAIndexer(nn.Module):
         """
         metadata = self._metadata()
         if metadata is None:
+            # The profiling run is the last eager visit this code gets before graph
+            # capture, and the table FlashInfer's pre-indexer reads cannot be built
+            # inside one.
+            if self.use_flashinfer_pre_indexer:
+                warmup_flashinfer_pre_indexer(self.rotary_emb.cos_sin_cache)
             # Preserve step-0 indices when later MTP steps reuse the buffer.
             if self.skip_topk and out is not None:
                 return out, None
@@ -295,19 +320,14 @@ class QSAIndexer(nn.Module):
         compressed_key_cache = self.compressed_key_cache.kv_cache
 
         main_outputs: tuple[torch.Tensor, torch.Tensor] | None = None
-        if attn.use_fused_qsa_prepare:
-            if qkv is None or slot_mapping is None:
-                raise ValueError("fused QSA prepare requires qkv and slot_mapping")
+        if attn.use_fused_qsa_prepare or self.use_flashinfer_pre_indexer:
             q = projected_q.new_empty(
                 num_tokens,
                 self.index_n_heads,
                 self.index_head_dim,
                 dtype=self.indexer_dtype,
             )
-            main_kv_cache = attn.kv_cache.transpose(1, 2)
-            if attn.kv_cache_dtype in ("fp8", "fp8_e4m3"):
-                main_kv_cache = main_kv_cache.view(torch.float8_e4m3fn)
-            main_outputs = qsa_prepare(
+            indexer_args = (
                 projected_q,
                 raw_keys,
                 positions,
@@ -324,22 +344,43 @@ class QSAIndexer(nn.Module):
                 compressed_key_cache,
                 compressed_metadata.slot_mapping,
                 compressed_metadata.k_work_metadata,
-                compress_ratio=self.compress_ratio,
-                mrope_section=getattr(self.rotary_emb, "mrope_section", None),
-                rope_pos_offset=(
-                    raw_key_state_cache.rope_position_offset
-                    if raw_key_state_cache.rope_position_cache is not None
-                    else None
-                ),
-                main_qkv=qkv[:num_tokens],
-                main_q_norm_weight=attn.q_norm.weight,
-                main_k_norm_weight=attn.k_norm.weight,
-                main_eps=attn.q_norm.variance_epsilon,
-                main_kv_cache=main_kv_cache,
-                main_slot_mapping=slot_mapping[:num_tokens],
-                main_k_scale=attn._k_scale_float,
-                main_v_scale=attn._v_scale_float,
             )
+            mrope_section = getattr(self.rotary_emb, "mrope_section", None)
+            rope_pos_offset = (
+                raw_key_state_cache.rope_position_offset
+                if raw_key_state_cache.rope_position_cache is not None
+                else None
+            )
+            if attn.use_fused_qsa_prepare:
+                if qkv is None or slot_mapping is None:
+                    raise ValueError("fused QSA prepare requires qkv and slot_mapping")
+                main_kv_cache = attn.kv_cache.transpose(1, 2)
+                if attn.kv_cache_dtype in ("fp8", "fp8_e4m3"):
+                    main_kv_cache = main_kv_cache.view(torch.float8_e4m3fn)
+                main_outputs = qsa_prepare(
+                    *indexer_args,
+                    compress_ratio=self.compress_ratio,
+                    mrope_section=mrope_section,
+                    rope_pos_offset=rope_pos_offset,
+                    main_qkv=qkv[:num_tokens],
+                    main_q_norm_weight=attn.q_norm.weight,
+                    main_k_norm_weight=attn.k_norm.weight,
+                    main_eps=attn.q_norm.variance_epsilon,
+                    main_kv_cache=main_kv_cache,
+                    main_slot_mapping=slot_mapping[:num_tokens],
+                    main_k_scale=attn._k_scale_float,
+                    main_v_scale=attn._v_scale_float,
+                )
+            else:
+                # The indexer rows only. The attention is off the fused prepare
+                # whenever this path runs, so it prepared Q/gate itself and its
+                # K/V update writes the cache.
+                qsa_pre_indexer_flashinfer(
+                    *indexer_args,
+                    compress_ratio=self.compress_ratio,
+                    mrope_section=mrope_section,
+                    rope_pos_offset=rope_pos_offset,
+                )
         else:
             # Unfused reference path
             from flashinfer.norm import gemma_rmsnorm
