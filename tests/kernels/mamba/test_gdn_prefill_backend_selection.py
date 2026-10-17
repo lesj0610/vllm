@@ -153,6 +153,10 @@ def _stub_without_max_seqlen(seen: dict):
         output_final_state=False,
         cu_seqlens=None,
         use_qk_l2norm_in_kernel=False,
+        state_checkpoints=None,
+        checkpoint_cu_starts=None,
+        checkpoint_every_n_tokens=0,
+        use_cp="auto",
         backend="auto",
     ):
         seen.update(backend=backend, has_max_seqlen=False, q_shape=tuple(q.shape))
@@ -172,6 +176,10 @@ def _stub_with_max_seqlen(seen: dict):
         output_final_state=False,
         cu_seqlens=None,
         use_qk_l2norm_in_kernel=False,
+        state_checkpoints=None,
+        checkpoint_cu_starts=None,
+        checkpoint_every_n_tokens=0,
+        use_cp="auto",
         backend="auto",
         max_seqlen=None,
     ):
