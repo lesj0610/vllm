@@ -127,6 +127,8 @@ class GDNAttentionMetadata:
     prefill_max_seq_len: int | None = None
     # Chunk-kernel inputs for prefill
     prefill_query_start_loc: torch.Tensor | None = None
+    # Host copy of prefill_query_start_loc: prefill only, rebased to 0.
+    prefill_query_start_loc_cpu: torch.Tensor | None = None
     prefill_state_indices: torch.Tensor | None = None
     prefill_has_initial_state: torch.Tensor | None = None
     aiter_prefill_metadata: object | None = None
@@ -518,6 +520,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         chunk_offsets: torch.Tensor | None = None
         prefill_max_seq_len: int | None = None
         prefill_query_start_loc: torch.Tensor | None = None
+        prefill_query_start_loc_cpu: torch.Tensor | None = None
         prefill_state_indices: torch.Tensor | None = None
         prefill_has_initial_state: torch.Tensor | None = None
         aiter_prefill_metadata: object | None = None
@@ -597,6 +600,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         if checkpoint is not None and self.plan_flashinfer_checkpoints:
             assert checkpoint.offsets is not None
             assert checkpoint.query_lens is not None
+            assert prefill_query_start_loc_cpu is not None
             # The prefill kernel runs the trailing checkpoint rows.
             num_prefill_rows = prefill_query_start_loc_cpu.shape[0] - 1
             every_n_tokens, cu_starts, rows = plan_flashinfer_checkpoints(
@@ -696,6 +700,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             chunk_offsets=chunk_offsets,
             prefill_max_seq_len=prefill_max_seq_len,
             prefill_query_start_loc=prefill_query_start_loc,
+            prefill_query_start_loc_cpu=prefill_query_start_loc_cpu,
             prefill_state_indices=prefill_state_indices,
             prefill_has_initial_state=prefill_has_initial_state,
             aiter_prefill_metadata=aiter_prefill_metadata,

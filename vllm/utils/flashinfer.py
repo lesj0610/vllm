@@ -523,13 +523,12 @@ def has_flashinfer_gdn_prefill_sm8x() -> bool:
 
 
 @functools.cache
-def flashinfer_gdn_prefill_takes_max_seqlen() -> bool:
-    """Return whether the GDN prefill accepts an explicit batch maximum.
+def flashinfer_gdn_prefill_takes(parameter: str) -> bool:
+    """Return whether the GDN prefill accepts this keyword.
 
-    0.7.0 sizes its per-sequence grids from the token total and keeps the
-    maximum internal; taking it from the caller is a later addition. The
-    parameter is what says which build this is -- the SM8x gate above cannot,
-    because a build may carry one and not the other. Passing the argument to a
+    ``max_seqlen`` and ``cu_seqlens_cpu`` arrived after 0.7.0, separately. The
+    signature is what says which build this is -- the SM8x gate above cannot,
+    because a build may carry one and not the other. Passing an argument to a
     build without it raises TypeError on every architecture, including the
     ones that already worked.
     """
@@ -540,7 +539,7 @@ def flashinfer_gdn_prefill_takes_max_seqlen() -> bool:
     if fn is None:
         return False
     try:
-        return "max_seqlen" in inspect.signature(fn).parameters
+        return parameter in inspect.signature(fn).parameters
     except (TypeError, ValueError):
         return False
 

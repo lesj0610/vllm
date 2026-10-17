@@ -71,7 +71,7 @@ from vllm.third_party.flash_linear_attention.ops import (
 from vllm.third_party.flash_linear_attention.ops.chunk import l2norm_fwd
 from vllm.third_party.flash_linear_attention.ops.utils import FLA_CHUNK_SIZE
 from vllm.utils.flashinfer import (
-    flashinfer_gdn_prefill_takes_max_seqlen,
+    flashinfer_gdn_prefill_takes,
     has_flashinfer_gdn_prefill_sm8x,
 )
 from vllm.utils.math_utils import cdiv
@@ -328,6 +328,7 @@ def fi_chunk_gated_delta_rule(
     checkpoint_every_n_tokens: int = 0,
     use_cp: Literal["auto"] | bool = "auto",
     max_seq_len: int | None = None,
+    cu_seqlens_cpu: torch.Tensor | None = None,
 ):
     from flashinfer.gdn_prefill import (
         chunk_gated_delta_rule as chunk_gated_delta_rule_fi,
@@ -349,16 +350,16 @@ def fi_chunk_gated_delta_rule(
     fi_beta = beta.to(torch.float32)
     if cu_seqlens is not None:
         cu_seqlens = cu_seqlens.to(torch.int64)
-    # The batch's exact longest sequence. It enables the SM80 auto CP rule,
-    # which will not guess a maximum, and it avoids the conservative
-    # whole-batch grid the wrapper falls back to when the maximum is not
-    # stated -- the wrapper will not read cu_seqlens off the device to find
-    # out for itself. Only builds whose signature takes it are given it: a
-    # 0.7.0 without the argument serves every other architecture fine, and
-    # sizes its grids from the token total exactly as before.
-    batch_maximum: dict[str, int] = {}
-    if max_seq_len is not None and flashinfer_gdn_prefill_takes_max_seqlen():
+    # The batch's longest sequence sizes the CP grids, which otherwise fall back
+    # to the whole-batch length; the host copy of cu_seqlens is what the SM80
+    # auto CP and V32 rules read the exact maximum from. The wrapper will not
+    # read cu_seqlens off the device for either. Only builds whose signature
+    # takes an argument are given it.
+    batch_maximum: dict[str, int | torch.Tensor] = {}
+    if max_seq_len is not None and flashinfer_gdn_prefill_takes("max_seqlen"):
         batch_maximum["max_seqlen"] = max_seq_len
+    if cu_seqlens_cpu is not None and flashinfer_gdn_prefill_takes("cu_seqlens_cpu"):
+        batch_maximum["cu_seqlens_cpu"] = cu_seqlens_cpu
     result = chunk_gated_delta_rule_fi(
         q=q,
         k=k,
@@ -439,6 +440,7 @@ class ChunkGatedDeltaRule(CustomOp):
         use_qk_l2norm_in_kernel: bool = True,
         core_attn_out: torch.Tensor | None = None,
         max_seq_len: int | None = None,
+        cu_seqlens_cpu: torch.Tensor | None = None,
         aiter_prefill_metadata: object | None = None,
     ):
         o, final_state = fi_chunk_gated_delta_rule(
@@ -452,6 +454,7 @@ class ChunkGatedDeltaRule(CustomOp):
             cu_seqlens=cu_seqlens,
             use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
             max_seq_len=max_seq_len,
+            cu_seqlens_cpu=cu_seqlens_cpu,
         )
         if core_attn_out is not None:
             o_flat = o.squeeze(0).reshape(-1)
@@ -474,10 +477,11 @@ class ChunkGatedDeltaRule(CustomOp):
         use_qk_l2norm_in_kernel: bool = True,
         core_attn_out: torch.Tensor | None = None,
         max_seq_len: int | None = None,
+        cu_seqlens_cpu: torch.Tensor | None = None,
         aiter_prefill_metadata: object | None = None,
     ):
         # Only the FlashInfer path sizes anything from this.
-        del max_seq_len
+        del max_seq_len, cu_seqlens_cpu
         return fla_chunk_gated_delta_rule(
             q=q,
             k=k,
@@ -508,10 +512,11 @@ class ChunkGatedDeltaRule(CustomOp):
         use_qk_l2norm_in_kernel: bool = True,
         core_attn_out: torch.Tensor | None = None,
         max_seq_len: int | None = None,
+        cu_seqlens_cpu: torch.Tensor | None = None,
         aiter_prefill_metadata: object | None = None,
     ):
         # Only the FlashInfer path sizes anything from this.
-        del max_seq_len
+        del max_seq_len, cu_seqlens_cpu
         from vllm.model_executor.layers.mamba.ops.gdn_chunk_cutedsl import (
             chunk_gated_delta_rule_cutedsl,
         )
@@ -555,10 +560,11 @@ class ChunkGatedDeltaRule(CustomOp):
         use_qk_l2norm_in_kernel: bool = True,
         core_attn_out: torch.Tensor | None = None,
         max_seq_len: int | None = None,
+        cu_seqlens_cpu: torch.Tensor | None = None,
         aiter_prefill_metadata: object | None = None,
     ):
         # Only the FlashInfer path sizes anything from this.
-        del max_seq_len
+        del max_seq_len, cu_seqlens_cpu
         o, final_state = rocm_aiter_ops.gdn_flydsl_prefill(
             q=q,
             k=k,
@@ -1384,6 +1390,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 cu_seqlens=torch.tensor([0, T], device=device, dtype=torch.int32),
                 use_qk_l2norm_in_kernel=False,
                 max_seq_len=T,
+                cu_seqlens_cpu=torch.tensor([0, T], dtype=torch.int32),
             )
         except Exception:
             if self.gdn_prefill_backend_requested == self.gdn_prefill_backend:
@@ -1510,6 +1517,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 chunk_offsets=chunk_offsets,
                 use_qk_l2norm_in_kernel=False,
                 max_seq_len=T,
+                cu_seqlens_cpu=torch.tensor([0, T], dtype=torch.int32),
                 aiter_prefill_metadata=aiter_prefill_metadata,
             )
             if self.gdn_prefill_backend == "flashinfer":
@@ -1947,6 +1955,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                     chunk_offsets=attn_metadata.chunk_offsets,
                     use_qk_l2norm_in_kernel=False,
                     max_seq_len=attn_metadata.prefill_max_seq_len,
+                    cu_seqlens_cpu=attn_metadata.prefill_query_start_loc_cpu,
                     aiter_prefill_metadata=attn_metadata.aiter_prefill_metadata,
                 )
             else:
