@@ -83,7 +83,10 @@ def _make_vllm_config():
         block_size=BLOCK_SIZE,
         hf_config_override={"linear_key_head_dim": K},
     )
-    config.additional_config = {"gdn_prefill_backend": "cutedsl"}
+    # "auto", not a named backend. What this file compares is the fused path
+    # against the reference; naming a kernel the device cannot run is now a
+    # configuration error rather than something the selector substitutes away.
+    config.additional_config = {"gdn_prefill_backend": "auto"}
     config.cache_config.mamba_cache_mode = "none"
     config.speculative_config = SpeculativeConfig(
         method="ngram", num_speculative_tokens=NUM_SPEC
