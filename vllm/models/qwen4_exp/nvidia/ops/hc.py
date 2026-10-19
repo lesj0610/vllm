@@ -8,7 +8,6 @@ import torch
 
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
-from vllm.utils.torch_utils import direct_register_custom_op
 
 
 @functools.cache
@@ -24,6 +23,25 @@ _NATIVE_HC_COUNTS = frozenset({2, 4, 8})
 
 def _native_hc_streams(hc_count: int) -> bool:
     return _has_cuda_hc() and hc_count in _NATIVE_HC_COUNTS
+
+
+def _unit_injection(
+    injection_logits: torch.Tensor | None,
+    residual: torch.Tensor,
+    hc_count: int,
+) -> torch.Tensor:
+    """Stand in for a missing injection with the logits that mean unit weight.
+
+    The first hyper-connection layer has no previous injection, and the kernels
+    take the tensor unconditionally -- the op schema declares it non-optional,
+    so ``None`` reaches C++ as an undefined handle and the first stride query
+    on it fails. Both kernels gate on ``2 * sigmoid(logit * inv_hc)``, which is
+    exactly 1 at a logit of zero, so zeros reproduce the unweighted add the
+    unfused path does. Exact in floating point, not an approximation.
+    """
+    if injection_logits is not None:
+        return injection_logits
+    return residual.new_zeros((residual.shape[0], hc_count))
 
 
 @triton.jit
@@ -69,7 +87,7 @@ def _grouped_gemma_rmsnorm_kernel(
     tl.store(y_ptr + row * stride_y + offsets, y, mask)
 
 
-def _grouped_gemma_rmsnorm(
+def grouped_gemma_rmsnorm(
     x: torch.Tensor, weight: torch.Tensor, eps: float, num_groups: int
 ) -> torch.Tensor:
     if _has_cuda_hc() and x.is_cuda:
@@ -126,7 +144,7 @@ def _hc_silu_kernel(
     tl.store(y_ptr + row * stride_y + offs, y, mask)
 
 
-def _hc_silu(x: torch.Tensor, hc_count: int) -> torch.Tensor:
+def hc_silu(x: torch.Tensor, hc_count: int) -> torch.Tensor:
     if _has_cuda_hc() and x.is_cuda:
         y = x.new_empty(x.shape)
         torch.ops._C.qwen4_exp_hc_silu(x, hc_count, y)
@@ -185,7 +203,7 @@ def _hc_gate_mix_kernel(
     tl.store(y_ptr + row * stride_y + offs_inner, acc, mask)
 
 
-def _hc_gate_mix(x: torch.Tensor, gate: torch.Tensor, hc_count: int) -> torch.Tensor:
+def hc_gate_mix(x: torch.Tensor, gate: torch.Tensor, hc_count: int) -> torch.Tensor:
     if _native_hc_streams(hc_count) and x.is_cuda:
         y = x.new_empty(gate.shape[0], gate.shape[1] // hc_count)
         torch.ops._C.qwen4_exp_hc_gate_mix(x, gate, hc_count, y)
@@ -261,7 +279,7 @@ def _hc_combine_kernel(
     tl.store(out_ptr + row * stride_out + offs, out, mask=mask)
 
 
-def _hc_combine(
+def hc_combine(
     residual: torch.Tensor,
     block_output: torch.Tensor,
     injection_logits: torch.Tensor | None,
@@ -270,7 +288,11 @@ def _hc_combine(
     if _native_hc_streams(hc_count) and residual.is_cuda:
         out = residual.new_empty(residual.shape)
         torch.ops._C.qwen4_exp_hc_combine(
-            residual, block_output, injection_logits, hc_count, out
+            residual,
+            block_output,
+            _unit_injection(injection_logits, residual, hc_count),
+            hc_count,
+            out,
         )
         return out
     N, DIM = residual.shape
@@ -380,7 +402,7 @@ def _hc_combine_norm_kernel(
     tl.store(y_ptr + row * stride_y + offs, y, mask_inner)
 
 
-def _hc_combine_norm(
+def hc_combine_norm(
     residual: torch.Tensor,
     block_output: torch.Tensor,
     injection_logits: torch.Tensor | None,
@@ -392,7 +414,14 @@ def _hc_combine_norm(
         out = residual.new_empty(residual.shape)
         y = residual.new_empty(residual.shape)
         torch.ops._C.qwen4_exp_hc_combine_norm(
-            residual, block_output, injection_logits, norm_weight, eps, hc_count, out, y
+            residual,
+            block_output,
+            _unit_injection(injection_logits, residual, hc_count),
+            norm_weight,
+            eps,
+            hc_count,
+            out,
+            y,
         )
         return out, y
     N, DIM = residual.shape
@@ -432,131 +461,6 @@ def _hc_combine_norm(
         launch_pdl=current_platform.is_arch_support_pdl(),
     )
     return out, y
-
-
-def _same_shape_fake(x: torch.Tensor, *args) -> torch.Tensor:
-    return x.new_empty(x.shape)
-
-
-def _hc_gate_mix_fake(
-    x: torch.Tensor, gate: torch.Tensor, hc_count: int
-) -> torch.Tensor:
-    del gate
-    return x.new_empty((x.shape[0], x.shape[1] // hc_count))
-
-
-def _hc_combine_fake(
-    residual: torch.Tensor,
-    block_output: torch.Tensor,
-    injection_logits: torch.Tensor | None,
-    hc_count: int,
-) -> torch.Tensor:
-    del block_output, injection_logits, hc_count
-    return residual.new_empty(residual.shape)
-
-
-def _hc_combine_norm_fake(
-    residual: torch.Tensor,
-    block_output: torch.Tensor,
-    injection_logits: torch.Tensor | None,
-    norm_weight: torch.Tensor,
-    eps: float,
-    hc_count: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    del block_output, injection_logits, norm_weight, eps, hc_count
-    return residual.new_empty(residual.shape), residual.new_empty(residual.shape)
-
-
-direct_register_custom_op(
-    op_name="qwen4_exp_grouped_gemma_rmsnorm",
-    op_func=_grouped_gemma_rmsnorm,
-    fake_impl=_same_shape_fake,
-)
-direct_register_custom_op(
-    op_name="qwen4_exp_hc_silu",
-    op_func=_hc_silu,
-    fake_impl=_same_shape_fake,
-)
-direct_register_custom_op(
-    op_name="qwen4_exp_hc_gate_mix",
-    op_func=_hc_gate_mix,
-    fake_impl=_hc_gate_mix_fake,
-)
-direct_register_custom_op(
-    op_name="qwen4_exp_hc_combine",
-    op_func=_hc_combine,
-    fake_impl=_hc_combine_fake,
-)
-direct_register_custom_op(
-    op_name="qwen4_exp_hc_combine_norm",
-    op_func=_hc_combine_norm,
-    fake_impl=_hc_combine_norm_fake,
-)
-
-
-def grouped_gemma_rmsnorm(
-    x: torch.Tensor, weight: torch.Tensor, eps: float, num_groups: int
-) -> torch.Tensor:
-    return torch.ops.vllm.qwen4_exp_grouped_gemma_rmsnorm(x, weight, eps, num_groups)
-
-
-def hc_silu(x: torch.Tensor, hc_count: int) -> torch.Tensor:
-    return torch.ops.vllm.qwen4_exp_hc_silu(x, hc_count)
-
-
-def hc_gate_mix(x: torch.Tensor, gate: torch.Tensor, hc_count: int) -> torch.Tensor:
-    return torch.ops.vllm.qwen4_exp_hc_gate_mix(x, gate, hc_count)
-
-
-def _unit_injection(
-    injection_logits: torch.Tensor | None,
-    residual: torch.Tensor,
-    hc_count: int,
-) -> torch.Tensor:
-    """Stand in for a missing injection with the logits that mean unit weight.
-
-    The first hyper-connection layer has no previous injection, and the kernels
-    take the tensor unconditionally -- the op schema declares it non-optional,
-    so ``None`` reaches C++ as an undefined handle and the first stride query
-    on it fails. Both kernels gate on ``2 * sigmoid(logit * inv_hc)``, which is
-    exactly 1 at a logit of zero, so zeros reproduce the unweighted add the
-    unfused path does. Exact in floating point, not an approximation.
-    """
-    if injection_logits is not None:
-        return injection_logits
-    return residual.new_zeros((residual.shape[0], hc_count))
-
-
-def hc_combine(
-    residual: torch.Tensor,
-    block_output: torch.Tensor,
-    injection_logits: torch.Tensor | None,
-    hc_count: int,
-) -> torch.Tensor:
-    return torch.ops.vllm.qwen4_exp_hc_combine(
-        residual,
-        block_output,
-        _unit_injection(injection_logits, residual, hc_count),
-        hc_count,
-    )
-
-
-def hc_combine_norm(
-    residual: torch.Tensor,
-    block_output: torch.Tensor,
-    injection_logits: torch.Tensor | None,
-    norm_weight: torch.Tensor,
-    eps: float,
-    hc_count: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    return torch.ops.vllm.qwen4_exp_hc_combine_norm(
-        residual,
-        block_output,
-        _unit_injection(injection_logits, residual, hc_count),
-        norm_weight,
-        eps,
-        hc_count,
-    )
 
 
 __all__ = [
