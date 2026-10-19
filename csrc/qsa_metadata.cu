@@ -266,7 +266,8 @@ __global__ void qsa_metadata_kernel(
                  num_block_table_columns > 0;
     const int32_t page =
         valid ? block_table[request * block_table_stride_0] : -1;
-    valid = valid && page >= 0;
+    // Dummy and padding requests own no ring and sit on the null block.
+    valid = valid && page > 0;
     if (valid) {
       const int32_t in_ring = POW2 ? (position & (circular_buffer_size - 1))
                                    : position % circular_buffer_size;
