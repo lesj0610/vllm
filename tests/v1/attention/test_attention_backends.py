@@ -1699,6 +1699,43 @@ def test_flashinfer_xqa_decode_correctness(default_vllm_config):
 
 @pytest.mark.skipif(
     AttentionBackendEnum.FLASHINFER not in BACKENDS_TO_TEST
+    or not current_platform.is_device_capability(120),
+    reason="FlashInfer's FP8-query fa2 decode requires SM120.",
+)
+@pytest.mark.parametrize("batch_spec_name", ["small_decode", "large_decode"])
+def test_flashinfer_fp8_query_decode_correctness(default_vllm_config, batch_spec_name):
+    """On SM120, an FP8 KV cache at head_dim 256 decodes with fa2 on an FP8
+    query instead of XQA, and matches SDPA."""
+    import unittest.mock
+
+    from vllm.v1.attention.backends import flashinfer as fi
+
+    def causal_mask_mod(b, h, q_idx, kv_idx, *, context_len: int):
+        return (q_idx + context_len) >= kv_idx
+
+    decode_cls = fi.BatchDecodeWithPagedKVCacheWrapper
+    with (
+        unittest.mock.patch.object(
+            decode_cls, "run", autospec=True, side_effect=decode_cls.run
+        ) as decode,
+        unittest.mock.patch.object(
+            fi, "flashinfer_xqa_batch_decode_with_kv_cache"
+        ) as xqa,
+    ):
+        # GQA 4 at head_dim 256.
+        _test_backend_correctness(
+            BATCH_SPECS[batch_spec_name],
+            "Qwen/Qwen3.5-0.8B",
+            [AttentionBackendEnum.FLASHINFER],
+            causal_mask_mod,
+            kv_cache_dtype="fp8",
+        )
+    assert not xqa.called
+    assert decode.call_args.args[1].dtype == current_platform.fp8_dtype()
+
+
+@pytest.mark.skipif(
+    AttentionBackendEnum.FLASHINFER not in BACKENDS_TO_TEST
     or not current_platform.is_device_capability_family(120),
     reason="NVFP4 XQA decode requires SM12x.",
 )

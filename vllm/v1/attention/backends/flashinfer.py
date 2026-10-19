@@ -858,6 +858,34 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             assert self.kv_cache_spec.dtype == self.model_config.dtype
             self.kv_cache_dtype = self.kv_cache_spec.dtype
 
+        # Global hyperparameters shared by all attention layers
+        # TODO: discard this for trtllm-gen backend
+        per_layer_parameters = get_per_layer_parameters(
+            vllm_config, layer_names, FlashInferImpl
+        )
+        self.global_hyperparameters = infer_global_hyperparameters(per_layer_parameters)
+        self.sm_scale = self.global_hyperparameters.sm_scale
+        self.window_left = self.global_hyperparameters.window_left
+        self.logits_soft_cap = self.global_hyperparameters.logits_soft_cap
+        self.has_sinks = self.global_hyperparameters.has_sinks
+
+        # On SM120, FlashInfer's fa2 tensor-core decode takes an FP8 query over an
+        # FP8 KV cache and is faster than XQA with a BF16 query. Use it for the
+        # shapes it supports, unless trtllm attention is forced.
+        self.fa2_fp8_q_decode = (
+            current_platform.is_device_capability(120)
+            and self.cache_dtype in ("fp8", "fp8_e4m3")
+            and self.model_config.dtype == torch.bfloat16
+            and self.head_dim == 256
+            and self.num_qo_heads in [self.num_kv_heads * g for g in (1, 2, 4, 8)]
+            and not self.logits_soft_cap
+            and not self.has_sinks
+            and not self.use_dcp
+            and speculative_config is None
+            and force_use_trtllm_attention() is not True
+            and not self.vllm_config.attention_config.disable_flashinfer_q_quantization
+        )
+
         # Compute per-phase Q dtype.  On SM90 (XQA decode), the prefill and
         # decode phases require different Q dtypes when the KV cache is FP8
         # (FP8-Q for the FI native prefill, BF16/FP16-Q for XQA decode),
@@ -871,6 +899,8 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         can_use_xqa_or_trtllm_gen_decode = can_use_trtllm_attention(
             self.num_qo_heads, self.num_kv_heads, is_prefill=False
         ) and (not self.nvfp4_fa2 or current_platform.is_device_capability_family(120))
+        if self.fa2_fp8_q_decode:
+            can_use_xqa_or_trtllm_gen_decode = False
         # Page sizes >= 128 require the trtllm-gen GQA/MQA path (guaranteed by
         # get_supported_kernel_block_sizes).
         assert self.page_size <= 64 or (
@@ -940,16 +970,6 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             supports_dcp_with_varlen=False,
         )
 
-        # Global hyperparameters shared by all attention layers
-        # TODO: discard this for trtllm-gen backend
-        per_layer_parameters = get_per_layer_parameters(
-            vllm_config, layer_names, FlashInferImpl
-        )
-        self.global_hyperparameters = infer_global_hyperparameters(per_layer_parameters)
-        self.sm_scale = self.global_hyperparameters.sm_scale
-        self.window_left = self.global_hyperparameters.window_left
-        self.logits_soft_cap = self.global_hyperparameters.logits_soft_cap
-        self.has_sinks = self.global_hyperparameters.has_sinks
         if self.has_sinks and (self.nvfp4_fa2 or not FlashInferBackend.supports_sink()):
             raise NotImplementedError(
                 "FlashInfer backend currently does not support attention "
@@ -993,6 +1013,9 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         # to 1 explicitly, use model dtype for query.
         if self.vllm_config.attention_config.disable_flashinfer_q_quantization:
             return self.model_config.dtype
+
+        if not is_prefill and self.fa2_fp8_q_decode:
+            return FlashInferBackend.get_dtype_for_flashinfer(self.cache_dtype)
 
         # self.cache_dtype is resolved per KV-cache group: it is "auto" when
         # this group is unquantized (e.g. --kv-cache-dtype-skip-layers), even
