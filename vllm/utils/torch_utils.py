@@ -994,16 +994,11 @@ HAS_OPAQUE_TYPE = is_torch_equal_or_newer("2.11.0.dev")
 # Set VLLM_USE_LAYERNAME=0 to disable even on torch >= 2.11.
 _USE_LAYERNAME = HAS_OPAQUE_TYPE and envs.VLLM_USE_LAYERNAME
 
-if HAS_OPAQUE_TYPE:
-    from torch._opaque_base import OpaqueBase
-else:
-    OpaqueBase = object  # type: ignore[misc, assignment]
 
-
-class LayerName(OpaqueBase):  # type: ignore[misc]
+class LayerName:
     """Wraps a module name string for use as a torch opaque type.
 
-    When torch >= 2.11, this is registered as a hoisted value-type opaque
+    When torch >= 2.11, this is registered as a hoisted constant-type opaque
     object so that torch.compile lifts it as a graph input instead of baking
     it as a constant.  This avoids per-layer recompilation for custom ops
     that accept layer name strings (attention, MOE, KV cache, etc.).
@@ -1023,9 +1018,9 @@ class LayerName(OpaqueBase):  # type: ignore[misc]
 
 
 if HAS_OPAQUE_TYPE:
-    from torch._library.opaque_object import register_opaque_type
+    from torch._library.opaque_object import register_custom_class
 
-    register_opaque_type(LayerName, typ="value", hoist=True)
+    register_custom_class(LayerName, typ="constant", hoist=True)
 
 # On torch >= 2.11 (with VLLM_USE_LAYERNAME enabled), custom op
 # layer_name parameters use LayerName; otherwise they remain plain str.
