@@ -2,10 +2,46 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """NVIDIA HyperConnection kernels for Qwen4Exp."""
 
+import functools
+
 import torch
 
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+
+
+@functools.cache
+def _has_cuda_hc() -> bool:
+    return hasattr(torch.ops._C, "qwen4_exp_hc_silu")
+
+
+# The native stream-mixing kernels are specialized on the stream count, so they
+# only exist for these. The model configuration accepts any hc_count > 1, and
+# the Triton kernels below serve the rest.
+_NATIVE_HC_COUNTS = frozenset({2, 4, 8})
+
+
+def _native_hc_streams(hc_count: int) -> bool:
+    return _has_cuda_hc() and hc_count in _NATIVE_HC_COUNTS
+
+
+def _unit_injection(
+    injection_logits: torch.Tensor | None,
+    residual: torch.Tensor,
+    hc_count: int,
+) -> torch.Tensor:
+    """Stand in for a missing injection with the logits that mean unit weight.
+
+    The first hyper-connection layer has no previous injection, and the kernels
+    take the tensor unconditionally -- the op schema declares it non-optional,
+    so ``None`` reaches C++ as an undefined handle and the first stride query
+    on it fails. Both kernels gate on ``2 * sigmoid(logit * inv_hc)``, which is
+    exactly 1 at a logit of zero, so zeros reproduce the unweighted add the
+    unfused path does. Exact in floating point, not an approximation.
+    """
+    if injection_logits is not None:
+        return injection_logits
+    return residual.new_zeros((residual.shape[0], hc_count))
 
 
 @triton.jit
@@ -54,6 +90,10 @@ def _grouped_gemma_rmsnorm_kernel(
 def grouped_gemma_rmsnorm(
     x: torch.Tensor, weight: torch.Tensor, eps: float, num_groups: int
 ) -> torch.Tensor:
+    if _has_cuda_hc() and x.is_cuda:
+        y = x.new_empty(x.shape)
+        torch.ops._C.qwen4_exp_grouped_gemma_rmsnorm(x, weight, eps, num_groups, y)
+        return y
     N, DIM = x.shape
     assert x.stride(1) == 1, "grouped Gemma RMSNorm requires unit inner stride"
     assert weight.is_contiguous(), "grouped Gemma RMSNorm weight must be contiguous"
@@ -105,6 +145,10 @@ def _hc_silu_kernel(
 
 
 def hc_silu(x: torch.Tensor, hc_count: int) -> torch.Tensor:
+    if _has_cuda_hc() and x.is_cuda:
+        y = x.new_empty(x.shape)
+        torch.ops._C.qwen4_exp_hc_silu(x, hc_count, y)
+        return y
     num_tokens, DIM = x.shape
     assert x.stride(1) == 1
 
@@ -160,6 +204,10 @@ def _hc_gate_mix_kernel(
 
 
 def hc_gate_mix(x: torch.Tensor, gate: torch.Tensor, hc_count: int) -> torch.Tensor:
+    if _native_hc_streams(hc_count) and x.is_cuda:
+        y = x.new_empty(gate.shape[0], gate.shape[1] // hc_count)
+        torch.ops._C.qwen4_exp_hc_gate_mix(x, gate, hc_count, y)
+        return y
     N, DIM = gate.shape
     assert x.shape == gate.shape
     assert DIM % hc_count == 0
@@ -237,6 +285,16 @@ def hc_combine(
     injection_logits: torch.Tensor | None,
     hc_count: int,
 ) -> torch.Tensor:
+    if _native_hc_streams(hc_count) and residual.is_cuda:
+        out = residual.new_empty(residual.shape)
+        torch.ops._C.qwen4_exp_hc_combine(
+            residual,
+            block_output,
+            _unit_injection(injection_logits, residual, hc_count),
+            hc_count,
+            out,
+        )
+        return out
     N, DIM = residual.shape
     assert DIM % hc_count == 0
     hc_dim = DIM // hc_count
@@ -352,6 +410,20 @@ def hc_combine_norm(
     eps: float,
     hc_count: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    if _native_hc_streams(hc_count) and residual.is_cuda:
+        out = residual.new_empty(residual.shape)
+        y = residual.new_empty(residual.shape)
+        torch.ops._C.qwen4_exp_hc_combine_norm(
+            residual,
+            block_output,
+            _unit_injection(injection_logits, residual, hc_count),
+            norm_weight,
+            eps,
+            hc_count,
+            out,
+            y,
+        )
+        return out, y
     N, DIM = residual.shape
     assert DIM % hc_count == 0
     hc_dim = DIM // hc_count
