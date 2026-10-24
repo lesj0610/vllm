@@ -566,10 +566,60 @@ def _build_qsa_metadata_torch(
     return token_to_req, logical_positions, visible_blocks, slot_mapping
 
 
-# Resolve the fallback outside the per-step metadata hot path.
-build_qsa_metadata = (
-    build_qsa_metadata_triton if HAS_TRITON else _build_qsa_metadata_torch
-)
+def build_qsa_metadata(
+    common_attn_metadata: CommonAttentionMetadata,
+    token_to_req_buffer: torch.Tensor,
+    logical_positions_buffer: torch.Tensor,
+    visible_blocks_buffer: torch.Tensor,
+    slot_mapping_buffer: torch.Tensor,
+    *,
+    storage_block_size: int,
+    compress_ratio: int,
+    circular_buffer_size: int = 0,
+    k_work_metadata_buffer: torch.Tensor | None = None,
+    request_capacity: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build the per-step QSA metadata on the CUDA builder where it applies."""
+    if common_attn_metadata.query_start_loc.is_cuda:
+        num_tokens = common_attn_metadata.num_actual_tokens
+        num_mapped = int(common_attn_metadata.query_start_loc_cpu[-1])
+        token_to_req = token_to_req_buffer[:num_tokens]
+        logical_positions = logical_positions_buffer[:num_tokens]
+        visible_blocks = visible_blocks_buffer[:num_tokens]
+        slot_mapping = slot_mapping_buffer[:num_tokens]
+        # The work buffer is sized by its owner; its whole length is the bound.
+        del request_capacity
+        torch.ops._C.qsa_build_metadata(
+            common_attn_metadata.query_start_loc,
+            common_attn_metadata.seq_lens,
+            common_attn_metadata.slot_mapping,
+            common_attn_metadata.block_table_tensor,
+            token_to_req,
+            logical_positions,
+            visible_blocks,
+            slot_mapping,
+            k_work_metadata_buffer,
+            storage_block_size,
+            compress_ratio,
+            circular_buffer_size,
+            num_mapped,
+        )
+        return token_to_req, logical_positions, visible_blocks, slot_mapping
+
+    # Resolve the fallback outside the per-step metadata hot path.
+    fallback = build_qsa_metadata_triton if HAS_TRITON else _build_qsa_metadata_torch
+    return fallback(
+        common_attn_metadata,
+        token_to_req_buffer,
+        logical_positions_buffer,
+        visible_blocks_buffer,
+        slot_mapping_buffer,
+        storage_block_size=storage_block_size,
+        compress_ratio=compress_ratio,
+        circular_buffer_size=circular_buffer_size,
+        k_work_metadata_buffer=k_work_metadata_buffer,
+        request_capacity=request_capacity,
+    )
 
 
 @dataclass
