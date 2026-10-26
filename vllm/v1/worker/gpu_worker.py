@@ -705,9 +705,15 @@ class Worker(WorkerBase):
         # the AMD-CI mem tests), and graph_pool_handle resolves to the same
         # torch.cuda handle the live capture path already uses on ROCm.
         cudagraph_memory_estimate = 0
-        if (
-            current_platform.is_cuda_alike() or current_platform.is_xpu()
-        ) and self.vllm_config.compilation_config.cudagraph_mode != CUDAGraphMode.NONE:
+        compilation_config = self.vllm_config.compilation_config
+        if (current_platform.is_cuda_alike() or current_platform.is_xpu()) and (
+            compilation_config.cudagraph_mode != CUDAGraphMode.NONE
+            or (
+                self.use_v2_model_runner
+                and compilation_config.cudagraph_mm_encoder
+                and not self.model_config.enforce_eager
+            )
+        ):
             cudagraph_memory_estimate = self.model_runner.profile_cudagraph_memory()
 
         # Respect the opt-in flag as originally designed.
@@ -737,8 +743,12 @@ class Worker(WorkerBase):
             profile_result.non_kv_cache_memory = (
                 profile_result.total_consumed + profile_result.transient_peak_headroom
             )
+        # State the KV cache init allocates beside the cache, which the runner
+        # measured while profiling CUDA graphs. It is consumed memory, not CUDA
+        # graph memory, and it comes out of the KV cache budget.
+        kv_cache_init_memory = getattr(self.model_runner, "kv_cache_init_memory", 0)
 
-        self.total_consumed = profile_result.total_consumed
+        self.total_consumed = profile_result.total_consumed + kv_cache_init_memory
         self.peak_activation_memory = (
             profile_result.transient_peak_headroom + cudagraph_memory_estimate_applied
         )
@@ -747,6 +757,7 @@ class Worker(WorkerBase):
         self.available_kv_cache_memory_bytes = (
             self.requested_memory
             - profile_result.non_kv_cache_memory
+            - kv_cache_init_memory
             - cudagraph_memory_estimate_applied
         )
 
@@ -1395,6 +1406,7 @@ class Worker(WorkerBase):
         *,
         delay_iterations: int | None = None,
         max_iterations: int | None = None,
+        profiler_kwargs: dict | None = None,
     ):
         # Check if profiling is enabled
         if self.profiler_config is None or self.profiler_config.profiler is None:
@@ -1425,9 +1437,11 @@ class Worker(WorkerBase):
                     self.profiler_config,
                     worker_name=trace_name,
                     local_rank=self.local_rank,
+                    profiler_kwargs=profiler_kwargs,
                 )
 
             self.profiler.set_output_name(trace_name)
+            self.profiler.set_profiler_kwargs(profiler_kwargs)
             self.profiler.start(
                 delay_iterations=delay_iterations,
                 max_iterations=max_iterations,
