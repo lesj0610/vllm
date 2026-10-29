@@ -12,7 +12,9 @@ from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.scalar_type import ScalarType
 from vllm.utils.flashinfer import (
+    flashinfer_fp4_quantize,
     flashinfer_quant_nvfp4_8x4_sf_layout,
+    has_flashinfer,
 )
 from vllm.utils.math_utils import cdiv
 
@@ -1583,6 +1585,18 @@ def scaled_fp4_quant(
     if use_8x4_sf_layout:
         output, output_scale = flashinfer_quant_nvfp4_8x4_sf_layout(
             input, input_global_scale
+        )
+    elif (
+        padded_n is None
+        and not current_platform.has_device_capability(100)
+        and has_flashinfer()
+    ):
+        # vLLM compiles this kernel for SM100+ only; FlashInfer has it for SM80+.
+        # The vLLM kernel reads input_global_scale[0]; FlashInfer wants shape [1].
+        output, output_scale = flashinfer_fp4_quantize(
+            input,
+            input_global_scale.reshape(-1)[:1],
+            is_sf_swizzled_layout=is_sf_swizzled_layout,
         )
     else:
         # Pre-allocate and call .out variant (same behavior as old in-place API)

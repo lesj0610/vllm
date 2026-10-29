@@ -38,6 +38,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey,
 )
 from vllm.model_executor.utils import move_parameter
+from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
 
@@ -222,6 +223,12 @@ def select_nvfp4_moe_backend(
         NvFp4MoeBackend.EMULATION,
     ]
     AVAILABLE_BACKENDS = prioritize_humming(AVAILABLE_BACKENDS)
+    if not current_platform.has_device_capability(100):
+        # Below SM100 FlashInfer runs NVFP4 MoE on software kernels: opt in
+        # with moe_backend rather than taking them over the native backends.
+        AVAILABLE_BACKENDS = [
+            b for b in AVAILABLE_BACKENDS if b not in FLASHINFER_NVFP4_MOE_BACKENDS
+        ]
 
     NVFP4_BACKENDS_WITH_CLAMP = {
         NvFp4MoeBackend.B12X,
@@ -522,6 +529,30 @@ def convert_to_nvfp4_moe_kernel_format(
     else:
         raise ValueError(f"Unknown NvFp4 backend for MoE: {nvfp4_backend}")
 
+    if nvfp4_backend in (
+        NvFp4MoeBackend.FLASHINFER_TRTLLM,
+        NvFp4MoeBackend.FLASHINFER_CUTLASS,
+        NvFp4MoeBackend.FLASHINFER_CUTEDSL,
+    ) and not current_platform.has_device_capability(100):
+        # Below SM100 FlashInfer runs these on its CUTLASS SM80 kernels and
+        # converts the weights on every call unless given their operands.
+        from flashinfer.fused_moe import (
+            cutlass_nvfp4_sm80_weights,
+            trtllm_nvfp4_sm80_weights,
+        )
+
+        if nvfp4_backend == NvFp4MoeBackend.FLASHINFER_TRTLLM:
+            w13, w13_scale, w2, w2_scale = trtllm_nvfp4_sm80_weights(
+                w13, w13_scale, w2, w2_scale, is_act_and_mul
+            )
+        else:
+            interleaved = (
+                nvfp4_backend == NvFp4MoeBackend.FLASHINFER_CUTEDSL and is_act_and_mul
+            )
+            w13, w13_scale, w2, w2_scale = cutlass_nvfp4_sm80_weights(
+                w13, w13_scale, w2, w2_scale, layer.moe_config.in_dtype, interleaved
+            )
+
     return (
         w13,
         w13_scale,
@@ -587,7 +618,11 @@ def make_nvfp4_moe_quant_config(
             gemm1_clamp_limit=swiglu_limit,
         )
 
-    if backend == NvFp4MoeBackend.FLASHINFER_CUTEDSL:
+    # Scales prepared below SM100 (cutlass_nvfp4_sm80_weights) are read as is.
+    if (
+        backend == NvFp4MoeBackend.FLASHINFER_CUTEDSL
+        and w13_scale.dtype == torch.float8_e4m3fn
+    ):
         w13_scale = nvfp4_swizzled_scale_to_cutedsl_mma_view(w13_scale)
         w2_scale = nvfp4_swizzled_scale_to_cutedsl_mma_view(w2_scale)
 

@@ -275,8 +275,8 @@ def test_ipc_cache_cold_start_and_warm_restart(
     if case.check_flashinfer_cache:
         from vllm.utils.flashinfer import has_flashinfer
 
-        if not (has_flashinfer() and current_platform.has_device_capability(90)):
-            pytest.skip("FlashInfer autotune requires FlashInfer and SM90+")
+        if not (has_flashinfer() and current_platform.has_device_capability(80)):
+            pytest.skip("FlashInfer autotune requires FlashInfer and SM80+")
         # Isolate the on-disk autotune cache. The engines are in-process
         # (envs read lazily); the daemon subprocesses spawn later and
         # inherit it.
@@ -304,8 +304,8 @@ def test_d2d_warmup_cache_seeding(vllm_runner, tmp_path):
         pytest.skip("Kimi K3 IPC weight cache requires an SM100 MXFP4 backend")
     from vllm.utils.flashinfer import has_flashinfer
 
-    if not (has_flashinfer() and current_platform.has_device_capability(90)):
-        pytest.skip("FlashInfer autotune requires FlashInfer and SM90+")
+    if not (has_flashinfer() and current_platform.has_device_capability(80)):
+        pytest.skip("FlashInfer autotune requires FlashInfer and SM80+")
 
     case = replace(
         K3_CASE,

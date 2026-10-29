@@ -129,12 +129,9 @@ class FlashInferExperts(mk.FusedMoEExpertsModular):
         p = current_platform
         return (
             p.is_cuda()
-            and (
-                p.is_device_capability(90)
-                or p.is_device_capability_family(100)
-                # SM110 excluded: flashinfer-ai/flashinfer#3134
-                or p.is_device_capability_family(120)
-            )
+            and p.has_device_capability(80)
+            # SM110 excluded: flashinfer-ai/flashinfer#3134
+            and not p.is_device_capability_family(110)
             and has_flashinfer_cutlass_fused_moe()
         )
 
@@ -169,14 +166,10 @@ class FlashInferExperts(mk.FusedMoEExpertsModular):
                 ]
                 and p.is_device_capability(90)
             )
-            # nvfp4, wmxfp4amxfp8 on 10.0+
+            # nvfp4 on 8.0+ (software kernels below 10.0), wmxfp4amxfp8 on 10.0+
+            or scheme == (kNvfp4Static, kNvfp4Dynamic)
             or (
-                scheme
-                in [
-                    (kMxfp4Static, kMxfp8Dynamic),
-                    (kNvfp4Static, kNvfp4Dynamic),
-                ]
-                and p.has_device_capability(100)
+                scheme == (kMxfp4Static, kMxfp8Dynamic) and p.has_device_capability(100)
             )
         )
 
@@ -302,12 +295,18 @@ class FlashInferExperts(mk.FusedMoEExpertsModular):
             )
             # Flashinfer CUTLASS kernel takes scalar global scales,
             # min because inv_scale.
+            # Below SM100 the scales were prepared at load in the output dtype
+            # (cutlass_nvfp4_sm80_weights); the SM100 kernels read them as int32.
+            w1_scale, w2_scale = (
+                s.view(torch.int32) if s.dtype == torch.float8_e4m3fn else s
+                for s in (self.w1_scale, self.w2_scale)
+            )
             quant_scales = [
                 self.a1_gscale,
-                self.w1_scale.view(torch.int32),
+                w1_scale,
                 self.g1_alphas,
                 self.a2_gscale,
-                self.w2_scale.view(torch.int32),
+                w2_scale,
                 self.g2_alphas,
             ]
             # FlashInfer API requires weight to be long for nvfp4

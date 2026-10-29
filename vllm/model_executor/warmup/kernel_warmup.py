@@ -268,10 +268,10 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
     enable_flashinfer_autotune = (
         worker.vllm_config.kernel_config.enable_flashinfer_autotune
     )
-    # FlashInfer autotune for Hopper (SM 9.0) and Blackwell (SM 10.0) GPUs
+    # FlashInfer autotune for Ampere (SM 8.0) and newer GPUs
     if enable_flashinfer_autotune is False:
         logger.info_once("Skipping FlashInfer autotune because it is disabled.")
-    elif has_flashinfer() and current_platform.has_device_capability(90):
+    elif has_flashinfer() and current_platform.has_device_capability(80):
         flashinfer_autotune(worker.model_runner)
 
     # FlashInfer attention warmup

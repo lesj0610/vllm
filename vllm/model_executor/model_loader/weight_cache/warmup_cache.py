@@ -72,7 +72,7 @@ class FlashInferWarmupCache(WarmupCache):
         if (
             vllm_config.kernel_config.enable_flashinfer_autotune is False
             or not has_flashinfer()
-            or not current_platform.has_device_capability(90)
+            or not current_platform.has_device_capability(80)
             or is_draft_model_cacheable(vllm_config.speculative_config)
         ):
             return

@@ -148,7 +148,9 @@ class FlashInferCuteDSLExperts(mk.FusedMoEExpertsModular):
         p = current_platform
         return (
             p.is_cuda()
-            and p.is_device_capability_family(100)
+            # Below SM100 FlashInfer runs it on its CUTLASS SM80 kernels.
+            and p.has_device_capability(80)
+            and not p.has_device_capability(110)
             and has_flashinfer_cutedsl_moe_nvfp4()
         )
 
