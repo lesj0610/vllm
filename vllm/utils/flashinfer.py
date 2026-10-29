@@ -29,6 +29,13 @@ from vllm.utils.torch_utils import PIN_MEMORY
 logger = init_logger(__name__)
 
 
+def is_flashinfer_autotuning() -> bool:
+    """Whether a FlashInfer autotune(True) context is active."""
+    from flashinfer.autotuner import AutoTuner
+
+    return AutoTuner.get().is_tuning_mode
+
+
 def flashinfer_bf16_mm(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -527,6 +534,27 @@ def has_flashinfer_bf16_fp4() -> bool:
     return mod is not None and all(
         hasattr(mod, name) for name in ("mm_bf16_fp4", "prepare_bf16_fp4_weights")
     )
+
+
+@functools.cache
+def flashinfer_gdn_prefill_takes(parameter: str) -> bool:
+    """Return whether the GDN prefill accepts this keyword.
+
+    ``max_seqlen`` and ``cu_seqlens_cpu`` arrived after 0.7.0, separately, so a
+    build may take one and not the other. Passing an argument to a build
+    without it raises TypeError on every architecture, including the ones that
+    already worked.
+    """
+    if not has_flashinfer():
+        return False
+    mod = _get_submodule("flashinfer.gdn_prefill")
+    fn = getattr(mod, "chunk_gated_delta_rule", None) if mod is not None else None
+    if fn is None:
+        return False
+    try:
+        return parameter in inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
 
 
 @functools.cache
@@ -1310,6 +1338,7 @@ def is_flashinfer_cudnn_fp8_prefill_attn_supported() -> bool:
 __all__ = [
     "has_flashinfer",
     "flashinfer_bf16_mm",
+    "is_flashinfer_autotuning",
     "has_flashinfer_bf16_gemm",
     "has_flashinfer_concat_mla_kv_quant_fp8",
     "is_flashinfer_bf16_gemm_supported",
