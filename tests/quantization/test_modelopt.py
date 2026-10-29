@@ -1239,6 +1239,7 @@ def test_modelopt_nvfp4_moe_activation_override(quantization, per_token):
     "quant_method,activation,backend,error",
     [
         ("NVFP4", kNvfp4DynamicToken, "FLASHINFER_TRTLLM", None),
+        ("NVFP4", kNvfp4DynamicToken, "FLASHINFER_CUTEDSL", None),
         ("W4A16_NVFP4", kNvfp4DynamicToken, "FLASHINFER_TRTLLM", "W4A4 checkpoint"),
         (
             "NVFP4",
