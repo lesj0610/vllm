@@ -39,6 +39,7 @@ from vllm.model_executor.layers.fused_moe.oracle.mxfp8 import (
     select_mxfp8_moe_backend,
 )
 from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import (
+    PER_TOKEN_NVFP4_MOE_BACKENDS,
     NvFp4MoeBackend,
     convert_to_nvfp4_moe_kernel_format,
     is_global_sf_supported_for_nvfp4_backend,
@@ -881,11 +882,11 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
         )
         if (
             self.per_token_activation
-            and self.nvfp4_backend != NvFp4MoeBackend.FLASHINFER_TRTLLM
+            and self.nvfp4_backend not in PER_TOKEN_NVFP4_MOE_BACKENDS
         ):
             raise ValueError(
                 "Per-token NVFP4 activation for pre-quantized weights "
-                "requires the FlashInfer TRTLLM MoE backend."
+                "requires the FlashInfer TRTLLM or CuTeDSL MoE backend."
             )
 
         self.use_global_sf = is_global_sf_supported_for_nvfp4_backend(
