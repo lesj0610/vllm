@@ -134,6 +134,17 @@ class TrtLlmNvFp4ExpertsBase:
             clamp,
         )
 
+    @property
+    def _weight_scales(self) -> tuple[torch.Tensor, torch.Tensor]:
+        w1_scale = self.quant_config.w1_scale
+        w2_scale = self.quant_config.w2_scale
+        assert w1_scale is not None and w2_scale is not None
+        # Below SM100 the scales were prepared at load in BF16
+        # (trtllm_nvfp4_sm80_weights); the SM100 kernels read E4M3 bytes.
+        if w1_scale.dtype == torch.bfloat16:
+            return w1_scale, w2_scale
+        return w1_scale.view(torch.float8_e4m3fn), w2_scale.view(torch.float8_e4m3fn)
+
     def _compute_g1_scale_c(self) -> torch.Tensor:
         assert self.quant_config.g1_alphas is not None
         assert self.quant_config.a2_gscale is not None
@@ -202,11 +213,13 @@ class TrtLlmNvFp4ExpertsBase:
 
     @staticmethod
     def _supports_current_device() -> bool:
-        """Supports only Blackwell-family GPUs."""
+        """Supports SM80 to SM10x; below SM100 FlashInfer runs the MoE on
+        its CUTLASS SM80 kernels."""
         p = current_platform
         return (
             p.is_cuda()
-            and p.is_device_capability_family(100)
+            and p.has_device_capability(80)
+            and not p.has_device_capability(110)
             and has_flashinfer_trtllm_fused_moe()
         )
 
@@ -352,6 +365,7 @@ class TrtLlmNvFp4ExpertsModular(TrtLlmNvFp4ExpertsBase, mk.FusedMoEExpertsModula
         defer = output is not None and self._uses_post_gemm2_hook(topk_ids.shape[0])
 
         # Invoke kernel.
+        w1_scale, w2_scale = self._weight_scales
         flashinfer_output = flashinfer.fused_moe.trtllm_fp4_block_scale_routed_moe(
             topk_ids=(topk_ids, topk_weights),
             routing_bias=None,
@@ -360,13 +374,13 @@ class TrtLlmNvFp4ExpertsModular(TrtLlmNvFp4ExpertsBase, mk.FusedMoEExpertsModula
                 *hidden_states.shape[:-1], -1
             ),
             gemm1_weights=w1,
-            gemm1_weights_scale=self.quant_config.w1_scale.view(torch.float8_e4m3fn),
+            gemm1_weights_scale=w1_scale,
             gemm1_bias=None,
             gemm1_alpha=self.gemm1_alpha,
             gemm1_beta=self.gemm1_beta,
             gemm1_clamp_limit=self.gemm1_clamp_limit,
             gemm2_weights=w2,
-            gemm2_weights_scale=self.quant_config.w2_scale.view(torch.float8_e4m3fn),
+            gemm2_weights_scale=w2_scale,
             gemm2_bias=None,
             output1_scale_scalar=self.g1_scale_c,
             output1_scale_gate_scalar=output1_scale_gate_scalar,
@@ -565,6 +579,7 @@ class TrtLlmNvFp4ExpertsMonolithic(
         # Invoke kernel.
         # NOTE: Activation padding and output
         # truncation are handled by the MoE runner's
+        w1_scale, w2_scale = self._weight_scales
         flashinfer_output = flashinfer.fused_moe.trtllm_fp4_block_scale_moe(
             routing_logits=router_logits,
             routing_bias=e_score_correction_bias,
@@ -573,13 +588,13 @@ class TrtLlmNvFp4ExpertsMonolithic(
                 *hidden_states.shape[:-1], -1
             ),
             gemm1_weights=w1,
-            gemm1_weights_scale=self.quant_config.w1_scale.view(torch.float8_e4m3fn),
+            gemm1_weights_scale=w1_scale,
             gemm1_bias=None,
             gemm1_alpha=self.gemm1_alpha,
             gemm1_beta=self.gemm1_beta,
             gemm1_clamp_limit=self.gemm1_clamp_limit,
             gemm2_weights=w2,
-            gemm2_weights_scale=self.quant_config.w2_scale.view(torch.float8_e4m3fn),
+            gemm2_weights_scale=w2_scale,
             gemm2_bias=None,
             output1_scale_scalar=self.g1_scale_c,
             output1_scale_gate_scalar=output1_scale_gate_scalar,

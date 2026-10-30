@@ -155,8 +155,13 @@ class CompressedTensorsMoEMethod(FusedMoEMethodBase):
                     "For NVFP4 weights, input quantization must also be NVFP4 "
                     f"format or None for NVFP4A16, found {input_quant}"
                 )
+            online_config = quant_config.online_quantization_config
+            moe_spec = online_config.args.moe if online_config is not None else None
             return CompressedTensorsW4A4Nvfp4MoEMethod(
-                layer.moe_config, layer_name, use_a16=(input_quant is None)
+                layer.moe_config,
+                layer_name,
+                use_a16=(input_quant is None),
+                activation_override=moe_spec.activation if moe_spec else None,
             )
         elif (
             quant_config._is_fp8_w8a8_sm90(weight_quant, input_quant)

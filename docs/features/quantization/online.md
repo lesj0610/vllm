@@ -97,6 +97,14 @@ checkpoints (gpt-oss) where you can opt into FP8 activations:
 vllm serve openai/gpt-oss-20b --quantization-config.moe.activation mxfp8
 ```
 
+On NVFP4 MoE checkpoints, `unquantized` runs the experts weight-only (W4A16)
+on the 16-bit activations instead of quantizing them to NVFP4, and ignores the
+checkpoint's activation scales. It applies to MoE layers only:
+
+```bash
+vllm serve <nvfp4-model> --quantization-config.moe.activation unquantized
+```
+
 Combine with `--moe-backend` to pin a specific kernel family.
 
 For MXFP4 linear layers on RDNA3/RDNA3.5 (gfx11), `int8_per_group_32` selects

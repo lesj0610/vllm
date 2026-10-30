@@ -1239,6 +1239,9 @@ def test_modelopt_nvfp4_moe_activation_override(quantization, per_token):
     "quant_method,activation,backend,error",
     [
         ("NVFP4", kNvfp4DynamicToken, "FLASHINFER_TRTLLM", None),
+        ("NVFP4", kNvfp4DynamicToken, "FLASHINFER_CUTEDSL", None),
+        ("NVFP4", "unquantized", "FLASHINFER_CUTLASS", None),
+        ("W4A16_NVFP4", "unquantized", "MARLIN", None),
         ("W4A16_NVFP4", kNvfp4DynamicToken, "FLASHINFER_TRTLLM", "W4A4 checkpoint"),
         (
             "NVFP4",
@@ -1268,8 +1271,10 @@ def test_modelopt_nvfp4_moe_validates_activation_override(
         expected,
     ):
         method = ModelOptNvFp4FusedMoE(config, Mock())
-        assert method.per_token_activation
-        assert select_backend.call_args.kwargs["activation_key"] == activation
+        key = None if activation == "unquantized" else activation
+        assert method.use_a16 == (key is None)
+        assert method.per_token_activation == (key == kNvfp4DynamicToken)
+        assert select_backend.call_args.kwargs["activation_key"] == key
 
 
 @pytest.mark.parametrize(
