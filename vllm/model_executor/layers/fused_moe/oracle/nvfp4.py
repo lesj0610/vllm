@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from enum import Enum
-from typing import Any
+from typing import Any, Literal
 
 import torch
 
@@ -36,6 +36,8 @@ from vllm.model_executor.layers.quantization.utils.nvfp4_emulation_utils import 
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey,
+    kNvfp4Dynamic,
+    kNvfp4DynamicToken,
 )
 from vllm.model_executor.utils import move_parameter
 from vllm.platforms import current_platform
@@ -192,6 +194,27 @@ def map_nvfp4_backend(runner_backend: MoEBackend) -> NvFp4MoeBackend:
         f"moe_backend='{runner_backend}' is not supported for NvFP4 MoE. "
         f"Expected one of {list(mapping.keys())}."
     )
+
+
+def resolve_nvfp4_moe_activation_key(
+    checkpoint_activation_key: QuantKey | None,
+    override: QuantKey | Literal["unquantized"] | None,
+) -> QuantKey | None:
+    """FC1 input scheme of an NVFP4 MoE layer: the checkpoint's, unless
+    quantization_config.moe.activation overrides it. None runs W4A16."""
+    if override is None:
+        return checkpoint_activation_key
+    if isinstance(override, str):  # "unquantized"
+        return None
+    if checkpoint_activation_key is None:
+        raise ValueError("NVFP4 activation overrides require a W4A4 checkpoint.")
+    if override not in (kNvfp4Dynamic, kNvfp4DynamicToken):
+        raise ValueError(
+            f"Unsupported NVFP4 MoE activation override: {override}. Use "
+            "quantization_config.moe.activation='nvfp4_per_token' or "
+            "'unquantized', or omit the override."
+        )
+    return override
 
 
 def _use_a16(backend: NvFp4MoeBackend, checkpoint_uses_a16: bool) -> bool:
@@ -364,13 +387,15 @@ def convert_to_nvfp4_moe_kernel_format(
     torch.Tensor,
 ]:
     use_a16 = _use_a16(nvfp4_backend, use_a16)
+    if use_a16:
+        # A16 kernels read no activation scales and A16 checkpoints carry none:
+        # give the backend preparation below neutral ones.
+        num_experts = w13.shape[0]
+        a13_scale = torch.ones(num_experts, dtype=torch.float32, device=w13.device)
+        a2_scale = torch.ones(num_experts, dtype=torch.float32, device=w2.device)
     if nvfp4_backend == NvFp4MoeBackend.B12X:
         if a13_scale is None or a2_scale is None:
-            if not use_a16:
-                raise ValueError("b12x NVFP4 MoE requires activation scales")
-            num_experts = w13.shape[0]
-            a13_scale = torch.ones(num_experts, dtype=torch.float32, device=w13.device)
-            a2_scale = torch.ones(num_experts, dtype=torch.float32, device=w2.device)
+            raise ValueError("b12x NVFP4 MoE requires activation scales")
         (
             w13,
             w13_scale,
@@ -594,7 +619,13 @@ def make_nvfp4_moe_quant_config(
             gemm1_clamp_limit=swiglu_limit,
         )
     elif backend == NvFp4MoeBackend.MARLIN or (
-        backend == NvFp4MoeBackend.B12X and use_a16
+        use_a16
+        and backend
+        in (
+            NvFp4MoeBackend.B12X,
+            NvFp4MoeBackend.FLASHINFER_CUTLASS,
+            NvFp4MoeBackend.FLASHINFER_CUTEDSL,
+        )
     ):
         return nvfp4_w4a16_moe_quant_config(
             g1_alphas=w13_scale_2,

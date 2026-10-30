@@ -88,6 +88,11 @@ def test_args_string_shorthand_missing_slot_raises():
         quant_config_args(linear="int8_per_channel_weight_only")
 
 
+def test_args_reject_unquantized_linear_activation():
+    with pytest.raises(ValueError, match="MoE layers only"):
+        quant_config_args(linear={"activation": "unquantized"})
+
+
 @pytest.mark.parametrize(
     "activation,expected",
     [("mxfp8", kMxfp8Dynamic), ("nvfp4_per_token", kNvfp4DynamicToken)],
@@ -136,7 +141,11 @@ def test_resolve_moe_only_shorthand_leaves_linear_unset(shorthand, weight):
 @pytest.mark.parametrize("quantization", [None, "modelopt_fp4"])
 @pytest.mark.parametrize(
     "activation,expected",
-    [("mxfp8", kMxfp8Dynamic), ("nvfp4_per_token", kNvfp4DynamicToken)],
+    [
+        ("mxfp8", kMxfp8Dynamic),
+        ("nvfp4_per_token", kNvfp4DynamicToken),
+        ("unquantized", "unquantized"),
+    ],
 )
 def test_resolve_activation_override(quantization, activation, expected):
     # When only `quantization_config` is given (e.g. for an already-quantized

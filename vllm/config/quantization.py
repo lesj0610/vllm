@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from typing import Annotated, Any
+from typing import Annotated, Any, Final, Literal
 
 import regex as re
 from pydantic import (
@@ -76,6 +76,26 @@ QuantKeyField = Annotated[
     ),
 ]
 
+# MoE-only activation value: run the experts on unquantized activations,
+# whatever activation quantization the checkpoint declares.
+UNQUANTIZED_ACTIVATION: Final = "unquantized"
+
+
+def _coerce_activation_key(v: Any) -> QuantKey | Literal["unquantized"] | None:
+    if v == UNQUANTIZED_ACTIVATION:
+        return UNQUANTIZED_ACTIVATION
+    return _coerce_quant_key(v)
+
+
+ActivationKeyField = Annotated[
+    QuantKey | Literal["unquantized"] | None,
+    GetPydanticSchema(
+        lambda _src, _handler: core_schema.no_info_plain_validator_function(
+            _coerce_activation_key
+        )
+    ),
+]
+
 
 @config
 class QuantSpec:
@@ -88,8 +108,9 @@ class QuantSpec:
     weight: QuantKeyField = None
     """Weight quantization key, or a name from QUANT_KEY_NAMES."""
 
-    activation: QuantKeyField = None
-    """Activation quantization key, or a name from QUANT_KEY_NAMES."""
+    activation: ActivationKeyField = None
+    """Activation quantization key, a name from QUANT_KEY_NAMES, or
+    "unquantized" (MoE only) to keep the activations unquantized."""
 
     def __str__(self) -> str:
         def quant_key_str(quant_key: QuantKey | None) -> str:
@@ -175,6 +196,15 @@ class QuantizationConfigArgs:
                         f"targets key {pattern} is not a valid regex: {e}"
                     ) from e
         return v
+
+    @model_validator(mode="after")
+    def _validate_unquantized_activation(self) -> "QuantizationConfigArgs":
+        if self.linear is not None and self.linear.activation == UNQUANTIZED_ACTIVATION:
+            raise ValueError(
+                "quantization_config.linear.activation='unquantized' is not "
+                "supported; it applies to MoE layers only."
+            )
+        return self
 
     @model_validator(mode="after")
     def _validate_targets_exclusivity(self) -> "QuantizationConfigArgs":

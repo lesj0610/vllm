@@ -125,6 +125,23 @@ class FlashInferExperts(mk.FusedMoEExpertsModular):
         return self.quant_config.use_fp8_w8a8 and self.quant_config.is_block_quantized
 
     @staticmethod
+    def is_supported_config(
+        cls: type[mk.FusedMoEExperts],
+        moe_config: mk.FusedMoEConfig,
+        weight_key: QuantKey | None,
+        activation_key: QuantKey | None,
+        activation_format: mk.FusedMoEActivationFormat,
+    ) -> tuple[bool, str | None]:
+        # NVFP4 W4A16 is verified with BF16 only.
+        if (weight_key, activation_key) == (kNvfp4Static, None) and (
+            moe_config.in_dtype != torch.bfloat16
+        ):
+            return False, f"NVFP4 W4A16 does not support {moe_config.in_dtype}"
+        return mk.FusedMoEExperts.is_supported_config(
+            cls, moe_config, weight_key, activation_key, activation_format
+        )
+
+    @staticmethod
     def _supports_current_device() -> bool:
         p = current_platform
         return (
@@ -168,6 +185,8 @@ class FlashInferExperts(mk.FusedMoEExpertsModular):
             )
             # nvfp4 on 8.0+ (software kernels below 10.0), wmxfp4amxfp8 on 10.0+
             or scheme == (kNvfp4Static, kNvfp4Dynamic)
+            # nvfp4 w4a16 below 10.0
+            or (scheme == (kNvfp4Static, None) and not p.has_device_capability(100))
             or (
                 scheme == (kMxfp4Static, kMxfp8Dynamic) and p.has_device_capability(100)
             )
@@ -310,6 +329,19 @@ class FlashInferExperts(mk.FusedMoEExpertsModular):
                 self.g2_alphas,
             ]
             # FlashInfer API requires weight to be long for nvfp4
+            fc1_expert_weights = w1.view(torch.long)
+            fc2_expert_weights = w2.view(torch.long)
+        elif self.quant_config.use_nvfp4_w4a16:
+            # The weight scales alone (block and global per GEMM) keep the
+            # activations 16-bit; the block scales were prepared at load.
+            assert self.w1_scale is not None and self.w2_scale is not None
+            quant_scales = [
+                self.w1_scale,
+                self.g1_alphas,
+                self.w2_scale,
+                self.g2_alphas,
+            ]
+            a1q_scale = None
             fc1_expert_weights = w1.view(torch.long)
             fc2_expert_weights = w2.view(torch.long)
         elif self.weight_quant_dtype == "mxfp4":

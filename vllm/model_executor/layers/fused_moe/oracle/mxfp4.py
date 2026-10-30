@@ -506,7 +506,13 @@ def _user_moe_activation_override() -> QuantKey | None:
     args = get_current_vllm_config().model_config.quantization_config
     if not isinstance(args, QuantizationConfigArgs) or args.moe is None:
         return None
-    return args.moe.activation
+    activation = args.moe.activation
+    if isinstance(activation, str):
+        raise ValueError(
+            f"quantization_config.moe.activation={activation!r} is supported "
+            "for NVFP4 MoE only."
+        )
+    return activation
 
 
 def _resolve_activation_key(

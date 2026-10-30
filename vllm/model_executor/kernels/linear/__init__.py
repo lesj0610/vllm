@@ -1021,7 +1021,10 @@ def _user_linear_activation_override() -> QuantKey | None:
     args = config.model_config.quantization_config
     if not isinstance(args, QuantizationConfigArgs) or args.linear is None:
         return None
-    return args.linear.activation
+    activation = args.linear.activation
+    # QuantizationConfigArgs takes "unquantized" for MoE layers only.
+    assert not isinstance(activation, str)
+    return activation
 
 
 def _resolve_linear_activation_key(

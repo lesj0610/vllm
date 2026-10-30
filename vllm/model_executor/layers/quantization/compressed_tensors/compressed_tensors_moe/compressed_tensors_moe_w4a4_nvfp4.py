@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from typing import Literal
 
 import torch
 
@@ -21,6 +22,7 @@ from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import (
     is_global_sf_supported_for_nvfp4_backend,
     make_nvfp4_moe_kernel,
     make_nvfp4_moe_quant_config,
+    resolve_nvfp4_moe_activation_key,
     select_nvfp4_moe_backend,
 )
 from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe import (  # noqa E501
@@ -64,14 +66,17 @@ class CompressedTensorsW4A4Nvfp4MoEMethod(CompressedTensorsMoEMethod):
         layer_name: str | None = None,
         use_a16: bool = False,
         activation_key: QuantKey = kNvfp4Dynamic,
+        activation_override: QuantKey | Literal["unquantized"] | None = None,
     ):
         super().__init__(moe)
         self.group_size = 16
-        self.use_a16 = use_a16
         # FC1 input scheme; a per-token one (``kNvfp4DynamicToken``) replaces
         # the checkpoint's static input scales. Only the backends that quantize
         # the input themselves accept it, so selection enforces the invariant.
-        self.activation_key: QuantKey | None = None if use_a16 else activation_key
+        self.activation_key = resolve_nvfp4_moe_activation_key(
+            None if use_a16 else activation_key, activation_override
+        )
+        self.use_a16 = self.activation_key is None
         self.per_token_activation = is_dynamic_per_token_outer_scale(
             self.activation_key
         )
