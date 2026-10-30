@@ -1593,10 +1593,13 @@ def scaled_fp4_quant(
     ):
         # vLLM compiles this kernel for SM100+ only; FlashInfer has it for SM80+.
         # The vLLM kernel reads input_global_scale[0]; FlashInfer wants shape [1].
+        # nvfp4_4over6=None keeps the vLLM kernel's standard recipe, which the
+        # caller's global scale assumes, even if FLASHINFER_NVFP4_4OVER6 is set.
         output, output_scale = flashinfer_fp4_quantize(
             input,
             input_global_scale.reshape(-1)[:1],
             is_sf_swizzled_layout=is_sf_swizzled_layout,
+            nvfp4_4over6=None,
         )
     else:
         # Pre-allocate and call .out variant (same behavior as old in-place API)
