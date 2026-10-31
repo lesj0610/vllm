@@ -320,11 +320,18 @@ class FlashInferExperts(mk.FusedMoEExpertsModular):
                 s.view(torch.int32) if s.dtype == torch.float8_e4m3fn else s
                 for s in (self.w1_scale, self.w2_scale)
             )
+            # The activation global scales repeat one value for every expert.
+            # Below SM100 FlashInfer takes them as scalars to restore each input
+            # token once, rather than each of its expert rows.
+            a1_gscale, a2_gscale = self.a1_gscale, self.a2_gscale
+            if not current_platform.has_device_capability(100):
+                assert a1_gscale is not None and a2_gscale is not None
+                a1_gscale, a2_gscale = a1_gscale[0], a2_gscale[0]
             quant_scales = [
-                self.a1_gscale,
+                a1_gscale,
                 w1_scale,
                 self.g1_alphas,
-                self.a2_gscale,
+                a2_gscale,
                 w2_scale,
                 self.g2_alphas,
             ]
