@@ -313,6 +313,12 @@ flashinfer_cutedsl_grouped_gemm_nt_masked = _lazy_import_wrapper(
 flashinfer_prepare_bf16_fp4_weights = _lazy_import_wrapper(
     "flashinfer.gemm", "prepare_bf16_fp4_weights"
 )
+flashinfer_encode_csf_scales = _lazy_import_wrapper(
+    "flashinfer.quantization", "encode_csf_scales"
+)
+flashinfer_expand_csf_scales = _lazy_import_wrapper(
+    "flashinfer.quantization", "expand_csf_scales"
+)
 flashinfer_fp4_quantize = _lazy_import_wrapper("flashinfer", "fp4_quantize")
 flashinfer_mxfp4_quantize = _lazy_import_wrapper("flashinfer", "mxfp4_quantize")
 nvfp4_batched_quantize = _lazy_import_wrapper("flashinfer", "nvfp4_batched_quantize")
@@ -533,6 +539,17 @@ def has_flashinfer_bf16_fp4() -> bool:
     mod = _get_submodule("flashinfer.gemm")
     return mod is not None and all(
         hasattr(mod, name) for name in ("mm_bf16_fp4", "prepare_bf16_fp4_weights")
+    )
+
+
+@functools.cache
+def has_flashinfer_csf_scales() -> bool:
+    """Return ``True`` if FlashInfer can keep block scales CSF-compressed."""
+    if not has_flashinfer():
+        return False
+    mod = _get_submodule("flashinfer.quantization")
+    return mod is not None and all(
+        hasattr(mod, name) for name in ("encode_csf_scales", "expand_csf_scales")
     )
 
 
@@ -1326,6 +1343,8 @@ __all__ = [
     "flashinfer_cutlass_fused_moe",
     "flashinfer_cutedsl_grouped_gemm_nt_masked",
     "flashinfer_prepare_bf16_fp4_weights",
+    "flashinfer_encode_csf_scales",
+    "flashinfer_expand_csf_scales",
     "flashinfer_fp4_quantize",
     "silu_and_mul_scaled_nvfp4_experts_quantize",
     "scaled_fp4_grouped_quantize",
@@ -1353,6 +1372,7 @@ __all__ = [
     "has_flashinfer_fused_kda_decode",
     "has_flashinfer_cutedsl_moe_nvfp4",
     "has_flashinfer_bf16_fp4",
+    "has_flashinfer_csf_scales",
     "has_flashinfer_b12x_moe",
     "has_flashinfer_b12x_gemm",
     "has_flashinfer_fp8_blockscale_gemm",

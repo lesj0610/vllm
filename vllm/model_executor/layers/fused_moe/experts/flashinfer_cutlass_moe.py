@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from typing import Any
+
 import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
@@ -29,10 +31,17 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 from vllm.platforms import current_platform
 from vllm.utils.flashinfer import (
     flashinfer_cutlass_fused_moe,
+    flashinfer_expand_csf_scales,
+    has_flashinfer_csf_scales,
     has_flashinfer_cutlass_fused_moe,
 )
 
 logger = init_logger(__name__)
+
+# Expansion targets of the resident CSF scales, shared by all layers of one
+# shape. Each call expands its routed experts' scales right before its MoE
+# kernel on the same stream, so sharing is safe while layers run one at a time.
+_CSF_SCALE_SCRATCH: dict[tuple[Any, ...], tuple[torch.Tensor, torch.Tensor]] = {}
 
 
 def is_valid_flashinfer_cutlass_fused_moe(
@@ -66,13 +75,58 @@ class FlashInferExperts(mk.FusedMoEExpertsModular):
         if self.quant_config.use_nvfp4_w4a4:
             layer.w13_weight_scale_2.data.mul_(layer.w13_input_scale)
             layer.w2_weight_scale_2.data.mul_(layer.w2_input_scale)
+        if self.csf_scales:
+            self._keep_csf_scales(layer)
+
+    def _keep_csf_scales(self, layer: torch.nn.Module) -> None:
+        """Replace the layer's NVFP4 block scales by their CSF encoding."""
+        csf = (layer.w13_weight_scale_csf, layer.w2_weight_scale_csf)
+        scales = (layer.w13_weight_scale, layer.w2_weight_scale)
+        if sum(t.nbytes for c in csf for t in c[:3]) >= sum(s.nbytes for s in scales):
+            # Scales that compress poorly stay expanded.
+            del layer.w13_weight_scale_csf, layer.w2_weight_scale_csf
+            self.csf_scales = False
+            return
+        from flashinfer import SfLayout
+
+        self._csf = csf
+        self._csf_layout = SfLayout.layout_128x4
+        key = (scales[0].device, scales[0].shape, scales[1].shape)
+        if key not in _CSF_SCALE_SCRATCH:
+            _CSF_SCALE_SCRATCH[key] = (
+                torch.zeros_like(scales[0]),
+                torch.zeros_like(scales[1]),
+            )
+        self.quant_config._w1.scale, self.quant_config._w2.scale = _CSF_SCALE_SCRATCH[
+            key
+        ]
+        for scale in scales:
+            scale.data = scale.data.new_empty(0)
+
+    def _expand_csf_scales(self, topk_ids: torch.Tensor | None) -> None:
+        """Expand the scales of the routed experts, or of all without ids."""
+        # Expanding only the routed experts compares each id with all the ids
+        # before it, which outgrows expanding every expert as tokens grow. The
+        # two crossed at 1.9-2.2 ids per expert on SM80 (512 experts, top-10).
+        ids = None
+        if topk_ids is not None and topk_ids.numel() < 2 * self.num_experts:
+            ids = topk_ids.to(torch.int)
+        w13_csf, w2_csf = self._csf
+        # The checkpoint's [w1; w3] rows become the kernels' [w3; w1].
+        flashinfer_expand_csf_scales(
+            w13_csf, self.w1_scale, ids, self._csf_layout, swap_row_halves=True
+        )
+        flashinfer_expand_csf_scales(w2_csf, self.w2_scale, ids, self._csf_layout)
 
     def __init__(
         self,
         moe_config: mk.FusedMoEConfig,
         quant_config: FusedMoEQuantConfig,
+        csf_scales: bool = False,
     ):
         super().__init__(moe_config, quant_config)
+        # Keep NVFP4 block scales CSF-compressed and expand them per call.
+        self.csf_scales = csf_scales
 
         assert quant_config.weight_quant_dtype in (
             "mxfp4",
@@ -141,6 +195,23 @@ class FlashInferExperts(mk.FusedMoEExpertsModular):
     @staticmethod
     def _supports_no_act_and_mul() -> bool:
         return True
+
+    @staticmethod
+    def supports_csf_scales(moe_config: mk.FusedMoEConfig) -> bool:
+        """Whether NVFP4 experts can keep CSF block scales resident."""
+        hidden = moe_config.hidden_dim
+        intermediate = moe_config.intermediate_size_per_partition
+        return (
+            has_flashinfer_csf_scales()
+            # Routing ids index the rank's experts only without EP.
+            and not moe_config.moe_parallel_config.use_ep
+            and moe_config.is_act_and_mul
+            # Per expert, w13's [2I, H/16] and w2's [H, I/16] scales need even
+            # columns, w13 halves of whole 16-row slabs and at most 2**24 bytes.
+            and hidden % 32 == 0
+            and intermediate % 32 == 0
+            and 2 * intermediate * (hidden // 16) <= 1 << 24
+        )
 
     @staticmethod
     def _supports_quant_scheme(
@@ -361,6 +432,9 @@ class FlashInferExperts(mk.FusedMoEExpertsModular):
             a1q_scale = None
             fc1_expert_weights = w1
             fc2_expert_weights = w2
+
+        if self.csf_scales:
+            self._expand_csf_scales(topk_ids)
 
         _ = flashinfer_cutlass_fused_moe(
             input=hidden_states,
