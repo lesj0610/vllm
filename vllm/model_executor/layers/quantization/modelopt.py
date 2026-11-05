@@ -50,6 +50,7 @@ from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import (
     is_global_sf_supported_for_nvfp4_backend,
     make_nvfp4_moe_kernel,
     make_nvfp4_moe_quant_config,
+    nvfp4_backend_supports_csf_scales,
     select_nvfp4_moe_backend,
 )
 from vllm.model_executor.layers.fusion.quant_activation import (
@@ -880,9 +881,12 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
         self,
         quant_config: ModelOptNvFp4Config,
         moe_config: FusedMoEConfig,
+        weight_scale_encoding: str | None = None,
     ) -> None:
         super().__init__(moe_config)
         self.quant_config = quant_config
+        if weight_scale_encoding is None:
+            weight_scale_encoding = quant_config.weight_scale_encoding
         self.use_a16 = quant_config.quant_method == "W4A16_NVFP4"
         # Whether the selected backend reads the activation input scales.
         self.uses_input_scales = True
@@ -919,6 +923,13 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
         self.use_global_sf = is_global_sf_supported_for_nvfp4_backend(
             self.nvfp4_backend
         )
+        # Backends that read CSF scales keep them compressed; the others get
+        # the scales decoded at load.
+        self.csf_scales = weight_scale_encoding is not None and (
+            nvfp4_backend_supports_csf_scales(self.nvfp4_backend, self.moe)
+        )
+        if self.csf_scales:
+            logger.info_once("Keeping CSF-compressed NVFP4 MoE scales on the GPU.")
 
     def uses_weight_scale_2_pattern(self) -> bool:
         """FP4 variants use 'weight_scale_2' pattern for per-tensor weight scales."""
@@ -1122,6 +1133,7 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
                 per_token_activation=self.per_token_activation,
                 is_act_and_mul=self.moe.is_act_and_mul,
             ),
+            csf_scales=self.csf_scales,
         )
 
         replace_parameter(layer, "w13_weight", w13)
@@ -1153,6 +1165,7 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
             backend=self.nvfp4_backend,
             routing_tables=layer._expert_routing_tables(),
             per_token_activation=self.per_token_activation,
+            csf_scales=self.csf_scales,
         )
         self.moe_kernel.fused_experts.keep_constants(layer)
         self.moe_kernel.fused_experts.process_weights_after_loading(layer)
@@ -1937,6 +1950,19 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
 
         return None
 
+    def _resolve_scale_encoding(self, prefix: str) -> str | None:
+        """A weight_scale_encoding declared under prefix, if any."""
+        return next(
+            (
+                encoding
+                for candidate in self._quantized_layer_prefix_candidates(prefix)
+                for key, info in self.quantized_layers.items()
+                if key == candidate or key.startswith(candidate + ".")
+                if (encoding := info.get("weight_scale_encoding")) is not None
+            ),
+            None,
+        )
+
     @staticmethod
     def _quantized_layer_prefix_candidates(prefix: str) -> tuple[str, ...]:
         candidates = [prefix]
@@ -2012,11 +2038,13 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
                 return ModelOptNvFp4FusedMoE(
                     quant_config=self.nvfp4_config,
                     moe_config=layer.moe_config,
+                    weight_scale_encoding=self._resolve_scale_encoding(prefix),
                 )
             if quant_algo == "W4A16_NVFP4":
                 return ModelOptNvFp4FusedMoE(
                     quant_config=self.w4a16_nvfp4_config,
                     moe_config=layer.moe_config,
+                    weight_scale_encoding=self._resolve_scale_encoding(prefix),
                 )
             if quant_algo == "MXFP8":
                 return ModelOptMxFp8FusedMoE(

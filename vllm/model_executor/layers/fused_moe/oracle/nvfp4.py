@@ -38,6 +38,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey,
 )
 from vllm.model_executor.utils import move_parameter, refill_derived
+from vllm.utils.flashinfer import flashinfer_encode_csf_scales
 
 logger = init_logger(__name__)
 
@@ -199,6 +200,19 @@ def _use_a16(backend: NvFp4MoeBackend, checkpoint_uses_a16: bool) -> bool:
     )
 
 
+def nvfp4_backend_supports_csf_scales(
+    backend: NvFp4MoeBackend, config: FusedMoEConfig
+) -> bool:
+    """Whether the backend keeps CSF checkpoint scales compressed."""
+    if backend != NvFp4MoeBackend.FLASHINFER_CUTLASS:
+        return False
+    from vllm.model_executor.layers.fused_moe.experts.flashinfer_cutlass_moe import (
+        FlashInferExperts,
+    )
+
+    return FlashInferExperts.supports_csf_scales(config)
+
+
 def select_nvfp4_moe_backend(
     config: FusedMoEConfig,
     weight_key: QuantKey | None,
@@ -358,6 +372,7 @@ def convert_to_nvfp4_moe_kernel_format(
     is_act_and_mul: bool,
     use_a16: bool = False,
     trtllm_hidden_alignment: int = 256,
+    csf_scales: bool = False,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -422,6 +437,17 @@ def convert_to_nvfp4_moe_kernel_format(
         nvfp4_backend in FLASHINFER_NVFP4_MOE_BACKENDS
         or nvfp4_backend == NvFp4MoeBackend.VLLM_CUTLASS
     ):
+        if csf_scales:
+            # The captured CUDA graphs expand the scales of the first load.
+            if hasattr(layer, "w13_weight_scale_csf"):
+                raise NotImplementedError(
+                    "NVFP4 MoE with resident CSF scales does not support "
+                    "weight reloading"
+                )
+            # The experts keep the rank's scales compressed in checkpoint
+            # order and expand them into the layout prepared below.
+            layer.w13_weight_scale_csf = flashinfer_encode_csf_scales(w13_scale)
+            layer.w2_weight_scale_csf = flashinfer_encode_csf_scales(w2_scale)
         (
             w13,
             w13_scale,
@@ -643,6 +669,7 @@ def make_nvfp4_moe_kernel(
     backend: NvFp4MoeBackend,
     routing_tables: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
     per_token_activation: bool = False,
+    csf_scales: bool = False,
 ) -> mk.FusedMoEKernel:
     # Marlin consumes A16 and must not receive per-token A4 metadata.
     if backend == NvFp4MoeBackend.MARLIN and moe_quant_config.use_nvfp4_w4a16:
@@ -673,6 +700,8 @@ def make_nvfp4_moe_kernel(
                 f"{backend.value}."
             )
         extra_kwargs["per_token_activation"] = True
+    if csf_scales:
+        extra_kwargs["csf_scales"] = True
 
     # Create Experts.
     if prepare_finalize.activation_format == mk.FusedMoEActivationFormat.BatchedExperts:
