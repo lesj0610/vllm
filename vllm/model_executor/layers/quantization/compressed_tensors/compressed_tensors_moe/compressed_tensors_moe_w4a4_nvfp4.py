@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from typing import Literal
+from collections.abc import Iterator
 
 import torch
 
+from vllm.config.quantization import QuantSpec
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import (
     FusedMoeWeightScaleSupported,
@@ -42,6 +43,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 )
 from vllm.model_executor.utils import (
     move_parameter,
+    refill_derived,
     replace_parameter,
     set_weight_attrs,
 )
@@ -66,7 +68,7 @@ class CompressedTensorsW4A4Nvfp4MoEMethod(CompressedTensorsMoEMethod):
         layer_name: str | None = None,
         use_a16: bool = False,
         activation_key: QuantKey = kNvfp4Dynamic,
-        activation_override: QuantKey | Literal["unquantized"] | None = None,
+        moe_spec: QuantSpec | None = None,
     ):
         super().__init__(moe)
         self.group_size = 16
@@ -74,7 +76,7 @@ class CompressedTensorsW4A4Nvfp4MoEMethod(CompressedTensorsMoEMethod):
         # the checkpoint's static input scales. Only the backends that quantize
         # the input themselves accept it, so selection enforces the invariant.
         self.activation_key = resolve_nvfp4_moe_activation_key(
-            None if use_a16 else activation_key, activation_override
+            None if use_a16 else activation_key, moe_spec
         )
         self.use_a16 = self.activation_key is None
         self.per_token_activation = is_dynamic_per_token_outer_scale(
@@ -212,8 +214,8 @@ class CompressedTensorsW4A4Nvfp4MoEMethod(CompressedTensorsMoEMethod):
 
     def dequantize_weight(
         self, layer: torch.nn.Module
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Materialize serialized NVFP4 expert weights for requantization."""
+    ) -> Iterator[tuple[slice, torch.Tensor, torch.Tensor]]:
+        """Yield ``(experts, w13, w2)`` dequantized NVFP4 experts."""
         return dequantize_nvfp4_moe_weights(
             layer.w13_weight_packed,
             layer.w13_weight_scale,
@@ -285,8 +287,8 @@ class CompressedTensorsW4A4Nvfp4MoEMethod(CompressedTensorsMoEMethod):
         replace_parameter(layer, "w2_weight_scale", w2_scale)
         replace_parameter(layer, "w13_weight_scale_2", w13_scale_2)
         replace_parameter(layer, "w2_weight_scale_2", w2_scale_2)
-        layer.w13_input_scale = a13_scale
-        layer.w2_input_scale = a2_scale
+        refill_derived(layer, "w13_input_scale", a13_scale)
+        refill_derived(layer, "w2_input_scale", a2_scale)
 
         # Setup modular kernel.
         self.moe_quant_config = self.get_fused_moe_quant_config(layer)
@@ -299,6 +301,7 @@ class CompressedTensorsW4A4Nvfp4MoEMethod(CompressedTensorsMoEMethod):
             routing_tables=layer._expert_routing_tables(),
             per_token_activation=self.per_token_activation,
         )
+        self.moe_kernel.fused_experts.keep_constants(layer)
         self.moe_kernel.fused_experts.process_weights_after_loading(layer)
 
     def get_fused_moe_quant_config(self, layer: torch.nn.Module) -> FusedMoEQuantConfig:

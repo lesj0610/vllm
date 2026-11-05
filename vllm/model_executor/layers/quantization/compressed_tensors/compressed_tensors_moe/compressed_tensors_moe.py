@@ -161,7 +161,7 @@ class CompressedTensorsMoEMethod(FusedMoEMethodBase):
                 layer.moe_config,
                 layer_name,
                 use_a16=(input_quant is None),
-                activation_override=moe_spec.activation if moe_spec else None,
+                moe_spec=moe_spec,
             )
         elif (
             quant_config._is_fp8_w8a8_sm90(weight_quant, input_quant)

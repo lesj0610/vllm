@@ -1,13 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from enum import Enum
-from typing import Any, Literal
+from typing import Any
 
 import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm import envs
 from vllm.config.kernel import MoEBackend
+from vllm.config.quantization import QuantSpec
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.all2all_utils import (
     maybe_make_prepare_finalize,
@@ -39,7 +40,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kNvfp4Dynamic,
     kNvfp4DynamicToken,
 )
-from vllm.model_executor.utils import move_parameter
+from vllm.model_executor.utils import move_parameter, refill_derived
 from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
@@ -198,21 +199,23 @@ def map_nvfp4_backend(runner_backend: MoEBackend) -> NvFp4MoeBackend:
 
 def resolve_nvfp4_moe_activation_key(
     checkpoint_activation_key: QuantKey | None,
-    override: QuantKey | Literal["unquantized"] | None,
+    moe_spec: QuantSpec | None,
 ) -> QuantKey | None:
     """FC1 input scheme of an NVFP4 MoE layer: the checkpoint's, unless
-    quantization_config.moe.activation overrides it. None runs W4A16."""
-    if override is None:
+    quantization_config.moe.activation overrides it. None runs W4A16, which an
+    explicit `activation: null` requests."""
+    if moe_spec is None or "activation" not in moe_spec.fields_set:
         return checkpoint_activation_key
-    if isinstance(override, str):  # "unquantized"
+    override = moe_spec.activation
+    if override is None:
         return None
     if checkpoint_activation_key is None:
         raise ValueError("NVFP4 activation overrides require a W4A4 checkpoint.")
     if override not in (kNvfp4Dynamic, kNvfp4DynamicToken):
         raise ValueError(
             f"Unsupported NVFP4 MoE activation override: {override}. Use "
-            "quantization_config.moe.activation='nvfp4_per_token' or "
-            "'unquantized', or omit the override."
+            "quantization_config.moe.activation='nvfp4_per_token' or null, "
+            "or omit the override."
         )
     return override
 
@@ -231,6 +234,18 @@ def select_nvfp4_moe_backend(
     """Select the primary NvFP4 MoE backend
     Note: Shape-specific fallbacks may still occur at runtime.
     """
+    from vllm.model_executor.layers.quantization.online.requantization import (
+        is_requantization_source,
+    )
+
+    # TODO: remove and let the oracles have an option to skip init.
+    if is_requantization_source():
+        from vllm.model_executor.layers.fused_moe.experts.nvfp4_emulation_moe import (
+            Nvfp4QuantizationEmulationTritonExperts,
+        )
+
+        return NvFp4MoeBackend.EMULATION, Nvfp4QuantizationEmulationTritonExperts
+
     # NOTE: the kernels are selected in the following order.
     # FLASHINFER_B12X is intentionally excluded from auto-selection until
     # the upstream CUTLASS SM121 MMA op guard is resolved; use
@@ -657,6 +672,12 @@ def make_nvfp4_moe_quant_config(
         w13_scale = nvfp4_swizzled_scale_to_cutedsl_mma_view(w13_scale)
         w2_scale = nvfp4_swizzled_scale_to_cutedsl_mma_view(w2_scale)
 
+    a1_gscale = 1.0 / a13_scale
+    a2_gscale = 1.0 / a2_scale
+    if layer is not None:
+        a1_gscale = refill_derived(layer, "_a1_gscale", a1_gscale)
+        a2_gscale = refill_derived(layer, "_a2_gscale", a2_gscale)
+
     # Pass w13_scale_2 / w2_scale_2 directly as g1/g2_alphas.
     # The expert's process_weights_after_loading will fuse activation
     # scales in-place. Since the quant config references the same tensor
@@ -664,8 +685,8 @@ def make_nvfp4_moe_quant_config(
     return nvfp4_moe_quant_config(
         g1_alphas=w13_scale_2,
         g2_alphas=w2_scale_2,
-        a1_gscale=(1.0 / a13_scale),
-        a2_gscale=(1.0 / a2_scale),
+        a1_gscale=a1_gscale,
+        a2_gscale=a2_gscale,
         w1_scale=w13_scale,
         w2_scale=w2_scale,
         # NOTE(rob): this is a hack until the MoE kernels

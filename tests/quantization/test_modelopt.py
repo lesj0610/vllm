@@ -935,7 +935,7 @@ def test_modelopt_mixed_dspark_checkpoint(tmp_path, monkeypatch, vllm_runner):
 )
 def test_modelopt_fp8_pc_pt_checkpoint_setup(monkeypatch, dist_init, workspace_init):
     """Test ModelOpt FP8_PER_CHANNEL_PER_TOKEN checkpoint setup."""
-    model_id = "CedricHwang/qwen2.5-0.5b-modelopt-fp8-pc-pt"
+    model_id = "vllm-project/qwen2.5-0.5b-modelopt-fp8-pc-pt"
     model_path = _snapshot_download_or_skip(model_id)
 
     model, vllm_config = load_model_without_vllm_runner(
@@ -985,7 +985,7 @@ def test_modelopt_fp8_pc_pt_checkpoint_setup(monkeypatch, dist_init, workspace_i
 )
 def test_modelopt_fp8_pb_wo_checkpoint_setup(monkeypatch, dist_init, workspace_init):
     """Test ModelOpt FP8_PB_WO checkpoint setup."""
-    model_id = "CedricHwang/qwen2.5-0.5b-modelopt-fp8-pb-wo"
+    model_id = "vllm-project/qwen2.5-0.5b-modelopt-fp8-pb-wo"
     model_path = _snapshot_download_or_skip(model_id)
 
     model, vllm_config = load_model_without_vllm_runner(
@@ -1231,7 +1231,11 @@ def test_modelopt_nvfp4_moe_activation_override(quantization, per_token):
     if isinstance(config, ModelOptMixedPrecisionConfig):
         config = config.nvfp4_config
     assert isinstance(config, ModelOptNvFp4Config)
-    assert config.moe_activation_override == (kNvfp4DynamicToken if per_token else None)
+    if per_token:
+        assert config.moe_spec is not None
+        assert config.moe_spec.activation == kNvfp4DynamicToken
+    else:
+        assert config.moe_spec is None
     assert "_online_quantization_args" not in hf_config
 
 
@@ -1240,8 +1244,8 @@ def test_modelopt_nvfp4_moe_activation_override(quantization, per_token):
     [
         ("NVFP4", kNvfp4DynamicToken, "FLASHINFER_TRTLLM", None),
         ("NVFP4", kNvfp4DynamicToken, "FLASHINFER_CUTEDSL", None),
-        ("NVFP4", "unquantized", "FLASHINFER_CUTLASS", None),
-        ("W4A16_NVFP4", "unquantized", "MARLIN", None),
+        ("NVFP4", None, "FLASHINFER_CUTLASS", None),
+        ("W4A16_NVFP4", None, "MARLIN", None),
         ("W4A16_NVFP4", kNvfp4DynamicToken, "FLASHINFER_TRTLLM", "W4A4 checkpoint"),
         (
             "NVFP4",
@@ -1271,10 +1275,9 @@ def test_modelopt_nvfp4_moe_validates_activation_override(
         expected,
     ):
         method = ModelOptNvFp4FusedMoE(config, Mock())
-        key = None if activation == "unquantized" else activation
-        assert method.use_a16 == (key is None)
-        assert method.per_token_activation == (key == kNvfp4DynamicToken)
-        assert select_backend.call_args.kwargs["activation_key"] == key
+        assert method.use_a16 == (activation is None)
+        assert method.per_token_activation == (activation == kNvfp4DynamicToken)
+        assert select_backend.call_args.kwargs["activation_key"] == activation
 
 
 @pytest.mark.parametrize(
@@ -1380,7 +1383,6 @@ def test_modelopt_fp8_pb_wo_hides_output_padding(monkeypatch):
     method.wkey = mo.SCHEME_FOR[kFp8Static128BlockSym]
     method.akey = mo.SCHEME_FOR[kFp8Dynamic128Sym]
     method.input_dtype = method.out_dtype = torch.bfloat16
-    method.marlin_input_dtype = None
 
     layer = torch.nn.Module()
     with (
@@ -1625,6 +1627,7 @@ def test_modelopt_block_quant_loads_expert_blocks_with_aligned_tp_slices(
     layer = torch.nn.Module()
     layer.layer_name = "model.layers.0.mlp.experts"
     layer.is_fused_checkpoint_transposed = False
+    layer.shared_expert_online_loader = None
     layer._orient_fused_weight = RoutedExperts._orient_fused_weight
     layer.get_expert_mapping = lambda **kwargs: (
         RoutedExperts.build_expert_params_mapping(
