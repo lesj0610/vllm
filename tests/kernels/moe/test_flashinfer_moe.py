@@ -34,7 +34,7 @@ from vllm.utils.math_utils import next_power_of_2
 from vllm.utils.torch_utils import set_random_seed
 
 if not has_flashinfer_cutlass_fused_moe() or not current_platform.has_device_capability(
-    100
+    80
 ):
     pytest.skip(
         "Requires flashinfer_cutlass_fused_moe and nvfp4 support",

@@ -52,10 +52,11 @@ from vllm.utils.torch_utils import set_random_seed
 
 if pytest and (
     not has_flashinfer_trtllm_fused_moe()
-    or not current_platform.is_device_capability_family(100)
+    or not current_platform.has_device_capability(80)
+    or current_platform.has_device_capability(110)
 ):
     pytest.skip(
-        "Requires flashinfer TRTLLM fused MoE and NvFP4 (SM100)",
+        "Requires flashinfer TRTLLM fused MoE and NvFP4 (SM80 to SM10x)",
         allow_module_level=True,
     )
 

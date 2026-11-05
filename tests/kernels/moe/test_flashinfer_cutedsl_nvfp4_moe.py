@@ -51,10 +51,11 @@ from vllm.utils.math_utils import next_power_of_2
 from vllm.utils.torch_utils import set_random_seed
 
 if not has_flashinfer_cutedsl_moe_nvfp4() or not (
-    current_platform.is_device_capability_family(100)
+    current_platform.has_device_capability(80)
+    and not current_platform.has_device_capability(110)
 ):
     pytest.skip(
-        "Requires FlashInfer CuTeDSL NVFP4 MoE on SM100",
+        "Requires FlashInfer CuTeDSL NVFP4 MoE on SM80 to SM10x",
         allow_module_level=True,
     )
 

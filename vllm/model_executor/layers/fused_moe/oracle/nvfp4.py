@@ -8,6 +8,7 @@ import torch
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm import envs
 from vllm.config.kernel import MoEBackend
+from vllm.config.quantization import QuantSpec
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.all2all_utils import (
     maybe_make_prepare_finalize,
@@ -36,8 +37,11 @@ from vllm.model_executor.layers.quantization.utils.nvfp4_emulation_utils import 
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey,
+    kNvfp4Dynamic,
+    kNvfp4DynamicToken,
 )
 from vllm.model_executor.utils import move_parameter, refill_derived
+from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
 
@@ -193,6 +197,29 @@ def map_nvfp4_backend(runner_backend: MoEBackend) -> NvFp4MoeBackend:
     )
 
 
+def resolve_nvfp4_moe_activation_key(
+    checkpoint_activation_key: QuantKey | None,
+    moe_spec: QuantSpec | None,
+) -> QuantKey | None:
+    """FC1 input scheme of an NVFP4 MoE layer: the checkpoint's, unless
+    quantization_config.moe.activation overrides it. None runs W4A16, which an
+    explicit `activation: null` requests."""
+    if moe_spec is None or "activation" not in moe_spec.fields_set:
+        return checkpoint_activation_key
+    override = moe_spec.activation
+    if override is None:
+        return None
+    if checkpoint_activation_key is None:
+        raise ValueError("NVFP4 activation overrides require a W4A4 checkpoint.")
+    if override not in (kNvfp4Dynamic, kNvfp4DynamicToken):
+        raise ValueError(
+            f"Unsupported NVFP4 MoE activation override: {override}. Use "
+            "quantization_config.moe.activation='nvfp4_per_token' or null, "
+            "or omit the override."
+        )
+    return override
+
+
 def _use_a16(backend: NvFp4MoeBackend, checkpoint_uses_a16: bool) -> bool:
     return checkpoint_uses_a16 or (
         backend == NvFp4MoeBackend.B12X and envs.VLLM_B12X_MOE_FP4_FORCE_A16
@@ -234,6 +261,12 @@ def select_nvfp4_moe_backend(
         NvFp4MoeBackend.EMULATION,
     ]
     AVAILABLE_BACKENDS = prioritize_humming(AVAILABLE_BACKENDS)
+    if not current_platform.has_device_capability(100):
+        # Below SM100 FlashInfer runs NVFP4 MoE on software kernels: opt in
+        # with moe_backend rather than taking them over the native backends.
+        AVAILABLE_BACKENDS = [
+            b for b in AVAILABLE_BACKENDS if b not in FLASHINFER_NVFP4_MOE_BACKENDS
+        ]
 
     NVFP4_BACKENDS_WITH_CLAMP = {
         NvFp4MoeBackend.B12X,
@@ -369,13 +402,15 @@ def convert_to_nvfp4_moe_kernel_format(
     torch.Tensor,
 ]:
     use_a16 = _use_a16(nvfp4_backend, use_a16)
+    if use_a16:
+        # A16 kernels read no activation scales and A16 checkpoints carry none:
+        # give the backend preparation below neutral ones.
+        num_experts = w13.shape[0]
+        a13_scale = torch.ones(num_experts, dtype=torch.float32, device=w13.device)
+        a2_scale = torch.ones(num_experts, dtype=torch.float32, device=w2.device)
     if nvfp4_backend == NvFp4MoeBackend.B12X:
         if a13_scale is None or a2_scale is None:
-            if not use_a16:
-                raise ValueError("b12x NVFP4 MoE requires activation scales")
-            num_experts = w13.shape[0]
-            a13_scale = torch.ones(num_experts, dtype=torch.float32, device=w13.device)
-            a2_scale = torch.ones(num_experts, dtype=torch.float32, device=w2.device)
+            raise ValueError("b12x NVFP4 MoE requires activation scales")
         (
             w13,
             w13_scale,
@@ -534,6 +569,30 @@ def convert_to_nvfp4_moe_kernel_format(
     else:
         raise ValueError(f"Unknown NvFp4 backend for MoE: {nvfp4_backend}")
 
+    if nvfp4_backend in (
+        NvFp4MoeBackend.FLASHINFER_TRTLLM,
+        NvFp4MoeBackend.FLASHINFER_CUTLASS,
+        NvFp4MoeBackend.FLASHINFER_CUTEDSL,
+    ) and not current_platform.has_device_capability(100):
+        # Below SM100 FlashInfer runs these on its CUTLASS SM80 kernels and
+        # converts the weights on every call unless given their operands.
+        from flashinfer.fused_moe import (
+            cutlass_nvfp4_sm80_weights,
+            trtllm_nvfp4_sm80_weights,
+        )
+
+        if nvfp4_backend == NvFp4MoeBackend.FLASHINFER_TRTLLM:
+            w13, w13_scale, w2, w2_scale = trtllm_nvfp4_sm80_weights(
+                w13, w13_scale, w2, w2_scale, is_act_and_mul
+            )
+        else:
+            interleaved = (
+                nvfp4_backend == NvFp4MoeBackend.FLASHINFER_CUTEDSL and is_act_and_mul
+            )
+            w13, w13_scale, w2, w2_scale = cutlass_nvfp4_sm80_weights(
+                w13, w13_scale, w2, w2_scale, layer.moe_config.in_dtype, interleaved
+            )
+
     return (
         w13,
         w13_scale,
@@ -575,7 +634,13 @@ def make_nvfp4_moe_quant_config(
             gemm1_clamp_limit=swiglu_limit,
         )
     elif backend == NvFp4MoeBackend.MARLIN or (
-        backend == NvFp4MoeBackend.B12X and use_a16
+        use_a16
+        and backend
+        in (
+            NvFp4MoeBackend.B12X,
+            NvFp4MoeBackend.FLASHINFER_CUTLASS,
+            NvFp4MoeBackend.FLASHINFER_CUTEDSL,
+        )
     ):
         return nvfp4_w4a16_moe_quant_config(
             g1_alphas=w13_scale_2,
@@ -599,7 +664,11 @@ def make_nvfp4_moe_quant_config(
             gemm1_clamp_limit=swiglu_limit,
         )
 
-    if backend == NvFp4MoeBackend.FLASHINFER_CUTEDSL:
+    # Scales prepared below SM100 (cutlass_nvfp4_sm80_weights) are read as is.
+    if (
+        backend == NvFp4MoeBackend.FLASHINFER_CUTEDSL
+        and w13_scale.dtype == torch.float8_e4m3fn
+    ):
         w13_scale = nvfp4_swizzled_scale_to_cutedsl_mma_view(w13_scale)
         w2_scale = nvfp4_swizzled_scale_to_cutedsl_mma_view(w2_scale)
 

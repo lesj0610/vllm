@@ -1231,7 +1231,11 @@ def test_modelopt_nvfp4_moe_activation_override(quantization, per_token):
     if isinstance(config, ModelOptMixedPrecisionConfig):
         config = config.nvfp4_config
     assert isinstance(config, ModelOptNvFp4Config)
-    assert config.moe_activation_override == (kNvfp4DynamicToken if per_token else None)
+    if per_token:
+        assert config.moe_spec is not None
+        assert config.moe_spec.activation == kNvfp4DynamicToken
+    else:
+        assert config.moe_spec is None
     assert "_online_quantization_args" not in hf_config
 
 
@@ -1239,6 +1243,9 @@ def test_modelopt_nvfp4_moe_activation_override(quantization, per_token):
     "quant_method,activation,backend,error",
     [
         ("NVFP4", kNvfp4DynamicToken, "FLASHINFER_TRTLLM", None),
+        ("NVFP4", kNvfp4DynamicToken, "FLASHINFER_CUTEDSL", None),
+        ("NVFP4", None, "FLASHINFER_CUTLASS", None),
+        ("W4A16_NVFP4", None, "MARLIN", None),
         ("W4A16_NVFP4", kNvfp4DynamicToken, "FLASHINFER_TRTLLM", "W4A4 checkpoint"),
         (
             "NVFP4",
@@ -1268,7 +1275,8 @@ def test_modelopt_nvfp4_moe_validates_activation_override(
         expected,
     ):
         method = ModelOptNvFp4FusedMoE(config, Mock())
-        assert method.per_token_activation
+        assert method.use_a16 == (activation is None)
+        assert method.per_token_activation == (activation == kNvfp4DynamicToken)
         assert select_backend.call_args.kwargs["activation_key"] == activation
 
 

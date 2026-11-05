@@ -136,7 +136,7 @@ def sync_flashinfer_autotune_cache(
             from vllm.platforms import current_platform
             from vllm.utils.flashinfer import has_flashinfer
 
-            if has_flashinfer() and current_platform.has_device_capability(90):
+            if has_flashinfer() and current_platform.has_device_capability(80):
                 from flashinfer.autotuner import AutoTuner
 
                 with tempfile.TemporaryDirectory() as temp_dir:
