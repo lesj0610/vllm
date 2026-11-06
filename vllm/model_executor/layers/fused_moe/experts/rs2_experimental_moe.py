@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Weight-only NVFP4 MoE for sm_80 (BF16 activations) behind
+"""Weight-only NVFP4 MoE for sm_80 to sm_90 (BF16 activations) behind
 moe_backend="rs2_experimental".
 
 The weights are converted once into records (rs2_records) that the _moe_C
@@ -242,7 +242,11 @@ class Rs2ExperimentalExperts(mk.FusedMoEExpertsModular):
     @staticmethod
     def _supports_current_device() -> bool:
         p = current_platform
-        return p.is_cuda() and p.is_device_capability((8, 0))
+        return (
+            p.is_cuda()
+            and p.has_device_capability((8, 0))
+            and not p.has_device_capability((10, 0))
+        )
 
     @staticmethod
     def _supports_no_act_and_mul() -> bool:
