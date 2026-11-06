@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 //
-// Weight-only NVFP4 MoE for sm_80: BF16 activations, NVFP4 weights converted
+// Weight-only NVFP4 MoE: BF16 activations, NVFP4 weights converted
 // once at load time into records (rs2_experimental_moe.py). A record covers one
 // expert, 128 output columns and 128 k: 8192 B of E2M1 codes in MMA fragment
 // order, then 1024 B of block scales, each the E4M3 scale's magnitude as a
@@ -17,6 +17,11 @@
 // each 32 columns, activation rows swizzled in shared memory) after the
 // multi-CTA prep. The host ops launch one whole output tile per CTA; the
 // kernels' split-tile (stream-K) path is not used by them.
+//
+// The kernels need cp.async, ldmatrix and the bf16 mma.sync, so they build
+// for sm_80 and sm_90; sm_86, sm_87 and sm_89 run the sm_80 code. The largest
+// GEMM config takes 79872 B of shared memory per CTA, within the 99 KB
+// per-block limit of sm_86 and sm_89.
 #include <torch/csrc/stable/accelerator.h>
 #include <torch/csrc/stable/library.h>
 #include <torch/csrc/stable/tensor.h>
@@ -42,6 +47,8 @@ constexpr int kRec = kWBytes + kSBytes;        // 9216
 constexpr int kHalfW = kWBytes / 2;  // 4096: k 0..63 of a record, all warps
 constexpr int kTailRec = kHalfW + kSBytes;  // 5120: a K tail of at most 64
 constexpr int kActPitch = 272;  // 256 B row + 16 B against ldmatrix conflicts
+// Smallest per-block shared memory limit from sm_80 to sm_90 (sm_86, sm_89).
+constexpr int kSmemLimit = 99 * 1024;
 
 template <int R>
 struct Cfg {
@@ -1075,6 +1082,7 @@ __global__ void finalize(const __nv_bfloat16* __restrict__ y,
 
 template <int R, int ACT, int STAGES, bool KT>
 void launch_gemm(GemmParams const& p, int grid, cudaStream_t st) {
+  static_assert(STAGES * Cfg<R>::kStageBytes <= kSmemLimit);
   const int smem = STAGES * Cfg<R>::kStageBytes;
   cudaFuncSetAttribute(gemm<R, ACT, STAGES, KT>,
                        cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
@@ -1083,6 +1091,7 @@ void launch_gemm(GemmParams const& p, int grid, cudaStream_t st) {
 
 template <int R, int WC, int NW, int ACT, int STAGES, bool KT>
 void launch_gemm2d(GemmParams const& p, int grid, cudaStream_t st) {
+  static_assert(STAGES * Cfg<R>::kStageBytes <= kSmemLimit);
   const int smem = STAGES * Cfg<R>::kStageBytes;
   cudaFuncSetAttribute(gemm2d<R, WC, NW, ACT, STAGES, KT>,
                        cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
