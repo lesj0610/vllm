@@ -144,6 +144,7 @@ MoEBackend = Literal[
     "hpc",
     "emulation",
     "rdna3",
+    "rs2_experimental",
 ]
 
 FLASHINFER_MOE_EP_CUTEDSL = "flashinfer_moe_ep_cutedsl"

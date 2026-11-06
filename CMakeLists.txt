@@ -1528,6 +1528,17 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
     message(STATUS "Not building Marlin MOE kernels as no compatible archs found"
                    " in CUDA target architectures")
   endif()
+
+  # Weight-only NVFP4 MoE for sm_80 (rs2_experimental backend)
+  cuda_archs_loose_intersection(RS2_MOE_ARCHS "8.0" "${CUDA_ARCHS}")
+  if (RS2_MOE_ARCHS)
+    set(RS2_MOE_SRC "csrc/moe/rs2_moe.cu")
+    set_gencode_flags_for_srcs(
+      SRCS "${RS2_MOE_SRC}"
+      CUDA_ARCHS "${RS2_MOE_ARCHS}")
+    list(APPEND VLLM_MOE_EXT_SRC "${RS2_MOE_SRC}")
+    message(STATUS "Building the sm_80 NVFP4 MoE kernels for archs: ${RS2_MOE_ARCHS}")
+  endif()
 endif()
 
 message(STATUS "Enabling MoE C_stable extension.")

@@ -54,6 +54,7 @@ class NvFp4MoeBackend(Enum):
     MARLIN = "MARLIN"
     HUMMING = "HUMMING"
     EMULATION = "EMULATION"
+    RS2_EXPERIMENTAL = "RS2_EXPERIMENTAL"
     FLASHINFER_MOE_EP_CUTEDSL = "FLASHINFER_MOE_EP_CUTEDSL"
 
 
@@ -144,6 +145,12 @@ def backend_to_kernel_cls(
         )
 
         return [MarlinExperts]
+    elif backend == NvFp4MoeBackend.RS2_EXPERIMENTAL:
+        from vllm.model_executor.layers.fused_moe.experts.rs2_experimental_moe import (
+            Rs2ExperimentalExperts,
+        )
+
+        return [Rs2ExperimentalExperts]
     elif backend == NvFp4MoeBackend.HUMMING:
         from vllm.model_executor.layers.fused_moe.experts.fused_humming_moe import (
             BatchedHummingGroupedExperts,
@@ -185,6 +192,7 @@ def map_nvfp4_backend(runner_backend: MoEBackend) -> NvFp4MoeBackend:
         "marlin": NvFp4MoeBackend.MARLIN,
         "humming": NvFp4MoeBackend.HUMMING,
         "emulation": NvFp4MoeBackend.EMULATION,
+        "rs2_experimental": NvFp4MoeBackend.RS2_EXPERIMENTAL,
     }
     if backend := mapping.get(runner_backend):
         return backend
@@ -465,6 +473,19 @@ def convert_to_nvfp4_moe_kernel_format(
             w2_scale_2=w2_scale_2,
             is_act_and_mul=is_act_and_mul,
         )
+    elif nvfp4_backend == NvFp4MoeBackend.RS2_EXPERIMENTAL:
+        from vllm.model_executor.layers.fused_moe.experts.rs2_experimental_moe import (
+            rs2_records,
+        )
+
+        # Weight-only: the records carry codes and block scales; the global
+        # scales stay per expert. Empty scale tensors release the loaded ones.
+        a13_scale = None
+        a2_scale = None
+        w13 = rs2_records(w13, w13_scale, is_act_and_mul)
+        w2 = rs2_records(w2, w2_scale, False)
+        w13_scale = w13_scale.new_empty(0)
+        w2_scale = w2_scale.new_empty(0)
     elif nvfp4_backend == NvFp4MoeBackend.EMULATION:
         # Move the E2M1 lookup table to the device now, because
         # `.to(device)` is not allowed during CUDA graph capture.
@@ -539,7 +560,7 @@ def make_nvfp4_moe_quant_config(
             gemm1_beta=getattr(layer, "swiglu_beta", None),
             gemm1_clamp_limit=swiglu_limit,
         )
-    elif backend == NvFp4MoeBackend.MARLIN or (
+    elif backend in (NvFp4MoeBackend.MARLIN, NvFp4MoeBackend.RS2_EXPERIMENTAL) or (
         backend == NvFp4MoeBackend.B12X and use_a16
     ):
         return nvfp4_w4a16_moe_quant_config(
@@ -610,7 +631,10 @@ def make_nvfp4_moe_kernel(
     per_token_activation: bool = False,
 ) -> mk.FusedMoEKernel:
     # Marlin consumes A16 and must not receive per-token A4 metadata.
-    if backend == NvFp4MoeBackend.MARLIN and moe_quant_config.use_nvfp4_w4a16:
+    if (
+        backend in (NvFp4MoeBackend.MARLIN, NvFp4MoeBackend.RS2_EXPERIMENTAL)
+        and moe_quant_config.use_nvfp4_w4a16
+    ):
         per_token_activation = False
 
     extra_kwargs: dict[str, Any] = {}
