@@ -101,6 +101,20 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_moe_C, m) {
       "bool use_fp32_reduce, bool is_zp_float,"
       "int thread_k, int thread_n, int blocks_per_sm) -> Tensor");
 
+  // Weight-only NVFP4 MoE for sm_80 (rs2_experimental backend): routing
+  // prep, one GEMM over the routed blocks, and the top-k weighted sum.
+  m.def(
+      "rs2_moe_prep(Tensor topk_ids, Tensor! meta, Tensor! rowmap, "
+      "Tensor! workspace, int num_experts, int row_tile, int max_blocks) -> "
+      "()");
+  m.def(
+      "rs2_moe_gemm(Tensor records, Tensor alpha, Tensor act, Tensor meta, "
+      "Tensor rowmap, Tensor! out, int row_tile, int activation, int top_k, "
+      "int N, int K, int Nout, int max_blocks) -> ()");
+  m.def(
+      "rs2_moe_finalize(Tensor y, Tensor topk_weights, Tensor! out, "
+      "int top_k) -> ()");
+
   m.def(
       "moe_permute(Tensor input, Tensor topk_ids,"
       "Tensor token_expert_indices, Tensor? expert_map, int n_expert,"
