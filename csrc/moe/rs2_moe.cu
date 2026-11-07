@@ -15,8 +15,10 @@
 // it every fp32 sum order, repeats bit for bit between calls. R 8, 16 and 32
 // run gemm (8 warps, each 16 columns of all R rows); R 64 runs gemm2d (4 warps,
 // each 32 columns, activation rows swizzled in shared memory) after the
-// multi-CTA prep. The host ops launch one whole output tile per CTA; the
-// kernels' split-tile (stream-K) path is not used by them.
+// multi-CTA prep. The host ops launch one whole output tile per CTA, except
+// where only one gemm CTA fits on an SM: there gemm runs one CTA per SM, each
+// taking whole tiles in turn. The kernels' split-tile (stream-K) path is not
+// used by them.
 //
 // The kernels need cp.async, ldmatrix and the bf16 mma.sync, so they build
 // for sm_80 and sm_90; sm_86, sm_87 and sm_89 run the sm_80 code. The largest
@@ -151,9 +153,19 @@ struct GemmParams {
   int top_k, N,
       K;     // N: record columns, a multiple of 128 (gated: 2 x I padded to 64)
   int Nout;  // output columns (gated: I)
-  int units_per_cta;  // 0: stream-K equal split; > 0: fixed (S = one tile per
-                      // CTA)
+  int units_per_cta;  // k steps per CTA: > 0 that many (S: one tile), < 0
+                      // persistent whole tiles, 0 an equal stream-K split
 };
+
+// k steps per CTA from units_per_cta; persistent whole tiles take
+// ceil(tiles / grid) tiles each, from the device block count.
+__device__ __forceinline__ int cta_units(int units_per_cta, int tiles, int S,
+                                         int total) {
+  return units_per_cta > 0   ? units_per_cta
+         : units_per_cta < 0 ? S * ((tiles + static_cast<int>(gridDim.x) - 1) /
+                                    static_cast<int>(gridDim.x))
+                             : (total + gridDim.x - 1) / gridDim.x;
+}
 
 // ACT: 0 none (GEMM2), 1 silu(gate) * up (GEMM1, gated), 2 relu(x)^2 (GEMM1,
 // not gated) KT: K % 128 != 0 (a tail k-step per chunk).
@@ -175,8 +187,7 @@ __global__ void __launch_bounds__(kT) gemm(GemmParams p) {
       static_cast<long>(S - 1) * kRec + (half ? kTailRec : kRec);  // KT only
   const int upb = chunks * S;  // units per block
   const int total = nb * upb;
-  const int L = p.units_per_cta > 0 ? p.units_per_cta
-                                    : (total + gridDim.x - 1) / gridDim.x;
+  const int L = cta_units(p.units_per_cta, nb * chunks, S, total);
   const int u0 = blockIdx.x * L;
   const int u1 = min(u0 + L, total);
   if (u0 >= u1) return;
@@ -471,13 +482,7 @@ __device__ __forceinline__ void gemm2d_body(GemmParams const& p) {
       static_cast<long>(S - 1) * kRec + (half ? kTailRec : kRec);
   const int upb = chunks * S;
   const int total = nb * upb;
-  // units_per_cta < 0: persistent whole tiles, ceil(tiles / grid) per CTA from
-  // the device nb
-  const int L = p.units_per_cta > 0 ? p.units_per_cta
-                : p.units_per_cta < 0
-                    ? S * ((nb * chunks + static_cast<int>(gridDim.x) - 1) /
-                           static_cast<int>(gridDim.x))
-                    : (total + gridDim.x - 1) / gridDim.x;
+  const int L = cta_units(p.units_per_cta, nb * chunks, S, total);
   const int u0 = blockIdx.x * L;
   const int u1 = min(u0 + L, total);
   if (u0 >= u1) return;
@@ -1080,13 +1085,22 @@ __global__ void finalize(const __nv_bfloat16* __restrict__ y,
   *reinterpret_cast<uint4*>(out + static_cast<long>(t) * H + c * 8) = o;
 }
 
+// With one CTA per SM (R 16 and 32 on 100 KB of shared memory per SM) no other
+// CTA runs while a CTA fills and drains its pipeline, so gemm then runs one
+// CTA per SM over whole tiles, loading the next tile during the current one.
 template <int R, int ACT, int STAGES, bool KT>
-void launch_gemm(GemmParams const& p, int grid, cudaStream_t st) {
+void launch_gemm(GemmParams p, int grid, cudaStream_t st) {
   static_assert(STAGES * Cfg<R>::kStageBytes <= kSmemLimit);
   const int smem = STAGES * Cfg<R>::kStageBytes;
-  cudaFuncSetAttribute(gemm<R, ACT, STAGES, KT>,
-                       cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
-  gemm<R, ACT, STAGES, KT><<<grid, kT, smem, st>>>(p);
+  const auto kern = gemm<R, ACT, STAGES, KT>;
+  cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+  int ctas = 0;
+  cudaOccupancyMaxActiveBlocksPerMultiprocessor(&ctas, kern, kT, smem);
+  if (ctas == 1) {
+    p.units_per_cta = -1;
+    grid = std::min(grid, get_device_prop()->multiProcessorCount);
+  }
+  kern<<<grid, kT, smem, st>>>(p);
 }
 
 template <int R, int WC, int NW, int ACT, int STAGES, bool KT>
