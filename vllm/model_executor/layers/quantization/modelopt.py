@@ -45,11 +45,13 @@ from vllm.model_executor.layers.fused_moe.oracle.mxfp8 import (
     select_mxfp8_moe_backend,
 )
 from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import (
+    PER_TOKEN_NVFP4_MOE_BACKENDS,
     NvFp4MoeBackend,
     convert_to_nvfp4_moe_kernel_format,
     is_global_sf_supported_for_nvfp4_backend,
     make_nvfp4_moe_kernel,
     make_nvfp4_moe_quant_config,
+    resolve_nvfp4_moe_activation_key,
     select_nvfp4_moe_backend,
 )
 from vllm.model_executor.layers.fusion.quant_activation import (
@@ -751,9 +753,8 @@ class ModelOptNvFp4Config(ModelOptQuantConfigBase):
         self.quant_method = quant_method
         self.is_checkpoint_nvfp4_serialized = is_checkpoint_nvfp4_serialized
         moe_spec = quantization_args.moe if quantization_args is not None else None
-        self.moe_activation_override: QuantKey | None = (
-            moe_spec.activation if moe_spec is not None else None
-        )
+        # The user's quantization_config.moe spec, if any.
+        self.moe_spec = moe_spec
         if weight_scale_encoding is not None and (
             weight_scale_encoding not in CSF_SCALE_ENCODINGS
         ):
@@ -883,23 +884,13 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
     ) -> None:
         super().__init__(moe_config)
         self.quant_config = quant_config
-        self.use_a16 = quant_config.quant_method == "W4A16_NVFP4"
         # Whether the selected backend reads the activation input scales.
         self.uses_input_scales = True
-        activation_key = None if self.use_a16 else kNvfp4Dynamic
-
-        if quant_config.moe_activation_override is not None:
-            if self.use_a16:
-                raise ValueError(
-                    "NVFP4 activation overrides require a W4A4 checkpoint."
-                )
-            activation_key = quant_config.moe_activation_override
-            if activation_key not in (kNvfp4Dynamic, kNvfp4DynamicToken):
-                raise ValueError(
-                    "Unsupported ModelOpt NVFP4 MoE activation override: "
-                    f"{activation_key}. Use quantization_config.moe.activation="
-                    "'nvfp4_per_token' or omit the override."
-                )
+        activation_key = resolve_nvfp4_moe_activation_key(
+            None if quant_config.quant_method == "W4A16_NVFP4" else kNvfp4Dynamic,
+            quant_config.moe_spec,
+        )
+        self.use_a16 = activation_key is None
         self.per_token_activation = activation_key == kNvfp4DynamicToken
 
         self.nvfp4_backend, self.experts_cls = select_nvfp4_moe_backend(
@@ -909,11 +900,11 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
         )
         if (
             self.per_token_activation
-            and self.nvfp4_backend != NvFp4MoeBackend.FLASHINFER_TRTLLM
+            and self.nvfp4_backend not in PER_TOKEN_NVFP4_MOE_BACKENDS
         ):
             raise ValueError(
                 "Per-token NVFP4 activation for pre-quantized weights "
-                "requires the FlashInfer TRTLLM MoE backend."
+                "requires the FlashInfer TRTLLM or CuTeDSL MoE backend."
             )
 
         self.use_global_sf = is_global_sf_supported_for_nvfp4_backend(
