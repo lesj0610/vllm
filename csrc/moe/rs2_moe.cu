@@ -13,15 +13,18 @@
 // and finalize (the top-k weighted sum). prep places entry f = token * top_k +
 // slot at the rank of f among its expert's entries, so the placement, and with
 // it every fp32 sum order, repeats bit for bit between calls. R 8, 16 and 32
-// run gemm (8 warps, each 16 columns of all R rows); R 64 runs gemm2d (4 warps,
-// each 32 columns, activation rows swizzled in shared memory) after the
-// multi-CTA prep. The host ops launch one whole output tile per CTA; the
-// kernels' split-tile (stream-K) path is not used by them.
+// use 8 warps, each covering 16 columns of all R rows; R 64 uses 4 warps,
+// each covering 32 columns, with swizzled activation rows, after the
+// multi-CTA prep. R 96 and the two-record R 64 variants (rs2_moe_gemm_w64s,
+// rs2_moe_gemm_g2w64x) cover two 128-column records per CTA: 8 warps of 32
+// columns and 4 warps of 64 columns. One GEMM template covers every warp
+// layout; the host launches one whole output tile per CTA.
 //
 // The kernels need cp.async, ldmatrix and the bf16 mma.sync, so they build
-// for sm_80 and sm_90; sm_86, sm_87 and sm_89 run the sm_80 code. The largest
-// GEMM config takes 79872 B of shared memory per CTA, within the 99 KB
-// per-block limit of sm_86 and sm_89.
+// for sm_80 and sm_90; sm_86, sm_87 and sm_89 run the sm_80 code. Every config
+// but R 96 at 3 stages fits the 99 KB per-block shared memory limit of sm_86
+// and sm_89 (at most 89088 B); R 96 takes 3 stages (133632 B) only where a
+// block can have that much and 2 stages otherwise.
 #include <torch/csrc/stable/accelerator.h>
 #include <torch/csrc/stable/library.h>
 #include <torch/csrc/stable/tensor.h>
@@ -37,9 +40,10 @@
 #include <cstdint>
 #include <type_traits>
 
+#include "cutlass/fast_math.h"
+
 namespace vllm::rs2_moe {
 
-constexpr int kT = 256;
 constexpr int kTileN = 128, kTileK = 128;
 constexpr int kWBytes = kTileN * kTileK / 2;   // 8192
 constexpr int kSBytes = kTileN * kTileK / 16;  // 1024
@@ -50,10 +54,10 @@ constexpr int kActPitch = 272;  // 256 B row + 16 B against ldmatrix conflicts
 // Smallest per-block shared memory limit from sm_80 to sm_90 (sm_86, sm_89).
 constexpr int kSmemLimit = 99 * 1024;
 
-template <int R>
+template <int R, int NC = 1>
 struct Cfg {
   static constexpr int kABytes = R * kActPitch;
-  static constexpr int kStageBytes = kRec + kABytes;
+  static constexpr int kStageBytes = NC * kRec + kABytes;
 };
 
 __device__ __forceinline__ void cp16(uint32_t s, const void* g) {
@@ -75,6 +79,43 @@ __device__ __forceinline__ void lds64(uint32_t* d, uint32_t a) {
                : "=r"(d[0]), "=r"(d[1])
                : "r"(a));
 }
+__device__ __forceinline__ void lds32(uint32_t* d, uint32_t a) {
+  asm volatile("ld.shared.u32 %0, [%1];" : "=r"(d[0]) : "r"(a));
+}
+// Volatile shared loads: ptxas does not merge them into wider loads.
+__device__ __forceinline__ void lds32v(uint32_t* d, uint32_t a) {
+  asm volatile("ld.volatile.shared.u32 %0, [%1];" : "=r"(d[0]) : "r"(a));
+}
+// gt / d for d = 1 + __expf(-gt), bit-identical to the IEEE division (checked
+// over all 2^32 fp32 gt on sm_80): the division's own fast path (MUFU.RCP + 4
+// FFMA) with the cases its FCHK sends to the slow path written out as selects,
+// no branch.
+__device__ __forceinline__ float rcp_approx(float d) {
+  float r;
+  asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(r) : "f"(d));
+  return r;
+}
+__device__ __forceinline__ float div_fast(float n, float d) {
+  float r = rcp_approx(d);
+  const float t = fmaf(-d, r, 1.f);
+  r = fmaf(r, t, r);
+  const float q0 = fmaf(n, r, 0.f);
+  const float e = fmaf(-d, q0, n);
+  return fmaf(r, e, q0);
+}
+__device__ __forceinline__ float silu_div(float n, float d) {
+  const float inf = __int_as_float(0x7f800000);
+  const float s = d >= 0x1p126f ? 0x1p-24f : 1.f;
+  float q = div_fast(n, d * s) * s;
+  q = d == inf ? n * 0.f : q;
+  q = (n == 0.f || n == inf) ? n : q;
+  return q;
+}
+__device__ __forceinline__ void lds64v(uint32_t* d, uint32_t a) {
+  asm volatile("ld.volatile.shared.v2.u32 {%0, %1}, [%2];"
+               : "=r"(d[0]), "=r"(d[1])
+               : "r"(a));
+}
 __device__ __forceinline__ void lds128(uint32_t* d, uint32_t a) {
   asm volatile("ld.shared.v4.u32 {%0, %1, %2, %3}, [%4];"
                : "=r"(d[0]), "=r"(d[1]), "=r"(d[2]), "=r"(d[3])
@@ -85,6 +126,11 @@ __device__ __forceinline__ void ldsm_x4(uint32_t* d, uint32_t a) {
       "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];"
       : "=r"(d[0]), "=r"(d[1]), "=r"(d[2]), "=r"(d[3])
       : "r"(a));
+}
+__device__ __forceinline__ void ldsm_x2(uint32_t* d, uint32_t a) {
+  asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];"
+               : "=r"(d[0]), "=r"(d[1])
+               : "r"(a));
 }
 __device__ __forceinline__ void mma_bf16(float* d, uint32_t const* a,
                                          uint32_t const* b) {
@@ -146,306 +192,45 @@ struct GemmParams {
   const int* rowmap;        // [nb][R]: token * top_k + slot, or -1
   __nv_bfloat16* out;       // GEMM1: blocked intermediate [nb][R][Nout]; GEMM2:
                             // [tokens*top_k][Nout]
-  float* ws;                // [grid][2][R][128] fp32 partials
-  int* cnt;                 // per-tile k-step counters, zero between launches
+  float* ws;  // unused: one whole tile per CTA, no split-tile partials
+  int* cnt;   // unused, as ws
   int top_k, N,
       K;     // N: record columns, a multiple of 128 (gated: 2 x I padded to 64)
   int Nout;  // output columns (gated: I)
-  int units_per_cta;  // 0: stream-K equal split; > 0: fixed (S = one tile per
-                      // CTA)
+  int units_per_cta;            // unused, as ws
+  cutlass::FastDivmod topk_dm;  // f / top_k via host-built magic (G1
+                                // only); appended to preserve layout
 };
+
+// bf16 pair (lo in the low 16 bits) and an 8 x 8 b16 transpose across the warp
+// (movmatrix, sm_75+): lane l reads row l / 4, columns 2 (l % 4) and + 1 of the
+// piece and gets the same positions of the transposed piece.
+__device__ __forceinline__ uint32_t pack_bf16x2(float lo, float hi) {
+  __nv_bfloat162 h = __floats2bfloat162_rn(lo, hi);
+  return *reinterpret_cast<uint32_t*>(&h);
+}
+
+__device__ __forceinline__ uint32_t movm_trans(uint32_t x) {
+  uint32_t y;
+  asm volatile("movmatrix.sync.aligned.m8n8.trans.b16 %0, %1;\n"
+               : "=r"(y)
+               : "r"(x));
+  return y;
+}
 
 // ACT: 0 none (GEMM2), 1 silu(gate) * up (GEMM1, gated), 2 relu(x)^2 (GEMM1,
 // not gated) KT: K % 128 != 0 (a tail k-step per chunk).
-template <int R, int ACT, int STAGES, bool KT>
-__global__ void __launch_bounds__(kT) gemm(GemmParams p) {
-  using C = Cfg<R>;
-  constexpr int G = R / 8;
-  constexpr uint32_t kStage = C::kStageBytes;
-  constexpr uint32_t kRing = STAGES * kStage;
-  extern __shared__ __align__(128) uint8_t smem[];
-  __shared__ int last_flag;
-  const int nb = *p.nblocks;
-  const int top_k = p.top_k, K = p.K;
-  const int chunks = p.N / kTileN;
-  const int S = KT ? (K + kTileK - 1) / kTileK : K / kTileK;
-  const int kr = K - (S - 1) * kTileK;       // valid k of a chunk's last step
-  const bool half = KT && kr <= kTileK / 2;  // that step's record is 5120 B
-  const long cbytes =
-      static_cast<long>(S - 1) * kRec + (half ? kTailRec : kRec);  // KT only
-  const int upb = chunks * S;  // units per block
-  const int total = nb * upb;
-  const int L = p.units_per_cta > 0 ? p.units_per_cta
-                                    : (total + gridDim.x - 1) / gridDim.x;
-  const int u0 = blockIdx.x * L;
-  const int u1 = min(u0 + L, total);
-  if (u0 >= u1) return;
-  const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, g8 = lane >> 2,
-            tq = lane & 3;
-  const uint32_t sbase = static_cast<uint32_t>(__cvta_generic_to_shared(smem));
-
-  // Issue side: block ib, unit within block iw (= c * S + ks), k-step iks, ring
-  // offset islot.
-  int ib = u0 / upb;
-  int iw = u0 - ib * upb;
-  int iks = iw % S;
-  uint32_t islot = 0;
-  const uint8_t* gws = nullptr;  // this thread's 16 B of the current record
-  constexpr int RJ =
-      R > 16
-          ? R / 16
-          : 1;  // activation rows per thread: 256 threads load 16 rows a pass
-  const __nv_bfloat16* gact[RJ];
-  bool avalid[RJ];
-#pragma unroll
-  for (int j = 0; j < RJ; ++j) avalid[j] = true;
-  const int ar = tid >> 4, aq = tid & 15;
-  const bool has_act = tid < R * 16;
-  const bool has_s = tid < kSBytes / 16;
-  const uint32_t sw_i = sbase + tid * 16;
-  const uint32_t sa_i = sbase + kRec + (has_act ? ar : 0) * kActPitch + aq * 16;
-  auto load_block = [&]() {
-    const long e = p.block_expert[ib];
-    if constexpr (KT) {
-      const int c = iw / S;
-      gws = p.w + (e * chunks + c) * cbytes +
-            static_cast<long>(iw - c * S) * kRec + tid * 16;
-    } else {
-      gws = p.w + (e * upb + iw) * kRec + tid * 16;
-    }
-#pragma unroll
-    for (int j = 0; j < RJ; ++j) {
-      const int r = ar + 16 * j;
-      long row = 0;
-      if (has_act) {
-        if constexpr (ACT != 0) {
-          const int f = p.rowmap[ib * R + r];
-          avalid[j] = f >= 0;
-          row = avalid[j] ? f / top_k : 0;
-        } else {
-          row = static_cast<long>(ib) * R + r;
-        }
-      }
-      gact[j] = p.act + row * K + aq * 8 + iks * kTileK;
-    }
-  };
-  load_block();
-  auto issue = [&]() {
-    bool tl = false, hf = false;
-    if constexpr (KT) {
-      tl = iks == S - 1;
-      hf = tl && half;
-    }
-    cp16(sw_i + islot, gws);
-    if (!hf) cp16(sw_i + islot + kHalfW, gws + kHalfW);
-    if (has_s) cp16(sw_i + islot + kWBytes, gws + (hf ? kHalfW : kWBytes));
-    if (has_act) {
-#pragma unroll
-      for (int j = 0; j < RJ; ++j) {
-        const uint32_t sa = sa_i + j * 16 * kActPitch + islot;
-        if constexpr (KT) {
-          const bool in = !tl || aq * 8 < kr;
-          if (!hf || aq < 8) cp16z(sa, in ? gact[j] : p.act, avalid[j] && in);
-        } else {
-          cp16z(sa, gact[j], avalid[j]);
-        }
-      }
-    }
-    islot = islot + kStage == kRing ? 0u : islot + kStage;
-    gws += hf ? kTailRec : kRec;
-#pragma unroll
-    for (int j = 0; j < RJ; ++j) gact[j] += kTileK;
-    ++iw;
-    if (++iks == S) {
-      iks = 0;
-#pragma unroll
-      for (int j = 0; j < RJ; ++j) gact[j] -= S * kTileK;
-      if (iw == upb) {
-        iw = 0;
-        ++ib;
-        if (ib < nb) load_block();
-      }
-    }
-  };
-
-  // Writes one tile's results from per-lane fp32 values v[G][4] (already summed
-  // over k).
-  auto write_tile = [&](int b, int c, float (*v)[4]) {
-    const float a = p.alpha[p.block_expert[b]];
-    const int Nout = p.Nout;
-#pragma unroll
-    for (int gi = 0; gi < G; ++gi) {
-      const int r0 = gi * 8 + 2 * tq;
-      if constexpr (ACT == 1) {
-        const int i = c * 64 + warp * 8 + g8;
-        if (i < Nout) {
-#pragma unroll
-          for (int h = 0; h < 2; ++h) {
-            const float gt = v[gi][h] * a, up = v[gi][2 + h] * a;
-            const float y = gt / (1.f + __expf(-gt)) * up;
-            p.out[(static_cast<long>(b) * R + r0 + h) * Nout + i] =
-                __float2bfloat16_rn(y);
-          }
-        }
-      } else if constexpr (ACT == 2) {
-        const int n = c * kTileN + warp * 16 + g8;
-#pragma unroll
-        for (int q = 0; q < 4; ++q) {
-          const int nn = n + (q >> 1) * 8;
-          if (nn < Nout) {
-            const float x = fmaxf(v[gi][q] * a, 0.f);
-            p.out[(static_cast<long>(b) * R + r0 + (q & 1)) * Nout + nn] =
-                __float2bfloat16_rn(x * x);
-          }
-        }
-      } else {
-        const int rows = p.block_rows[b];
-        const int n = c * kTileN + warp * 16 + g8;
-#pragma unroll
-        for (int h = 0; h < 2; ++h) {
-          const int r = r0 + h;
-          if (r < rows) {
-            const long f = p.rowmap[b * R + r];
-            if (n < Nout)
-              p.out[f * Nout + n] = __float2bfloat16_rn(v[gi][h] * a);
-            if (n + 8 < Nout)
-              p.out[f * Nout + n + 8] = __float2bfloat16_rn(v[gi][2 + h] * a);
-          }
-        }
-      }
-    }
-  };
-
-  const uint32_t sw_c = sbase + warp * 512 + lane * 16;
-  const uint32_t ss_c = sbase + kWBytes + warp * 128 + g8 * 16;
-  const uint32_t sa_c =
-      sbase + kRec + (lane & 7) * kActPitch + (lane >> 3) * 16;
-  float acc[G][4];
-#pragma unroll
-  for (int gi = 0; gi < G; ++gi)
-#pragma unroll
-    for (int q = 0; q < 4; ++q) acc[gi][q] = 0.f;
-
-#pragma unroll
-  for (int i = 0; i < STAGES - 1; ++i) {
-    if (u0 + i < u1) issue();
-    commit();
-  }
-  uint32_t cslot = 0;
-  int u = u0;
-  int tile = u0 / S;
-  while (true) {
-    const int tstart = tile * S;
-    const int u_end = min(tstart + S, u1);
-    const int seg = u;
-    for (; u < u_end; ++u) {
-      wait_group<STAGES - 2>();
-      __syncthreads();
-      if (u + STAGES - 1 < u1) issue();
-      commit();
-      const uint32_t sb = cslot;
-      cslot = cslot + kStage == kRing ? 0u : cslot + kStage;
-      bool hf = false;
-      if constexpr (KT) hf = half && u - tstart == S - 1;
-      uint32_t wq[8], sq[4];
-      lds128(wq, sw_c + sb);
-      lds128(wq + 4, sw_c + sb + kHalfW);
-      lds128(sq, ss_c + sb);
-#pragma unroll
-      for (int j2 = 0; j2 < 4; ++j2) {
-        if (KT && j2 == 2 && hf) break;  // a 5120 B tail record: k 0..63 only
-        uint32_t bf[G][4];
-#pragma unroll
-        for (int gi = 0; gi < G; ++gi)
-          ldsm_x4(bf[gi], sa_c + sb + gi * 8 * kActPitch + j2 * 64);
-#pragma unroll
-        for (int h = 0; h < 2; ++h) {
-          const uint32_t s2 = h ? u5_odd(sq[j2]) : u5_even(sq[j2]);
-          uint32_t d[4], a[4];
-          cvt31(wq[j2 * 2 + h], d);
-          a[0] = mul_lo(d[0], s2);
-          a[1] = mul_hi(d[1], s2);
-          a[2] = mul_lo(d[2], s2);
-          a[3] = mul_hi(d[3], s2);
-#pragma unroll
-          for (int gi = 0; gi < G; ++gi) mma_bf16(acc[gi], a, bf[gi] + 2 * h);
-        }
-      }
-    }
-    const bool tile_end = u_end == tstart + S;
-    const int cb = tile / chunks, cc = tile - cb * chunks;
-    if (seg == tstart && tile_end) {
-      write_tile(cb, cc, acc);
-    } else {
-      // Partial tile: slot 0 if the tile began at or before this CTA's range,
-      // else 1.
-      const int slot = tstart <= u0 ? 0 : 1;
-      float* wsl =
-          p.ws + (static_cast<long>(blockIdx.x) * 2 + slot) * R * kTileN;
-#pragma unroll
-      for (int gi = 0; gi < G; ++gi)
-#pragma unroll
-        for (int q = 0; q < 4; ++q)
-          wsl[(gi * 8 + 2 * tq + (q & 1)) * kTileN + warp * 16 + g8 +
-              (q >> 1) * 8] = acc[gi][q];
-      __threadfence();
-      __syncthreads();
-      if (tid == 0) {
-        const int steps = u_end - seg;
-        const int old = atomicAdd(p.cnt + tile, steps);
-        last_flag = (old + steps == S);
-      }
-      __syncthreads();
-      if (last_flag) {
-        __threadfence();
-        float v[G][4];
-#pragma unroll
-        for (int gi = 0; gi < G; ++gi)
-#pragma unroll
-          for (int q = 0; q < 4; ++q) v[gi][q] = 0.f;
-        const int cf = tstart / L, cl = (tstart + S - 1) / L;
-        for (int ci = cf; ci <= cl; ++ci) {
-          const int sl = tstart <= ci * L ? 0 : 1;
-          const float* src =
-              p.ws + (static_cast<long>(ci) * 2 + sl) * R * kTileN;
-#pragma unroll
-          for (int gi = 0; gi < G; ++gi)
-#pragma unroll
-            for (int q = 0; q < 4; ++q)
-              v[gi][q] += __ldcg(src + (gi * 8 + 2 * tq + (q & 1)) * kTileN +
-                                 warp * 16 + g8 + (q >> 1) * 8);
-        }
-        write_tile(cb, cc, v);
-        if (tid == 0) p.cnt[tile] = 0;
-      }
-    }
-#pragma unroll
-    for (int gi = 0; gi < G; ++gi)
-#pragma unroll
-      for (int q = 0; q < 4; ++q) acc[gi][q] = 0.f;
-    if (u >= u1) break;
-    ++tile;
-  }
-}
-
-// 2D warp tiles for many rows per block. The CTA still covers R rows x one
-// 128-column record, but warp w takes the record's warp slots [wc SC, wc SC +
-// SC) (16 columns each) and rows [wt TW, wt TW + TW), wc = w % WC, wt = w / WC.
-// An activation fragment then feeds SC MMAs (gemm: 1), so the activation
-// shared-memory reads per MMA drop by SC; a dequantized weight fragment feeds
-// TW / 8 MMAs (gemm: R / 8). Issue side, records, stream-K partials and outputs
-// are gemm's.
-template <int R, int WC, int NW, int ACT, int STAGES, bool KT>
-__device__ __forceinline__ void gemm2d_body(GemmParams const& p) {
-  using C = Cfg<R>;
+template <int R, int WC, int NW, int ACT, int STAGES, bool KT, int NC = 1>
+__device__ __forceinline__ void gemm_body(GemmParams const& p) {
+  using C = Cfg<R, NC>;
   constexpr int NT = NW * 32;
-  constexpr int SC = 8 / WC, WT = NW / WC, TW = R / WT, G = TW / 8;
+  constexpr int SC = 8 * NC / WC, WT = NW / WC, TW = R / WT, G = TW / 8;
   constexpr int RP =
       NT / 16;  // activation rows per pass: 16 threads x 16 B per 256 B row
   constexpr int WP = kWBytes / (NT * 16);  // weight cp16 per thread and record
-  static_assert(
-      (WC == 2 || WC == 4) && NW % WC == 0 && R % RP == 0 && TW % 8 == 0,
-      "2D tile");
+  static_assert((WC == 4 || WC == 8) && NW % WC == 0 &&
+                    (R % RP == 0 || RP % R == 0) && TW % 8 == 0,
+                "warp tile");
   static_assert(
       kWBytes % (NT * 16) == 0 && kHalfW % (NT * 16) == 0 && kSBytes / 16 <= NT,
       "issue");
@@ -453,81 +238,91 @@ __device__ __forceinline__ void gemm2d_body(GemmParams const& p) {
   // chunk q of row r at chunk q ^ (r & 7) (a permutation inside the chunk's 128
   // B half), in place of the 272 B padded pitch. The cp.async writes and the
   // ldmatrix reads take the same mapping; the stage keeps its R x 272 B.
-  constexpr bool SWZ = R == 64 && NW == 4;
+  constexpr bool SWZ = R >= 64;
   constexpr int AP = SWZ ? 256 : kActPitch;
   static_assert(!SWZ || (RP % 8 == 0 && TW % 8 == 0),
                 "swizzle: r & 7 is fixed per thread and per lane");
   constexpr uint32_t kStage = C::kStageBytes;
   constexpr uint32_t kRing = STAGES * kStage;
   extern __shared__ __align__(128) uint8_t smem[];
-  __shared__ int last_flag;
   const int nb = *p.nblocks;
-  const int top_k = p.top_k, K = p.K;
-  const int chunks = p.N / kTileN;
+  const int K = p.K;
+  const int record_chunks = p.N / kTileN;
+  const int chunks = (record_chunks + NC - 1) / NC;
   const int S = KT ? (K + kTileK - 1) / kTileK : K / kTileK;
   const int kr = K - (S - 1) * kTileK;
   const bool half = KT && kr <= kTileK / 2;
   const long cbytes =
       static_cast<long>(S - 1) * kRec + (half ? kTailRec : kRec);
-  const int upb = chunks * S;
-  const int total = nb * upb;
-  // units_per_cta < 0: persistent whole tiles, ceil(tiles / grid) per CTA from
-  // the device nb
-  const int L = p.units_per_cta > 0 ? p.units_per_cta
-                : p.units_per_cta < 0
-                    ? S * ((nb * chunks + static_cast<int>(gridDim.x) - 1) /
-                           static_cast<int>(gridDim.x))
-                    : (total + gridDim.x - 1) / gridDim.x;
-  const int u0 = blockIdx.x * L;
-  const int u1 = min(u0 + L, total);
-  if (u0 >= u1) return;
+  if (blockIdx.x >= nb * chunks) return;
+  const int upb = record_chunks * S;
+  const int u0 = 0, u1 = S;
   const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, g8 = lane >> 2,
             tq = lane & 3;
   const int wc = warp % WC, wt = warp / WC;
   const uint32_t sbase = static_cast<uint32_t>(__cvta_generic_to_shared(smem));
 
-  int ib = u0 / upb;
-  int iw = u0 - ib * upb;
-  int iks = iw % S;
+  const int ib = blockIdx.x / chunks;
+  int iw = (blockIdx.x % chunks) * NC * S;
+  int iks = 0;
   uint32_t islot = 0;
-  const uint8_t* gws = nullptr;
-  constexpr int RJ = R / RP;
-  const __nv_bfloat16* gact[RJ];
+  const uint8_t* gws[NC];
+  bool valid_record[NC];
+  constexpr int RJ = R > RP ? R / RP : 1;
+  // Linear GEMM2 (ACT 0) at R 64, 2 stages: the RJ activation-row source
+  // pointers differ only by a constant RP * K, so keep one and rebuild the
+  // rest from it to free registers. Other ACT/R/STAGES keep gact[RJ].
+  constexpr bool kLinSingle = ACT == 0 && R == 64 && STAGES == 2;
+  constexpr int GJ = kLinSingle ? 1 : RJ;
+  const __nv_bfloat16* gact[GJ];
   bool avalid[RJ];
+  // SC 4: the rows as indices (-1: absent), the source formed at each issue
+  constexpr bool kRowIndex = SC == 4 && ACT != 0;
+  int arow[kRowIndex ? RJ : 1];
 #pragma unroll
   for (int j = 0; j < RJ; ++j) avalid[j] = true;
   const int ar = tid >> 4, aq = tid & 15;
+  const bool has_act = R >= RP || tid < R * 16;
   const bool has_s = tid < kSBytes / 16;
   const uint32_t sw_i = sbase + tid * 16;
   // rows ar + RP j share ar & 7 (RP % 8 == 0), so the swizzled chunk is one
   // constant per thread
-  const uint32_t sa_i =
-      sbase + kRec + ar * AP + (SWZ ? (aq ^ (ar & 7)) : aq) * 16;
+  const uint32_t sa_i = sbase + NC * kRec + (has_act ? ar : 0) * AP +
+                        (SWZ ? (aq ^ (ar & 7)) : aq) * 16;
   auto load_block = [&]() {
     const long e = p.block_expert[ib];
     const int brows = ACT == 0 ? p.block_rows[ib] : R;
-    if constexpr (KT) {
-      const int c = iw / S;
-      gws = p.w + (e * chunks + c) * cbytes +
-            static_cast<long>(iw - c * S) * kRec + tid * 16;
-    } else {
-      gws = p.w + (e * upb + iw) * kRec + tid * 16;
+#pragma unroll
+    for (int rec = 0; rec < NC; ++rec) {
+      const int c = iw / S + rec;
+      valid_record[rec] = NC == 1 || c < record_chunks;
+      if constexpr (KT) {
+        gws[rec] = p.w + (e * record_chunks + c) * cbytes + tid * 16;
+      } else {
+        gws[rec] = p.w + (e * upb + iw + rec * S) * kRec + tid * 16;
+      }
     }
 #pragma unroll
     for (int j = 0; j < RJ; ++j) {
       const int r = ar + RP * j;
-      long row;
-      if constexpr (ACT != 0) {
-        const int f = p.rowmap[ib * R + r];
-        avalid[j] = f >= 0;
-        row = avalid[j] ? f / top_k : 0;
-      } else {
-        row = static_cast<long>(ib) * R + r;
-        avalid[j] =
-            r <
-            brows;  // a padding row of the intermediate: zero-filled, not read
+      long row = 0;
+      if (has_act) {
+        if constexpr (ACT != 0) {
+          const int f = p.rowmap[ib * R + r];
+          avalid[j] = f >= 0;
+          row = avalid[j] ? p.topk_dm.div(f) : 0;
+        } else {
+          row = static_cast<long>(ib) * R + r;
+          avalid[j] = r < brows;  // a padding row of the intermediate:
+                                  // zero-filled, not read
+        }
       }
-      gact[j] = p.act + row * K + aq * 8 + iks * kTileK;
+      if constexpr (kLinSingle) {
+        if (j == 0) gact[0] = p.act + row * K + aq * 8 + iks * kTileK;
+      } else {
+        gact[j] = p.act + row * K + aq * 8 + iks * kTileK;
+      }
+      if constexpr (kRowIndex) arow[j] = avalid[j] ? static_cast<int>(row) : -1;
     }
   };
   load_block();
@@ -538,15 +333,45 @@ __device__ __forceinline__ void gemm2d_body(GemmParams const& p) {
       hf = tl && half;
     }
 #pragma unroll
-    for (int q = 0; q < WP; ++q) {
-      const int o = q * NT * 16;
-      if (!hf || o < kHalfW) cp16(sw_i + islot + o, gws + o);
+    for (int rec = 0; rec < NC; ++rec) {
+      const uint32_t dst = sw_i + islot + rec * kRec;
+      const uint8_t* src = valid_record[rec] ? gws[rec] : p.w;
+#pragma unroll
+      for (int q = 0; q < WP; ++q) {
+        const int o = q * NT * 16;
+        if (!hf || o < kHalfW) cp16z(dst + o, src + o, valid_record[rec]);
+      }
+      if (has_s)
+        cp16z(dst + kWBytes, src + (hf ? kHalfW : kWBytes), valid_record[rec]);
     }
-    if (has_s) cp16(sw_i + islot + kWBytes, gws + (hf ? kHalfW : kWBytes));
 #pragma unroll
     for (int j = 0; j < RJ; ++j) {
+      if (!has_act) continue;
       const uint32_t sa = sa_i + j * RP * AP + islot;
-      if constexpr (KT) {
+      if constexpr (kRowIndex) {
+        const bool av = arow[j] >= 0;
+        const __nv_bfloat16* ga = p.act +
+                                  static_cast<long>(av ? arow[j] : 0) * K +
+                                  aq * 8 + iks * kTileK;
+        if constexpr (KT) {
+          const bool in = !tl || aq * 8 < kr;
+          if (!hf || aq < 8) cp16z(sa, in ? ga : p.act, av && in);
+        } else {
+          cp16z(sa, ga, av);
+        }
+      } else if constexpr (kLinSingle) {
+        const __nv_bfloat16* gj;
+        if constexpr (kLinSingle)
+          gj = gact[0] + static_cast<long>(j) * RP * K;
+        else
+          gj = gact[j];
+        if constexpr (KT) {
+          const bool in = !tl || aq * 8 < kr;
+          if (!hf || aq < 8) cp16z(sa, in ? gj : p.act, avalid[j] && in);
+        } else {
+          cp16z(sa, gj, avalid[j]);
+        }
+      } else if constexpr (KT) {
         const bool in = !tl || aq * 8 < kr;
         if (!hf || aq < 8) cp16z(sa, in ? gact[j] : p.act, avalid[j] && in);
       } else {
@@ -554,20 +379,15 @@ __device__ __forceinline__ void gemm2d_body(GemmParams const& p) {
       }
     }
     islot = islot + kStage == kRing ? 0u : islot + kStage;
-    gws += hf ? kTailRec : kRec;
 #pragma unroll
-    for (int j = 0; j < RJ; ++j) gact[j] += kTileK;
-    ++iw;
-    if (++iks == S) {
-      iks = 0;
+    for (int rec = 0; rec < NC; ++rec) gws[rec] += hf ? kTailRec : kRec;
+    if constexpr (kLinSingle) {
+      gact[0] += kTileK;
+    } else {
 #pragma unroll
-      for (int j = 0; j < RJ; ++j) gact[j] -= S * kTileK;
-      if (iw == upb) {
-        iw = 0;
-        ++ib;
-        if (ib < nb) load_block();
-      }
+      for (int j = 0; j < RJ; ++j) gact[j] += kTileK;
     }
+    ++iks;
   };
 
   // Writes one tile from per-lane fp32 values v[SC][G][4] (summed over k);
@@ -576,6 +396,44 @@ __device__ __forceinline__ void gemm2d_body(GemmParams const& p) {
   auto write_tile = [&](int b, int c, float (*v)[G][4]) {
     const float a = p.alpha[p.block_expert[b]];
     const int Nout = p.Nout;
+    if constexpr (ACT == 0 && SC == 4) {
+      // v[s][gi][2 hh + h] is column ws 16 + 8 hh + g8, row gi 8 + 2 tq + h:
+      // per (s, gi, hh) an 8 x 8 piece, columns x rows, one bf16 pair (rows 2
+      // tq, 2 tq + 1) per lane. Transposed, lane (g8, tq) holds row gi 8 + g8,
+      // columns 8 hh + 2 tq and + 1: one 4 B store (Nout even, out 4 B
+      // aligned).
+      if ((Nout & 1) == 0 && (reinterpret_cast<uintptr_t>(p.out) & 3) == 0) {
+        const int rows = p.block_rows[b];
+        int drow[G];
+#pragma unroll
+        for (int gi = 0; gi < G; ++gi)
+          drow[gi] = p.rowmap[b * R + wt * TW + gi * 8 + g8];
+#pragma unroll
+        for (int gi = 0; gi < G; ++gi)
+          if (wt * TW + gi * 8 + g8 >= rows) drow[gi] = -1;
+        const int n0 = c * NC * kTileN + wc * SC * 16 + 2 * tq;
+#pragma unroll
+        for (int gi = 0; gi < G; ++gi) {
+          uint32_t t[SC][2];
+#pragma unroll
+          for (int s = 0; s < SC; ++s)
+#pragma unroll
+            for (int hh = 0; hh < 2; ++hh)
+              t[s][hh] = movm_trans(
+                  pack_bf16x2(v[s][gi][2 * hh] * a, v[s][gi][2 * hh + 1] * a));
+          if (drow[gi] >= 0) {
+            __nv_bfloat16* o = p.out + static_cast<long>(drow[gi]) * Nout + n0;
+#pragma unroll
+            for (int s = 0; s < SC; ++s)
+#pragma unroll
+              for (int hh = 0; hh < 2; ++hh)
+                if (n0 + s * 16 + hh * 8 < Nout)
+                  *reinterpret_cast<uint32_t*>(o + s * 16 + hh * 8) = t[s][hh];
+          }
+        }
+        return;
+      }
+    }
     // GEMM2 scatters rows: every destination row is loaded first (independent
     // loads within the block), so no load waits behind the stores before it; -1
     // marks a padding row.
@@ -600,18 +458,22 @@ __device__ __forceinline__ void gemm2d_body(GemmParams const& p) {
       for (int gi = 0; gi < G; ++gi) {
         const int r0 = wt * TW + gi * 8 + 2 * tq;
         if constexpr (ACT == 1) {
-          const int i = c * 64 + ws * 8 + g8;
+          const int i = c * NC * 64 + ws * 8 + g8;
           if (i < Nout) {
 #pragma unroll
             for (int h = 0; h < 2; ++h) {
               const float gt = v[s][gi][h] * a, up = v[s][gi][2 + h] * a;
-              const float y = gt / (1.f + __expf(-gt)) * up;
+              float y;
+              if constexpr (SC == 4)  // GEMM1 of rs2_moe_gemm_w64s
+                y = silu_div(gt, 1.f + __expf(-gt)) * up;
+              else
+                y = gt / (1.f + __expf(-gt)) * up;
               p.out[(static_cast<long>(b) * R + r0 + h) * Nout + i] =
                   __float2bfloat16_rn(y);
             }
           }
         } else if constexpr (ACT == 2) {
-          const int n = c * kTileN + ws * 16 + g8;
+          const int n = c * NC * kTileN + ws * 16 + g8;
 #pragma unroll
           for (int q = 0; q < 4; ++q) {
             const int nn = n + (q >> 1) * 8;
@@ -622,7 +484,7 @@ __device__ __forceinline__ void gemm2d_body(GemmParams const& p) {
             }
           }
         } else {
-          const int n = c * kTileN + ws * 16 + g8;
+          const int n = c * NC * kTileN + ws * 16 + g8;
 #pragma unroll
           for (int h = 0; h < 2; ++h) {
             if (dst[gi][h] >= 0) {
@@ -639,17 +501,19 @@ __device__ __forceinline__ void gemm2d_body(GemmParams const& p) {
     }
   };
 
-  const uint32_t sw_c = sbase + wc * SC * 512 + lane * 16;
-  const uint32_t ss_c = sbase + kWBytes + wc * SC * 128 + g8 * 16;
+  const uint32_t sw_c =
+      sbase + (wc * SC / 8) * kRec + (wc * SC % 8) * 512 + lane * 16;
+  const uint32_t ss_c =
+      sbase + (wc * SC / 8) * kRec + kWBytes + (wc * SC % 8) * 128 + g8 * 16;
   const uint32_t sa_c =
-      sbase + kRec + (wt * TW + (lane & 7)) * kActPitch + (lane >> 3) * 16;
+      sbase + NC * kRec + (wt * TW + (lane & 7)) * kActPitch + (lane >> 3) * 16;
   // Swizzled: a lane's ldmatrix rows wt TW + gi 8 + (lane & 7) share r & 7 =
   // lane & 7, and step j2 reads logical chunk (lane >> 3) + 4 j2: j2 even sits
   // at sa_s0 + (j2 >> 1) 128 and j2 odd (chunk bit 2 set, which the XOR flips)
   // at sa_s1 + (j2 >> 1) 128
-  const uint32_t sa_s0 = sbase + kRec + (wt * TW + (lane & 7)) * AP +
+  const uint32_t sa_s0 = sbase + NC * kRec + (wt * TW + (lane & 7)) * AP +
                          (((lane >> 3)) ^ (lane & 7)) * 16;
-  const uint32_t sa_s1 = sbase + kRec + (wt * TW + (lane & 7)) * AP +
+  const uint32_t sa_s1 = sbase + NC * kRec + (wt * TW + (lane & 7)) * AP +
                          (((lane >> 3) + 4) ^ (lane & 7)) * 16;
   float acc[SC][G][4];
 #pragma unroll
@@ -663,43 +527,140 @@ __device__ __forceinline__ void gemm2d_body(GemmParams const& p) {
   // dropped. A warp runs the ldmatrix and MMA of its 8-row groups only up to
   // its last real row, in quarters of its G groups, so the group count is a
   // constant in each copy of the step and acc stays in registers.
-  constexpr int Q = G % 4 == 0 ? 4 : 1;
+  constexpr int Q = R == 96 ? 6 : (SC > 1 && G % 4 == 0 ? 4 : 1);
   auto step = [&](auto ngc, uint32_t sb, bool hf) {
     constexpr int NG = decltype(ngc)::value;
-    uint32_t wq[SC][8], sq[SC][4];
-#pragma unroll
-    for (int s = 0; s < SC; ++s) {
-      lds128(wq[s], sw_c + sb + s * 512);
-      lds128(wq[s] + 4, sw_c + sb + s * 512 + kHalfW);
-      lds128(sq[s], ss_c + sb + s * 128);
-    }
-#pragma unroll
-    for (int j2 = 0; j2 < 4; ++j2) {
-      if (KT && j2 == 2 && hf) break;  // a 5120 B tail record: k 0..63 only
-      uint32_t bf[NG][4];
-#pragma unroll
-      for (int gi = 0; gi < NG; ++gi) {
-        if constexpr (SWZ) {
-          ldsm_x4(bf[gi], ((j2 & 1) ? sa_s1 : sa_s0) + sb + gi * 8 * AP +
-                              (j2 >> 1) * 128);
-        } else {
-          ldsm_x4(bf[gi], sa_c + sb + gi * 8 * kActPitch + j2 * 64);
-        }
-      }
-#pragma unroll
-      for (int h = 0; h < 2; ++h) {
+    if constexpr (SC == 4) {
+      // Four 16-column slots per warp (128 fp32 accumulators): a slot's weights
+      // (8 B) and scales (4 B) of one k32 are read one k32 ahead, in place of
+      // the whole k128 up front. Same operands, same MMA order.
+      static_assert(
+          G <= 8 && R == 64 && STAGES == 2,
+          "SC 4 step: the k16 activation fragments of R 64, 2 stages");
+      uint32_t wn[SC][2], sn[SC];
+      auto load_ws = [&](int j2) {
 #pragma unroll
         for (int s = 0; s < SC; ++s) {
-          const uint32_t s2 = h ? u5_odd(sq[s][j2]) : u5_even(sq[s][j2]);
-          uint32_t d[4], a[4];
-          cvt31(wq[s][j2 * 2 + h], d);
-          a[0] = mul_lo(d[0], s2);
-          a[1] = mul_hi(d[1], s2);
-          a[2] = mul_lo(d[2], s2);
-          a[3] = mul_hi(d[3], s2);
+          lds64v(wn[s],
+                 sw_c + sb + s * 512 + (j2 >> 1) * kHalfW + (j2 & 1) * 8);
+          lds32v(sn + s, ss_c + sb + s * 128 + j2 * 4);
+        }
+      };
+      load_ws(0);
+#pragma unroll
+      for (int j2 = 0; j2 < 4; ++j2) {
+        if (KT && j2 == 2 && hf) break;  // a 5120 B tail record: k 0..63 only
+        uint32_t wq[SC][2], sq[SC];
+#pragma unroll
+        for (int s = 0; s < SC; ++s) {
+          wq[s][0] = wn[s][0];
+          wq[s][1] = wn[s][1];
+          sq[s] = sn[s];
+        }
+        if (j2 < 3 && !(KT && j2 == 1 && hf)) load_ws(j2 + 1);
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+        constexpr bool kV3 = ACT != 0;  // sm_90 G1: v3 code (x4 spills there)
+#else
+        constexpr bool kV3 = false;
+#endif
+        if constexpr (kV3) {
+          uint32_t bf[NG][2];
+#pragma unroll
+          for (int h = 0; h < 2; ++h) {
+#pragma unroll
+            for (int gi = 0; gi < NG; ++gi) {
+              const uint32_t address =
+                  sbase + NC * kRec + (wt * TW + gi * 8 + (lane & 7)) * AP +
+                  (((((lane >> 3) & 1) + 2 * h + 4 * j2) ^ (lane & 7)) * 16);
+              ldsm_x2(bf[gi], address + sb);
+            }
+#pragma unroll
+            for (int s = 0; s < SC; ++s) {
+              const uint32_t s2 = h ? u5_odd(sq[s]) : u5_even(sq[s]);
+              uint32_t d[4], a[4];
+              cvt31(wq[s][h], d);
+              a[0] = mul_lo(d[0], s2);
+              a[1] = mul_hi(d[1], s2);
+              a[2] = mul_lo(d[2], s2);
+              a[3] = mul_hi(d[3], s2);
+#pragma unroll
+              for (int gi = 0; gi < NG; ++gi) mma_bf16(acc[s][gi], a, bf[gi]);
+            }
+          }
+        } else {
+          // One ldmatrix x4 per 8-row group and k32: chunks 4 j2 .. 4 j2 + 3 of
+          // the row (both k16 halves; bf[gi] + 2 h is half h), in place of one
+          // x2 per half. Same fragments and MMA order, half the ldmatrix
+          // instructions.
+          uint32_t bf[NG][4];
 #pragma unroll
           for (int gi = 0; gi < NG; ++gi)
-            mma_bf16(acc[s][gi], a, bf[gi] + 2 * h);
+            ldsm_x4(bf[gi], ((j2 & 1) ? sa_s1 : sa_s0) + sb + gi * 8 * AP +
+                                (j2 >> 1) * 128);
+#pragma unroll
+          for (int h = 0; h < 2; ++h) {
+#pragma unroll
+            for (int s = 0; s < SC; ++s) {
+              const uint32_t s2 = h ? u5_odd(sq[s]) : u5_even(sq[s]);
+              uint32_t d[4], a[4];
+              cvt31(wq[s][h], d);
+              a[0] = mul_lo(d[0], s2);
+              a[1] = mul_hi(d[1], s2);
+              a[2] = mul_lo(d[2], s2);
+              a[3] = mul_hi(d[3], s2);
+#pragma unroll
+              for (int gi = 0; gi < NG; ++gi)
+                mma_bf16(acc[s][gi], a, bf[gi] + 2 * h);
+            }
+          }
+        }
+      }
+    } else {
+      uint32_t wq[SC][8], sq[SC][4];
+#pragma unroll
+      for (int s = 0; s < SC; ++s) {
+        lds128(wq[s], sw_c + sb + s * 512);
+        lds128(wq[s] + 4, sw_c + sb + s * 512 + kHalfW);
+        lds128(sq[s], ss_c + sb + s * 128);
+      }
+#pragma unroll
+      for (int j2 = 0; j2 < 4; ++j2) {
+        if (KT && j2 == 2 && hf) break;  // a 5120 B tail record: k 0..63 only
+        constexpr bool half_fragment = G > 8 || (R == 64 && STAGES == 2);
+        uint32_t bf[NG][half_fragment ? 2 : 4];
+        auto load_activation = [&](int h) {
+#pragma unroll
+          for (int gi = 0; gi < NG; ++gi) {
+            if constexpr (half_fragment) {
+              const uint32_t address =
+                  sbase + NC * kRec + (wt * TW + gi * 8 + (lane & 7)) * AP +
+                  (((((lane >> 3) & 1) + 2 * h + 4 * j2) ^ (lane & 7)) * 16);
+              ldsm_x2(bf[gi], address + sb);
+            } else if constexpr (SWZ) {
+              ldsm_x4(bf[gi], ((j2 & 1) ? sa_s1 : sa_s0) + sb + gi * 8 * AP +
+                                  (j2 >> 1) * 128);
+            } else {
+              ldsm_x4(bf[gi], sa_c + sb + gi * 8 * kActPitch + j2 * 64);
+            }
+          }
+        };
+        if constexpr (!half_fragment) load_activation(0);
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+          if constexpr (half_fragment) load_activation(h);
+#pragma unroll
+          for (int s = 0; s < SC; ++s) {
+            const uint32_t s2 = h ? u5_odd(sq[s][j2]) : u5_even(sq[s][j2]);
+            uint32_t d[4], a[4];
+            cvt31(wq[s][j2 * 2 + h], d);
+            a[0] = mul_lo(d[0], s2);
+            a[1] = mul_hi(d[1], s2);
+            a[2] = mul_lo(d[2], s2);
+            a[3] = mul_hi(d[3], s2);
+#pragma unroll
+            for (int gi = 0; gi < NG; ++gi)
+              mma_bf16(acc[s][gi], a, bf[gi] + (half_fragment ? 0 : 2 * h));
+          }
         }
       }
     }
@@ -712,14 +673,17 @@ __device__ __forceinline__ void gemm2d_body(GemmParams const& p) {
   }
   uint32_t cslot = 0;
   int u = u0;
-  int tile = u0 / S;
-  while (true) {
-    const int tstart = tile * S;
-    const int u_end = min(tstart + S, u1);
-    const int seg = u;
+  const int tile = blockIdx.x;
+  {
+    const int tstart = 0;
+    const int u_end = S;
     // quarters of this warp's TW rows that hold a real row of the tile's block
-    const int nq = min(
-        Q, (max(0, p.block_rows[tile / chunks] - wt * TW) * Q + TW - 1) / TW);
+    const int nq =
+        SC == 1
+            ? 1
+            : min(Q,
+                  (max(0, p.block_rows[tile / chunks] - wt * TW) * Q + TW - 1) /
+                      TW);
     for (; u < u_end; ++u) {
       wait_group<STAGES - 2>();
       __syncthreads();
@@ -746,76 +710,54 @@ __device__ __forceinline__ void gemm2d_body(GemmParams const& p) {
             step(std::integral_constant<int, G>{}, sb, hf);
             break;
         }
+      } else if constexpr (Q == 6) {
+        switch (nq) {
+          case 0:
+            break;
+          case 1:
+            step(std::integral_constant<int, G / 6>{}, sb, hf);
+            break;
+          case 2:
+            step(std::integral_constant<int, 2 * G / 6>{}, sb, hf);
+            break;
+          case 3:
+            step(std::integral_constant<int, 3 * G / 6>{}, sb, hf);
+            break;
+          case 4:
+            step(std::integral_constant<int, 4 * G / 6>{}, sb, hf);
+            break;
+          case 5:
+            step(std::integral_constant<int, 5 * G / 6>{}, sb, hf);
+            break;
+          default:
+            step(std::integral_constant<int, G>{}, sb, hf);
+            break;
+        }
+      } else if constexpr (Q == 3) {
+        switch (nq) {
+          case 0:
+            break;
+          case 1:
+            step(std::integral_constant<int, G / 3>{}, sb, hf);
+            break;
+          case 2:
+            step(std::integral_constant<int, 2 * G / 3>{}, sb, hf);
+            break;
+          default:
+            step(std::integral_constant<int, G>{}, sb, hf);
+            break;
+        }
       } else if (nq > 0) {
         step(std::integral_constant<int, G>{}, sb, hf);
       }
     }
-    const bool tile_end = u_end == tstart + S;
-    const int cb = tile / chunks, cc = tile - cb * chunks;
-    if (seg == tstart && tile_end) {
-      write_tile(cb, cc, acc);
-    } else {
-      const int slot = tstart <= u0 ? 0 : 1;
-      float* wsl =
-          p.ws + (static_cast<long>(blockIdx.x) * 2 + slot) * R * kTileN;
-#pragma unroll
-      for (int s = 0; s < SC; ++s)
-#pragma unroll
-        for (int gi = 0; gi < G; ++gi)
-#pragma unroll
-          for (int q = 0; q < 4; ++q)
-            wsl[(wt * TW + gi * 8 + 2 * tq + (q & 1)) * kTileN +
-                (wc * SC + s) * 16 + g8 + (q >> 1) * 8] = acc[s][gi][q];
-      __threadfence();
-      __syncthreads();
-      if (tid == 0) {
-        const int steps = u_end - seg;
-        const int old = atomicAdd(p.cnt + tile, steps);
-        last_flag = (old + steps == S);
-      }
-      __syncthreads();
-      if (last_flag) {
-        __threadfence();
-        float v[SC][G][4];
-#pragma unroll
-        for (int s = 0; s < SC; ++s)
-#pragma unroll
-          for (int gi = 0; gi < G; ++gi)
-#pragma unroll
-            for (int q = 0; q < 4; ++q) v[s][gi][q] = 0.f;
-        const int cf = tstart / L, cl = (tstart + S - 1) / L;
-        for (int ci = cf; ci <= cl; ++ci) {
-          const int sl = tstart <= ci * L ? 0 : 1;
-          const float* src =
-              p.ws + (static_cast<long>(ci) * 2 + sl) * R * kTileN;
-#pragma unroll
-          for (int s = 0; s < SC; ++s)
-#pragma unroll
-            for (int gi = 0; gi < G; ++gi)
-#pragma unroll
-              for (int q = 0; q < 4; ++q)
-                v[s][gi][q] += __ldcg(
-                    src + (wt * TW + gi * 8 + 2 * tq + (q & 1)) * kTileN +
-                    (wc * SC + s) * 16 + g8 + (q >> 1) * 8);
-        }
-        write_tile(cb, cc, v);
-        if (tid == 0) p.cnt[tile] = 0;
-      }
-    }
-#pragma unroll
-    for (int s = 0; s < SC; ++s)
-#pragma unroll
-      for (int gi = 0; gi < G; ++gi)
-#pragma unroll
-        for (int q = 0; q < 4; ++q) acc[s][gi][q] = 0.f;
-    if (u >= u1) break;
-    ++tile;
+    write_tile(tile / chunks, tile % chunks, acc);
   }
 }
 
-template <int R, int WC, int NW, int ACT, int STAGES, bool KT>
-__global__ void __launch_bounds__(NW * 32) gemm2d(GemmParams p) {
-  gemm2d_body<R, WC, NW, ACT, STAGES, KT>(p);
+template <int R, int WC, int NW, int ACT, int STAGES, bool KT, int NC = 1>
+__global__ void __launch_bounds__(NW * 32) gemm(GemmParams p) {
+  gemm_body<R, WC, NW, ACT, STAGES, KT, NC>(p);
 }
 
 // Routing -> blocks: one CTA, deterministic. Entry f = token * top_k + slot of
@@ -1080,36 +1022,37 @@ __global__ void finalize(const __nv_bfloat16* __restrict__ y,
   *reinterpret_cast<uint4*>(out + static_cast<long>(t) * H + c * 8) = o;
 }
 
-template <int R, int ACT, int STAGES, bool KT>
+template <int R, int WC, int NW, int ACT, int STAGES, bool KT, int NC = 1>
 void launch_gemm(GemmParams const& p, int grid, cudaStream_t st) {
-  static_assert(STAGES * Cfg<R>::kStageBytes <= kSmemLimit);
-  const int smem = STAGES * Cfg<R>::kStageBytes;
-  cudaFuncSetAttribute(gemm<R, ACT, STAGES, KT>,
+  static_assert(NC > 1 || STAGES * Cfg<R, NC>::kStageBytes <= kSmemLimit);
+  const int smem = STAGES * Cfg<R, NC>::kStageBytes;
+  STD_TORCH_CHECK(smem <= get_device_prop()->sharedMemPerBlockOptin,
+                  "rs2_moe_gemm: tile exceeds device shared memory");
+  cudaFuncSetAttribute(gemm<R, WC, NW, ACT, STAGES, KT, NC>,
                        cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
-  gemm<R, ACT, STAGES, KT><<<grid, kT, smem, st>>>(p);
+  gemm<R, WC, NW, ACT, STAGES, KT, NC><<<grid, NW * 32, smem, st>>>(p);
 }
 
-template <int R, int WC, int NW, int ACT, int STAGES, bool KT>
-void launch_gemm2d(GemmParams const& p, int grid, cudaStream_t st) {
-  static_assert(STAGES * Cfg<R>::kStageBytes <= kSmemLimit);
-  const int smem = STAGES * Cfg<R>::kStageBytes;
-  cudaFuncSetAttribute(gemm2d<R, WC, NW, ACT, STAGES, KT>,
-                       cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
-  gemm2d<R, WC, NW, ACT, STAGES, KT><<<grid, NW * 32, smem, st>>>(p);
-}
-
-// R 8, 16 and 32: gemm at 4 stages. R 64: gemm2d with 4 warps in one row group
-// at 3 stages (two CTAs per SM by shared memory).
-template <int ACT, bool KT>
+// R 8 and 32: 8 warps at 4 stages; R 16: 8 warps at 2 stages. R 96: two
+// records per CTA at 3 stages where the device allows it, else 2. R 64: one row
+// group at 3 stages (two CTAs per SM by shared memory); GEMM1 of
+// rs2_moe_gemm_stage2 runs it at 2 stages.
+template <int ACT, bool KT, bool G1S2 = false>
 void launch_tile(int R, GemmParams const& p, int grid, cudaStream_t st) {
   if (R == 8)
-    launch_gemm<8, ACT, 4, KT>(p, grid, st);
+    launch_gemm<8, 8, 8, ACT, 4, KT>(p, grid, st);
   else if (R == 16)
-    launch_gemm<16, ACT, 4, KT>(p, grid, st);
+    launch_gemm<16, 8, 8, ACT, 2, KT>(p, grid, st);
   else if (R == 32)
-    launch_gemm<32, ACT, 4, KT>(p, grid, st);
-  else
-    launch_gemm2d<64, 4, 4, ACT, 3, KT>(p, grid, st);
+    launch_gemm<32, 8, 8, ACT, 4, KT>(p, grid, st);
+  else if (R == 96) {
+    if (get_device_prop()->sharedMemPerBlockOptin >=
+        3 * Cfg<96, 2>::kStageBytes)
+      launch_gemm<96, 8, 8, ACT, 3, KT, 2>(p, grid, st);
+    else
+      launch_gemm<96, 8, 8, ACT, 2, KT, 2>(p, grid, st);
+  } else
+    launch_gemm<64, 4, 4, ACT, G1S2 && ACT != 0 ? 2 : 3, KT>(p, grid, st);
 }
 
 template <int R>
@@ -1144,9 +1087,9 @@ void rs2_moe_prep(torch::stable::Tensor const& topk_ids,
                   "rs2_moe_prep: int32 tensors");
   STD_TORCH_CHECK(topk_ids.is_contiguous(),
                   "rs2_moe_prep: topk_ids must be contiguous");
-  STD_TORCH_CHECK(
-      row_tile == 8 || row_tile == 16 || row_tile == 32 || row_tile == 64,
-      "rs2_moe_prep: row_tile");
+  STD_TORCH_CHECK(row_tile == 8 || row_tile == 16 || row_tile == 32 ||
+                      row_tile == 64 || row_tile == 96,
+                  "rs2_moe_prep: row_tile");
   const int R = static_cast<int>(row_tile);
   const int M = static_cast<int>(topk_ids.numel());
   const int e = static_cast<int>(num_experts);
@@ -1212,12 +1155,19 @@ void rs2_moe_prep(torch::stable::Tensor const& topk_ids,
                            smem);
   };
   big(prepx_count, sm_e);
-  big(prepx_scan<64>, sm_e);
-  big(prepx_place<64>, sm_p);
-  prepx_count<<<nC, 1024, sm_e, st>>>(ids, M, e, ch, pc);
-  prepx_scan<64>
-      <<<1, 1024, sm_e, st>>>(e, nC, pc, off, m, m + 1, m + 1 + nb, rm);
-  prepx_place<64><<<nC, 1024, sm_p, st>>>(ids, M, e, ch, W, Q, pc, off, rm);
+  auto route = [&](auto tile) {
+    constexpr int RT = decltype(tile)::value;
+    big(prepx_scan<RT>, sm_e);
+    big(prepx_place<RT>, sm_p);
+    prepx_count<<<nC, 1024, sm_e, st>>>(ids, M, e, ch, pc);
+    prepx_scan<RT>
+        <<<1, 1024, sm_e, st>>>(e, nC, pc, off, m, m + 1, m + 1 + nb, rm);
+    prepx_place<RT><<<nC, 1024, sm_p, st>>>(ids, M, e, ch, W, Q, pc, off, rm);
+  };
+  if (R == 96)
+    route(std::integral_constant<int, 96>{});
+  else
+    route(std::integral_constant<int, 64>{});
 }
 
 // One GEMM over the routed blocks. GEMM1 (activation 1: silu(gate) * up, 2:
@@ -1226,6 +1176,7 @@ void rs2_moe_prep(torch::stable::Tensor const& topk_ids,
 // and writes [tokens * top_k][Nout]. records: [E][N / 128 chunks][k steps]; N
 // is the record column count, a multiple of 128 (gated: gate and up each padded
 // to 64).
+template <bool G1S2 = false>
 void rs2_moe_gemm(torch::stable::Tensor const& records,
                   torch::stable::Tensor const& alpha,
                   torch::stable::Tensor const& act,
@@ -1246,9 +1197,9 @@ void rs2_moe_gemm(torch::stable::Tensor const& records,
       "rs2_moe_gemm: records, act and out must be contiguous");
   STD_TORCH_CHECK(N % kTileN == 0 && K % 16 == 0 && Nout % 8 == 0 && Nout <= N,
                   "rs2_moe_gemm: shape");
-  STD_TORCH_CHECK(
-      row_tile == 8 || row_tile == 16 || row_tile == 32 || row_tile == 64,
-      "rs2_moe_gemm: row_tile");
+  STD_TORCH_CHECK(row_tile == 8 || row_tile == 16 || row_tile == 32 ||
+                      row_tile == 64 || row_tile == 96,
+                  "rs2_moe_gemm: row_tile");
   STD_TORCH_CHECK(activation >= 0 && activation <= 2,
                   "rs2_moe_gemm: activation");
   const torch::stable::accelerator::DeviceGuard device_guard(
@@ -1266,24 +1217,28 @@ void rs2_moe_gemm(torch::stable::Tensor const& records,
   p.out = static_cast<__nv_bfloat16*>(out.mutable_data_ptr());
   p.ws = nullptr;  // one whole tile per CTA: no split-tile partials
   p.cnt = nullptr;
-  p.top_k = static_cast<int>(top_k);
+  if (activation != 0)
+    p.topk_dm = cutlass::FastDivmod(
+        static_cast<int>(top_k));  // G1 only; G2 keeps identity
   p.N = static_cast<int>(N);
   p.K = static_cast<int>(K);
   p.Nout = static_cast<int>(Nout);
   p.units_per_cta =
       static_cast<int>((K + kTileK - 1) / kTileK);  // all k steps of one tile
-  const int grid = static_cast<int>(max_blocks * (N / kTileN));
+  const int columns = static_cast<int>(N / kTileN);
+  const int grid = static_cast<int>(max_blocks) *
+                   (row_tile == 96 ? (columns + 1) / 2 : columns);
   const int R = static_cast<int>(row_tile);
   const bool kt = K % kTileK != 0;
   if (activation == 0)
-    kt ? launch_tile<0, true>(R, p, grid, st)
-       : launch_tile<0, false>(R, p, grid, st);
+    kt ? launch_tile<0, true, G1S2>(R, p, grid, st)
+       : launch_tile<0, false, G1S2>(R, p, grid, st);
   else if (activation == 1)
-    kt ? launch_tile<1, true>(R, p, grid, st)
-       : launch_tile<1, false>(R, p, grid, st);
+    kt ? launch_tile<1, true, G1S2>(R, p, grid, st)
+       : launch_tile<1, false, G1S2>(R, p, grid, st);
   else
-    kt ? launch_tile<2, true>(R, p, grid, st)
-       : launch_tile<2, false>(R, p, grid, st);
+    kt ? launch_tile<2, true, G1S2>(R, p, grid, st)
+       : launch_tile<2, false, G1S2>(R, p, grid, st);
 }
 
 // out[t][h] = sum_j topk_weights[t][j] * y[t * top_k + j][h], fp32 in slot
@@ -1314,8 +1269,173 @@ void rs2_moe_finalize(torch::stable::Tensor const& y,
       static_cast<int>(top_k), H);
 }
 
+// GEMM2 (activation 0) at row tile 64 with 2 stages instead of 3, on the same
+// gemm_body. Valid only for row_tile 64, activation 0.
+void rs2_moe_gemm_g2lin(torch::stable::Tensor const& records,
+                        torch::stable::Tensor const& alpha,
+                        torch::stable::Tensor const& act,
+                        torch::stable::Tensor const& meta,
+                        torch::stable::Tensor const& rowmap,
+                        torch::stable::Tensor& out, int64_t row_tile,
+                        int64_t activation, int64_t top_k, int64_t N, int64_t K,
+                        int64_t Nout, int64_t max_blocks) {
+  using namespace vllm::rs2_moe;
+  using torch::headeronly::ScalarType;
+  STD_TORCH_CHECK(records.scalar_type() == ScalarType::Byte &&
+                      alpha.scalar_type() == ScalarType::Float &&
+                      act.scalar_type() == ScalarType::BFloat16 &&
+                      out.scalar_type() == ScalarType::BFloat16,
+                  "rs2_moe_gemm_g2lin: dtypes");
+  STD_TORCH_CHECK(
+      records.is_contiguous() && act.is_contiguous() && out.is_contiguous(),
+      "rs2_moe_gemm_g2lin: records, act and out must be contiguous");
+  STD_TORCH_CHECK(N % kTileN == 0 && K % 16 == 0 && Nout % 8 == 0 && Nout <= N,
+                  "rs2_moe_gemm_g2lin: shape");
+  STD_TORCH_CHECK(row_tile == 64 && activation == 0,
+                  "rs2_moe_gemm_g2lin: only row_tile 64, activation 0");
+  const torch::stable::accelerator::DeviceGuard device_guard(
+      act.get_device_index());
+  const cudaStream_t st = get_current_cuda_stream(act.get_device_index());
+  const int* m = static_cast<const int*>(meta.const_data_ptr());
+  GemmParams p;
+  p.w = static_cast<const uint8_t*>(records.const_data_ptr());
+  p.alpha = static_cast<const float*>(alpha.const_data_ptr());
+  p.act = static_cast<const __nv_bfloat16*>(act.const_data_ptr());
+  p.nblocks = m;
+  p.block_expert = m + 1;
+  p.block_rows = m + 1 + max_blocks;
+  p.rowmap = static_cast<const int*>(rowmap.const_data_ptr());
+  p.out = static_cast<__nv_bfloat16*>(out.mutable_data_ptr());
+  p.ws = nullptr;
+  p.cnt = nullptr;
+  // G2 (activation 0): topk_dm unused on device; keep default identity (no host
+  // divmod).
+  p.N = static_cast<int>(N);
+  p.K = static_cast<int>(K);
+  p.Nout = static_cast<int>(Nout);
+  p.units_per_cta = static_cast<int>((K + kTileK - 1) / kTileK);
+  const int columns = static_cast<int>(N / kTileN);
+  const int grid = static_cast<int>(max_blocks) * columns;  // R 64 is not 96
+  const bool kt = K % kTileK != 0;
+  kt ? launch_gemm<64, 4, 4, 0, 2, true>(p, grid, st)
+     : launch_gemm<64, 4, 4, 0, 2, false>(p, grid, st);
+}
+
+// GEMM1 at row tile 64 with two 128-column records per CTA: 4 warps, each 64
+// rows x 64 columns (SC 4), two stages. Same R 64 blocks, rowmap and blocked
+// intermediate as rs2_moe_gemm_stage2.
+void rs2_moe_gemm_w64s(torch::stable::Tensor const& records,
+                       torch::stable::Tensor const& alpha,
+                       torch::stable::Tensor const& act,
+                       torch::stable::Tensor const& meta,
+                       torch::stable::Tensor const& rowmap,
+                       torch::stable::Tensor& out, int64_t row_tile,
+                       int64_t activation, int64_t top_k, int64_t N, int64_t K,
+                       int64_t Nout, int64_t max_blocks) {
+  using namespace vllm::rs2_moe;
+  using torch::headeronly::ScalarType;
+  STD_TORCH_CHECK(records.scalar_type() == ScalarType::Byte &&
+                      alpha.scalar_type() == ScalarType::Float &&
+                      act.scalar_type() == ScalarType::BFloat16 &&
+                      out.scalar_type() == ScalarType::BFloat16,
+                  "rs2_moe_gemm_w64s: dtypes");
+  STD_TORCH_CHECK(
+      records.is_contiguous() && act.is_contiguous() && out.is_contiguous(),
+      "rs2_moe_gemm_w64s: records, act and out must be contiguous");
+  STD_TORCH_CHECK(N % kTileN == 0 && K % 16 == 0 && Nout % 8 == 0 && Nout <= N,
+                  "rs2_moe_gemm_w64s: shape");
+  STD_TORCH_CHECK(row_tile == 64 && (activation == 1 || activation == 2),
+                  "rs2_moe_gemm_w64s: only row_tile 64, activation 1 or 2");
+  const torch::stable::accelerator::DeviceGuard device_guard(
+      act.get_device_index());
+  const cudaStream_t st = get_current_cuda_stream(act.get_device_index());
+  const int* m = static_cast<const int*>(meta.const_data_ptr());
+  GemmParams p;
+  p.w = static_cast<const uint8_t*>(records.const_data_ptr());
+  p.alpha = static_cast<const float*>(alpha.const_data_ptr());
+  p.act = static_cast<const __nv_bfloat16*>(act.const_data_ptr());
+  p.nblocks = m;
+  p.block_expert = m + 1;
+  p.block_rows = m + 1 + max_blocks;
+  p.rowmap = static_cast<const int*>(rowmap.const_data_ptr());
+  p.out = static_cast<__nv_bfloat16*>(out.mutable_data_ptr());
+  p.ws = nullptr;
+  p.cnt = nullptr;
+  p.topk_dm = cutlass::FastDivmod(static_cast<int>(top_k));
+  p.N = static_cast<int>(N);
+  p.K = static_cast<int>(K);
+  p.Nout = static_cast<int>(Nout);
+  p.units_per_cta = static_cast<int>((K + kTileK - 1) / kTileK);
+  const int columns = static_cast<int>(N / kTileN);
+  const int grid = static_cast<int>(max_blocks) * ((columns + 1) / 2);
+  const bool kt = K % kTileK != 0;
+  if (activation == 1)
+    kt ? launch_gemm<64, 4, 4, 1, 2, true, 2>(p, grid, st)
+       : launch_gemm<64, 4, 4, 1, 2, false, 2>(p, grid, st);
+  else
+    kt ? launch_gemm<64, 4, 4, 2, 2, true, 2>(p, grid, st)
+       : launch_gemm<64, 4, 4, 2, 2, false, 2>(p, grid, st);
+}
+
+// GEMM2 at row tile 64 with two 128-column records per CTA: 4 warps, each 64
+// rows x 64 columns (SC 4), two stages. Same R 64 blocks, blocked intermediate
+// and y2 rows as rs2_moe_gemm_g2lin. Valid only for row_tile 64, activation 0.
+void rs2_moe_gemm_g2w64x(torch::stable::Tensor const& records,
+                         torch::stable::Tensor const& alpha,
+                         torch::stable::Tensor const& act,
+                         torch::stable::Tensor const& meta,
+                         torch::stable::Tensor const& rowmap,
+                         torch::stable::Tensor& out, int64_t row_tile,
+                         int64_t activation, int64_t top_k, int64_t N,
+                         int64_t K, int64_t Nout, int64_t max_blocks) {
+  using namespace vllm::rs2_moe;
+  using torch::headeronly::ScalarType;
+  STD_TORCH_CHECK(records.scalar_type() == ScalarType::Byte &&
+                      alpha.scalar_type() == ScalarType::Float &&
+                      act.scalar_type() == ScalarType::BFloat16 &&
+                      out.scalar_type() == ScalarType::BFloat16,
+                  "rs2_moe_gemm_g2w64x: dtypes");
+  STD_TORCH_CHECK(
+      records.is_contiguous() && act.is_contiguous() && out.is_contiguous(),
+      "rs2_moe_gemm_g2w64x: records, act and out must be contiguous");
+  STD_TORCH_CHECK(N % kTileN == 0 && K % 16 == 0 && Nout % 8 == 0 && Nout <= N,
+                  "rs2_moe_gemm_g2w64x: shape");
+  STD_TORCH_CHECK(row_tile == 64 && activation == 0,
+                  "rs2_moe_gemm_g2w64x: only row_tile 64, activation 0");
+  const torch::stable::accelerator::DeviceGuard device_guard(
+      act.get_device_index());
+  const cudaStream_t st = get_current_cuda_stream(act.get_device_index());
+  const int* m = static_cast<const int*>(meta.const_data_ptr());
+  GemmParams p;
+  p.w = static_cast<const uint8_t*>(records.const_data_ptr());
+  p.alpha = static_cast<const float*>(alpha.const_data_ptr());
+  p.act = static_cast<const __nv_bfloat16*>(act.const_data_ptr());
+  p.nblocks = m;
+  p.block_expert = m + 1;
+  p.block_rows = m + 1 + max_blocks;
+  p.rowmap = static_cast<const int*>(rowmap.const_data_ptr());
+  p.out = static_cast<__nv_bfloat16*>(out.mutable_data_ptr());
+  p.ws = nullptr;
+  p.cnt = nullptr;
+  // G2 (activation 0): topk_dm unused on device; keep default identity (no host
+  // divmod).
+  p.N = static_cast<int>(N);
+  p.K = static_cast<int>(K);
+  p.Nout = static_cast<int>(Nout);
+  p.units_per_cta = static_cast<int>((K + kTileK - 1) / kTileK);
+  const int columns = static_cast<int>(N / kTileN);
+  const int grid = static_cast<int>(max_blocks) * ((columns + 1) / 2);
+  const bool kt = K % kTileK != 0;
+  kt ? launch_gemm<64, 4, 4, 0, 2, true, 2>(p, grid, st)
+     : launch_gemm<64, 4, 4, 0, 2, false, 2>(p, grid, st);
+}
+
 STABLE_TORCH_LIBRARY_IMPL(_moe_C, CUDA, m) {
   m.impl("rs2_moe_prep", TORCH_BOX(&rs2_moe_prep));
-  m.impl("rs2_moe_gemm", TORCH_BOX(&rs2_moe_gemm));
+  m.impl("rs2_moe_gemm", TORCH_BOX(&rs2_moe_gemm<false>));
   m.impl("rs2_moe_finalize", TORCH_BOX(&rs2_moe_finalize));
+  m.impl("rs2_moe_gemm_stage2", TORCH_BOX(&rs2_moe_gemm<true>));
+  m.impl("rs2_moe_gemm_g2lin", TORCH_BOX(&rs2_moe_gemm_g2lin));
+  m.impl("rs2_moe_gemm_w64s", TORCH_BOX(&rs2_moe_gemm_w64s));
+  m.impl("rs2_moe_gemm_g2w64x", TORCH_BOX(&rs2_moe_gemm_g2w64x));
 }
