@@ -1895,6 +1895,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 qo_indptr_cpu[prefill_start:] - qo_indptr_cpu[prefill_start]
             )
             assert qo_indptr_prefill_cpu.shape[0] == num_prefills + 1
+            kv_lens_prefill_cpu: torch.Tensor | None = None
 
             if prefill_use_trtllm:
                 # TRTLLM prefill has no cross-rank combine for DCP-sharded KV;
@@ -2065,28 +2066,32 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     qo_indptr_prefill_cpu = qo_indptr_prefill_cpu.pin_memory()
                     mm_kv_indptr_cpu = mm_kv_indptr_cpu.pin_memory()
                     mm_last_page_len_cpu = mm_last_page_len_cpu.pin_memory()
-                attn_metadata.mm_wrapper = self._get_mm_prefill_wrapper()
-                # WORKAROUND: the ranges wrapper takes no seq_lens, so plan()
-                # builds kv_lens in pageable memory and copies them with
-                # non_blocking=True. Drop this once the wrapper accepts pinned
-                # seq_lens.
-                with gpu_sync_allowed():
-                    attn_metadata.mm_wrapper.plan(
-                        qo_indptr=qo_indptr_prefill_cpu,
-                        paged_kv_indptr=mm_kv_indptr_cpu,
-                        paged_kv_indices=paged_kv_indices,
-                        paged_kv_last_page_len=mm_last_page_len_cpu,
-                        num_qo_heads=self.num_qo_heads,
-                        num_kv_heads=self.num_kv_heads,
-                        head_dim_qk=self.head_dim,
-                        page_size=self.page_size,
-                        # The variant owns the whole mask; run() takes the windows.
-                        causal=False,
-                        sm_scale=self.sm_scale,
-                        window_left=-1,
-                        fixed_split_size=self.prefill_fixed_split_size,
-                        disable_split_kv=self.disable_split_kv,
+                # The native prefill path above already staged pinned kv
+                # lengths for these requests; the TRTLLM path did not.
+                if kv_lens_prefill_cpu is None:
+                    kv_lens_prefill_cpu = get_seq_lens(
+                        mm_kv_indptr_cpu, mm_last_page_len_cpu, page_size
                     )
+                    if PIN_MEMORY:
+                        kv_lens_prefill_cpu = kv_lens_prefill_cpu.pin_memory()
+                attn_metadata.mm_wrapper = self._get_mm_prefill_wrapper()
+                attn_metadata.mm_wrapper.plan(
+                    qo_indptr=qo_indptr_prefill_cpu,
+                    paged_kv_indptr=mm_kv_indptr_cpu,
+                    paged_kv_indices=paged_kv_indices,
+                    paged_kv_last_page_len=mm_last_page_len_cpu,
+                    seq_lens=kv_lens_prefill_cpu,
+                    num_qo_heads=self.num_qo_heads,
+                    num_kv_heads=self.num_kv_heads,
+                    head_dim_qk=self.head_dim,
+                    page_size=self.page_size,
+                    # The variant owns the whole mask; run() takes the windows.
+                    causal=False,
+                    sm_scale=self.sm_scale,
+                    window_left=-1,
+                    fixed_split_size=self.prefill_fixed_split_size,
+                    disable_split_kv=self.disable_split_kv,
+                )
 
         ## DECODE PATHWAY
         if num_decodes > 0:
