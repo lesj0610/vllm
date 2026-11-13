@@ -128,8 +128,9 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_moe_C, m) {
       "int N, int K, int Nout, int max_blocks) -> ()");
   // Variants of rs2_moe_gemm with the same arguments, one config each for a
   // per-shape choice: stage2 runs the R 64 GEMM1 at 2 stages, g2lin the R 64
-  // GEMM2 at 2 stages, and w64s / g2w64x the R 64 GEMM1 / GEMM2 over two
-  // 128-column records per CTA.
+  // GEMM2 at 2 stages, w64s / g2w64x the R 64 GEMM1 / GEMM2 over two
+  // 128-column records per CTA, g2w64v g2w64x with vector scale loads, and
+  // x96 / q12 the R 96 2-stage paths.
   m.def(
       "rs2_moe_gemm_stage2(Tensor records, Tensor alpha, Tensor act, "
       "Tensor meta, Tensor rowmap, Tensor! out, int row_tile, int activation, "
@@ -144,6 +145,18 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_moe_C, m) {
       "int top_k, int N, int K, int Nout, int max_blocks) -> ()");
   m.def(
       "rs2_moe_gemm_g2w64x(Tensor records, Tensor alpha, Tensor act, "
+      "Tensor meta, Tensor rowmap, Tensor! out, int row_tile, int activation, "
+      "int top_k, int N, int K, int Nout, int max_blocks) -> ()");
+  m.def(
+      "rs2_moe_gemm_g2w64v(Tensor records, Tensor alpha, Tensor act, "
+      "Tensor meta, Tensor rowmap, Tensor! out, int row_tile, int activation, "
+      "int top_k, int N, int K, int Nout, int max_blocks) -> ()");
+  m.def(
+      "rs2_moe_gemm_x96(Tensor records, Tensor alpha, Tensor act, "
+      "Tensor meta, Tensor rowmap, Tensor! out, int row_tile, int activation, "
+      "int top_k, int N, int K, int Nout, int max_blocks) -> ()");
+  m.def(
+      "rs2_moe_gemm_q12(Tensor records, Tensor alpha, Tensor act, "
       "Tensor meta, Tensor rowmap, Tensor! out, int row_tile, int activation, "
       "int top_k, int N, int K, int Nout, int max_blocks) -> ()");
   m.def(

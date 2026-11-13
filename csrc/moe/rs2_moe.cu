@@ -17,8 +17,12 @@
 // each covering 32 columns, with swizzled activation rows, after the
 // multi-CTA prep. R 96 and the two-record R 64 variants (rs2_moe_gemm_w64s,
 // rs2_moe_gemm_g2w64x) cover two 128-column records per CTA: 8 warps of 32
-// columns and 4 warps of 64 columns. One GEMM template covers every warp
-// layout; the host launches one whole output tile per CTA.
+// columns and 4 warps of 64 columns. rs2_moe_gemm_g2w64v is rs2_moe_gemm_g2w64x
+// with one 16 B scale load per k128. rs2_moe_gemm_x96 and rs2_moe_gemm_q12 are
+// rs2_moe_gemm where R 96 runs at 2 stages: the R 64 two-record epilogue, a
+// hoisted activation address and shift-only dequant; q12 also splits the rows
+// in 12 parts instead of 6. One GEMM template covers every warp layout; the
+// host launches one whole output tile per CTA.
 //
 // The kernels need cp.async, ldmatrix and the bf16 mma.sync, so they build
 // for sm_80 and sm_90; sm_86, sm_87 and sm_89 run the sm_80 code. Every config
@@ -163,12 +167,26 @@ __device__ __forceinline__ uint32_t mul_hi(uint32_t a, uint32_t s2) {
 }
 
 // 3+1 layout -> four bf16x2 registers of e2m1 x 2^-126.
+template <bool SHF = false>
 __device__ __forceinline__ void cvt31(uint32_t w, uint32_t* d) {
   d[0] = (w << 6) & 0x81C081C0u;
   d[1] = (w << 3) & 0x81C081C0u;
   d[2] = w & 0x81C081C0u;
-  const uint32_t x =
-      __umulhi(w & 0x2C002C00u, 0x22000000u);  // (m >> 3) + (m >> 7), disjoint
+  // m = w & 0x2C002C00u has bits only in {10, 11, 13, 26, 27, 29} and
+  // 0x22000000 = 2^29 + 2^25, so __umulhi(m, 0x22000000) = (m >> 3) +
+  // (m >> 7), two bit-disjoint shifts. SHF computes the same bits with shifts
+  // instead of the IMAD.HI; sm_90 keeps the multiply.
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+  const uint32_t x = __umulhi(w & 0x2C002C00u, 0x22000000u);
+#else
+  uint32_t x;
+  if constexpr (SHF) {
+    const uint32_t m = w & 0x2C002C00u;
+    x = (m >> 3) | (m >> 7);
+  } else {
+    x = __umulhi(w & 0x2C002C00u, 0x22000000u);
+  }
+#endif
   d[3] = (x & 0x01C001C0u) | ((w & 0x40004000u) << 1);
 }
 // Two U5 scale pairs of one word: even j (bytes 0, 2) and odd j (bytes 1, 3),
@@ -219,8 +237,11 @@ __device__ __forceinline__ uint32_t movm_trans(uint32_t x) {
 }
 
 // ACT: 0 none (GEMM2), 1 silu(gate) * up (GEMM1, gated), 2 relu(x)^2 (GEMM1,
-// not gated) KT: K % 128 != 0 (a tail k-step per chunk).
-template <int R, int WC, int NW, int ACT, int STAGES, bool KT, int NC = 1>
+// not gated) KT: K % 128 != 0 (a tail k-step per chunk). G1E, Q12F: the R 96
+// 2-stage paths of rs2_moe_gemm_x96 and rs2_moe_gemm_q12. VS: the scale load of
+// rs2_moe_gemm_g2w64v.
+template <int R, int WC, int NW, int ACT, int STAGES, bool KT, int NC = 1,
+          bool G1E = false, bool Q12F = false, bool VS = false>
 __device__ __forceinline__ void gemm_body(GemmParams const& p) {
   using C = Cfg<R, NC>;
   constexpr int NT = NW * 32;
@@ -396,7 +417,8 @@ __device__ __forceinline__ void gemm_body(GemmParams const& p) {
   auto write_tile = [&](int b, int c, float (*v)[G][4]) {
     const float a = p.alpha[p.block_expert[b]];
     const int Nout = p.Nout;
-    if constexpr (ACT == 0 && SC == 4) {
+    if constexpr (ACT == 0 &&
+                  (SC == 4 || (G1E && R == 96 && STAGES == 2 && !KT))) {
       // v[s][gi][2 hh + h] is column ws 16 + 8 hh + g8, row gi 8 + 2 tq + h:
       // per (s, gi, hh) an 8 x 8 piece, columns x rows, one bf16 pair (rows 2
       // tq, 2 tq + 1) per lane. Transposed, lane (g8, tq) holds row gi 8 + g8,
@@ -464,7 +486,7 @@ __device__ __forceinline__ void gemm_body(GemmParams const& p) {
             for (int h = 0; h < 2; ++h) {
               const float gt = v[s][gi][h] * a, up = v[s][gi][2 + h] * a;
               float y;
-              if constexpr (SC == 4)  // GEMM1 of rs2_moe_gemm_w64s
+              if constexpr (SC == 4 || (G1E && R == 96 && STAGES == 2 && !KT))
                 y = silu_div(gt, 1.f + __expf(-gt)) * up;
               else
                 y = gt / (1.f + __expf(-gt)) * up;
@@ -515,6 +537,8 @@ __device__ __forceinline__ void gemm_body(GemmParams const& p) {
                          (((lane >> 3)) ^ (lane & 7)) * 16;
   const uint32_t sa_s1 = sbase + NC * kRec + (wt * TW + (lane & 7)) * AP +
                          (((lane >> 3) + 4) ^ (lane & 7)) * 16;
+  // R 96 at 2 stages with G1E: the row part of the half-fragment address
+  const uint32_t sa_base_hf = sbase + NC * kRec + (wt * TW + (lane & 7)) * AP;
   float acc[SC][G][4];
 #pragma unroll
   for (int s = 0; s < SC; ++s)
@@ -527,7 +551,10 @@ __device__ __forceinline__ void gemm_body(GemmParams const& p) {
   // dropped. A warp runs the ldmatrix and MMA of its 8-row groups only up to
   // its last real row, in quarters of its G groups, so the group count is a
   // constant in each copy of the step and acc stays in registers.
-  constexpr int Q = R == 96 ? 6 : (SC > 1 && G % 4 == 0 ? 4 : 1);
+  constexpr int Q =
+      (Q12F && R == 96 && STAGES == 2 && !KT && (ACT == 0 || ACT == 1)) ? 12
+      : R == 96                                                         ? 6
+                : (SC > 1 && G % 4 == 0 ? 4 : 1);
   auto step = [&](auto ngc, uint32_t sb, bool hf) {
     constexpr int NG = decltype(ngc)::value;
     if constexpr (SC == 4) {
@@ -537,13 +564,26 @@ __device__ __forceinline__ void gemm_body(GemmParams const& p) {
       static_assert(
           G <= 8 && R == 64 && STAGES == 2,
           "SC 4 step: the k16 activation fragments of R 64, 2 stages");
+      // VS (GEMM2 without a K tail, below sm_90): a slot's four scale words
+      // of the k128 are read once with one 16 B load, in place of one 4 B
+      // load per k32.
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+      constexpr bool kVS = false;
+#else
+      constexpr bool kVS = ACT == 0 && !KT && VS;
+#endif
       uint32_t wn[SC][2], sn[SC];
+      uint32_t sc[SC][4];
+      if constexpr (kVS) {
+#pragma unroll
+        for (int s = 0; s < SC; ++s) lds128(sc[s], ss_c + sb + s * 128);
+      }
       auto load_ws = [&](int j2) {
 #pragma unroll
         for (int s = 0; s < SC; ++s) {
           lds64v(wn[s],
                  sw_c + sb + s * 512 + (j2 >> 1) * kHalfW + (j2 & 1) * 8);
-          lds32v(sn + s, ss_c + sb + s * 128 + j2 * 4);
+          if constexpr (!kVS) lds32v(sn + s, ss_c + sb + s * 128 + j2 * 4);
         }
       };
       load_ws(0);
@@ -555,7 +595,7 @@ __device__ __forceinline__ void gemm_body(GemmParams const& p) {
         for (int s = 0; s < SC; ++s) {
           wq[s][0] = wn[s][0];
           wq[s][1] = wn[s][1];
-          sq[s] = sn[s];
+          if constexpr (!kVS) sq[s] = sn[s];
         }
         if (j2 < 3 && !(KT && j2 == 1 && hf)) load_ws(j2 + 1);
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
@@ -601,7 +641,8 @@ __device__ __forceinline__ void gemm_body(GemmParams const& p) {
           for (int h = 0; h < 2; ++h) {
 #pragma unroll
             for (int s = 0; s < SC; ++s) {
-              const uint32_t s2 = h ? u5_odd(sq[s]) : u5_even(sq[s]);
+              const uint32_t sw = kVS ? sc[s][j2] : sq[s];
+              const uint32_t s2 = h ? u5_odd(sw) : u5_even(sw);
               uint32_t d[4], a[4];
               cvt31(wq[s][h], d);
               a[0] = mul_lo(d[0], s2);
@@ -633,7 +674,10 @@ __device__ __forceinline__ void gemm_body(GemmParams const& p) {
           for (int gi = 0; gi < NG; ++gi) {
             if constexpr (half_fragment) {
               const uint32_t address =
-                  sbase + NC * kRec + (wt * TW + gi * 8 + (lane & 7)) * AP +
+                  (R == 96 && STAGES == 2 && G1E
+                       ? sa_base_hf + gi * 8 * AP
+                       : sbase + NC * kRec +
+                             (wt * TW + gi * 8 + (lane & 7)) * AP) +
                   (((((lane >> 3) & 1) + 2 * h + 4 * j2) ^ (lane & 7)) * 16);
               ldsm_x2(bf[gi], address + sb);
             } else if constexpr (SWZ) {
@@ -652,7 +696,8 @@ __device__ __forceinline__ void gemm_body(GemmParams const& p) {
           for (int s = 0; s < SC; ++s) {
             const uint32_t s2 = h ? u5_odd(sq[s][j2]) : u5_even(sq[s][j2]);
             uint32_t d[4], a[4];
-            cvt31(wq[s][j2 * 2 + h], d);
+            constexpr bool kShfCvt = R == 96 && STAGES == 2 && G1E;
+            cvt31<kShfCvt>(wq[s][j2 * 2 + h], d);
             a[0] = mul_lo(d[0], s2);
             a[1] = mul_hi(d[1], s2);
             a[2] = mul_lo(d[2], s2);
@@ -733,6 +778,47 @@ __device__ __forceinline__ void gemm_body(GemmParams const& p) {
             step(std::integral_constant<int, G>{}, sb, hf);
             break;
         }
+      } else if constexpr (Q == 12) {
+        switch (nq) {
+          case 0:
+            break;
+          case 1:
+            step(std::integral_constant<int, 1 * G / 12>{}, sb, hf);
+            break;
+          case 2:
+            step(std::integral_constant<int, 2 * G / 12>{}, sb, hf);
+            break;
+          case 3:
+            step(std::integral_constant<int, 3 * G / 12>{}, sb, hf);
+            break;
+          case 4:
+            step(std::integral_constant<int, 4 * G / 12>{}, sb, hf);
+            break;
+          case 5:
+            step(std::integral_constant<int, 5 * G / 12>{}, sb, hf);
+            break;
+          case 6:
+            step(std::integral_constant<int, 6 * G / 12>{}, sb, hf);
+            break;
+          case 7:
+            step(std::integral_constant<int, 7 * G / 12>{}, sb, hf);
+            break;
+          case 8:
+            step(std::integral_constant<int, 8 * G / 12>{}, sb, hf);
+            break;
+          case 9:
+            step(std::integral_constant<int, 9 * G / 12>{}, sb, hf);
+            break;
+          case 10:
+            step(std::integral_constant<int, 10 * G / 12>{}, sb, hf);
+            break;
+          case 11:
+            step(std::integral_constant<int, 11 * G / 12>{}, sb, hf);
+            break;
+          default:
+            step(std::integral_constant<int, G>{}, sb, hf);
+            break;
+        }
       } else if constexpr (Q == 3) {
         switch (nq) {
           case 0:
@@ -755,9 +841,10 @@ __device__ __forceinline__ void gemm_body(GemmParams const& p) {
   }
 }
 
-template <int R, int WC, int NW, int ACT, int STAGES, bool KT, int NC = 1>
+template <int R, int WC, int NW, int ACT, int STAGES, bool KT, int NC = 1,
+          bool G1E = false, bool Q12F = false, bool VS = false>
 __global__ void __launch_bounds__(NW * 32) gemm(GemmParams p) {
-  gemm_body<R, WC, NW, ACT, STAGES, KT, NC>(p);
+  gemm_body<R, WC, NW, ACT, STAGES, KT, NC, G1E, Q12F, VS>(p);
 }
 
 // Routing -> blocks: one CTA, deterministic. Entry f = token * top_k + slot of
@@ -1022,35 +1109,42 @@ __global__ void finalize(const __nv_bfloat16* __restrict__ y,
   *reinterpret_cast<uint4*>(out + static_cast<long>(t) * H + c * 8) = o;
 }
 
-template <int R, int WC, int NW, int ACT, int STAGES, bool KT, int NC = 1>
+template <int R, int WC, int NW, int ACT, int STAGES, bool KT, int NC = 1,
+          bool G1E = false, bool Q12F = false, bool VS = false>
 void launch_gemm(GemmParams const& p, int grid, cudaStream_t st) {
   static_assert(NC > 1 || STAGES * Cfg<R, NC>::kStageBytes <= kSmemLimit);
   const int smem = STAGES * Cfg<R, NC>::kStageBytes;
   STD_TORCH_CHECK(smem <= get_device_prop()->sharedMemPerBlockOptin,
                   "rs2_moe_gemm: tile exceeds device shared memory");
-  cudaFuncSetAttribute(gemm<R, WC, NW, ACT, STAGES, KT, NC>,
+  cudaFuncSetAttribute(gemm<R, WC, NW, ACT, STAGES, KT, NC, G1E, Q12F, VS>,
                        cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
-  gemm<R, WC, NW, ACT, STAGES, KT, NC><<<grid, NW * 32, smem, st>>>(p);
+  gemm<R, WC, NW, ACT, STAGES, KT, NC, G1E, Q12F, VS>
+      <<<grid, NW * 32, smem, st>>>(p);
 }
 
-// R 8 and 32: 8 warps at 4 stages; R 16: 8 warps at 2 stages. R 96: two
-// records per CTA at 3 stages where the device allows it, else 2. R 64: one row
-// group at 3 stages (two CTAs per SM by shared memory); GEMM1 of
+// R 8: 8 warps at 4 stages; R 16: 8 warps at 2 stages; R 32: 8 warps at 4
+// stages, 2 where an SM has at most 100 KiB of shared memory. R 96: two
+// records per CTA at 3 stages where the device allows it, else 2. R 64: one
+// row group at 3 stages (two CTAs per SM by shared memory); GEMM1 of
 // rs2_moe_gemm_stage2 runs it at 2 stages.
-template <int ACT, bool KT, bool G1S2 = false>
+template <int ACT, bool KT, bool G1S2 = false, bool G1E = false,
+          bool Q12F = false>
 void launch_tile(int R, GemmParams const& p, int grid, cudaStream_t st) {
   if (R == 8)
     launch_gemm<8, 8, 8, ACT, 4, KT>(p, grid, st);
   else if (R == 16)
     launch_gemm<16, 8, 8, ACT, 2, KT>(p, grid, st);
-  else if (R == 32)
-    launch_gemm<32, 8, 8, ACT, 4, KT>(p, grid, st);
-  else if (R == 96) {
+  else if (R == 32) {
+    if (get_device_prop()->sharedMemPerMultiprocessor <= 100 * 1024)
+      launch_gemm<32, 8, 8, ACT, 2, KT>(p, grid, st);
+    else
+      launch_gemm<32, 8, 8, ACT, 4, KT>(p, grid, st);
+  } else if (R == 96) {
     if (get_device_prop()->sharedMemPerBlockOptin >=
         3 * Cfg<96, 2>::kStageBytes)
-      launch_gemm<96, 8, 8, ACT, 3, KT, 2>(p, grid, st);
+      launch_gemm<96, 8, 8, ACT, 3, KT, 2, G1E, Q12F>(p, grid, st);
     else
-      launch_gemm<96, 8, 8, ACT, 2, KT, 2>(p, grid, st);
+      launch_gemm<96, 8, 8, ACT, 2, KT, 2, G1E, Q12F>(p, grid, st);
   } else
     launch_gemm<64, 4, 4, ACT, G1S2 && ACT != 0 ? 2 : 3, KT>(p, grid, st);
 }
@@ -1176,7 +1270,7 @@ void rs2_moe_prep(torch::stable::Tensor const& topk_ids,
 // and writes [tokens * top_k][Nout]. records: [E][N / 128 chunks][k steps]; N
 // is the record column count, a multiple of 128 (gated: gate and up each padded
 // to 64).
-template <bool G1S2 = false>
+template <bool G1S2 = false, bool G1E = false, bool Q12F = false>
 void rs2_moe_gemm(torch::stable::Tensor const& records,
                   torch::stable::Tensor const& alpha,
                   torch::stable::Tensor const& act,
@@ -1231,14 +1325,14 @@ void rs2_moe_gemm(torch::stable::Tensor const& records,
   const int R = static_cast<int>(row_tile);
   const bool kt = K % kTileK != 0;
   if (activation == 0)
-    kt ? launch_tile<0, true, G1S2>(R, p, grid, st)
-       : launch_tile<0, false, G1S2>(R, p, grid, st);
+    kt ? launch_tile<0, true, G1S2, G1E, Q12F>(R, p, grid, st)
+       : launch_tile<0, false, G1S2, G1E, Q12F>(R, p, grid, st);
   else if (activation == 1)
-    kt ? launch_tile<1, true, G1S2>(R, p, grid, st)
-       : launch_tile<1, false, G1S2>(R, p, grid, st);
+    kt ? launch_tile<1, true, G1S2, G1E, Q12F>(R, p, grid, st)
+       : launch_tile<1, false, G1S2, G1E, Q12F>(R, p, grid, st);
   else
-    kt ? launch_tile<2, true, G1S2>(R, p, grid, st)
-       : launch_tile<2, false, G1S2>(R, p, grid, st);
+    kt ? launch_tile<2, true, G1S2, G1E, Q12F>(R, p, grid, st)
+       : launch_tile<2, false, G1S2, G1E, Q12F>(R, p, grid, st);
 }
 
 // out[t][h] = sum_j topk_weights[t][j] * y[t * top_k + j][h], fp32 in slot
@@ -1380,6 +1474,7 @@ void rs2_moe_gemm_w64s(torch::stable::Tensor const& records,
 // GEMM2 at row tile 64 with two 128-column records per CTA: 4 warps, each 64
 // rows x 64 columns (SC 4), two stages. Same R 64 blocks, blocked intermediate
 // and y2 rows as rs2_moe_gemm_g2lin. Valid only for row_tile 64, activation 0.
+template <bool VS>
 void rs2_moe_gemm_g2w64x(torch::stable::Tensor const& records,
                          torch::stable::Tensor const& alpha,
                          torch::stable::Tensor const& act,
@@ -1426,8 +1521,8 @@ void rs2_moe_gemm_g2w64x(torch::stable::Tensor const& records,
   const int columns = static_cast<int>(N / kTileN);
   const int grid = static_cast<int>(max_blocks) * ((columns + 1) / 2);
   const bool kt = K % kTileK != 0;
-  kt ? launch_gemm<64, 4, 4, 0, 2, true, 2>(p, grid, st)
-     : launch_gemm<64, 4, 4, 0, 2, false, 2>(p, grid, st);
+  kt ? launch_gemm<64, 4, 4, 0, 2, true, 2, false, false, VS>(p, grid, st)
+     : launch_gemm<64, 4, 4, 0, 2, false, 2, false, false, VS>(p, grid, st);
 }
 
 STABLE_TORCH_LIBRARY_IMPL(_moe_C, CUDA, m) {
@@ -1437,5 +1532,8 @@ STABLE_TORCH_LIBRARY_IMPL(_moe_C, CUDA, m) {
   m.impl("rs2_moe_gemm_stage2", TORCH_BOX(&rs2_moe_gemm<true>));
   m.impl("rs2_moe_gemm_g2lin", TORCH_BOX(&rs2_moe_gemm_g2lin));
   m.impl("rs2_moe_gemm_w64s", TORCH_BOX(&rs2_moe_gemm_w64s));
-  m.impl("rs2_moe_gemm_g2w64x", TORCH_BOX(&rs2_moe_gemm_g2w64x));
+  m.impl("rs2_moe_gemm_g2w64x", TORCH_BOX(&rs2_moe_gemm_g2w64x<false>));
+  m.impl("rs2_moe_gemm_g2w64v", TORCH_BOX(&rs2_moe_gemm_g2w64x<true>));
+  m.impl("rs2_moe_gemm_x96", TORCH_BOX((&rs2_moe_gemm<false, true, false>)));
+  m.impl("rs2_moe_gemm_q12", TORCH_BOX((&rs2_moe_gemm<false, true, true>)));
 }
