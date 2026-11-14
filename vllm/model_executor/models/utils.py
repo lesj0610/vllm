@@ -51,41 +51,69 @@ WeightsTransformFn: TypeAlias = Callable[
 unrecognized tensors through unchanged."""
 
 
-@dataclass
+@dataclass(frozen=True, slots=True)
+class RankLocalTransform:
+    """Marks a weights transform that is safe to run on only the weights this
+    rank loads.
+
+    When every transform is wrapped, `AutoWeightsLoader` drops a raw weight
+    before the transforms if its mapped name falls in a layer this pipeline
+    stage skips, or names an expert weight that its MoE layer leaves to
+    another expert parallel rank. Wrap a transform only if:
+
+    - dropping one layer's or one expert's inputs leaves the outputs of every
+      other layer and expert unchanged (no max over all weights or over a
+      layer's experts, no merging weights across layers or experts), and
+    - each output's mapped name falls in the same layer and names the same
+      expert as the mapped names of the inputs it was built from, and names an
+      input scale only if they do (MoE layers with a global scale load every
+      expert's input scales).
+    """
+
+    transform: WeightsTransformFn
+
+    def __call__(
+        self, weights: Iterable[tuple[str, torch.Tensor]]
+    ) -> Iterable[tuple[str, torch.Tensor]]:
+        return self.transform(weights)
+
+
+@dataclass(slots=True)
 class WeightsMapper:
     """Maps the name of each weight if they match the following patterns.
 
     If a key maps to a value of `None`, the corresponding weight is ignored.
 
-    `weights_transforms` rewrite the raw weight stream in list order before
-    any name mapping."""
+    Fields are applied in declaration order. `weights_transforms` rewrite the raw
+    weight stream in list order before any name mapping, and stacked rules run
+    last so that they see the final vLLM names."""
 
+    weights_transforms: list[WeightsTransformFn] = field(default_factory=list)
     orig_to_new_renaming: list["WeightRenaming"] = field(default_factory=list)
     orig_to_new_regex: Mapping[re.Pattern, str | None] = field(default_factory=dict)
     orig_to_new_substr: Mapping[str, str | None] = field(default_factory=dict)
+    orig_to_new_prefix: Mapping[str, str | None] = field(default_factory=dict)
+    orig_to_new_suffix: Mapping[str, str | None] = field(default_factory=dict)
     orig_to_new_stacked: Mapping[str, tuple[str, ShardIds]] = field(
         default_factory=dict
     )
-    orig_to_new_prefix: Mapping[str, str | None] = field(default_factory=dict)
-    orig_to_new_suffix: Mapping[str, str | None] = field(default_factory=dict)
-    weights_transforms: list[WeightsTransformFn] = field(default_factory=list)
 
     def __or__(self, other: "WeightsMapper") -> "WeightsMapper":
         """Combine two `WeightsMapper`s by merging their mappings."""
         return WeightsMapper(
+            weights_transforms=[*self.weights_transforms, *other.weights_transforms],
             orig_to_new_renaming=[
                 *self.orig_to_new_renaming,
                 *other.orig_to_new_renaming,
             ],
             orig_to_new_regex={**self.orig_to_new_regex, **other.orig_to_new_regex},
             orig_to_new_substr={**self.orig_to_new_substr, **other.orig_to_new_substr},
+            orig_to_new_prefix={**self.orig_to_new_prefix, **other.orig_to_new_prefix},
+            orig_to_new_suffix={**self.orig_to_new_suffix, **other.orig_to_new_suffix},
             orig_to_new_stacked={
                 **self.orig_to_new_stacked,
                 **other.orig_to_new_stacked,
             },
-            orig_to_new_prefix={**self.orig_to_new_prefix, **other.orig_to_new_prefix},
-            orig_to_new_suffix={**self.orig_to_new_suffix, **other.orig_to_new_suffix},
-            weights_transforms=[*self.weights_transforms, *other.weights_transforms],
         )
 
     def map_name(self, key: str) -> str | None:
@@ -133,12 +161,6 @@ class WeightsMapper:
 
                 key = key.replace(substr, new_key, 1)
 
-        shard_id: ShardIds | None = None
-        for substr, (new_key, new_shard_id) in self.orig_to_new_stacked.items():
-            if substr in key:
-                key = key.replace(substr, new_key, 1)
-                shard_id = new_shard_id
-
         for prefix, new_key in self.orig_to_new_prefix.items():
             if key.startswith(prefix):
                 if new_key is None:
@@ -152,6 +174,12 @@ class WeightsMapper:
                     return None
 
                 key = new_key.join(key.rsplit(suffix, 1))
+
+        shard_id: ShardIds | None = None
+        for substr, (new_key, new_shard_id) in self.orig_to_new_stacked.items():
+            if substr in key:
+                key = key.replace(substr, new_key, 1)
+                shard_id = new_shard_id
 
         return key, shard_id
 
@@ -204,12 +232,12 @@ class WeightsMapper:
         remove_none = lambda d: {k: v for k, v in d.items() if v is not None}
         return replace(
             self,
+            weights_transforms=[],
             orig_to_new_regex=remove_none(self.orig_to_new_regex),
             orig_to_new_substr=remove_none(self.orig_to_new_substr),
-            orig_to_new_stacked={},
             orig_to_new_prefix=remove_none(self.orig_to_new_prefix),
             orig_to_new_suffix=remove_none(self.orig_to_new_suffix),
-            weights_transforms=[],
+            orig_to_new_stacked={},
         )
 
 
@@ -225,6 +253,9 @@ def _get_tied_embedding_params(module: nn.Module) -> dict[str, str]:
             if (first_name := canonical.setdefault(id(param), qualname)) != qualname:
                 aliased[qualname] = first_name
     return aliased
+
+
+_NUMBERED_NAME_PART = re.compile(r"\.(\d+)(?=\.)")
 
 
 class AutoWeightsLoader:
@@ -481,10 +512,49 @@ class AutoWeightsLoader:
             self.ignore_unexpected_suffixes.extend(ignore_unexpected_suffixes)
         mapper |= self.REMOVE_UNUSED_ROTARY_EMBEDS_MAPPER
 
+        transforms = mapper.weights_transforms
+        if transforms and all(isinstance(t, RankLocalTransform) for t in transforms):
+            weights = self._drop_other_ranks_weights(weights, mapper)
         weights = mapper.apply(weights)
         weights = self._filter_skipped(weights)
 
         return set(self._load_module("", self.module, weights))
+
+    def _drop_other_ranks_weights(
+        self,
+        weights: Iterable[tuple[str, torch.Tensor]],
+        mapper: WeightsMapper,
+    ) -> Iterable[tuple[str, torch.Tensor]]:
+        """Drop the weights of layers on other pipeline stages and of experts
+        on other expert parallel ranks. Loading skips them anyway; dropping
+        them first spares the transforms from rewriting them."""
+        from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
+
+        expert_filters = {
+            name: expert_filter
+            for name, module in self.module.named_modules()
+            if isinstance(module, MoERunner)
+            and (expert_filter := module.routed_experts.make_expert_weight_filter())
+            is not None
+        }
+        if not expert_filters and not get_pp_missing_layer_names(self.module):
+            return weights
+
+        def keeps(name: str) -> bool:
+            if is_pp_missing_parameter(name, self.module):
+                return False
+            # An expert ID directly follows the path of its MoE layer.
+            for match in _NUMBERED_NAME_PART.finditer(name):
+                expert_filter = expert_filters.get(name[: match.start()])
+                if expert_filter is not None:
+                    return expert_filter(name, int(match.group(1)))
+            return True
+
+        return (
+            (name, weight)
+            for name, weight in weights
+            if (mapped := mapper.map_name(name)) is None or keeps(mapped)
+        )
 
     def _filter_skipped(
         self, weights: Iterable[tuple[str, torch.Tensor]]
