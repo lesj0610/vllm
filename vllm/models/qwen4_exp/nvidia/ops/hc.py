@@ -34,8 +34,8 @@ def _unit_injection(
 
     The first hyper-connection layer has no previous injection, and the kernels
     take the tensor unconditionally -- the op schema declares it non-optional,
-    so ``None`` reaches C++ as an undefined handle and the first stride query
-    on it fails. Both kernels gate on ``2 * sigmoid(logit * inv_hc)``, which is
+    so `None` reaches C++ as an undefined handle and the first stride query
+    on it fails. Both kernels gate on `2 * sigmoid(logit * inv_hc)`, which is
     exactly 1 at a logit of zero, so zeros reproduce the unweighted add the
     unfused path does. Exact in floating point, not an approximation.
     """
