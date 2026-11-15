@@ -17,11 +17,15 @@ import torch
 import vllm.model_executor.warmup.kernel_warmup as warmup
 import vllm.utils.flashinfer as fi_utils
 from vllm.config.utils import hash_config
+from vllm.model_executor.warmup.flashinfer_autotune_cache import (
+    runs_flashinfer_autotune,
+)
 from vllm.model_executor.warmup.kernel_warmup import (
     _flashinfer_autotune_token_counts,
     _run_flashinfer_autotune_dummy_runs,
     flashinfer_autotune,
 )
+from vllm.platforms import current_platform
 
 pytestmark = pytest.mark.cpu_test
 
@@ -90,6 +94,109 @@ def test_flashinfer_autotune_token_counts_are_bounded_and_deduplicated():
         token_counts = _flashinfer_autotune_token_counts(runner)
 
     assert token_counts == (32,)
+
+
+class _FakeCuteDSLExperts:
+    """Stand-in for FlashInferCuteDSLExperts."""
+
+
+class _FakeCutlassExperts:
+    """Stand-in for FlashInferExperts."""
+
+
+class _FakeTrtLlmNvFp4Experts:
+    """Stand-in for TrtLlmNvFp4ExpertsBase."""
+
+
+class _FakeKernelMoERunner(_FakeMoERunner):
+    _quant_method: Any
+
+
+@pytest.mark.parametrize(
+    "capability, experts, expected",
+    [
+        (90, None, True),
+        (80, _FakeCuteDSLExperts(), True),
+        (80, _FakeCutlassExperts(), True),
+        (86, _FakeTrtLlmNvFp4Experts(), True),
+        (89, object(), False),
+        (80, None, False),
+    ],
+)
+def test_flashinfer_autotunes_below_sm90_only_its_moe_experts(
+    capability, experts, expected
+):
+    moe = _FakeKernelMoERunner()
+    kernel = SimpleNamespace(impl=SimpleNamespace(fused_experts=experts))
+    moe._quant_method = SimpleNamespace(moe_kernel=kernel if experts else None)
+    runner = _make_runner([object(), moe])
+    experts_module = "vllm.model_executor.layers.fused_moe.experts."
+
+    with (
+        patch("vllm.model_executor.layers.fused_moe.MoERunner", _FakeMoERunner),
+        patch(
+            experts_module + "flashinfer_cutedsl_moe.FlashInferCuteDSLExperts",
+            _FakeCuteDSLExperts,
+        ),
+        patch(
+            experts_module + "flashinfer_cutlass_moe.FlashInferExperts",
+            _FakeCutlassExperts,
+        ),
+        patch(
+            experts_module + "trtllm_nvfp4_moe.TrtLlmNvFp4ExpertsBase",
+            _FakeTrtLlmNvFp4Experts,
+        ),
+        patch.object(
+            current_platform,
+            "has_device_capability",
+            lambda c, device_id=0: capability >= c,
+        ),
+    ):
+        assert runs_flashinfer_autotune(runner) == expected
+
+
+@pytest.mark.parametrize(
+    "capability, stage_runs, expected",
+    [
+        (80, [False, True], [True, True]),
+        (80, [False, False], [False, False]),
+        (80, [False], [False]),
+        (90, [True, True], [True, True]),
+    ],
+)
+def test_flashinfer_autotune_joins_every_pp_stage_once_one_runs_it(
+    monkeypatch, capability, stage_runs, expected
+):
+    from vllm.distributed import parallel_state
+
+    pp = len(stage_runs)
+    gathered = []
+
+    def all_gather_object(out, obj, group):
+        gathered.append(obj)
+        out[:] = stage_runs
+
+    monkeypatch.setattr(
+        parallel_state, "get_pp_group", lambda: SimpleNamespace(world_size=pp)
+    )
+    monkeypatch.setattr(
+        parallel_state,
+        "get_world_group",
+        lambda: SimpleNamespace(world_size=pp, cpu_group=None),
+    )
+    monkeypatch.setattr(torch.distributed, "all_gather_object", all_gather_object)
+    monkeypatch.setattr(
+        current_platform,
+        "has_device_capability",
+        lambda c, device_id=0: capability >= c,
+    )
+    joins = []
+    for runs in stage_runs:
+        monkeypatch.setattr(warmup, "runs_flashinfer_autotune", lambda _, r=runs: r)
+        joins.append(warmup.joins_flashinfer_autotune(_make_runner([])))
+
+    assert joins == expected
+    assert gathered == (stage_runs if capability < 90 and pp > 1 else [])
 
 
 @pytest.mark.parametrize("skip_attn", [False, True])

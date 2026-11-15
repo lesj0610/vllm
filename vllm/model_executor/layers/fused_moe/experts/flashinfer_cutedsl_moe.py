@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from typing import Any
+
 import torch
 
 import vllm.envs as envs
@@ -27,6 +29,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kNvfp4DynamicToken,
     kNvfp4Static,
 )
+from vllm.model_executor.utils import refill_derived, replace_parameter
 from vllm.platforms import current_platform
 from vllm.utils.flashinfer import (
     flashinfer_cute_dsl_fused_moe_nvfp4,
@@ -44,6 +47,54 @@ def _one_sm_count(res) -> int:
         "Widen localized_sm_count to a list in FlashInfer before allowing this."
     )
     return counts[0]
+
+
+def _flashinfer_activation_kwargs(
+    activation: MoEActivation,
+    swiglu_alpha: float | None,
+    swiglu_beta: float | None,
+    swiglu_limit: float | None,
+    situ_beta: float | None = None,
+    situ_linear_beta: float | None = None,
+) -> dict[str, Any]:
+    # The kernel defaults swiglu_{alpha,beta,limit} to the plain-SwiGLU
+    # values, so only forward the ones the model actually sets.
+    swiglu_params: dict[str, float | None] = {}
+    if activation == MoEActivation.SILU:
+        swiglu_params = {"swiglu_limit": swiglu_limit}
+    elif activation in (
+        MoEActivation.SWIGLUOAI,
+        MoEActivation.SWIGLUOAI_UNINTERLEAVE,
+    ):
+        swiglu_params = {
+            "swiglu_alpha": swiglu_alpha,
+            "swiglu_beta": swiglu_beta,
+            "swiglu_limit": swiglu_limit,
+        }
+    elif activation == MoEActivation.SITU:
+        # The cute_dsl kernel keys SiTU on situ_beta and requires
+        # activation_type to stay a base type (ActivationType.Situ is
+        # rejected by normalize_cute_dsl_moe_activation_type), so the
+        # Swiglu base type is passed below and SiTU rides the betas.
+        if situ_beta is None:
+            raise ValueError("SITU activation requires moe_config.activation_situ_beta")
+        swiglu_params = {"situ_beta": situ_beta, "situ_linear_beta": situ_linear_beta}
+    return {
+        # normalize_cute_dsl_moe_activation_type rejects ActivationType.Situ,
+        # so SiTU is expressed as the SILU base type plus the betas above.
+        "activation_type": activation_to_flashinfer_int(
+            MoEActivation.SILU if activation == MoEActivation.SITU else activation
+        ),
+        **{k: v for k, v in swiglu_params.items() if v is not None},
+    }
+
+
+def _runs_w4a16() -> bool:
+    """From SM80 to SM90, FlashInfer runs NVFP4 weights with BF16 activations."""
+    p = current_platform
+    return (
+        p.is_cuda() and p.has_device_capability(80) and not p.has_device_capability(100)
+    )
 
 
 class FlashInferCuteDSLExperts(mk.FusedMoEExpertsModular):
@@ -66,7 +117,7 @@ class FlashInferCuteDSLExperts(mk.FusedMoEExpertsModular):
             moe_config=moe_config,
             quant_config=quant_config,
         )
-        assert quant_config.weight_quant_dtype == "nvfp4", (
+        assert quant_config.quant_dtype == "nvfp4", (
             "Only nvfp4 quantization is currently supported."
         )
         self.out_dtype = moe_config.in_dtype
@@ -95,9 +146,14 @@ class FlashInferCuteDSLExperts(mk.FusedMoEExpertsModular):
             )
         self.autotune_use_cuda_graph = moe_config.max_capture_size > 0
         self._localized_kwargs: dict = {}
+        self.w4a16 = _runs_w4a16()
+        # Weight-shaped views of one element, once records hold the weights.
+        self._weight_shapes: tuple[torch.Tensor, torch.Tensor] | None = None
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        if self.quant_config.use_nvfp4_w4a4:
+        if self.w4a16:
+            self._prepare_w4a16_records(layer)
+        else:
             layer.w13_weight_scale_2.data.mul_(layer.w13_input_scale)
             layer.w2_weight_scale_2.data.mul_(layer.w2_input_scale)
         self._localized_kwargs = {}
@@ -142,9 +198,77 @@ class FlashInferCuteDSLExperts(mk.FusedMoEExpertsModular):
             ),
         }
 
+    def _prepare_w4a16_records(self, layer: torch.nn.Module) -> None:
+        """Pack the weights and block scales once into the records FlashInfer
+        would otherwise convert them to on every call, and release them."""
+        from flashinfer.fused_moe import cute_dsl_w4a16_sm80_weights
+
+        w1, w2 = layer.w13_weight, layer.w2_weight
+        r1, r2 = cute_dsl_w4a16_sm80_weights(
+            w1, self.w1_scale, w2, self.w2_scale, self.moe_config.activation.is_gated
+        )
+        # Refilled in place on reloads, so captured CUDA graphs read them.
+        self.quant_config._w1.scale = refill_derived(layer, "_experts_w1_records", r1)
+        self.quant_config._w2.scale = refill_derived(layer, "_experts_w2_records", r2)
+        # FlashInfer then reads only the shapes of the weights.
+        self._weight_shapes = (
+            w1.new_empty(()).expand(w1.shape),
+            w2.new_empty(()).expand(w2.shape),
+        )
+        for name in ("w13_weight", "w13_weight_scale", "w2_weight", "w2_weight_scale"):
+            replace_parameter(layer, name, getattr(layer, name).new_empty(0))
+
+    def _activation_kwargs(self, activation: MoEActivation) -> dict[str, Any]:
+        return _flashinfer_activation_kwargs(
+            activation,
+            self.gemm1_alpha,
+            self.gemm1_beta,
+            self.gemm1_clamp_limit,
+            self.situ_beta,
+            self.situ_linear_beta,
+        )
+
+    @staticmethod
+    def _runs_on_records(moe_config: FusedMoEConfig) -> bool:
+        """Whether FlashInfer runs the layer below SM100 on records, prepared
+        once, instead of converting the weights on every call."""
+        from flashinfer.fused_moe import cute_dsl_w4a16_sm80_supported
+
+        if moe_config.activation == MoEActivation.SITU:
+            return False
+        num_local_experts = moe_config.num_local_experts
+        return cute_dsl_w4a16_sm80_supported(
+            moe_config.num_experts,
+            num_local_experts,
+            moe_config.moe_parallel_config.ep_rank * num_local_experts,
+            moe_config.in_dtype,
+            **_flashinfer_activation_kwargs(
+                moe_config.activation,
+                moe_config.swiglu_alpha,
+                moe_config.swiglu_beta,
+                moe_config.swiglu_limit,
+            ),
+        )
+
     @staticmethod
     def activation_format() -> mk.FusedMoEActivationFormat:
         return mk.FusedMoEActivationFormat.Standard
+
+    @staticmethod
+    def _supports_current_device() -> bool:
+        p = current_platform
+        return (
+            p.is_cuda()
+            and (p.is_device_capability_family(100) or _runs_w4a16())
+            and has_flashinfer_cutedsl_moe_nvfp4()
+        )
+
+    @staticmethod
+    def executed_activation_key(
+        weight_key: QuantKey | None,
+        activation_key: QuantKey | None,
+    ) -> QuantKey | None:
+        return None if _runs_w4a16() else activation_key
 
     @staticmethod
     def is_supported_config(
@@ -154,24 +278,38 @@ class FlashInferCuteDSLExperts(mk.FusedMoEExpertsModular):
         activation_key: QuantKey | None,
         activation_format: mk.FusedMoEActivationFormat,
     ) -> tuple[bool, str | None]:
-        # FlashInfer's CuTe-DSL W4A16 runs BF16 only.
-        if (weight_key, activation_key) == (kNvfp4Static, None) and (
-            moe_config.in_dtype != torch.bfloat16
-        ):
-            return False, f"NVFP4 W4A16 does not support {moe_config.in_dtype}"
+        if _runs_w4a16():
+            # Below SM100 the layer keeps its NVFP4 W4A4 quant config, also
+            # when it runs W4A16 by request.
+            if activation_key not in (kNvfp4Dynamic, kNvfp4DynamicToken, None):
+                return False, "kernel supports only NVFP4 layers below SM100"
+            if moe_config.in_dtype != torch.bfloat16:
+                return (
+                    False,
+                    f"kernel does not support {moe_config.in_dtype} below SM100",
+                )
+            if (
+                activation_key == kNvfp4Dynamic
+                and moe_config.moe_parallel_config.use_fi_nvl_one_sided_kernels
+            ):
+                # The dispatch layout would follow the NVFP4 quant config.
+                return (
+                    False,
+                    "kernel does not support NVFP4 one-sided dispatch below SM100",
+                )
+            # Elsewhere FlashInfer would convert the weights on every call.
+            if FlashInferCuteDSLExperts._supports_current_device() and not (
+                FlashInferCuteDSLExperts._runs_on_records(moe_config)
+            ):
+                return (
+                    False,
+                    (
+                        "kernel supports below SM100 only SwiGLU with default "
+                        "parameters or ReLU2, without expert parallelism"
+                    ),
+                )
         return mk.FusedMoEExperts.is_supported_config(
             cls, moe_config, weight_key, activation_key, activation_format
-        )
-
-    @staticmethod
-    def _supports_current_device() -> bool:
-        p = current_platform
-        return (
-            p.is_cuda()
-            # Below SM100 FlashInfer runs it on its CUTLASS SM80 kernels.
-            and p.has_device_capability(80)
-            and not p.has_device_capability(110)
-            and has_flashinfer_cutedsl_moe_nvfp4()
         )
 
     @staticmethod
@@ -183,16 +321,13 @@ class FlashInferCuteDSLExperts(mk.FusedMoEExpertsModular):
         weight_key: QuantKey | None,
         activation_key: QuantKey | None,
     ) -> bool:
-        SUPPORTED_W_A = [
+        SUPPORTED_W_A: list[tuple[QuantKey, QuantKey | None]] = [
             (kNvfp4Static, kNvfp4Dynamic),
             (kNvfp4Static, kNvfp4DynamicToken),
         ]
-        scheme = (weight_key, activation_key)
-        return scheme in SUPPORTED_W_A or (
-            # W4A16 below SM100
-            scheme == (kNvfp4Static, None)
-            and not current_platform.has_device_capability(100)
-        )
+        if _runs_w4a16():  # the activations run unquantized
+            SUPPORTED_W_A.append((kNvfp4Static, None))
+        return (weight_key, activation_key) in SUPPORTED_W_A
 
     @staticmethod
     def _supports_activation(activation: MoEActivation) -> bool:
@@ -215,7 +350,18 @@ class FlashInferCuteDSLExperts(mk.FusedMoEExpertsModular):
 
     @property
     def expects_unquantized_inputs(self) -> bool:
-        return self.per_token_activation or self.quant_config.use_nvfp4_w4a16
+        return self.per_token_activation or self.w4a16
+
+    def moe_problem_size(
+        self,
+        a1: torch.Tensor,
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> tuple[int, int, int, int, int]:
+        if self._weight_shapes is not None:
+            w1, w2 = self._weight_shapes
+        return super().moe_problem_size(a1, w1, w2, topk_ids)
 
     def workspace_shapes(
         self,
@@ -253,58 +399,36 @@ class FlashInferCuteDSLExperts(mk.FusedMoEExpertsModular):
         expert_tokens_meta: mk.ExpertTokensMetadata | None,
         apply_router_weight_on_input: bool | None,
     ):
+        assert self.quant_dtype == "nvfp4"
         assert self.w1_scale is not None
         assert self.w2_scale is not None
+        if self._weight_shapes is not None:
+            w1, w2 = self._weight_shapes
 
-        # The functional API expects x_sf with trailing dim: (M, K//16, 1).
-        x_sf: torch.Tensor | None = None
-        fc2_input_scale: torch.Tensor | None = None
-        quant_kwargs: dict = {}
-        if self.quant_config.use_nvfp4_w4a16:
-            # The kernel reads the 16-bit activations as they are.
-            quant_kwargs["quant_mode"] = "w4a16"
-        elif self.per_token_activation:
+        if self.w4a16:
+            block_scale = per_token_scale = fc2_input_scale = None
+        elif self.expects_unquantized_inputs:
             hidden_states, block_scale, per_token_scale = (
                 quantize_nvfp4_per_token_input(hidden_states)
             )
-            x_sf = block_scale.unsqueeze(-1)
             fc2_input_scale = self.per_token_global_scale
-            quant_kwargs["per_token_scale"] = per_token_scale
         else:
-            # a1q_scale is (M, K//16) float8_e4m3fn from fp4_quantize.
-            assert a1q_scale is not None and self.a2_gscale is not None
-            x_sf = a1q_scale.unsqueeze(-1)
+            assert a1q_scale is not None
+            block_scale = a1q_scale
+            per_token_scale = None
             fc2_input_scale = self.a2_gscale
 
-        # The kernel defaults swiglu_{alpha,beta,limit} to the plain-SwiGLU
-        # values, so only forward the ones the model actually sets.
-        swiglu_params: dict[str, float | None] = {}
-        if activation == MoEActivation.SILU:
-            swiglu_params = {"swiglu_limit": self.gemm1_clamp_limit}
-        elif activation in (
-            MoEActivation.SWIGLUOAI,
-            MoEActivation.SWIGLUOAI_UNINTERLEAVE,
-        ):
-            swiglu_params = {
-                "swiglu_alpha": self.gemm1_alpha,
-                "swiglu_beta": self.gemm1_beta,
-                "swiglu_limit": self.gemm1_clamp_limit,
-            }
-        elif activation == MoEActivation.SITU:
-            # The cute_dsl kernel keys SiTU on situ_beta and requires
-            # activation_type to stay a base type (ActivationType.Situ is
-            # rejected by normalize_cute_dsl_moe_activation_type), so the
-            # Swiglu base type is passed below and SiTU rides the betas.
-            if self.situ_beta is None:
-                raise ValueError(
-                    "SITU activation requires moe_config.activation_situ_beta"
-                )
-            swiglu_params = {
-                "situ_beta": self.situ_beta,
-                "situ_linear_beta": self.situ_linear_beta,
-            }
-        swiglu_kwargs = {k: v for k, v in swiglu_params.items() if v is not None}
+        if not self.w4a16:
+            assert block_scale is not None
+            assert fc2_input_scale is not None
 
+        # a1q_scale is (M, K//16) float8_e4m3fn from fp4_quantize.
+        # The functional API expects x_sf with trailing dim: (M, K//16, 1).
+        x_sf = None if block_scale is None else block_scale.unsqueeze(-1)
+
+        per_token_kwargs = (
+            {"per_token_scale": per_token_scale} if self.per_token_activation else {}
+        )
         flashinfer_cute_dsl_fused_moe_nvfp4(
             x=hidden_states,
             x_sf=x_sf,
@@ -324,13 +448,9 @@ class FlashInferCuteDSLExperts(mk.FusedMoEExpertsModular):
             output_dtype=output.dtype,
             moe_output=output,
             autotune_use_cuda_graph=self.autotune_use_cuda_graph,
-            # normalize_cute_dsl_moe_activation_type rejects ActivationType.Situ,
-            # so SiTU is expressed as the SILU base type plus the betas below.
-            activation_type=activation_to_flashinfer_int(
-                MoEActivation.SILU if activation == MoEActivation.SITU else activation
-            ),
-            **swiglu_kwargs,
-            **quant_kwargs,
+            **self._activation_kwargs(activation),
+            **per_token_kwargs,
+            quant_mode="w4a16" if self.w4a16 else "w4a4",
             # Full-width weight metadata is retained even when storage is released.
             **self._localized_kwargs,
         )

@@ -47,7 +47,6 @@ from vllm.model_executor.layers.fused_moe.oracle.mxfp8 import (
     select_mxfp8_moe_backend,
 )
 from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import (
-    PER_TOKEN_NVFP4_MOE_BACKENDS,
     NvFp4MoeBackend,
     convert_to_nvfp4_moe_kernel_format,
     is_global_sf_supported_for_nvfp4_backend,
@@ -920,14 +919,16 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
             weight_key=kNvfp4Static,
             activation_key=activation_key,
         )
-        # NONE: requantization source, which has no compute backend.
-        if self.per_token_activation and self.nvfp4_backend not in (
-            *PER_TOKEN_NVFP4_MOE_BACKENDS,
-            NvFp4MoeBackend.NONE,
-        ):
+        # NONE: requantization source, which has no compute backend. Below
+        # SM100, FLASHINFER_CUTEDSL runs the activations unquantized.
+        per_token_backends = {NvFp4MoeBackend.FLASHINFER_TRTLLM, NvFp4MoeBackend.NONE}
+        if not current_platform.is_device_capability_family(100):
+            per_token_backends.add(NvFp4MoeBackend.FLASHINFER_CUTEDSL)
+        if self.per_token_activation and self.nvfp4_backend not in per_token_backends:
             raise ValueError(
                 "Per-token NVFP4 activation for pre-quantized weights "
-                "requires the FlashInfer TRTLLM or CuTeDSL MoE backend."
+                "requires the FlashInfer TRTLLM MoE backend, or below SM100 "
+                "the FlashInfer CuTeDSL one."
             )
 
         self.use_global_sf = is_global_sf_supported_for_nvfp4_backend(
