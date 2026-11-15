@@ -262,7 +262,9 @@ def test_flashinfer_fp4_moe_no_graph(
         )
 
 
-def test_csf_scales_stay_resident_only_on_flashinfer_cutlass(monkeypatch):
+def test_csf_scales_stay_resident_on_flashinfer_cutlass(
+    monkeypatch, default_vllm_config
+):
     config = make_dummy_moe_config(hidden_dim=2560, intermediate_size=640)
     backend = NvFp4MoeBackend.FLASHINFER_CUTLASS
     has_csf_ops = (
@@ -271,15 +273,15 @@ def test_csf_scales_stay_resident_only_on_flashinfer_cutlass(monkeypatch):
     )
     # A FlashInfer without the CSF ops decodes the scales at load.
     monkeypatch.setattr(has_csf_ops, lambda: False)
-    assert not nvfp4_backend_supports_csf_scales(backend, config)
+    assert not nvfp4_backend_supports_csf_scales(backend, config, False)
     monkeypatch.setattr(has_csf_ops, lambda: True)
-    assert nvfp4_backend_supports_csf_scales(backend, config)
+    assert nvfp4_backend_supports_csf_scales(backend, config, False)
     assert not nvfp4_backend_supports_csf_scales(
-        NvFp4MoeBackend.FLASHINFER_TRTLLM, config
+        NvFp4MoeBackend.FLASHINFER_TRTLLM, config, False
     )
     # With EP the routing ids are global expert ids.
     monkeypatch.setattr(config.moe_parallel_config, "use_ep", True)
-    assert not nvfp4_backend_supports_csf_scales(backend, config)
+    assert not nvfp4_backend_supports_csf_scales(backend, config, False)
 
 
 @pytest.mark.skipif(
