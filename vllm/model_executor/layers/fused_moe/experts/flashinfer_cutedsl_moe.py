@@ -89,8 +89,8 @@ def _flashinfer_activation_kwargs(
     }
 
 
-def _runs_w4a16() -> bool:
-    """From SM80 to SM90, FlashInfer runs NVFP4 weights with BF16 activations."""
+def _below_sm100() -> bool:
+    """From SM80 to SM90, FlashInfer runs the layer on its SM80 kernels."""
     p = current_platform
     return (
         p.is_cuda() and p.has_device_capability(80) and not p.has_device_capability(100)
@@ -117,7 +117,7 @@ class FlashInferCuteDSLExperts(mk.FusedMoEExpertsModular):
             moe_config=moe_config,
             quant_config=quant_config,
         )
-        assert quant_config.quant_dtype == "nvfp4", (
+        assert quant_config.weight_quant_dtype == "nvfp4", (
             "Only nvfp4 quantization is currently supported."
         )
         self.out_dtype = moe_config.in_dtype
@@ -146,7 +146,7 @@ class FlashInferCuteDSLExperts(mk.FusedMoEExpertsModular):
             )
         self.autotune_use_cuda_graph = moe_config.max_capture_size > 0
         self._localized_kwargs: dict = {}
-        self.w4a16 = _runs_w4a16()
+        self.w4a16 = quant_config.use_nvfp4_w4a16
         # Weight-shaped views of one element, once records hold the weights.
         self._weight_shapes: tuple[torch.Tensor, torch.Tensor] | None = None
 
@@ -259,16 +259,9 @@ class FlashInferCuteDSLExperts(mk.FusedMoEExpertsModular):
         p = current_platform
         return (
             p.is_cuda()
-            and (p.is_device_capability_family(100) or _runs_w4a16())
+            and (p.is_device_capability_family(100) or _below_sm100())
             and has_flashinfer_cutedsl_moe_nvfp4()
         )
-
-    @staticmethod
-    def executed_activation_key(
-        weight_key: QuantKey | None,
-        activation_key: QuantKey | None,
-    ) -> QuantKey | None:
-        return None if _runs_w4a16() else activation_key
 
     @staticmethod
     def is_supported_config(
@@ -278,24 +271,12 @@ class FlashInferCuteDSLExperts(mk.FusedMoEExpertsModular):
         activation_key: QuantKey | None,
         activation_format: mk.FusedMoEActivationFormat,
     ) -> tuple[bool, str | None]:
-        if _runs_w4a16():
-            # Below SM100 the layer keeps its NVFP4 W4A4 quant config, also
-            # when it runs W4A16 by request.
-            if activation_key not in (kNvfp4Dynamic, kNvfp4DynamicToken, None):
-                return False, "kernel supports only NVFP4 layers below SM100"
+        if _below_sm100() and activation_key is None:
+            # FlashInfer runs W4A16 on records, in BF16 only.
             if moe_config.in_dtype != torch.bfloat16:
                 return (
                     False,
-                    f"kernel does not support {moe_config.in_dtype} below SM100",
-                )
-            if (
-                activation_key == kNvfp4Dynamic
-                and moe_config.moe_parallel_config.use_fi_nvl_one_sided_kernels
-            ):
-                # The dispatch layout would follow the NVFP4 quant config.
-                return (
-                    False,
-                    "kernel does not support NVFP4 one-sided dispatch below SM100",
+                    f"kernel does not support W4A16 in {moe_config.in_dtype}",
                 )
             # Elsewhere FlashInfer would convert the weights on every call.
             if FlashInferCuteDSLExperts._supports_current_device() and not (
@@ -325,7 +306,7 @@ class FlashInferCuteDSLExperts(mk.FusedMoEExpertsModular):
             (kNvfp4Static, kNvfp4Dynamic),
             (kNvfp4Static, kNvfp4DynamicToken),
         ]
-        if _runs_w4a16():  # the activations run unquantized
+        if _below_sm100():  # W4A16 on records
             SUPPORTED_W_A.append((kNvfp4Static, None))
         return (weight_key, activation_key) in SUPPORTED_W_A
 
@@ -399,7 +380,6 @@ class FlashInferCuteDSLExperts(mk.FusedMoEExpertsModular):
         expert_tokens_meta: mk.ExpertTokensMetadata | None,
         apply_router_weight_on_input: bool | None,
     ):
-        assert self.quant_dtype == "nvfp4"
         assert self.w1_scale is not None
         assert self.w2_scale is not None
         if self._weight_shapes is not None:

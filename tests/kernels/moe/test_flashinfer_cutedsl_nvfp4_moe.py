@@ -9,7 +9,6 @@ import pytest
 import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
-from tests.kernels.moe.utils import _scaled_fp4_quant_emulated
 from tests.kernels.quantization.nvfp4_utils import (
     FLOAT4_E2M1_MAX,
     FLOAT8_E4M3_MAX,
@@ -32,10 +31,11 @@ from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEParallelConfig,
     RoutingMethodType,
     nvfp4_moe_quant_config,
+    nvfp4_w4a16_moe_quant_config,
 )
 from vllm.model_executor.layers.fused_moe.experts.flashinfer_cutedsl_moe import (
     FlashInferCuteDSLExperts,
-    _runs_w4a16,
+    _below_sm100,
 )
 from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import (
     NvFp4MoeBackend,
@@ -61,7 +61,6 @@ if not FlashInferCuteDSLExperts._supports_current_device():
         "Requires FlashInfer CuTeDSL NVFP4 MoE on this device",
         allow_module_level=True,
     )
-_W4A16 = _runs_w4a16()
 
 _SWIGLU_ALPHA = 1.702
 _SWIGLU_BETA = 1.0
@@ -145,14 +144,11 @@ def _quantize_nvfp4_linear(
         global_scale = (
             FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / expert_weight.abs().max()
         ).to(torch.float32)
-        if _W4A16:  # no quantization kernel
-            weight_q, scale = _scaled_fp4_quant_emulated(expert_weight, global_scale)
-        else:
-            weight_q, scale = ops.scaled_fp4_quant(
-                expert_weight,
-                global_scale,
-                is_sf_swizzled_layout=False,
-            )
+        weight_q, scale = ops.scaled_fp4_quant(
+            expert_weight,
+            global_scale,
+            is_sf_swizzled_layout=False,
+        )
         weights_q.append(weight_q)
         scales.append(scale)
         global_scales.append(global_scale)
@@ -187,6 +183,7 @@ def _dequantize_nvfp4_linear(
 )
 @pytest.mark.parametrize("activation,alpha,beta,limit", _ACT_CASES)
 @pytest.mark.parametrize("per_token_activation", [False, True])
+@pytest.mark.parametrize("w4a16", [False, True])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("localization", ["off", "retain", "free"])
 @torch.inference_mode()
@@ -201,6 +198,7 @@ def test_flashinfer_cutedsl_fp4_moe(
     beta: float | None,
     limit: float | None,
     per_token_activation: bool,
+    w4a16: bool,
     dtype: torch.dtype,
     localization: str,
     monkeypatch,
@@ -209,6 +207,8 @@ def test_flashinfer_cutedsl_fp4_moe(
     import vllm.distributed.localization as loc
     import vllm.model_executor.layers.fused_moe.experts.flashinfer_cutedsl_moe as mod
 
+    if w4a16 and (per_token_activation or not _below_sm100()):
+        pytest.skip("FlashInfer runs NVFP4 W4A16 MoE below SM100")
     if current_platform.is_device_capability(107) and per_token_activation:
         pytest.skip("Rubin CuTeDSL MoE does not support per-token activation scales")
     if current_platform.is_device_capability(107) and (
@@ -280,16 +280,20 @@ def test_flashinfer_cutedsl_fp4_moe(
             FlashInferCuteDSLExperts,
             moe_config,
             kNvfp4Static,
-            kNvfp4DynamicToken if per_token_activation else kNvfp4Dynamic,
+            None
+            if w4a16
+            else kNvfp4DynamicToken
+            if per_token_activation
+            else kNvfp4Dynamic,
             mk.FusedMoEActivationFormat.Standard,
         )
-        # Below SM100 FlashInfer outputs BF16 only, and would convert the
-        # weights on every call for other activations than these.
+        # FlashInfer runs W4A16 in BF16 only, and would convert the weights on
+        # every call for other activations than these.
         records = limit is None and activation in (
             MoEActivation.SILU,
             MoEActivation.RELU2_NO_MUL,
         )
-        if _W4A16 and not (records and dtype == torch.bfloat16):
+        if w4a16 and not (records and dtype == torch.bfloat16):
             assert not supported
             return
         assert supported
@@ -297,8 +301,8 @@ def test_flashinfer_cutedsl_fp4_moe(
         fake_layer.activation = activation
         fake_layer.moe_config = moe_config
         # With 16-bit activations the activation scales must go unused.
-        a1_scale = torch.full((1,), 0.5 if _W4A16 else 1.0, device="cuda")
-        a2_scale = torch.full((1,), 0.5 if _W4A16 else 1.0, device="cuda")
+        a1_scale = torch.full((1,), 0.5 if w4a16 else 1.0, device="cuda")
+        a2_scale = torch.full((1,), 0.5 if w4a16 else 1.0, device="cuda")
         (
             w1_cutedsl,
             w1_scale_cutedsl,
@@ -343,6 +347,7 @@ def test_flashinfer_cutedsl_fp4_moe(
             swiglu_alpha=alpha,
             swiglu_beta=beta,
             swiglu_limit=limit,
+            use_a16=w4a16,
         )
 
         if resources is not None and activation.is_gated:
@@ -391,7 +396,7 @@ def test_flashinfer_cutedsl_fp4_moe(
         fake_layer.w2_input_scale = a2_scale
         alphas = (w1_alpha.clone(), w2_alpha.clone())
         experts.process_weights_after_loading(fake_layer)
-        if _W4A16:
+        if w4a16:
             assert torch.equal(w1_alpha, alphas[0])
             assert torch.equal(w2_alpha, alphas[1])
             # FlashInfer runs these on records, prepared once in place of the
@@ -447,7 +452,7 @@ def test_flashinfer_cutedsl_fp4_moe(
         torch.accelerator.synchronize()
         torch.testing.assert_close(captured_output, cutedsl_output)
 
-        if _W4A16:
+        if w4a16:
             a_in_dtype = hidden_states
         else:
             a_global_scale = torch.ones(1, device="cuda", dtype=torch.float32)
@@ -510,7 +515,9 @@ def test_flashinfer_cutedsl_fp4_moe(
         assert cosine > 0.99, f"cosine similarity {cosine:.4f} below 0.99"
 
 
-@pytest.mark.skipif(not _W4A16, reason="FlashInfer runs W4A16 records below SM100")
+@pytest.mark.skipif(
+    not _below_sm100(), reason="FlashInfer runs W4A16 records below SM100"
+)
 @pytest.mark.parametrize("mode", ["layerwise", "direct"])
 def test_w4a16_records_refilled_in_place_on_reload(monkeypatch, mode):
     from flashinfer.fused_moe import cute_dsl_w4a16_sm80_weights
@@ -577,11 +584,9 @@ def test_w4a16_records_refilled_in_place_on_reload(monkeypatch, mode):
             raise NotImplementedError
 
         def process_weights_after_loading(self, layer):
-            quant_config = nvfp4_moe_quant_config(
+            quant_config = nvfp4_w4a16_moe_quant_config(
                 g1_alphas=one,
                 g2_alphas=one,
-                a1_gscale=one,
-                a2_gscale=one,
                 w1_scale=layer.w13_weight_scale,
                 w2_scale=layer.w2_weight_scale,
             )
@@ -624,7 +629,6 @@ def test_w4a16_records_refilled_in_place_on_reload(monkeypatch, mode):
         assert getattr(model, name).numel() == 0
 
 
-@pytest.mark.skipif(_W4A16, reason="FlashInfer does not localize W4A16 MoE")
 @pytest.mark.parametrize("localized", [False, True])
 @pytest.mark.parametrize("overlap", [False, True])
 @pytest.mark.parametrize("max_capture_size", [0, 256])

@@ -920,7 +920,7 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
             activation_key=activation_key,
         )
         # NONE: requantization source, which has no compute backend. Below
-        # SM100, FLASHINFER_CUTEDSL runs the activations unquantized.
+        # SM100, FLASHINFER_CUTEDSL runs them too.
         per_token_backends = {NvFp4MoeBackend.FLASHINFER_TRTLLM, NvFp4MoeBackend.NONE}
         if not current_platform.is_device_capability_family(100):
             per_token_backends.add(NvFp4MoeBackend.FLASHINFER_CUTEDSL)

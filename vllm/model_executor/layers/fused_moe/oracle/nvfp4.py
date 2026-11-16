@@ -546,12 +546,14 @@ def convert_to_nvfp4_moe_kernel_format(
     else:
         raise ValueError(f"Unknown NvFp4 backend for MoE: {nvfp4_backend}")
 
-    if nvfp4_backend in (
-        NvFp4MoeBackend.FLASHINFER_TRTLLM,
-        NvFp4MoeBackend.FLASHINFER_CUTLASS,
+    if (
+        nvfp4_backend
+        in (NvFp4MoeBackend.FLASHINFER_TRTLLM, NvFp4MoeBackend.FLASHINFER_CUTLASS)
+        or (nvfp4_backend == NvFp4MoeBackend.FLASHINFER_CUTEDSL and not use_a16)
     ) and not current_platform.has_device_capability(100):
         # Below SM100 FlashInfer runs these on its CUTLASS SM80 kernels and
         # converts the weights on every call unless given their operands.
+        # CuTeDSL W4A16 runs on records, which its experts prepare.
         from flashinfer.fused_moe import (
             cutlass_nvfp4_sm80_weights,
             trtllm_nvfp4_sm80_weights,
@@ -562,8 +564,11 @@ def convert_to_nvfp4_moe_kernel_format(
                 w13, w13_scale, w2, w2_scale, is_act_and_mul
             )
         else:
+            interleaved = (
+                nvfp4_backend == NvFp4MoeBackend.FLASHINFER_CUTEDSL and is_act_and_mul
+            )
             w13, w13_scale, w2, w2_scale = cutlass_nvfp4_sm80_weights(
-                w13, w13_scale, w2, w2_scale, layer.moe_config.in_dtype
+                w13, w13_scale, w2, w2_scale, layer.moe_config.in_dtype, interleaved
             )
 
     return (
@@ -593,6 +598,13 @@ def make_nvfp4_moe_quant_config(
     use_a16: bool = False,
 ) -> FusedMoEQuantConfig:
     use_a16 = _use_a16(backend, use_a16)
+    # Scales prepared below SM100 (cutlass_nvfp4_sm80_weights) are read as is.
+    if (
+        backend == NvFp4MoeBackend.FLASHINFER_CUTEDSL
+        and w13_scale.dtype == torch.float8_e4m3fn
+    ):
+        w13_scale = nvfp4_swizzled_scale_to_cutedsl_mma_view(w13_scale)
+        w2_scale = nvfp4_swizzled_scale_to_cutedsl_mma_view(w2_scale)
     if backend == NvFp4MoeBackend.HUMMING:
         from vllm.model_executor.layers.fused_moe import RoutedExperts
         from vllm.model_executor.layers.quantization.utils.humming import (
@@ -608,7 +620,12 @@ def make_nvfp4_moe_quant_config(
         )
     elif backend == NvFp4MoeBackend.MARLIN or (
         use_a16
-        and backend in (NvFp4MoeBackend.B12X, NvFp4MoeBackend.FLASHINFER_CUTLASS)
+        and backend
+        in (
+            NvFp4MoeBackend.B12X,
+            NvFp4MoeBackend.FLASHINFER_CUTLASS,
+            NvFp4MoeBackend.FLASHINFER_CUTEDSL,
+        )
     ):
         return nvfp4_w4a16_moe_quant_config(
             g1_alphas=w13_scale_2,
@@ -631,10 +648,6 @@ def make_nvfp4_moe_quant_config(
             gemm1_beta=swiglu_beta,
             gemm1_clamp_limit=swiglu_limit,
         )
-
-    if backend == NvFp4MoeBackend.FLASHINFER_CUTEDSL:
-        w13_scale = nvfp4_swizzled_scale_to_cutedsl_mma_view(w13_scale)
-        w2_scale = nvfp4_swizzled_scale_to_cutedsl_mma_view(w2_scale)
 
     a1_gscale = 1.0 / a13_scale
     a2_gscale = 1.0 / a2_scale
