@@ -617,6 +617,7 @@ def test_online_nvfp4_reuses_kernel_when_weights_are_reprocessed(
     monkeypatch, is_act_and_mul, expected_hidden_alignment
 ) -> None:
     monkeypatch.setattr(current_platform, "is_device_capability_family", lambda _: True)
+    monkeypatch.setattr(current_platform, "has_device_capability", lambda _: True)
     select_backend = Mock(return_value=(object(), object))
     monkeypatch.setattr(
         "vllm.model_executor.layers.quantization.online.nvfp4.select_nvfp4_moe_backend",

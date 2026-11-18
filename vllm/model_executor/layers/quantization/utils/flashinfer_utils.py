@@ -6,6 +6,7 @@ import torch
 
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+from vllm.platforms import current_platform
 from vllm.utils.math_utils import round_up
 
 if TYPE_CHECKING:
@@ -303,8 +304,13 @@ def trtllm_nvfp4_hidden_alignment(
     The per-token (dynamic activation scale) non-gated variant has far fewer
     tile configs for 256-aligned K and its heuristic default tactic fails with
     "No valid config found" (e.g. Nemotron's 2688 -> 2816), so pad to 512.
+    Below SM100 no cubin runs.
     """
-    if per_token_activation and not is_act_and_mul:
+    if (
+        per_token_activation
+        and not is_act_and_mul
+        and current_platform.has_device_capability(100)
+    ):
         return 512
     return 256
 

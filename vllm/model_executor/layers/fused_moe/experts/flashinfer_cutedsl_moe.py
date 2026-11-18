@@ -97,6 +97,74 @@ def _below_sm100() -> bool:
     )
 
 
+def runs_on_sm80_records(
+    moe_config: FusedMoEConfig,
+    per_token_activation: bool = False,
+    cutlass_w4a4: bool = False,
+    w1_scale: torch.Tensor | None = None,
+    trtllm: bool = False,
+) -> bool:
+    """Whether FlashInfer runs this NVFP4 layer below SM100 on records, prepared
+    once (`use_sm80_records`): W4A16, or NVFP4 activations without per-token
+    scales nor, with the CUTLASS MoE, the environment's 4over6 GEMM2 input.
+    With the TRT-LLM MoE (`trtllm`) per-token ReLU2 too, at the standard recipe
+    with the quantizers' fast math: FlashInfer then quantizes per token as its
+    CUTLASS path does. From the experts, `w1_scale` must still hold E4M3 block
+    scales: callers of `convert_to_nvfp4_moe_kernel_format` without
+    `sm80_records` convert them."""
+    if not _below_sm100():
+        return False
+    if per_token_activation:
+        from flashinfer.quantization.nvfp4_quantization_utils import (
+            current_nvfp4_4over6_config,
+            env_flag_enabled,
+        )
+
+        if (
+            not trtllm
+            or moe_config.activation != MoEActivation.RELU2_NO_MUL
+            or current_nvfp4_4over6_config() is not None
+            or env_flag_enabled("FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH")
+            or env_flag_enabled("TRTLLM_DISABLE_FP4_QUANT_FAST_MATH")
+        ):
+            return False
+    if w1_scale is not None and w1_scale.element_size() != 1:
+        return False
+    if cutlass_w4a4:
+        from flashinfer.quantization.nvfp4_quantization_utils import (
+            current_nvfp4_4over6_config,
+        )
+
+        if current_nvfp4_4over6_config() is not None:
+            return False
+    return FlashInferCuteDSLExperts._runs_on_records(moe_config)
+
+
+def use_sm80_records(
+    experts: mk.FusedMoEExperts,
+    layer: torch.nn.Module,
+    records: tuple[torch.Tensor, torch.Tensor],
+) -> None:
+    """Pass FlashInfer the records packed once from the layer's weights and
+    block scales, which it would otherwise convert on every call, and release
+    those. `experts._weight_shapes` then stands in for the weights."""
+    # Refilled in place on reloads, so captured CUDA graphs read them.
+    experts.quant_config._w1.scale = refill_derived(
+        layer, "_experts_w1_records", records[0]
+    )
+    experts.quant_config._w2.scale = refill_derived(
+        layer, "_experts_w2_records", records[1]
+    )
+    # FlashInfer then reads only the shapes of the weights; one stored row keeps
+    # their integer views valid.
+    experts._weight_shapes = tuple(  # type: ignore[attr-defined]
+        w.new_empty(w.shape[-1]).expand(w.shape)
+        for w in (layer.w13_weight, layer.w2_weight)
+    )
+    for name in ("w13_weight", "w13_weight_scale", "w2_weight", "w2_weight_scale"):
+        replace_parameter(layer, name, getattr(layer, name).new_empty(0))
+
+
 class FlashInferCuteDSLExperts(mk.FusedMoEExpertsModular):
     """CuteDSL NvFP4 MoE experts using the FlashInfer functional API.
 
@@ -151,11 +219,13 @@ class FlashInferCuteDSLExperts(mk.FusedMoEExpertsModular):
         self._weight_shapes: tuple[torch.Tensor, torch.Tensor] | None = None
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        if self.w4a16:
-            self._prepare_w4a16_records(layer)
-        else:
+        if not self.w4a16:
             layer.w13_weight_scale_2.data.mul_(layer.w13_input_scale)
             layer.w2_weight_scale_2.data.mul_(layer.w2_input_scale)
+        if self.w4a16 or runs_on_sm80_records(
+            self.moe_config, self.per_token_activation, w1_scale=self.w1_scale
+        ):
+            self._prepare_w4a16_records(layer)
         self._localized_kwargs = {}
         res = get_localized_resources()
         shards = getattr(layer, "localized_shards", None)
@@ -199,24 +269,14 @@ class FlashInferCuteDSLExperts(mk.FusedMoEExpertsModular):
         }
 
     def _prepare_w4a16_records(self, layer: torch.nn.Module) -> None:
-        """Pack the weights and block scales once into the records FlashInfer
-        would otherwise convert them to on every call, and release them."""
+        """Run W4A16, or W4A4 without per-token scales, on records."""
         from flashinfer.fused_moe import cute_dsl_w4a16_sm80_weights
 
         w1, w2 = layer.w13_weight, layer.w2_weight
-        r1, r2 = cute_dsl_w4a16_sm80_weights(
+        records = cute_dsl_w4a16_sm80_weights(
             w1, self.w1_scale, w2, self.w2_scale, self.moe_config.activation.is_gated
         )
-        # Refilled in place on reloads, so captured CUDA graphs read them.
-        self.quant_config._w1.scale = refill_derived(layer, "_experts_w1_records", r1)
-        self.quant_config._w2.scale = refill_derived(layer, "_experts_w2_records", r2)
-        # FlashInfer then reads only the shapes of the weights.
-        self._weight_shapes = (
-            w1.new_empty(()).expand(w1.shape),
-            w2.new_empty(()).expand(w2.shape),
-        )
-        for name in ("w13_weight", "w13_weight_scale", "w2_weight", "w2_weight_scale"):
-            replace_parameter(layer, name, getattr(layer, name).new_empty(0))
+        use_sm80_records(self, layer, records)
 
     def _activation_kwargs(self, activation: MoEActivation) -> dict[str, Any]:
         return _flashinfer_activation_kwargs(
@@ -331,7 +391,10 @@ class FlashInferCuteDSLExperts(mk.FusedMoEExpertsModular):
 
     @property
     def expects_unquantized_inputs(self) -> bool:
-        return self.per_token_activation or self.w4a16
+        # Standard W4A4 on records quantizes the BF16 input as it routes it.
+        return (
+            self.per_token_activation or self.w4a16 or self._weight_shapes is not None
+        )
 
     def moe_problem_size(
         self,
@@ -385,13 +448,19 @@ class FlashInferCuteDSLExperts(mk.FusedMoEExpertsModular):
         if self._weight_shapes is not None:
             w1, w2 = self._weight_shapes
 
+        fc1_input_scale = None
         if self.w4a16:
             block_scale = per_token_scale = fc2_input_scale = None
-        elif self.expects_unquantized_inputs:
+        elif self.per_token_activation:
             hidden_states, block_scale, per_token_scale = (
                 quantize_nvfp4_per_token_input(hidden_states)
             )
             fc2_input_scale = self.per_token_global_scale
+        elif self.expects_unquantized_inputs:
+            assert self.a1_gscale is not None
+            block_scale = per_token_scale = None
+            fc1_input_scale = self.a1_gscale.reshape(-1)[:1]
+            fc2_input_scale = self.a2_gscale
         else:
             assert a1q_scale is not None
             block_scale = a1q_scale
@@ -399,7 +468,7 @@ class FlashInferCuteDSLExperts(mk.FusedMoEExpertsModular):
             fc2_input_scale = self.a2_gscale
 
         if not self.w4a16:
-            assert block_scale is not None
+            assert block_scale is not None or fc1_input_scale is not None
             assert fc2_input_scale is not None
 
         # a1q_scale is (M, K//16) float8_e4m3fn from fp4_quantize.
@@ -408,6 +477,9 @@ class FlashInferCuteDSLExperts(mk.FusedMoEExpertsModular):
 
         per_token_kwargs = (
             {"per_token_scale": per_token_scale} if self.per_token_activation else {}
+        )
+        fc1_kwargs = (
+            {} if fc1_input_scale is None else {"fc1_input_scale": fc1_input_scale}
         )
         flashinfer_cute_dsl_fused_moe_nvfp4(
             x=hidden_states,
@@ -430,6 +502,7 @@ class FlashInferCuteDSLExperts(mk.FusedMoEExpertsModular):
             autotune_use_cuda_graph=self.autotune_use_cuda_graph,
             **self._activation_kwargs(activation),
             **per_token_kwargs,
+            **fc1_kwargs,
             quant_mode="w4a16" if self.w4a16 else "w4a4",
             # Full-width weight metadata is retained even when storage is released.
             **self._localized_kwargs,

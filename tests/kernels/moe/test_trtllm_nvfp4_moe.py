@@ -105,6 +105,8 @@ SITU = op_registry[_SITU_OP_NAME]
 def _make_trtllm_fp4_moe_kernel(
     moe_config: FusedMoEConfig,
     quant_config: FusedMoEQuantConfig,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
     per_token_activation: bool = False,
 ) -> mk.FusedMoEKernel:
     experts = TrtLlmNvFp4ExpertsModular(
@@ -124,6 +126,14 @@ def _make_trtllm_fp4_moe_kernel(
     fake_layer.w2_weight_scale_2 = quant_config.g2_alphas
     fake_layer.w13_input_scale = torch.ones_like(quant_config.g1_alphas)
     fake_layer.w2_input_scale = torch.ones_like(quant_config.g2_alphas)
+    # Below SM100 the experts pack the weights into records at load.
+    for name, w in (
+        ("w13_weight", w1),
+        ("w13_weight_scale", quant_config.w1_scale),
+        ("w2_weight", w2),
+        ("w2_weight_scale", quant_config.w2_scale),
+    ):
+        setattr(fake_layer, name, torch.nn.Parameter(w, requires_grad=False))
     experts.process_weights_after_loading(fake_layer)
     return mk.FusedMoEKernel(
         maybe_make_prepare_finalize(
@@ -299,6 +309,8 @@ def test_trtllm_fp4_moe_no_graph(
         trtllm_experts = _make_trtllm_fp4_moe_kernel(
             moe_config,
             quant_config,
+            w1_q,
+            w2_q,
             per_token_activation=per_token_activation,
         )
         if activation == MoEActivation.SITU:
@@ -520,6 +532,8 @@ def test_trtllm_fp4_moe_padding_robust(
         kernel = _make_trtllm_fp4_moe_kernel(
             moe_config,
             quant_config,
+            w1_q,
+            w2_q,
             per_token_activation=per_token_activation,
         )
 
@@ -538,7 +552,7 @@ def test_trtllm_fp4_moe_padding_robust(
         a_poison[m:] = float("nan")
 
         def quantize(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
-            if per_token_activation:
+            if kernel.fused_experts.expects_unquantized_inputs:
                 return x, None
             assert quant_config.a1_gscale is not None
             return ops.scaled_fp4_quant(
@@ -682,7 +696,8 @@ def test_trtllm_fp4_moe_deferred_finalize(
             routing_method=RoutingMethodType.TopK,
             max_num_tokens=next_power_of_2(m),
         )
-        kernel = _make_trtllm_fp4_moe_kernel(moe_config, quant_config)
+        kernel = _make_trtllm_fp4_moe_kernel(moe_config, quant_config, w1_q, w2_q)
+        records = getattr(kernel.fused_experts, "_weight_shapes", None) is not None
 
         check_deferred_moe_finalize(
             moe_config,
@@ -698,7 +713,8 @@ def test_trtllm_fp4_moe_deferred_finalize(
                 apply_router_weight_on_input=False,
             ),
             router_weights=topk_weights,
-            chunked=chunk_size is not None,
+            # Below SM100 records finalize instead.
+            chunked=chunk_size is not None or records,
         )
 
 

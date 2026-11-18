@@ -239,7 +239,20 @@ class NvFp4MoEKernelOracle(MoEKernelOracle[NvFp4MoeBackend]):
     def backend_to_kernel_cls(
         self, backend: NvFp4MoeBackend
     ) -> list[type[mk.FusedMoEExperts]]:
-        return backend_to_kernel_cls(backend)
+        classes = backend_to_kernel_cls(backend)
+        if backend == NvFp4MoeBackend.FLASHINFER_TRTLLM:
+            from vllm.model_executor.layers.fused_moe.experts.flashinfer_cutedsl_moe import (  # noqa: E501
+                runs_on_sm80_records,
+            )
+
+            # Records take real expert ids: route with vLLM's router, not FlashInfer's.
+            if runs_on_sm80_records(
+                self.moe_config,
+                self.activation_key == kNvfp4DynamicToken,
+                trtllm=True,
+            ):
+                classes = classes[::-1]
+        return classes
 
 
 def nvfp4_backend_supports_csf_scales(
@@ -368,6 +381,8 @@ def convert_to_nvfp4_moe_kernel_format(
     use_a16: bool = False,
     trtllm_hidden_alignment: int = 256,
     csf_scales: bool = False,
+    sm80_records: bool = False,
+    per_token_activation: bool = False,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -546,14 +561,33 @@ def convert_to_nvfp4_moe_kernel_format(
     else:
         raise ValueError(f"Unknown NvFp4 backend for MoE: {nvfp4_backend}")
 
+    from vllm.model_executor.layers.fused_moe.experts.flashinfer_cutedsl_moe import (
+        runs_on_sm80_records,
+    )
+
     if (
-        nvfp4_backend
-        in (NvFp4MoeBackend.FLASHINFER_TRTLLM, NvFp4MoeBackend.FLASHINFER_CUTLASS)
-        or (nvfp4_backend == NvFp4MoeBackend.FLASHINFER_CUTEDSL and not use_a16)
-    ) and not current_platform.has_device_capability(100):
+        (
+            nvfp4_backend
+            in (NvFp4MoeBackend.FLASHINFER_TRTLLM, NvFp4MoeBackend.FLASHINFER_CUTLASS)
+            or (nvfp4_backend == NvFp4MoeBackend.FLASHINFER_CUTEDSL and not use_a16)
+        )
+        and not current_platform.has_device_capability(100)
+        and not (
+            sm80_records
+            and runs_on_sm80_records(
+                layer.moe_config,
+                per_token_activation,
+                cutlass_w4a4=(
+                    nvfp4_backend == NvFp4MoeBackend.FLASHINFER_CUTLASS and not use_a16
+                ),
+                trtllm=nvfp4_backend == NvFp4MoeBackend.FLASHINFER_TRTLLM,
+            )
+        )
+    ):
         # Below SM100 FlashInfer runs these on its CUTLASS SM80 kernels and
         # converts the weights on every call unless given their operands.
-        # CuTeDSL W4A16 runs on records, which its experts prepare.
+        # Records, which the experts prepare (CuTeDSL W4A16's always, the rest
+        # with `sm80_records`), run the others.
         from flashinfer.fused_moe import (
             cutlass_nvfp4_sm80_weights,
             trtllm_nvfp4_sm80_weights,

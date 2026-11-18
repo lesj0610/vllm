@@ -1147,6 +1147,8 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
                 is_act_and_mul=self.moe.is_act_and_mul,
             ),
             csf_scales=self.csf_scales,
+            sm80_records=True,
+            per_token_activation=self.per_token_activation,
         )
 
         replace_parameter(layer, "w13_weight", w13)
