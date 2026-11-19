@@ -210,6 +210,8 @@ class FlashInferExperts(mk.FusedMoEExpertsModular):
         intermediate = moe_config.intermediate_size_per_partition
         return (
             has_flashinfer_csf_scales()
+            # CSF expands into the SM100+ CUTLASS block-scale layout only.
+            and current_platform.has_device_capability(100)
             # Routing ids index the rank's experts only without EP.
             and not moe_config.moe_parallel_config.use_ep
             and moe_config.is_act_and_mul

@@ -275,6 +275,9 @@ def test_csf_scales_stay_resident_on_flashinfer_cutlass(
     monkeypatch.setattr(has_csf_ops, lambda: False)
     assert not nvfp4_backend_supports_csf_scales(backend, config, False)
     monkeypatch.setattr(has_csf_ops, lambda: True)
+    monkeypatch.setattr(current_platform, "has_device_capability", lambda *_: False)
+    assert not nvfp4_backend_supports_csf_scales(backend, config, False)
+    monkeypatch.setattr(current_platform, "has_device_capability", lambda *_: True)
     assert nvfp4_backend_supports_csf_scales(backend, config, False)
     assert not nvfp4_backend_supports_csf_scales(
         NvFp4MoeBackend.FLASHINFER_TRTLLM, config, False
@@ -285,7 +288,8 @@ def test_csf_scales_stay_resident_on_flashinfer_cutlass(
 
 
 @pytest.mark.skipif(
-    not has_flashinfer_csf_scales(), reason="requires FlashInfer CSF scales"
+    not has_flashinfer_csf_scales() or not current_platform.has_device_capability(100),
+    reason="requires FlashInfer CSF scales",
 )
 # Qwen3.8-Flash-Next routed-expert shards at TP1 and TP2.
 @pytest.mark.parametrize("intermediate_size", [640, 320])
