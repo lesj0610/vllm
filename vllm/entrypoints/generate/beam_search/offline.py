@@ -21,6 +21,7 @@ from vllm.sampling_params import (
 from vllm.tokenizers import TokenizerLike
 from vllm.v1.structured_output.backend_types import StructuredOutputBackend
 from vllm.v1.structured_output.request import get_structured_output_key
+from vllm.v1.structured_output.utils import allocate_token_bitmask
 
 from .utils import (
     BeamSearchInstance,
@@ -64,6 +65,7 @@ class BeamSearchOfflineMixin(OfflineInferenceMixin):
         lora_request: list[LoRARequest] | LoRARequest | None = None,
         use_tqdm: bool = False,
         concurrency_limit: int | None = None,
+        priority: int | Sequence[int] | None = None,
     ) -> list[BeamSearchOutput]:
         """Generate sequences using beam search.
 
@@ -75,6 +77,8 @@ class BeamSearchOfflineMixin(OfflineInferenceMixin):
             use_tqdm: Whether to use tqdm to display the progress bar.
             concurrency_limit: The maximum number of concurrent requests.
                 If None, the number of concurrent requests is unlimited.
+            priority: Scheduling priority, either shared or one per prompt.
+                Lower values have higher priority. Defaults to 0.
 
         """
         # TODO: how does beam search work together with length penalty,
@@ -90,6 +94,7 @@ class BeamSearchOfflineMixin(OfflineInferenceMixin):
 
         engine_inputs = self._preprocess_cmpl(prompts)
         lora_requests = self._lora_request_to_seq(lora_request, len(engine_inputs))
+        priorities = self._priority_to_seq(priority, len(engine_inputs))
 
         if use_tqdm and concurrency_limit is not None:
             logger.warning(
@@ -107,7 +112,7 @@ class BeamSearchOfflineMixin(OfflineInferenceMixin):
 
         # generate 2 * beam_width candidates at each step
         # following the huggingface transformers implementation
-        # at https://github.com/huggingface/transformers/blob/e15687fffe5c9d20598a19aeab721ae0a7580f8a/src/transformers/generation/beam_search.py#L534 # noqa
+        # at https://github.com/huggingface/transformers/blob/e15687fffe5c9d20598a19aeab721ae0a7580f8a/src/transformers/generation/beam_search.py#L534
         base_sampling_params = SamplingParams(
             logprobs=2 * beam_width,
             max_tokens=1,
@@ -132,10 +137,12 @@ class BeamSearchOfflineMixin(OfflineInferenceMixin):
             self.llm_engine.input_processor.generation_config_fields,
             tokenizer.eos_token_id,
         )
-        sort_beams_key = create_sort_beams_key_function(eos_token_ids, length_penalty)
+        sort_beams_key = create_sort_beams_key_function(length_penalty)
         instances: list[BeamSearchInstance] = []
 
-        for lora_req, prompt in zip(lora_requests, engine_inputs):
+        for lora_req, prompt, prompt_priority in zip(
+            lora_requests, engine_inputs, priorities
+        ):
             if prompt["type"] == "embeds":
                 raise NotImplementedError(
                     "Embedding prompt not supported for beam search"
@@ -146,6 +153,7 @@ class BeamSearchOfflineMixin(OfflineInferenceMixin):
                     prompt,
                     lora_request=lora_req,
                     logprobs=None,
+                    priority=prompt_priority,
                 ),
             )
 
@@ -225,6 +233,9 @@ class BeamSearchOfflineMixin(OfflineInferenceMixin):
                 instance.beams for instance in instances_batch
             )
         )
+        priorities = [
+            instance.priority for instance in instances_batch for _ in instance.beams
+        ]
         pos = [0] + list(
             itertools.accumulate(len(instance.beams) for instance in instances_batch)
         )
@@ -284,6 +295,7 @@ class BeamSearchOfflineMixin(OfflineInferenceMixin):
             params=active_params,
             output_type=RequestOutput,
             lora_requests=[beam.lora_request for beam in active_beams],
+            priorities=[priorities[i] for i in active_indices],
             use_tqdm=False,
         )
 
@@ -363,7 +375,13 @@ class BeamSearchOfflineMixin(OfflineInferenceMixin):
                 key=sort_beams_key,
                 reverse=True,
             )
-            instance.beams = sorted_beams[:beam_width]
+            instance.beams = []
+            for beam in sorted_beams[:beam_width]:
+                if len(beam.tokens) >= self.model_config.max_model_len:
+                    beam.finish_reason = "length"
+                    instance.completed.append(beam)
+                else:
+                    instance.beams.append(beam)
 
         return False
 
@@ -433,7 +451,7 @@ class BeamSearchOfflineMixin(OfflineInferenceMixin):
             raise ValueError(f"Unsupported structured output backend: {backend_name}")
 
         structured_output_key = get_structured_output_key(structured_outputs)
-        bitmask = backend.allocate_token_bitmask(1)
+        bitmask = allocate_token_bitmask(1, vocab_size)
 
         return backend, structured_output_key, bitmask
 
