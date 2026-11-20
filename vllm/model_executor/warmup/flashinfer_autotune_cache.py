@@ -108,6 +108,9 @@ def runs_flashinfer_autotune(runner: "GPUModelRunner") -> bool:
     from vllm.model_executor.layers.fused_moe.experts.flashinfer_cutlass_moe import (
         FlashInferExperts,
     )
+    from vllm.model_executor.layers.fused_moe.experts.trtllm_mxfp4_moe import (
+        TrtLlmMxfp4ExpertsBase,
+    )
     from vllm.model_executor.layers.fused_moe.experts.trtllm_nvfp4_moe import (
         TrtLlmNvFp4ExpertsBase,
     )
@@ -115,15 +118,18 @@ def runs_flashinfer_autotune(runner: "GPUModelRunner") -> bool:
     flashinfer_experts = (
         FlashInferCuteDSLExperts,
         FlashInferExperts,
+        TrtLlmMxfp4ExpertsBase,
         TrtLlmNvFp4ExpertsBase,
     )
-    for module in runner.get_model().modules():
-        if isinstance(module, MoERunner):
-            kernel = getattr(module._quant_method, "moe_kernel", None)
-            if kernel is not None and isinstance(
-                kernel.impl.fused_experts, flashinfer_experts
-            ):
-                return True
+    # The drafter is outside the target's module tree.
+    for model in (runner.get_model(), runner.get_draft_model()):
+        for module in model.modules() if model is not None else ():
+            if isinstance(module, MoERunner):
+                kernel = getattr(module._quant_method, "moe_kernel", None)
+                if kernel is not None and isinstance(
+                    kernel.impl.fused_experts, flashinfer_experts
+                ):
+                    return True
     return False
 
 

@@ -195,6 +195,7 @@ def _make_runner(modules, *, max_tokens: int = 8192):
         get_model=Mock(
             return_value=SimpleNamespace(modules=Mock(return_value=modules))
         ),
+        get_draft_model=Mock(return_value=None),
         _dummy_run=Mock(),
         speculator=None,
     )
@@ -237,6 +238,10 @@ class _FakeCutlassExperts:
     """Stand-in for FlashInferExperts."""
 
 
+class _FakeTrtLlmMxfp4Experts:
+    """Stand-in for TrtLlmMxfp4ExpertsBase."""
+
+
 class _FakeTrtLlmNvFp4Experts:
     """Stand-in for TrtLlmNvFp4ExpertsBase."""
 
@@ -252,17 +257,22 @@ class _FakeKernelMoERunner(_FakeMoERunner):
         (80, _FakeCuteDSLExperts(), True),
         (80, _FakeCutlassExperts(), True),
         (86, _FakeTrtLlmNvFp4Experts(), True),
+        (89, _FakeTrtLlmMxfp4Experts(), True),
         (89, object(), False),
         (80, None, False),
     ],
 )
+@pytest.mark.parametrize("in_draft", [False, True])
 def test_flashinfer_autotunes_below_sm90_only_its_moe_experts(
-    capability, experts, expected
+    capability, experts, expected, in_draft
 ):
     moe = _FakeKernelMoERunner()
     kernel = SimpleNamespace(impl=SimpleNamespace(fused_experts=experts))
     moe._quant_method = SimpleNamespace(moe_kernel=kernel if experts else None)
-    runner = _make_runner([object(), moe])
+    runner = _make_runner([object()] if in_draft else [object(), moe])
+    if in_draft:
+        draft = SimpleNamespace(modules=Mock(return_value=[moe]))
+        runner.get_draft_model = Mock(return_value=draft)
     experts_module = "vllm.model_executor.layers.fused_moe.experts."
 
     with (
@@ -274,6 +284,10 @@ def test_flashinfer_autotunes_below_sm90_only_its_moe_experts(
         patch(
             experts_module + "flashinfer_cutlass_moe.FlashInferExperts",
             _FakeCutlassExperts,
+        ),
+        patch(
+            experts_module + "trtllm_mxfp4_moe.TrtLlmMxfp4ExpertsBase",
+            _FakeTrtLlmMxfp4Experts,
         ),
         patch(
             experts_module + "trtllm_nvfp4_moe.TrtLlmNvFp4ExpertsBase",

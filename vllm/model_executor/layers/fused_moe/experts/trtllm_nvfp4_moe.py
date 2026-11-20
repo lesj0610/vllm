@@ -13,10 +13,6 @@ from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEQuantConfig,
     RoutingMethodType,
 )
-from vllm.model_executor.layers.fused_moe.experts.flashinfer_cutedsl_moe import (
-    runs_on_sm80_records,
-    use_sm80_records,
-)
 from vllm.model_executor.layers.fused_moe.moe_output import (
     UnfinalizedMoEOutput,
     convert_flashinfer_moe_output,
@@ -25,8 +21,10 @@ from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceNoOP,
 )
 from vllm.model_executor.layers.fused_moe.utils import fi_moe_largest_bucket
+from vllm.model_executor.layers.quantization.utils.flashinfer_fp4_moe import (
+    release_nvfp4_records_weights,
+)
 from vllm.model_executor.layers.quantization.utils.flashinfer_utils import (
-    NVFP4_PER_TOKEN_BASE_GLOBAL_SCALE,
     activation_to_flashinfer_int,
     has_flashinfer_situ_activation,
     has_flashinfer_swiglustep_activation,
@@ -100,10 +98,10 @@ class TrtLlmNvFp4ExpertsBase:
         self.local_num_experts = moe_config.num_local_experts
         self.ep_rank = moe_config.moe_parallel_config.ep_rank
         self.is_situ = moe_config.activation == MoEActivation.SITU
+        # Weight-shaped meta tensors, once records hold the weights.
+        self._weight_shapes: tuple[torch.Tensor, torch.Tensor] | None = None
 
         self.g1_scale_c = self._compute_g1_scale_c()
-        # Weight-shaped stand-ins, once records hold the weights.
-        self._weight_shapes: tuple[torch.Tensor, torch.Tensor] | None = None
 
         # Fall back to moe_config.swiglu_* when quant_config doesn't carry them
         # (ModelOpt NVFP4 checkpoints store these on moe_config, not quant_config).
@@ -182,9 +180,9 @@ class TrtLlmNvFp4ExpertsBase:
         w1_scale = self.quant_config.w1_scale
         w2_scale = self.quant_config.w2_scale
         assert w1_scale is not None and w2_scale is not None
-        # Below SM100 the scales were prepared at load in BF16 or as records
-        # (trtllm_nvfp4_sm80_weights); the SM100 kernels read E4M3 bytes.
-        if w1_scale.dtype == torch.bfloat16 or w1_scale.dim() == 2:
+        # Below SM100 they are records (prepare_records_nvfp4_weights); the
+        # SM100 kernels read E4M3 bytes.
+        if not current_platform.has_device_capability(100):
             return w1_scale, w2_scale
         return w1_scale.view(torch.float8_e4m3fn), w2_scale.view(torch.float8_e4m3fn)
 
@@ -241,49 +239,14 @@ class TrtLlmNvFp4ExpertsBase:
             replace_parameter(layer, "gemm1_alpha", self.gemm1_alpha)
             self.gemm1_alpha = layer.gemm1_alpha
 
-        # Records run SwiGLU without custom parameters only.
-        swiglu_params = (self.gemm1_clamp_limit, self.gemm1_alpha, self.gemm1_beta)
-        if all(v is None for v in swiglu_params) and runs_on_sm80_records(
-            self.moe_config,
-            self.per_token_activation,
-            w1_scale=self.quant_config.w1_scale,
-            trtllm=True,
-        ):
-            from flashinfer.fused_moe import trtllm_nvfp4_sm80_weights
-
-            if self.per_token_activation:  # the base inverse scale FlashInfer takes
-                self._per_token_base_scale = torch.full(
-                    (1,),
-                    NVFP4_PER_TOKEN_BASE_GLOBAL_SCALE,
-                    dtype=torch.float32,
-                    device=layer.w13_weight.device,
-                )
-
-            records = trtllm_nvfp4_sm80_weights(
-                *(layer.w13_weight, self.quant_config.w1_scale),
-                *(layer.w2_weight, self.quant_config.w2_scale),
-                self.moe_config.is_act_and_mul,
-                records=True,
-            )
-            use_sm80_records(self, layer, records)  # type: ignore[arg-type]
-            # FlashInfer runs records with their finalize only.
-            self.moe_config.limit_deferred_moe_finalize(0)
-
-    def moe_problem_size(
-        self,
-        a1: torch.Tensor,
-        w1: torch.Tensor,
-        w2: torch.Tensor,
-        topk_ids: torch.Tensor,
-    ) -> tuple[int, int, int, int, int]:
-        if self._weight_shapes is not None:
-            w1, w2 = self._weight_shapes
-        return super().moe_problem_size(a1, w1, w2, topk_ids)  # type: ignore[misc]
+        # Below SM100 the records hold the weights too.
+        if not current_platform.has_device_capability(100):
+            self._weight_shapes = release_nvfp4_records_weights(layer)
 
     @staticmethod
     def _supports_current_device() -> bool:
         """Supports SM80 to SM10x; below SM100 FlashInfer runs the MoE on
-        its CUTLASS SM80 kernels."""
+        records."""
         p = current_platform
         return (
             p.is_cuda()
@@ -338,36 +301,7 @@ class TrtLlmNvFp4ExpertsBase:
 
     @property
     def expects_unquantized_inputs(self) -> bool:
-        # SM80 records (`_weight_shapes`, set after loading) quantize BF16 input.
-        return self.per_token_activation or self._weight_shapes is not None
-
-    def _kernel_input(
-        self, hidden_states: torch.Tensor, a1q_scale: torch.Tensor | None
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
-        """The kernel's activations, scales and per-token scales: quantized per token
-        here; BF16 with the global scale; or as prepare() quantized under it."""
-        per_token_scale = None
-        if self.per_token_activation and self._weight_shapes is not None:
-            # SM80 records quantize per token too, writing the scales here.
-            return (
-                hidden_states,
-                self._per_token_base_scale,
-                hidden_states.new_empty(hidden_states.shape[0], dtype=torch.float32),
-            )
-        if self.per_token_activation:
-            hidden_states, a1q_scale, per_token_scale = quantize_nvfp4_per_token_input(
-                hidden_states
-            )
-        elif self.expects_unquantized_inputs:
-            assert self.quant_config.a1_gscale is not None
-            return hidden_states, self.quant_config.a1_gscale.reshape(-1)[:1], None
-        assert a1q_scale is not None
-        a1q_scale = a1q_scale.view(torch.float8_e4m3fn)
-        return (
-            hidden_states,
-            a1q_scale.reshape(*hidden_states.shape[:-1], -1),
-            per_token_scale,
-        )
+        return self.per_token_activation
 
     def _get_chunk_size(self) -> int:
         MAX_GRID_Y = 65535
@@ -412,6 +346,17 @@ class TrtLlmNvFp4ExpertsModular(TrtLlmNvFp4ExpertsBase, mk.FusedMoEExpertsModula
         super().__init__(moe_config, quant_config, per_token_activation)
         # Each launch permutes into its own buffer, so a chunked call finalizes.
         moe_config.limit_deferred_moe_finalize(self._get_chunk_size())
+
+    def moe_problem_size(
+        self,
+        a1: torch.Tensor,
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> tuple[int, int, int, int, int]:
+        if self._weight_shapes is not None:
+            w1, w2 = self._weight_shapes
+        return super().moe_problem_size(a1, w1, w2, topk_ids)
 
     @staticmethod
     def _supports_parallel_config(moe_parallel_config: FusedMoEParallelConfig) -> bool:
@@ -460,9 +405,14 @@ class TrtLlmNvFp4ExpertsModular(TrtLlmNvFp4ExpertsBase, mk.FusedMoEExpertsModula
         assert self.quant_config.w1_scale is not None
         assert self.quant_config.w2_scale is not None
 
-        hidden_states, hidden_states_scale, per_token_scale = self._kernel_input(
-            hidden_states, a1q_scale
-        )
+        # Per-token: input is unquantized, quantize it here. Otherwise it was
+        # already quantized in prepare() with the static global scale.
+        if self.expects_unquantized_inputs:
+            hidden_states, block_scale, per_token_scale = (
+                quantize_nvfp4_per_token_input(hidden_states)
+            )
+        else:
+            block_scale, per_token_scale = a1q_scale, None
         output1_scale_gate_scalar = self.quant_config.g1_alphas
         # With output=None the caller consumes the UnfinalizedMoEOutput itself.
         defer = output is not None and self._uses_post_gemm2_hook(topk_ids.shape[0])
@@ -473,7 +423,9 @@ class TrtLlmNvFp4ExpertsModular(TrtLlmNvFp4ExpertsBase, mk.FusedMoEExpertsModula
             topk_ids=(topk_ids, topk_weights),
             routing_bias=None,
             hidden_states=hidden_states,
-            hidden_states_scale=hidden_states_scale,
+            hidden_states_scale=block_scale.view(torch.float8_e4m3fn).reshape(
+                *hidden_states.shape[:-1], -1
+            ),
             gemm1_weights=w1,
             gemm1_weights_scale=w1_scale,
             gemm1_bias=None,
@@ -549,8 +501,6 @@ class TrtLlmNvFp4ExpertsModular(TrtLlmNvFp4ExpertsBase, mk.FusedMoEExpertsModula
 
         # DeepEP produces int64 indexes.
         topk_ids = topk_ids.to(dtype=torch.int32)
-        if self._weight_shapes is not None:
-            w1, w2 = self._weight_shapes
 
         M = hidden_states.shape[0]
         chunk_size = self._get_chunk_size()
@@ -663,12 +613,15 @@ class TrtLlmNvFp4ExpertsMonolithic(
             and self.routing_method_type != RoutingMethodType.Llama4
         )
 
-        hidden_states, hidden_states_scale, per_token_scale = self._kernel_input(
-            hidden_states, a1q_scale
-        )
+        # Per-token: input is unquantized, quantize it here (see modular apply).
+        if self.expects_unquantized_inputs:
+            hidden_states, block_scale, per_token_scale = (
+                quantize_nvfp4_per_token_input(hidden_states)
+            )
+        else:
+            block_scale, per_token_scale = a1q_scale, None
+
         output1_scale_gate_scalar = self.quant_config.g1_alphas
-        if self._weight_shapes is not None:
-            w1, w2 = self._weight_shapes
 
         num_tokens = hidden_states.shape[0]
         hooked = self._uses_post_gemm2_hook(num_tokens)
@@ -684,7 +637,9 @@ class TrtLlmNvFp4ExpertsMonolithic(
             routing_logits=router_logits,
             routing_bias=e_score_correction_bias,
             hidden_states=hidden_states,
-            hidden_states_scale=hidden_states_scale,
+            hidden_states_scale=block_scale.view(torch.float8_e4m3fn).reshape(
+                *hidden_states.shape[:-1], -1
+            ),
             gemm1_weights=w1,
             gemm1_weights_scale=w1_scale,
             gemm1_bias=None,

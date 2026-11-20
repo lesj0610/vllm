@@ -28,6 +28,7 @@ from vllm.model_executor.layers.quantization.utils.b12x_moe import (
 from vllm.model_executor.layers.quantization.utils.flashinfer_fp4_moe import (
     nvfp4_swizzled_scale_to_cutedsl_mma_view,
     prepare_nvfp4_moe_layer_for_fi_or_cutlass,
+    prepare_nvfp4_moe_layer_for_fi_records,
     prepare_nvfp4_moe_layer_for_flashinfer_cutedsl,
 )
 from vllm.model_executor.layers.quantization.utils.humming import prioritize_humming
@@ -239,20 +240,7 @@ class NvFp4MoEKernelOracle(MoEKernelOracle[NvFp4MoeBackend]):
     def backend_to_kernel_cls(
         self, backend: NvFp4MoeBackend
     ) -> list[type[mk.FusedMoEExperts]]:
-        classes = backend_to_kernel_cls(backend)
-        if backend == NvFp4MoeBackend.FLASHINFER_TRTLLM:
-            from vllm.model_executor.layers.fused_moe.experts.flashinfer_cutedsl_moe import (  # noqa: E501
-                runs_on_sm80_records,
-            )
-
-            # Records take real expert ids: route with vLLM's router, not FlashInfer's.
-            if runs_on_sm80_records(
-                self.moe_config,
-                self.activation_key == kNvfp4DynamicToken,
-                trtllm=True,
-            ):
-                classes = classes[::-1]
-        return classes
+        return backend_to_kernel_cls(backend)
 
 
 def nvfp4_backend_supports_csf_scales(
@@ -381,8 +369,6 @@ def convert_to_nvfp4_moe_kernel_format(
     use_a16: bool = False,
     trtllm_hidden_alignment: int = 256,
     csf_scales: bool = False,
-    sm80_records: bool = False,
-    per_token_activation: bool = False,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -400,7 +386,35 @@ def convert_to_nvfp4_moe_kernel_format(
         num_experts = w13.shape[0]
         a13_scale = torch.ones(num_experts, dtype=torch.float32, device=w13.device)
         a2_scale = torch.ones(num_experts, dtype=torch.float32, device=w2.device)
-    if nvfp4_backend == NvFp4MoeBackend.B12X:
+    if nvfp4_backend in (
+        NvFp4MoeBackend.FLASHINFER_TRTLLM,
+        NvFp4MoeBackend.FLASHINFER_CUTLASS,
+        NvFp4MoeBackend.FLASHINFER_CUTEDSL,
+    ) and not current_platform.has_device_capability(100):
+        # Below SM100 FlashInfer runs these on records.
+        assert a13_scale is not None and a2_scale is not None
+        (
+            w13,
+            w13_scale,
+            w13_scale_2,
+            a13_scale,
+            w2,
+            w2_scale,
+            w2_scale_2,
+            a2_scale,
+        ) = prepare_nvfp4_moe_layer_for_fi_records(
+            backend=nvfp4_backend,
+            layer=layer,
+            w13=w13,
+            w13_scale=w13_scale,
+            w13_scale_2=w13_scale_2,
+            a13_scale=a13_scale,
+            w2=w2,
+            w2_scale=w2_scale,
+            w2_scale_2=w2_scale_2,
+            a2_scale=a2_scale,
+        )
+    elif nvfp4_backend == NvFp4MoeBackend.B12X:
         if a13_scale is None or a2_scale is None:
             raise ValueError("b12x NVFP4 MoE requires activation scales")
         (
@@ -561,50 +575,6 @@ def convert_to_nvfp4_moe_kernel_format(
     else:
         raise ValueError(f"Unknown NvFp4 backend for MoE: {nvfp4_backend}")
 
-    from vllm.model_executor.layers.fused_moe.experts.flashinfer_cutedsl_moe import (
-        runs_on_sm80_records,
-    )
-
-    if (
-        (
-            nvfp4_backend
-            in (NvFp4MoeBackend.FLASHINFER_TRTLLM, NvFp4MoeBackend.FLASHINFER_CUTLASS)
-            or (nvfp4_backend == NvFp4MoeBackend.FLASHINFER_CUTEDSL and not use_a16)
-        )
-        and not current_platform.has_device_capability(100)
-        and not (
-            sm80_records
-            and runs_on_sm80_records(
-                layer.moe_config,
-                per_token_activation,
-                cutlass_w4a4=(
-                    nvfp4_backend == NvFp4MoeBackend.FLASHINFER_CUTLASS and not use_a16
-                ),
-                trtllm=nvfp4_backend == NvFp4MoeBackend.FLASHINFER_TRTLLM,
-            )
-        )
-    ):
-        # Below SM100 FlashInfer runs these on its CUTLASS SM80 kernels and
-        # converts the weights on every call unless given their operands.
-        # Records, which the experts prepare (CuTeDSL W4A16's always, the rest
-        # with `sm80_records`), run the others.
-        from flashinfer.fused_moe import (
-            cutlass_nvfp4_sm80_weights,
-            trtllm_nvfp4_sm80_weights,
-        )
-
-        if nvfp4_backend == NvFp4MoeBackend.FLASHINFER_TRTLLM:
-            w13, w13_scale, w2, w2_scale = trtllm_nvfp4_sm80_weights(
-                w13, w13_scale, w2, w2_scale, is_act_and_mul
-            )
-        else:
-            interleaved = (
-                nvfp4_backend == NvFp4MoeBackend.FLASHINFER_CUTEDSL and is_act_and_mul
-            )
-            w13, w13_scale, w2, w2_scale = cutlass_nvfp4_sm80_weights(
-                w13, w13_scale, w2, w2_scale, layer.moe_config.in_dtype, interleaved
-            )
-
     return (
         w13,
         w13_scale,
@@ -632,7 +602,8 @@ def make_nvfp4_moe_quant_config(
     use_a16: bool = False,
 ) -> FusedMoEQuantConfig:
     use_a16 = _use_a16(backend, use_a16)
-    # Scales prepared below SM100 (cutlass_nvfp4_sm80_weights) are read as is.
+    # Records prepared below SM100 (prepare_records_nvfp4_weights) are read
+    # as is.
     if (
         backend == NvFp4MoeBackend.FLASHINFER_CUTEDSL
         and w13_scale.dtype == torch.float8_e4m3fn

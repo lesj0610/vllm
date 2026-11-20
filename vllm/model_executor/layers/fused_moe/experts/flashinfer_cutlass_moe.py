@@ -10,12 +10,11 @@ from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEParallelConfig,
     FusedMoEQuantConfig,
 )
-from vllm.model_executor.layers.fused_moe.experts.flashinfer_cutedsl_moe import (
-    runs_on_sm80_records,
-    use_sm80_records,
-)
 from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceNoOP,
+)
+from vllm.model_executor.layers.quantization.utils.flashinfer_fp4_moe import (
+    release_nvfp4_records_weights,
 )
 from vllm.model_executor.layers.quantization.utils.flashinfer_utils import (
     activation_to_flashinfer_type,
@@ -73,23 +72,18 @@ class FlashInferExperts(mk.FusedMoEExpertsModular):
         "fake_input_scale",
     )
 
+    # Weight-shaped meta tensors, once NVFP4 records hold the weights.
+    _weight_shapes: tuple[torch.Tensor, torch.Tensor] | None
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        w4a4 = self.quant_config.use_nvfp4_w4a4
-        if w4a4:
+        if self.quant_config.use_nvfp4_w4a4:
             layer.w13_weight_scale_2.data.mul_(layer.w13_input_scale)
             layer.w2_weight_scale_2.data.mul_(layer.w2_input_scale)
-        if (w4a4 or self.quant_config.use_nvfp4_w4a16) and runs_on_sm80_records(
-            self.moe_config, cutlass_w4a4=w4a4, w1_scale=self.w1_scale
+        # Below SM100 the NVFP4 records hold the weights too.
+        if self.weight_quant_dtype == "nvfp4" and not (
+            current_platform.has_device_capability(100)
         ):
-            from flashinfer.fused_moe import cute_dsl_w4a16_sm80_weights
-
-            gated = self.moe_config.activation.is_gated
-            records = cute_dsl_w4a16_sm80_weights(
-                *(layer.w13_weight, self.w1_scale, layer.w2_weight, self.w2_scale),
-                gated,
-                interleaved=False,
-            )
-            use_sm80_records(self, layer, records)
+            self._weight_shapes = release_nvfp4_records_weights(layer)
 
     def __init__(
         self,
@@ -108,8 +102,6 @@ class FlashInferExperts(mk.FusedMoEExpertsModular):
             " float16 quantization are currently supported."
         )
         self.device = moe_config.device
-        # Weight-shaped stand-ins, once records hold the weights.
-        self._weight_shapes: tuple[torch.Tensor, torch.Tensor] | None = None
         self.num_experts = moe_config.num_local_experts
         self.ep_rank = moe_config.moe_parallel_config.ep_rank
         self.ep_size = moe_config.moe_parallel_config.ep_size
@@ -121,6 +113,7 @@ class FlashInferExperts(mk.FusedMoEExpertsModular):
         # - pass per-block weight scales to the kernel
         # - skip input activation quantization (kernel applies scaling)
         self.use_deepseek_fp8_block_scale = quant_config.is_block_quantized
+        self._weight_shapes = None
 
         def _per_expert(value: float | None) -> torch.Tensor | None:
             if value is None:
@@ -148,21 +141,7 @@ class FlashInferExperts(mk.FusedMoEExpertsModular):
 
     @property
     def expects_unquantized_inputs(self) -> bool:
-        # NVFP4 records below SM100 quantize the BF16 input as they route it.
-        if self.quant_config.use_nvfp4_w4a4 and self._weight_shapes is not None:
-            return True
         return self.quant_config.use_fp8_w8a8 and self.quant_config.is_block_quantized
-
-    def moe_problem_size(
-        self,
-        a1: torch.Tensor,
-        w1: torch.Tensor,
-        w2: torch.Tensor,
-        topk_ids: torch.Tensor,
-    ) -> tuple[int, int, int, int, int]:
-        if self._weight_shapes is not None:
-            w1, w2 = self._weight_shapes
-        return super().moe_problem_size(a1, w1, w2, topk_ids)
 
     @staticmethod
     def is_supported_config(
@@ -257,6 +236,17 @@ class FlashInferExperts(mk.FusedMoEExpertsModular):
     def finalize_weight_and_reduce_impl(self) -> mk.TopKWeightAndReduce:
         return TopKWeightAndReduceNoOP()
 
+    def moe_problem_size(
+        self,
+        a1: torch.Tensor,
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> tuple[int, int, int, int, int]:
+        if self._weight_shapes is not None:
+            w1, w2 = self._weight_shapes
+        return super().moe_problem_size(a1, w1, w2, topk_ids)
+
     def workspace_shapes(
         self,
         M: int,
@@ -289,8 +279,7 @@ class FlashInferExperts(mk.FusedMoEExpertsModular):
         workspace2 = (0,)
         # For NVFP4, the output is stored in a packed int8 format,
         # so the actual hidden dim is 2x the size of K here.
-        packed = self.quant_dtype == "nvfp4" and not self.expects_unquantized_inputs
-        output_shape = (M, K * 2 if packed else K)
+        output_shape = (M, K * 2 if self.quant_dtype == "nvfp4" else K)
         # The workspace is determined by `aq`, since it comes after any
         # potential communication op and is involved in the expert computation.
         return (workspace1, workspace2, output_shape)
@@ -357,8 +346,8 @@ class FlashInferExperts(mk.FusedMoEExpertsModular):
             )
             # Flashinfer CUTLASS kernel takes scalar global scales,
             # min because inv_scale.
-            # Below SM100 the scales were prepared at load in the output dtype
-            # (cutlass_nvfp4_sm80_weights); the SM100 kernels read them as int32.
+            # Below SM100 they are records (prepare_records_nvfp4_weights); the
+            # SM100 kernels read them as int32.
             w1_scale, w2_scale = (
                 s.view(torch.int32) if s.dtype == torch.float8_e4m3fn else s
                 for s in (self.w1_scale, self.w2_scale)
@@ -382,8 +371,8 @@ class FlashInferExperts(mk.FusedMoEExpertsModular):
             fc1_expert_weights = w1.view(torch.long)
             fc2_expert_weights = w2.view(torch.long)
         elif self.quant_config.use_nvfp4_w4a16:
-            # The weight scales alone (block and global per GEMM) keep the
-            # activations 16-bit; the block scales were prepared at load.
+            # The weight scales alone (records and global per GEMM) keep the
+            # activations 16-bit.
             assert self.w1_scale is not None and self.w2_scale is not None
             quant_scales = [
                 self.w1_scale,

@@ -279,8 +279,6 @@ class CompressedTensorsW4A4Nvfp4MoEMethod(CompressedTensorsMoEMethod):
                 per_token_activation=self.per_token_activation,
                 is_act_and_mul=self.moe.is_act_and_mul,
             ),
-            sm80_records=True,
-            per_token_activation=self.per_token_activation,
         )
 
         replace_parameter(layer, "w13_weight", w13)

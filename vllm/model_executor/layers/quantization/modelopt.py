@@ -1097,9 +1097,12 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
             if self.nvfp4_backend not in (
                 NvFp4MoeBackend.FLASHINFER_TRTLLM,
                 NvFp4MoeBackend.VLLM_CUTLASS,
+            ) or (
+                self.nvfp4_backend == NvFp4MoeBackend.FLASHINFER_TRTLLM
+                and not current_platform.has_device_capability(100)
             ):
                 raise RuntimeError(
-                    "pre-processed weights require FLASHINFER_TRTLLM or "
+                    "pre-processed weights require FLASHINFER_TRTLLM (SM100+) or "
                     f"VLLM_CUTLASS MoE backend, got {self.nvfp4_backend}"
                 )
             self._restore_padded_moe_dims(layer)
@@ -1147,8 +1150,6 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
                 is_act_and_mul=self.moe.is_act_and_mul,
             ),
             csf_scales=self.csf_scales,
-            sm80_records=True,
-            per_token_activation=self.per_token_activation,
         )
 
         replace_parameter(layer, "w13_weight", w13)
