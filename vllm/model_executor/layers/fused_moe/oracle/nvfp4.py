@@ -40,7 +40,6 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey,
 )
 from vllm.model_executor.utils import move_parameter, refill_derived
-from vllm.utils.flashinfer import flashinfer_encode_csf_scales
 
 logger = init_logger(__name__)
 
@@ -413,6 +412,8 @@ def convert_to_nvfp4_moe_kernel_format(
                     "NVFP4 MoE with resident CSF scales does not support "
                     "weight reloading"
                 )
+            from vllm.utils.flashinfer import flashinfer_encode_csf_scales
+
             # The experts keep the rank's scales compressed in checkpoint
             # order and expand them into the layout prepared below.
             layer.w13_weight_scale_csf = flashinfer_encode_csf_scales(w13_scale)

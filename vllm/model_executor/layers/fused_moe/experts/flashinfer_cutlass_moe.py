@@ -79,51 +79,11 @@ class FlashInferExperts(mk.FusedMoEExpertsModular):
     )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if self.csf_scales:
+            self._keep_csf_scales(layer)
         if self.quant_config.use_nvfp4_w4a4:
             layer.w13_weight_scale_2.data.mul_(layer.w13_input_scale)
             layer.w2_weight_scale_2.data.mul_(layer.w2_input_scale)
-        if self.csf_scales:
-            self._keep_csf_scales(layer)
-
-    def _keep_csf_scales(self, layer: torch.nn.Module) -> None:
-        """Replace the layer's NVFP4 block scales by their CSF encoding."""
-        csf = (layer.w13_weight_scale_csf, layer.w2_weight_scale_csf)
-        scales = (layer.w13_weight_scale, layer.w2_weight_scale)
-        if sum(t.nbytes for c in csf for t in c[:3]) >= sum(s.nbytes for s in scales):
-            # Scales that compress poorly stay expanded.
-            del layer.w13_weight_scale_csf, layer.w2_weight_scale_csf
-            self.csf_scales = False
-            return
-        from flashinfer import SfLayout
-
-        self._csf = csf
-        self._csf_layout = SfLayout.layout_128x4
-        key = (scales[0].device, scales[0].shape, scales[1].shape)
-        if key not in _CSF_SCALE_SCRATCH:
-            _CSF_SCALE_SCRATCH[key] = (
-                torch.zeros_like(scales[0]),
-                torch.zeros_like(scales[1]),
-            )
-        self.quant_config._w1.scale, self.quant_config._w2.scale = _CSF_SCALE_SCRATCH[
-            key
-        ]
-        for scale in scales:
-            scale.data = scale.data.new_empty(0)
-
-    def _expand_csf_scales(self, topk_ids: torch.Tensor | None) -> None:
-        """Expand the scales of the routed experts, or of all without ids."""
-        # Expanding only the routed experts compares each id with all the ids
-        # before it, which outgrows expanding every expert as tokens grow. The
-        # two crossed at 1.9-2.2 ids per expert on SM80 (512 experts, top-10).
-        ids = None
-        if topk_ids is not None and topk_ids.numel() < 2 * self.num_experts:
-            ids = topk_ids.to(torch.int)
-        w13_csf, w2_csf = self._csf
-        # The checkpoint's [w1; w3] rows become the kernels' [w3; w1].
-        flashinfer_expand_csf_scales(
-            w13_csf, self.w1_scale, ids, self._csf_layout, swap_row_halves=True
-        )
-        flashinfer_expand_csf_scales(w2_csf, self.w2_scale, ids, self._csf_layout)
 
     def __init__(
         self,
@@ -221,6 +181,46 @@ class FlashInferExperts(mk.FusedMoEExpertsModular):
             and intermediate % 32 == 0
             and 2 * intermediate * (hidden // 16) <= 1 << 24
         )
+
+    def _keep_csf_scales(self, layer: torch.nn.Module) -> None:
+        """Replace the layer's NVFP4 block scales by their CSF encoding."""
+        csf = (layer.w13_weight_scale_csf, layer.w2_weight_scale_csf)
+        scales = (layer.w13_weight_scale, layer.w2_weight_scale)
+        if sum(t.nbytes for c in csf for t in c[:3]) >= sum(s.nbytes for s in scales):
+            # Scales that compress poorly stay expanded.
+            del layer.w13_weight_scale_csf, layer.w2_weight_scale_csf
+            self.csf_scales = False
+            return
+        from flashinfer import SfLayout
+
+        self._csf = csf
+        self._csf_layout = SfLayout.layout_128x4
+        key = (scales[0].device, scales[0].shape, scales[1].shape)
+        if key not in _CSF_SCALE_SCRATCH:
+            _CSF_SCALE_SCRATCH[key] = (
+                torch.zeros_like(scales[0]),
+                torch.zeros_like(scales[1]),
+            )
+        self.quant_config._w1.scale, self.quant_config._w2.scale = _CSF_SCALE_SCRATCH[
+            key
+        ]
+        for scale in scales:
+            scale.data = scale.data.new_empty(0)
+
+    def _expand_csf_scales(self, topk_ids: torch.Tensor | None) -> None:
+        """Expand the scales of the routed experts, or of all without ids."""
+        # Expanding only the routed experts compares each id with all the ids
+        # before it, which outgrows expanding every expert as tokens grow. The
+        # two crossed at 1.9-2.2 ids per expert on SM80 (512 experts, top-10).
+        ids = None
+        if topk_ids is not None and topk_ids.numel() < 2 * self.num_experts:
+            ids = topk_ids.to(torch.int)
+        w13_csf, w2_csf = self._csf
+        # The checkpoint's [w1; w3] rows become the kernels' [w3; w1].
+        flashinfer_expand_csf_scales(
+            w13_csf, self.w1_scale, ids, self._csf_layout, swap_row_halves=True
+        )
+        flashinfer_expand_csf_scales(w2_csf, self.w2_scale, ids, self._csf_layout)
 
     @staticmethod
     def _supports_quant_scheme(
