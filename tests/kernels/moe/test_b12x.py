@@ -636,7 +636,7 @@ def test_explicit_b12x_nvfp4_selection(
 
 
 @pytest.mark.parametrize("uncompressed", [False, True])
-def test_csf_scales_stay_compressed_only_on_b12x_w4a4(uncompressed: bool) -> None:
+def test_b12x_keeps_csf_scales_compressed_for_w4a4(uncompressed: bool) -> None:
     config = make_dummy_moe_config(hidden_dim=2560, intermediate_size=640)
     kernel_config = KernelConfig(b12x_moe_uncompressed_scales=uncompressed)
     with set_current_vllm_config(VllmConfig(kernel_config=kernel_config)):
@@ -645,7 +645,7 @@ def test_csf_scales_stay_compressed_only_on_b12x_w4a4(uncompressed: bool) -> Non
         ) is (not uncompressed)
         assert not nvfp4_backend_supports_csf_scales(NvFp4MoeBackend.B12X, config, True)
         assert not nvfp4_backend_supports_csf_scales(
-            NvFp4MoeBackend.FLASHINFER_CUTLASS, config, False
+            NvFp4MoeBackend.FLASHINFER_TRTLLM, config, False
         )
 
 
