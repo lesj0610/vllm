@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Tests for FlashInfer CuTeDSL NVFP4 MoE."""
 
+from functools import partial
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -31,30 +32,35 @@ from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEParallelConfig,
     RoutingMethodType,
     nvfp4_moe_quant_config,
+    nvfp4_w4a16_moe_quant_config,
 )
 from vllm.model_executor.layers.fused_moe.experts.flashinfer_cutedsl_moe import (
     FlashInferCuteDSLExperts,
+    _below_sm100,
 )
 from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import (
     NvFp4MoeBackend,
     make_nvfp4_moe_quant_config,
 )
 from vllm.model_executor.layers.quantization.utils.flashinfer_fp4_moe import (
+    prepare_nvfp4_moe_layer_for_fi_records,
     prepare_nvfp4_moe_layer_for_flashinfer_cutedsl,
 )
 from vllm.model_executor.layers.quantization.utils.flashinfer_utils import (
     quantize_nvfp4_per_token_input,
 )
+from vllm.model_executor.layers.quantization.utils.quant_utils import (
+    kNvfp4Dynamic,
+    kNvfp4DynamicToken,
+    kNvfp4Static,
+)
 from vllm.platforms import current_platform
-from vllm.utils.flashinfer import has_flashinfer_cutedsl_moe_nvfp4
 from vllm.utils.math_utils import next_power_of_2
 from vllm.utils.torch_utils import set_random_seed
 
-if not has_flashinfer_cutedsl_moe_nvfp4() or not (
-    current_platform.is_device_capability_family(100)
-):
+if not FlashInferCuteDSLExperts._supports_current_device():
     pytest.skip(
-        "Requires FlashInfer CuTeDSL NVFP4 MoE on SM100",
+        "Requires FlashInfer CuTeDSL NVFP4 MoE on this device",
         allow_module_level=True,
     )
 
@@ -179,6 +185,7 @@ def _dequantize_nvfp4_linear(
 )
 @pytest.mark.parametrize("activation,alpha,beta,limit", _ACT_CASES)
 @pytest.mark.parametrize("per_token_activation", [False, True])
+@pytest.mark.parametrize("w4a16", [False, True])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("localization", ["off", "retain", "free"])
 @torch.inference_mode()
@@ -193,6 +200,7 @@ def test_flashinfer_cutedsl_fp4_moe(
     beta: float | None,
     limit: float | None,
     per_token_activation: bool,
+    w4a16: bool,
     dtype: torch.dtype,
     localization: str,
     monkeypatch,
@@ -201,6 +209,8 @@ def test_flashinfer_cutedsl_fp4_moe(
     import vllm.distributed.localization as loc
     import vllm.model_executor.layers.fused_moe.experts.flashinfer_cutedsl_moe as mod
 
+    if w4a16 and (per_token_activation or not _below_sm100()):
+        pytest.skip("FlashInfer runs NVFP4 W4A16 MoE below SM100")
     if current_platform.is_device_capability(107) and per_token_activation:
         pytest.skip("Rubin CuTeDSL MoE does not support per-token activation scales")
     if current_platform.is_device_capability(107) and (
@@ -264,12 +274,41 @@ def test_flashinfer_cutedsl_fp4_moe(
             in_dtype=dtype,
             routing_method=RoutingMethodType.TopK,
             max_num_tokens=next_power_of_2(m),
+            swiglu_limit=limit,
+            swiglu_alpha=alpha,
+            swiglu_beta=beta,
         )
+        supported, _ = FlashInferCuteDSLExperts.is_supported_config(
+            FlashInferCuteDSLExperts,
+            moe_config,
+            kNvfp4Static,
+            None
+            if w4a16
+            else kNvfp4DynamicToken
+            if per_token_activation
+            else kNvfp4Dynamic,
+            mk.FusedMoEActivationFormat.Standard,
+        )
+        # W4A16 is verified in BF16 only.
+        if w4a16 and dtype != torch.bfloat16:
+            assert not supported
+            return
+        assert supported
         fake_layer = torch.nn.Module()
         fake_layer.activation = activation
         fake_layer.moe_config = moe_config
-        a1_scale = torch.ones(1, device="cuda", dtype=torch.float32)
-        a2_scale = torch.ones(1, device="cuda", dtype=torch.float32)
+        # With 16-bit activations the activation scales must go unused.
+        a1_scale = torch.full((1,), 0.5 if w4a16 else 1.0, device="cuda")
+        a2_scale = torch.full((1,), 0.5 if w4a16 else 1.0, device="cuda")
+        # Below SM100 FlashInfer runs on records.
+        prepare = (
+            partial(
+                prepare_nvfp4_moe_layer_for_fi_records,
+                NvFp4MoeBackend.FLASHINFER_CUTEDSL,
+            )
+            if _below_sm100()
+            else prepare_nvfp4_moe_layer_for_flashinfer_cutedsl
+        )
         (
             w1_cutedsl,
             w1_scale_cutedsl,
@@ -279,7 +318,7 @@ def test_flashinfer_cutedsl_fp4_moe(
             w2_scale_cutedsl,
             w2_alpha,
             a2_scale,
-        ) = prepare_nvfp4_moe_layer_for_flashinfer_cutedsl(
+        ) = prepare(
             layer=fake_layer,
             w13=w1_q.clone(),
             w13_scale=w1_scale,
@@ -290,13 +329,17 @@ def test_flashinfer_cutedsl_fp4_moe(
             w2_scale_2=(1.0 / w2_global_scale),
             a2_scale=a2_scale,
         )
-        # I=192 must remain unpadded for gated experts, but become 256 for
-        # non-gated experts. The reference below uses the checkpoint shapes.
-        expected_n = n if activation.is_gated else (n + 127) // 128 * 128
+        # I=192 must remain unpadded for gated experts. From SM100 on it
+        # becomes 256 for non-gated experts and the hidden size a multiple of
+        # 256; records below SM100 take both as they are (multiples of 16).
+        # The reference below uses the checkpoint shapes.
+        expected_n = (
+            n if activation.is_gated or _below_sm100() else (n + 127) // 128 * 128
+        )
         assert moe_config.intermediate_size_per_partition == expected_n
         assert w1_cutedsl.shape[1] == expected_n * (2 if activation.is_gated else 1)
         assert w2_cutedsl.shape[2] * 2 == expected_n
-        expected_k = (k + 255) // 256 * 256
+        expected_k = k if _below_sm100() else (k + 255) // 256 * 256
         assert moe_config.hidden_dim == expected_k
         assert moe_config.hidden_dim_unpadded == k
         assert w1_cutedsl.shape[2] * 2 == expected_k
@@ -314,6 +357,7 @@ def test_flashinfer_cutedsl_fp4_moe(
             swiglu_alpha=alpha,
             swiglu_beta=beta,
             swiglu_limit=limit,
+            use_a16=w4a16,
         )
 
         if resources is not None and activation.is_gated:
@@ -349,11 +393,30 @@ def test_flashinfer_cutedsl_fp4_moe(
         experts = FlashInferCuteDSLExperts(
             moe_config, quant_config, per_token_activation=per_token_activation
         )
+        for name, param in (
+            ("w13_weight", w1_cutedsl),
+            ("w13_weight_scale", w1_scale_cutedsl),
+            ("w2_weight", w2_cutedsl),
+            ("w2_weight_scale", w2_scale_cutedsl),
+        ):
+            setattr(fake_layer, name, torch.nn.Parameter(param, requires_grad=False))
         fake_layer.w13_weight_scale_2 = w1_alpha
         fake_layer.w2_weight_scale_2 = w2_alpha
         fake_layer.w13_input_scale = a1_scale
         fake_layer.w2_input_scale = a2_scale
+        alphas = (w1_alpha.clone(), w2_alpha.clone())
         experts.process_weights_after_loading(fake_layer)
+        if w4a16:
+            assert torch.equal(w1_alpha, alphas[0])
+            assert torch.equal(w2_alpha, alphas[1])
+        if _below_sm100():
+            # FlashInfer runs these on records, prepared at load in place of the
+            # block scales, which hold the weights too: those are released.
+            for name in ("w13_weight", "w2_weight"):
+                assert getattr(fake_layer, name).untyped_storage().nbytes() == 0
+            prepared_scale = experts.w1_scale
+            assert prepared_scale is not None
+            assert prepared_scale.dim() == 2
 
         cutedsl_experts = mk.FusedMoEKernel(
             maybe_make_prepare_finalize(
@@ -373,8 +436,8 @@ def test_flashinfer_cutedsl_fp4_moe(
         def run():
             out = cutedsl_experts.apply(
                 hidden_states=padded_hidden_states,
-                w1=w1_cutedsl,
-                w2=w2_cutedsl,
+                w1=fake_layer.w13_weight,
+                w2=fake_layer.w2_weight,
                 topk_weights=topk_weights,
                 topk_ids=topk_ids,
                 activation=activation,
@@ -395,23 +458,28 @@ def test_flashinfer_cutedsl_fp4_moe(
         torch.accelerator.synchronize()
         torch.testing.assert_close(captured_output, cutedsl_output)
 
-        a_global_scale = torch.ones(1, device="cuda", dtype=torch.float32)
-        if per_token_activation:
-            a_q, a_scale, a_row_scale = quantize_nvfp4_per_token_input(hidden_states)
+        if w4a16:
+            a_in_dtype = hidden_states
         else:
-            a_q, a_scale = ops.scaled_fp4_quant(
-                hidden_states,
+            a_global_scale = torch.ones(1, device="cuda", dtype=torch.float32)
+            if per_token_activation:
+                a_q, a_scale, a_row_scale = quantize_nvfp4_per_token_input(
+                    hidden_states
+                )
+            else:
+                a_q, a_scale = ops.scaled_fp4_quant(
+                    hidden_states,
+                    a_global_scale,
+                    is_sf_swizzled_layout=False,
+                )
+            a_in_dtype = _dequantize_nvfp4_linear(
+                a_q,
+                a_scale,
                 a_global_scale,
-                is_sf_swizzled_layout=False,
+                dtype=dtype,
             )
-        a_in_dtype = _dequantize_nvfp4_linear(
-            a_q,
-            a_scale,
-            a_global_scale,
-            dtype=dtype,
-        )
-        if per_token_activation:
-            a_in_dtype = (a_in_dtype.float() * a_row_scale.view(-1, 1)).to(dtype)
+            if per_token_activation:
+                a_in_dtype = (a_in_dtype.float() * a_row_scale.view(-1, 1)).to(dtype)
 
         w1_d = torch.empty((e, w1_rows, k), device="cuda", dtype=dtype)
         w2_d = torch.empty((e, k, n), device="cuda", dtype=dtype)
@@ -453,6 +521,146 @@ def test_flashinfer_cutedsl_fp4_moe(
         assert cosine > 0.99, f"cosine similarity {cosine:.4f} below 0.99"
 
 
+@pytest.mark.skipif(
+    not _below_sm100(), reason="FlashInfer runs W4A16 records below SM100"
+)
+@pytest.mark.parametrize("mode", ["layerwise", "direct"])
+def test_w4a16_records_refilled_in_place_on_reload(monkeypatch, mode):
+    from flashinfer.fused_moe import prepare_records_nvfp4_weights
+
+    from vllm.model_executor.layers.quantization.base_config import (
+        QuantizeMethodBase,
+    )
+    from vllm.model_executor.model_loader.reload import (
+        finish_reload,
+        record_metadata_for_reloading,
+        start_reload,
+    )
+    from vllm.model_executor.model_loader.utils import process_weights_after_loading
+    from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+    from vllm.model_executor.utils import replace_parameter, set_weight_attrs
+
+    monkeypatch.setenv("VLLM_RELOAD_MODE", mode)
+    e, n, k = 4, 128, 512
+    moe_config = FusedMoEConfig(
+        num_experts=e,
+        experts_per_token=2,
+        hidden_dim=k,
+        intermediate_size=n,
+        num_local_experts=e,
+        num_logical_experts=e,
+        activation=MoEActivation.SILU,
+        device="cuda",
+        moe_parallel_config=FusedMoEParallelConfig.make_no_parallel(),
+        in_dtype=torch.bfloat16,
+        routing_method=RoutingMethodType.TopK,
+    )
+    one = torch.ones(1, device="cuda")
+    # Records hold no global scales.
+    ones = torch.ones(e, device="cuda")
+    names = ("w13_weight", "w13_weight_scale", "w2_weight", "w2_weight_scale")
+
+    def checkpoint(seed: int) -> dict[str, torch.Tensor]:
+        set_random_seed(seed)
+        w1 = torch.randn((e, 2 * n, k), device="cuda", dtype=torch.bfloat16) / 15
+        w2 = torch.randn((e, k, n), device="cuda", dtype=torch.bfloat16) / 15
+        w1_q, w1_scale, _ = _quantize_nvfp4_linear(w1)
+        w2_q, w2_scale, _ = _quantize_nvfp4_linear(w2)
+        return dict(zip(names, (w1_q, w1_scale, w2_q, w2_scale)))
+
+    def records(weights: dict[str, torch.Tensor]) -> tuple[torch.Tensor, ...]:
+        w1_q, w1_scale, w2_q, w2_scale = weights.values()
+        # FlashInfer's [up; gate] order.
+        w1_q, w1_scale = (
+            torch.cat([t[:, n:], t[:, :n]], dim=1) for t in (w1_q, w1_scale)
+        )
+        prepared = prepare_records_nvfp4_weights(
+            w1_q,
+            w1_scale.view(torch.float8_e4m3fn),
+            ones,
+            w2_q,
+            w2_scale.view(torch.float8_e4m3fn),
+            ones,
+            num_local_experts=e,
+            hidden_size=k,
+            intermediate_size=n,
+        )
+        return prepared["w1"], prepared["w2"]
+
+    class Method(QuantizeMethodBase):
+        """Builds the experts on every load, as ModelOpt does."""
+
+        def create_weights(self, layer, *args, **kwargs):
+            pass
+
+        def apply(self, layer, *args, **kwargs):
+            raise NotImplementedError
+
+        def process_weights_after_loading(self, layer):
+            prepared = prepare_nvfp4_moe_layer_for_fi_records(
+                NvFp4MoeBackend.FLASHINFER_CUTEDSL,
+                layer,
+                w13=layer.w13_weight,
+                w13_scale=layer.w13_weight_scale,
+                w13_scale_2=ones,
+                a13_scale=one,
+                w2=layer.w2_weight,
+                w2_scale=layer.w2_weight_scale,
+                w2_scale_2=ones,
+                a2_scale=one,
+            )
+            for name, i in zip(names, (0, 1, 4, 5)):
+                replace_parameter(layer, name, prepared[i])
+            quant_config = nvfp4_w4a16_moe_quant_config(
+                g1_alphas=one,
+                g2_alphas=one,
+                w1_scale=layer.w13_weight_scale,
+                w2_scale=layer.w2_weight_scale,
+            )
+            experts = FlashInferCuteDSLExperts(moe_config, quant_config)
+            experts.process_weights_after_loading(layer)
+
+    def load(weights: dict[str, torch.Tensor]) -> None:
+        for name, weight in weights.items():
+            param = getattr(model, name)
+            param.weight_loader(param, weight)
+
+    model_config = SimpleNamespace(
+        word_embeddings_untied_by_checkpoint=False, quantization=None
+    )
+    model = torch.nn.Module()
+    model.quant_method = Method()
+    model.activation = moe_config.activation
+    model.moe_config = moe_config
+    for name, weight in checkpoint(0).items():
+        param = torch.nn.Parameter(torch.empty_like(weight), requires_grad=False)
+        set_weight_attrs(param, {"weight_loader": default_weight_loader})
+        setattr(model, name, param)
+    # As the model loader, which builds the model on the target device.
+    with torch.device("cuda"):
+        record_metadata_for_reloading(model)
+    load(checkpoint(0))
+    process_weights_after_loading(model, model_config, torch.device("cuda"))
+    scales = ("w13_weight_scale", "w2_weight_scale")
+    # Captured CUDA graphs read the records at these addresses.
+    addresses = [getattr(model, name).data_ptr() for name in scales]
+    old = [getattr(model, name).clone() for name in scales]
+
+    weights = checkpoint(1)
+    expected = records(weights)
+    start_reload(model)
+    load(weights)
+    finish_reload(model, model_config, torch.device("cuda"))
+
+    for name, address, prior, want in zip(scales, addresses, old, expected):
+        new = getattr(model, name)
+        assert new.data_ptr() == address
+        assert torch.equal(new, want) and not torch.equal(new, prior)
+    # The records hold the weights too.
+    for name in ("w13_weight", "w2_weight"):
+        assert getattr(model, name).numel() == 0
+
+
 @pytest.mark.parametrize("localized", [False, True])
 @pytest.mark.parametrize("overlap", [False, True])
 @pytest.mark.parametrize("max_capture_size", [0, 256])
@@ -462,6 +670,8 @@ def test_localization_arguments_initialized_after_loading(
 ):
     import vllm.model_executor.layers.fused_moe.experts.flashinfer_cutedsl_moe as mod
 
+    # Localization splits a multi-die SM100 device.
+    monkeypatch.setattr(mod, "_below_sm100", lambda: False)
     scale = torch.ones(1)
     config = FusedMoEConfig(
         num_experts=2,

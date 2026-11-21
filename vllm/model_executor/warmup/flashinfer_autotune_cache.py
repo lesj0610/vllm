@@ -93,6 +93,46 @@ def flashinfer_autotune_cache_hash(runner: "GPUModelRunner") -> str:
     return hash_factors(factors)
 
 
+def runs_flashinfer_autotune(runner: "GPUModelRunner") -> bool:
+    """FlashInfer tunes its kernels from SM90, and below only its MoE experts,
+    which pick among their tactics per token count."""
+    from vllm.platforms import current_platform
+
+    if current_platform.has_device_capability(90):
+        return True
+
+    from vllm.model_executor.layers.fused_moe import MoERunner
+    from vllm.model_executor.layers.fused_moe.experts.flashinfer_cutedsl_moe import (
+        FlashInferCuteDSLExperts,
+    )
+    from vllm.model_executor.layers.fused_moe.experts.flashinfer_cutlass_moe import (
+        FlashInferExperts,
+    )
+    from vllm.model_executor.layers.fused_moe.experts.trtllm_mxfp4_moe import (
+        TrtLlmMxfp4ExpertsBase,
+    )
+    from vllm.model_executor.layers.fused_moe.experts.trtllm_nvfp4_moe import (
+        TrtLlmNvFp4ExpertsBase,
+    )
+
+    flashinfer_experts = (
+        FlashInferCuteDSLExperts,
+        FlashInferExperts,
+        TrtLlmMxfp4ExpertsBase,
+        TrtLlmNvFp4ExpertsBase,
+    )
+    # The drafter is outside the target's module tree.
+    for model in (runner.get_model(), runner.get_draft_model()):
+        for module in model.modules() if model is not None else ():
+            if isinstance(module, MoERunner):
+                kernel = getattr(module._quant_method, "moe_kernel", None)
+                if kernel is not None and isinstance(
+                    kernel.impl.fused_experts, flashinfer_experts
+                ):
+                    return True
+    return False
+
+
 def flashinfer_autotune_root() -> Path:
     """Root directory of the FlashInfer autotune cache (no runner needed)."""
     override_dir = envs.VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR
@@ -188,10 +228,9 @@ def sync_flashinfer_autotune_cache(
         and runner.vllm_config.kernel_config.enable_flashinfer_autotune
     ):
         try:
-            from vllm.platforms import current_platform
             from vllm.utils.flashinfer import has_flashinfer
 
-            if has_flashinfer() and current_platform.has_device_capability(90):
+            if has_flashinfer() and runs_flashinfer_autotune(runner):
                 from flashinfer.autotuner import AutoTuner
 
                 with tempfile.TemporaryDirectory() as temp_dir:

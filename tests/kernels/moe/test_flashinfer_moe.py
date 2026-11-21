@@ -3,7 +3,7 @@
 import pytest
 import torch
 
-from tests.kernels.moe.utils import make_test_quant_config
+from tests.kernels.moe.utils import make_nvfp4_records, make_test_quant_config
 from tests.kernels.quantization.nvfp4_utils import (
     FLOAT4_E2M1_MAX,
     FLOAT8_E4M3_MAX,
@@ -28,13 +28,14 @@ from vllm.model_executor.layers.fused_moe.experts.flashinfer_cutlass_moe import 
     is_valid_flashinfer_cutlass_fused_moe,
 )
 from vllm.model_executor.layers.fused_moe.modular_kernel import FusedMoEKernel
+from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import NvFp4MoeBackend
 from vllm.platforms import current_platform
 from vllm.utils.flashinfer import has_flashinfer_cutlass_fused_moe
 from vllm.utils.math_utils import next_power_of_2
 from vllm.utils.torch_utils import set_random_seed
 
 if not has_flashinfer_cutlass_fused_moe() or not current_platform.has_device_capability(
-    100
+    80
 ):
     pytest.skip(
         "Requires flashinfer_cutlass_fused_moe and nvfp4 support",
@@ -156,6 +157,15 @@ def test_flashinfer_fp4_moe_no_graph(
             per_act_token_quant=False,
             make_gate=is_gated_act,
         )
+        w1_scale, w2_scale = quant_config.w1_scale, quant_config.w2_scale
+        assert w1_scale is not None
+        assert w2_scale is not None
+        if not current_platform.has_device_capability(100):
+            # Below SM100 FlashInfer runs on records, reading only the shapes of
+            # the weights.
+            quant_config._w1.scale, quant_config._w2.scale = make_nvfp4_records(
+                NvFp4MoeBackend.FLASHINFER_CUTLASS, w1_q, w2_q, quant_config, activation
+            )
 
         score = torch.randn((m, e), device="cuda", dtype=dtype)
         topk_weights, topk_ids, _ = fused_topk(a, score, topk, renormalize=False)
@@ -219,14 +229,12 @@ def test_flashinfer_fp4_moe_no_graph(
         )
         w2_d = torch.empty((e, k, n), device="cuda", dtype=dtype)
 
-        assert quant_config.w1_scale is not None
-        assert quant_config.w2_scale is not None
         assert quant_config.g1_alphas is not None
         assert quant_config.g2_alphas is not None
         for idx in range(0, e):
             w1_d[idx] = dequantize_nvfp4_to_dtype(
                 w1_q[idx],
-                quant_config.w1_scale[idx],
+                w1_scale[idx],
                 (1 / quant_config.g1_alphas[idx]),
                 dtype=dtype,
                 device=w1_q.device,
@@ -234,7 +242,7 @@ def test_flashinfer_fp4_moe_no_graph(
             )
             w2_d[idx] = dequantize_nvfp4_to_dtype(
                 w2_q[idx],
-                quant_config.w2_scale[idx],
+                w2_scale[idx],
                 (1 / quant_config.g2_alphas[idx]),
                 dtype=dtype,
                 device=w2_q.device,

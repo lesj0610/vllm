@@ -13,6 +13,9 @@ from vllm.model_executor.layers.fused_moe.config import (
 from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceNoOP,
 )
+from vllm.model_executor.layers.quantization.utils.flashinfer_fp4_moe import (
+    release_nvfp4_records_weights,
+)
 from vllm.model_executor.layers.quantization.utils.flashinfer_utils import (
     activation_to_flashinfer_type,
 )
@@ -69,10 +72,18 @@ class FlashInferExperts(mk.FusedMoEExpertsModular):
         "fake_input_scale",
     )
 
+    # Weight-shaped meta tensors, once NVFP4 records hold the weights.
+    _weight_shapes: tuple[torch.Tensor, torch.Tensor] | None
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if self.quant_config.use_nvfp4_w4a4:
             layer.w13_weight_scale_2.data.mul_(layer.w13_input_scale)
             layer.w2_weight_scale_2.data.mul_(layer.w2_input_scale)
+        # Below SM100 the NVFP4 records hold the weights too.
+        if self.weight_quant_dtype == "nvfp4" and not (
+            current_platform.has_device_capability(100)
+        ):
+            self._weight_shapes = release_nvfp4_records_weights(layer)
 
     def __init__(
         self,
@@ -102,6 +113,7 @@ class FlashInferExperts(mk.FusedMoEExpertsModular):
         # - pass per-block weight scales to the kernel
         # - skip input activation quantization (kernel applies scaling)
         self.use_deepseek_fp8_block_scale = quant_config.is_block_quantized
+        self._weight_shapes = None
 
         def _per_expert(value: float | None) -> torch.Tensor | None:
             if value is None:
@@ -132,16 +144,30 @@ class FlashInferExperts(mk.FusedMoEExpertsModular):
         return self.quant_config.use_fp8_w8a8 and self.quant_config.is_block_quantized
 
     @staticmethod
+    def is_supported_config(
+        cls: type[mk.FusedMoEExperts],
+        moe_config: mk.FusedMoEConfig,
+        weight_key: QuantKey | None,
+        activation_key: QuantKey | None,
+        activation_format: mk.FusedMoEActivationFormat,
+    ) -> tuple[bool, str | None]:
+        # NVFP4 W4A16 is verified with BF16 only.
+        if (weight_key, activation_key) == (kNvfp4Static, None) and (
+            moe_config.in_dtype != torch.bfloat16
+        ):
+            return False, f"NVFP4 W4A16 does not support {moe_config.in_dtype}"
+        return mk.FusedMoEExperts.is_supported_config(
+            cls, moe_config, weight_key, activation_key, activation_format
+        )
+
+    @staticmethod
     def _supports_current_device() -> bool:
         p = current_platform
         return (
             p.is_cuda()
-            and (
-                p.is_device_capability(90)
-                or p.is_device_capability_family(100)
-                # SM110 excluded: flashinfer-ai/flashinfer#3134
-                or p.is_device_capability_family(120)
-            )
+            and p.has_device_capability(80)
+            # SM110 excluded: flashinfer-ai/flashinfer#3134
+            and not p.is_device_capability_family(110)
             and has_flashinfer_cutlass_fused_moe()
         )
 
@@ -176,14 +202,12 @@ class FlashInferExperts(mk.FusedMoEExpertsModular):
                 ]
                 and p.is_device_capability(90)
             )
-            # nvfp4, wmxfp4amxfp8 on 10.0+
+            # nvfp4 on 8.0+ (software kernels below 10.0), wmxfp4amxfp8 on 10.0+
+            or scheme == (kNvfp4Static, kNvfp4Dynamic)
+            # nvfp4 w4a16 below 10.0
+            or (scheme == (kNvfp4Static, None) and not p.has_device_capability(100))
             or (
-                scheme
-                in [
-                    (kMxfp4Static, kMxfp8Dynamic),
-                    (kNvfp4Static, kNvfp4Dynamic),
-                ]
-                and p.has_device_capability(100)
+                scheme == (kMxfp4Static, kMxfp8Dynamic) and p.has_device_capability(100)
             )
         )
 
@@ -211,6 +235,17 @@ class FlashInferExperts(mk.FusedMoEExpertsModular):
 
     def finalize_weight_and_reduce_impl(self) -> mk.TopKWeightAndReduce:
         return TopKWeightAndReduceNoOP()
+
+    def moe_problem_size(
+        self,
+        a1: torch.Tensor,
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> tuple[int, int, int, int, int]:
+        if self._weight_shapes is not None:
+            w1, w2 = self._weight_shapes
+        return super().moe_problem_size(a1, w1, w2, topk_ids)
 
     def workspace_shapes(
         self,
@@ -267,6 +302,8 @@ class FlashInferExperts(mk.FusedMoEExpertsModular):
         expert_tokens_meta: mk.ExpertTokensMetadata | None,
         apply_router_weight_on_input: bool | None,
     ):
+        if self._weight_shapes is not None:
+            w1, w2 = self._weight_shapes
         quant_scales = None
         fc1_expert_weights = None
         fc2_expert_weights = None
@@ -309,15 +346,41 @@ class FlashInferExperts(mk.FusedMoEExpertsModular):
             )
             # Flashinfer CUTLASS kernel takes scalar global scales,
             # min because inv_scale.
+            # Below SM100 they are records (prepare_records_nvfp4_weights); the
+            # SM100 kernels read them as int32.
+            w1_scale, w2_scale = (
+                s.view(torch.int32) if s.dtype == torch.float8_e4m3fn else s
+                for s in (self.w1_scale, self.w2_scale)
+            )
+            # The activation global scales repeat one value for every expert.
+            # Below SM100 FlashInfer takes them as scalars to restore each input
+            # token once, rather than each of its expert rows.
+            a1_gscale, a2_gscale = self.a1_gscale, self.a2_gscale
+            if not current_platform.has_device_capability(100):
+                assert a1_gscale is not None and a2_gscale is not None
+                a1_gscale, a2_gscale = a1_gscale[0], a2_gscale[0]
             quant_scales = [
-                self.a1_gscale,
-                self.w1_scale.view(torch.int32),
+                a1_gscale,
+                w1_scale,
                 self.g1_alphas,
-                self.a2_gscale,
-                self.w2_scale.view(torch.int32),
+                a2_gscale,
+                w2_scale,
                 self.g2_alphas,
             ]
             # FlashInfer API requires weight to be long for nvfp4
+            fc1_expert_weights = w1.view(torch.long)
+            fc2_expert_weights = w2.view(torch.long)
+        elif self.quant_config.use_nvfp4_w4a16:
+            # The weight scales alone (records and global per GEMM) keep the
+            # activations 16-bit.
+            assert self.w1_scale is not None and self.w2_scale is not None
+            quant_scales = [
+                self.w1_scale,
+                self.g1_alphas,
+                self.w2_scale,
+                self.g2_alphas,
+            ]
+            a1q_scale = None
             fc1_expert_weights = w1.view(torch.long)
             fc2_expert_weights = w2.view(torch.long)
         elif self.weight_quant_dtype == "mxfp4":

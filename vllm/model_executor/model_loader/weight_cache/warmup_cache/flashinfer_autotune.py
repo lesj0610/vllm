@@ -73,11 +73,14 @@ class FlashInferWarmupCache(WarmupCache):
         if (
             vllm_config.kernel_config.enable_flashinfer_autotune is False
             or not has_flashinfer()
-            or not current_platform.has_device_capability(90)
+            or not current_platform.has_device_capability(80)
             or is_draft_model_cacheable(vllm_config.speculative_config)
         ):
             return
-        from vllm.model_executor.warmup.kernel_warmup import flashinfer_autotune
+        from vllm.model_executor.warmup.kernel_warmup import (
+            flashinfer_autotune,
+            joins_flashinfer_autotune,
+        )
 
         try:
             current_platform.update_block_size_for_backend(vllm_config)
@@ -89,6 +92,8 @@ class FlashInferWarmupCache(WarmupCache):
             )
             assert daemon.model is not None, "warmup ran before load_model"
             runner.load_model(model=daemon.model)
+            if not joins_flashinfer_autotune(runner):
+                return
             # Shared stores come before D2D: they are built for read fan-out.
             if not self._adopt_from_stores(runner):
                 transport.adopt(self, runner)

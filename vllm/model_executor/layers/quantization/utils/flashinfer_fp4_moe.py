@@ -10,6 +10,7 @@ import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.quantization.utils.flashinfer_utils import (
+    activation_to_flashinfer_int,
     align_fp4_moe_hidden_dim_for_fi,
     align_fp4_moe_weights_for_fi,
 )
@@ -563,3 +564,96 @@ def prepare_nvfp4_moe_layer_for_fi_or_cutlass(
         w2_scale = swizzle_blockscale(w2_scale)
 
     return w13, w13_scale, w13_scale_2, a13_scale, w2, w2_scale, w2_scale_2, a2_scale
+
+
+def prepare_nvfp4_moe_layer_for_fi_records(
+    backend: "NvFp4MoeBackend",
+    layer: "RoutedExperts",
+    w13: torch.Tensor,
+    w13_scale: torch.Tensor,
+    w13_scale_2: torch.Tensor,
+    a13_scale: torch.Tensor,
+    w2: torch.Tensor,
+    w2_scale: torch.Tensor,
+    w2_scale_2: torch.Tensor,
+    a2_scale: torch.Tensor,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    """Prepare the FlashInfer TRT-LLM, CUTLASS and CuteDSL NVFP4 MoE below SM100.
+
+    FlashInfer runs them there on records, which hold the codes and block
+    scales together and are returned in the block-scale slots. The experts
+    release the weights, of which FlashInfer then reads only the shapes.
+    """
+    from flashinfer.fused_moe import prepare_records_nvfp4_weights
+
+    from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import NvFp4MoeBackend
+
+    num_experts = w13.shape[0]
+    enable_eplb = layer.moe_config.moe_parallel_config.enable_eplb
+    a13_scale = amax_for_moe_activation_quant(a13_scale, enable_eplb).repeat(
+        num_experts
+    )
+    a2_scale = amax_for_moe_activation_quant(a2_scale, enable_eplb).repeat(num_experts)
+
+    # Gated rows in FlashInfer's [up; gate] order, which all three take on
+    # records; SWIGLUOAI checkpoints interleave gate and up rows.
+    gated = layer.activation.is_gated
+    if gated and (
+        backend == NvFp4MoeBackend.FLASHINFER_CUTEDSL
+        or layer.activation == MoEActivation.SWIGLUOAI
+    ):
+        w13, w13_scale = reorder_w13_to_w31_for_flashinfer_cutedsl(
+            layer.activation, w13, w13_scale
+        )
+    elif gated:
+        w13, w13_scale = reorder_w1w3_to_w3w1(w13, w13_scale)
+
+    # Records take a gated intermediate size in multiples of 64 (else 16) and
+    # a hidden size in multiples of 16, so the activations stay unpadded.
+    w13, w13_scale, w2, w2_scale, padded_intermediate = align_fp4_moe_weights_for_fi(
+        w13,
+        w13_scale,
+        w2,
+        w2_scale,
+        is_act_and_mul=gated,
+        min_alignment=64 if gated else 16,
+    )
+    layer.moe_config.intermediate_size_per_partition = padded_intermediate
+
+    records = prepare_records_nvfp4_weights(
+        w13.view(torch.uint8),
+        w13_scale.view(torch.float8_e4m3fn),
+        w13_scale_2,
+        w2.view(torch.uint8),
+        w2_scale.view(torch.float8_e4m3fn),
+        w2_scale_2,
+        num_local_experts=num_experts,
+        hidden_size=w2.shape[1],
+        intermediate_size=padded_intermediate,
+        activation_type=activation_to_flashinfer_int(layer.activation),
+    )
+    w13_scale, w2_scale = records["w1"], records["w2"]
+
+    return w13, w13_scale, w13_scale_2, a13_scale, w2, w2_scale, w2_scale_2, a2_scale
+
+
+def release_nvfp4_records_weights(
+    layer: torch.nn.Module,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Release the weights the records hold too (FlashInfer below SM100), and
+    return meta tensors of their shapes, all FlashInfer then reads of them."""
+    shapes = []
+    for name in ("w13_weight", "w2_weight"):
+        weight = getattr(layer, name)
+        shapes.append(torch.empty(weight.shape, dtype=weight.dtype, device="meta"))
+        replace_parameter(layer, name, weight.new_empty(0))
+    return shapes[0], shapes[1]
