@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from tests.kernels.moe.utils import make_dummy_moe_config, make_test_quant_config
+from tests.kernels.moe.utils import make_test_quant_config
 from tests.kernels.quantization.nvfp4_utils import (
     FLOAT4_E2M1_MAX,
     FLOAT8_E4M3_MAX,
@@ -30,13 +30,6 @@ from vllm.model_executor.layers.fused_moe.experts.flashinfer_cutlass_moe import 
     is_valid_flashinfer_cutlass_fused_moe,
 )
 from vllm.model_executor.layers.fused_moe.modular_kernel import FusedMoEKernel
-from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import (
-    NvFp4MoeBackend,
-    convert_to_nvfp4_moe_kernel_format,
-    make_nvfp4_moe_kernel,
-    make_nvfp4_moe_quant_config,
-    nvfp4_backend_supports_csf_scales,
-)
 from vllm.platforms import current_platform
 from vllm.utils.flashinfer import (
     has_flashinfer_csf_scales,
@@ -265,6 +258,12 @@ def test_flashinfer_fp4_moe_no_graph(
 def test_csf_scales_stay_resident_on_flashinfer_cutlass(
     monkeypatch, default_vllm_config
 ):
+    from tests.kernels.moe.utils import make_dummy_moe_config
+    from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import (
+        NvFp4MoeBackend,
+        nvfp4_backend_supports_csf_scales,
+    )
+
     config = make_dummy_moe_config(hidden_dim=2560, intermediate_size=640)
     backend = NvFp4MoeBackend.FLASHINFER_CUTLASS
     has_csf_ops = (
@@ -297,6 +296,13 @@ def test_csf_scales_stay_resident_on_flashinfer_cutlass(
 def test_flashinfer_resident_csf_scales_match_decoded_scales(
     intermediate_size: int, workspace_init
 ) -> None:
+    from tests.kernels.moe.utils import make_dummy_moe_config
+    from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import (
+        NvFp4MoeBackend,
+        convert_to_nvfp4_moe_kernel_format,
+        make_nvfp4_moe_kernel,
+        make_nvfp4_moe_quant_config,
+    )
     from vllm.v1.worker.workspace import lock_workspace
 
     set_random_seed(29)
