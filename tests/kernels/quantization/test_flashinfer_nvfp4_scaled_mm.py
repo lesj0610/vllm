@@ -22,14 +22,12 @@ from vllm.platforms import current_platform
 from vllm.utils.flashinfer import (
     flashinfer_scaled_fp4_mm,
     has_flashinfer_b12x_gemm,
+    is_flashinfer_fp4_gemm_supported,
 )
 from vllm.utils.torch_utils import set_random_seed
 
-if not current_platform.has_device_capability(100):
-    pytest.skip(
-        reason="Nvfp4 Requires compute capability of 10 or above.",
-        allow_module_level=True,
-    )
+_CAPABILITY = current_platform.get_device_capability()
+_BELOW_SM100 = not current_platform.has_device_capability(100)
 
 DTYPES = [torch.float16, torch.bfloat16]
 # m, n, k
@@ -96,7 +94,14 @@ def test_flashinfer_nvfp4_gemm(
 ) -> None:
     if "trtllm" in backend and dtype == torch.float16:
         pytest.skip("Only torch.bfloat16 is supported for TRTLLM FP4 GEMM operations")
-    if backend == "cute-dsl" and not current_platform.is_device_capability_family(100):
+    if _BELOW_SM100:
+        if _CAPABILITY is None or not is_flashinfer_fp4_gemm_supported(
+            backend, _CAPABILITY.to_int()
+        ):
+            pytest.skip(f"FlashInfer {backend} FP4 GEMM is unavailable below SM100")
+    elif backend == "cute-dsl" and not current_platform.is_device_capability_family(
+        100
+    ):
         pytest.skip("FlashInfer cutedsl backend is only supported on SM10x")
     if backend == "b12x" and not current_platform.has_device_capability(120):
         pytest.skip("b12x FP4 GEMM requires SM120+ (CC 12.0+)")
@@ -203,13 +208,15 @@ def test_flashinfer_cutedsl_nvfp4_w4a16_linear(
         weight_quant_scale,
         is_sf_swizzled_layout=False,
     )
+    # Dequantize the reference on the CPU: the CUDA path uses Triton fp8e4nv,
+    # which Triton does not support below SM89.
     weight_ref = dequantize_to_dtype(
-        weight_fp4,
-        weight_scale,
-        weight_global_scale,
+        weight_fp4.cpu(),
+        weight_scale.cpu(),
+        weight_global_scale.cpu(),
         dtype=torch.bfloat16,
         swizzle=False,
-    )
+    ).to(device)
 
     layer = torch.nn.Module()
     layer.output_size_per_partition = n

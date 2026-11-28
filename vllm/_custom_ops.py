@@ -1526,15 +1526,14 @@ def scaled_fp4_quant(
         output, output_scale = flashinfer_quant_nvfp4_8x4_sf_layout(
             input, input_global_scale
         )
-    elif (
-        padded_n is None
-        and not current_platform.has_device_capability(100)
-        and has_flashinfer()
-    ):
+    elif not current_platform.has_device_capability(100) and has_flashinfer():
         # vLLM compiles this kernel for SM100+ only; FlashInfer has it for SM80+.
         # The vLLM kernel reads input_global_scale[0]; FlashInfer wants shape [1].
         # nvfp4_4over6=None keeps the vLLM kernel's standard recipe, which the
         # caller's global scale assumes, even if FLASHINFER_NVFP4_4OVER6 is set.
+        # Zero K padding quantizes to zero codes and block scales.
+        if padded_n is not None and padded_n > n:
+            input = torch.nn.functional.pad(input, (0, padded_n - n))
         output, output_scale = flashinfer_fp4_quantize(
             input,
             input_global_scale.reshape(-1)[:1],

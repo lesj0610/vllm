@@ -27,12 +27,6 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import set_random_seed
 
-if not current_platform.has_device_capability(100):
-    pytest.skip(
-        reason="Nvfp4 Requires compute capability of 10 or above.",
-        allow_module_level=True,
-    )
-
 DTYPES = [torch.float16, torch.bfloat16]
 # m, n, k
 SHAPES = [(128, 128, 64), (128, 128, 128), (256, 128, 64), (128, 256, 128)]
@@ -160,6 +154,8 @@ def test_nvfp4_gemm(
     device: str,
     has_bias: bool,
 ) -> None:
+    if not current_platform.has_device_capability(100):
+        pytest.skip("Nvfp4 Requires compute capability of 10 or above.")
     if has_bias and not current_platform.is_device_capability_family(120):
         pytest.skip("The bias epilogue is implemented for SM12x only.")
     set_random_seed(seed)

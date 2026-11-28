@@ -250,7 +250,11 @@ if current_platform.is_cuda_alike():
     _FUSED_ACT_QUANT[(SiluAndMul, kFp8Dynamic128Sym)] = _silu_and_mul_fp8_dynamic_128
 
 # Add NVFP4 if supported (requires SM100+)
-if current_platform.is_cuda() and hasattr(torch.ops._C, "silu_and_mul_nvfp4_quant"):
+if (
+    current_platform.is_cuda()
+    and current_platform.has_device_capability(100)
+    and hasattr(torch.ops._C, "silu_and_mul_nvfp4_quant")
+):
     _FUSED_ACT_QUANT[(SiluAndMul, kNvfp4Dynamic)] = _silu_and_mul_nvfp4_dynamic
 
 # The Triton act + NVFP4 producer uses Blackwell FP4/FP8 conversion PTX.

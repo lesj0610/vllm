@@ -686,6 +686,25 @@ def has_flashinfer_bf16_fp4() -> bool:
 
 
 @functools.cache
+def is_flashinfer_fp4_gemm_supported(
+    backend: str, compute_capability: int, weight_only: bool = False
+) -> bool:
+    """Return whether FlashInfer's NVFP4 GEMM (`mm_fp4`, or `mm_bf16_fp4` when
+    `weight_only`) reports `backend` for `compute_capability`."""
+    if not has_flashinfer():
+        return False
+    try:
+        mod = importlib.import_module("flashinfer.gemm")
+        gemm = getattr(mod, "mm_bf16_fp4" if weight_only else "mm_fp4", None)
+        backend_supported = getattr(gemm, "is_backend_supported", None)
+        if not callable(backend_supported):
+            return False
+        return bool(backend_supported(backend, compute_capability))
+    except (AttributeError, ImportError, OSError, RuntimeError, TypeError, ValueError):
+        return False
+
+
+@functools.cache
 def has_flashinfer_recurrent_kda() -> bool:
     """Return whether FlashInfer recurrent KDA prefill is available."""
     if not has_flashinfer():
