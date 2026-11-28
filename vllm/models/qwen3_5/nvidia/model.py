@@ -152,9 +152,11 @@ def _norm_quant_key(linear: nn.Module) -> QuantKey | None:
     if key in (kFp8StaticTensorSym, kFp8DynamicTokenSym):
         return key
     # The norm writes block scales for exactly K = hidden_size, in whole
-    # 4-column scale tiles (weights only require K % 32 == 0).
+    # 4-column scale tiles (weights only require K % 32 == 0). It packs FP4
+    # with cvt.e2m1x2, which needs SM100+.
     if (
         key == kNvfp4Dynamic
+        and current_platform.has_device_capability(100)
         and nvfp4_weight_padding_bytes(linear) == 0
         and linear.input_size_per_partition % 64 == 0
     ):

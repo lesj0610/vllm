@@ -24,9 +24,25 @@ from vllm.utils.flashinfer import (
     has_flashinfer,
     has_flashinfer_b12x_gemm,
     has_flashinfer_bf16_fp4,
+    is_flashinfer_fp4_gemm_supported,
 )
 
 from .base import NvFp4LinearKernel, NvFp4LinearLayerConfig
+
+
+def _flashinfer_supports_below_sm100(
+    backend: str, compute_capability: int | None = None, weight_only: bool = False
+) -> bool:
+    """Return whether FlashInfer reports this NVFP4 GEMM backend on a GPU
+    below SM100, which the SM100+ checks of these kernels do not admit."""
+    if compute_capability is None:
+        capability = current_platform.get_device_capability()
+        if capability is None:
+            return False
+        compute_capability = capability.to_int()
+    return compute_capability < 100 and is_flashinfer_fp4_gemm_supported(
+        backend, compute_capability, weight_only
+    )
 
 
 class FlashInferCuteDslNvFp4W4A16LinearKernel(NvFp4LinearKernel):
@@ -44,8 +60,12 @@ class FlashInferCuteDslNvFp4W4A16LinearKernel(NvFp4LinearKernel):
                 return False, "CUDA compute capability is unavailable"
             compute_capability = capability.to_int()
 
-        if compute_capability not in (100, 103) and not (
-            compute_capability >= 120 and compute_capability < 130
+        if (
+            compute_capability not in (100, 103)
+            and not (compute_capability >= 120 and compute_capability < 130)
+            and not _flashinfer_supports_below_sm100(
+                "cute-dsl", compute_capability, weight_only=True
+            )
         ):
             return False, "FlashInfer CuTe-DSL W4A16 requires sm_100 or sm_12x"
         if not has_flashinfer_bf16_fp4():
@@ -126,7 +146,10 @@ class FlashInferCuteDslNvFp4LinearKernel(NvFp4LinearKernel):
     def is_supported(
         cls, compute_capability: int | None = None
     ) -> tuple[bool, str | None]:
-        if not current_platform.is_device_capability_family(100):
+        if not (
+            current_platform.is_device_capability_family(100)
+            or _flashinfer_supports_below_sm100("cute-dsl", compute_capability)
+        ):
             return False, "FlashInfer cutedsl requires sm_10x"
         if not has_flashinfer():
             return False, "FlashInfer required"
@@ -192,7 +215,7 @@ class FlashInferCutlassNvFp4LinearKernel(NvFp4LinearKernel):
             cutlass_fp4_supported()
             and current_platform.has_device_capability(100)
             and has_flashinfer()
-        ):
+        ) or _flashinfer_supports_below_sm100("cutlass", compute_capability):
             return True, None
         return False, "FlashInfer + >=sm_100 required"
 
@@ -245,7 +268,10 @@ class FlashInferTrtllmNvFp4LinearKernel(NvFp4LinearKernel):
         # FlashInfer's TRT-LLM FP4 GEMM only supports the SM100 family.
         if not (
             current_platform.is_cuda()
-            and current_platform.is_device_capability_family(100)
+            and (
+                current_platform.is_device_capability_family(100)
+                or _flashinfer_supports_below_sm100("trtllm", compute_capability)
+            )
         ):
             return False, "FlashInfer TRT-LLM NVFP4 GEMM requires CUDA sm_10x"
         if has_flashinfer():
@@ -321,7 +347,11 @@ class FlashInferCudnnNvFp4LinearKernel(NvFp4LinearKernel):
         cls, compute_capability: int | None = None
     ) -> tuple[bool, str | None]:
         if not (
-            current_platform.is_cuda() and current_platform.has_device_capability(100)
+            current_platform.is_cuda()
+            and (
+                current_platform.has_device_capability(100)
+                or _flashinfer_supports_below_sm100("cudnn", compute_capability)
+            )
         ):
             return False, "NVFP4 activation quantization requires CUDA sm_100+"
         if has_flashinfer():

@@ -1,12 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Callable
+from types import SimpleNamespace
+from typing import TYPE_CHECKING
 
 import torch
 
 import vllm._custom_ops as ops
 from tests.kernels.quant_utils import per_block_cast_to_int8
-from tests.kernels.quantization.nvfp4_utils import FLOAT4_E2M1_MAX, FLOAT8_E4M3_MAX
+from tests.kernels.quantization.nvfp4_utils import (
+    FLOAT4_E2M1_MAX,
+    FLOAT8_E4M3_MAX,
+    convert_swizzled_to_linear,
+)
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.all2all_utils import (
     maybe_make_prepare_finalize,
@@ -42,6 +48,9 @@ from vllm.model_executor.layers.quantization.utils.nvfp4_emulation_utils import 
 from vllm.platforms import current_platform
 from vllm.utils.deep_gemm import per_block_cast_to_fp8
 from vllm.utils.math_utils import round_up
+
+if TYPE_CHECKING:
+    from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import NvFp4MoeBackend
 
 DEVICE = current_platform.device_type
 
@@ -504,6 +513,48 @@ def make_test_quant_config(
             is_scale_swizzled=is_scale_swizzled,
         ),
     )
+
+
+def make_nvfp4_records(
+    backend: "NvFp4MoeBackend",
+    w1_q: torch.Tensor,
+    w2_q: torch.Tensor,
+    quant_config: FusedMoEQuantConfig,
+    activation: MoEActivation,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The records FlashInfer runs `backend` on below SM100, prepared from the
+    NVFP4 weights of `make_test_quant_config` as the model loader does."""
+    from vllm.model_executor.layers.quantization.utils.flashinfer_fp4_moe import (
+        prepare_nvfp4_moe_layer_for_fi_records,
+    )
+
+    assert quant_config.w1_scale is not None and quant_config.w2_scale is not None
+    assert quant_config.g1_alphas is not None and quant_config.g2_alphas is not None
+    w1_scale, w2_scale = (
+        torch.stack(
+            [convert_swizzled_to_linear(s, w.size(1), w.size(2) * 2, 16) for s in scale]
+        )
+        for w, scale in ((w1_q, quant_config.w1_scale), (w2_q, quant_config.w2_scale))
+    )
+    layer = torch.nn.Module()
+    layer.activation = activation
+    layer.moe_config = SimpleNamespace(
+        moe_parallel_config=FusedMoEParallelConfig.make_no_parallel()
+    )
+    one = torch.ones(1, device=w1_q.device)
+    prepared = prepare_nvfp4_moe_layer_for_fi_records(
+        backend,
+        layer,  # type: ignore[arg-type]
+        w13=w1_q.clone(),  # may be reordered in place
+        w13_scale=w1_scale,
+        w13_scale_2=quant_config.g1_alphas,
+        a13_scale=one,
+        w2=w2_q,
+        w2_scale=w2_scale,
+        w2_scale_2=quant_config.g2_alphas,
+        a2_scale=one,
+    )
+    return prepared[1], prepared[5]
 
 
 def fused_moe(

@@ -750,13 +750,15 @@ def mxfp4_w4a16_moe_quant_config(
     gemm1_alpha: float | None = None,
     gemm1_beta: float | None = None,
     gemm1_clamp_limit: float | None = None,
+    g1_alphas: torch.Tensor | None = None,
+    g2_alphas: torch.Tensor | None = None,
 ) -> FusedMoEQuantConfig:
     """Construct a quant config for unquantized activations and mxfp4 weights."""
     return FusedMoEQuantConfig(
         _a1=FusedMoEQuantDesc(),
         _a2=FusedMoEQuantDesc(),
-        _w1=FusedMoEQuantDesc("mxfp4", None, w1_scale, None, None, w1_bias),
-        _w2=FusedMoEQuantDesc("mxfp4", None, w2_scale, None, None, w2_bias),
+        _w1=FusedMoEQuantDesc("mxfp4", None, w1_scale, g1_alphas, None, w1_bias),
+        _w2=FusedMoEQuantDesc("mxfp4", None, w2_scale, g2_alphas, None, w2_bias),
         gemm1_alpha=gemm1_alpha,
         gemm1_beta=gemm1_beta,
         gemm1_clamp_limit=gemm1_clamp_limit,
@@ -776,13 +778,15 @@ def mxfp4_mxfp8_moe_quant_config(
     gemm1_clamp_limit: float | None = None,
     mx_alignment: int = 0,
     is_scale_swizzled: bool = True,
+    g1_alphas: torch.Tensor | None = None,
+    g2_alphas: torch.Tensor | None = None,
 ) -> FusedMoEQuantConfig:
     """Construct a quant config for mxfp4 activations and mxfp4 weights."""
     return FusedMoEQuantConfig(
         _a1=FusedMoEQuantDesc("mxfp8"),
         _a2=FusedMoEQuantDesc("mxfp8"),
-        _w1=FusedMoEQuantDesc("mxfp4", None, w1_scale, None, None, w1_bias),
-        _w2=FusedMoEQuantDesc("mxfp4", None, w2_scale, None, None, w2_bias),
+        _w1=FusedMoEQuantDesc("mxfp4", None, w1_scale, g1_alphas, None, w1_bias),
+        _w2=FusedMoEQuantDesc("mxfp4", None, w2_scale, g2_alphas, None, w2_bias),
         gemm1_alpha=gemm1_alpha,
         gemm1_beta=gemm1_beta,
         gemm1_clamp_limit=gemm1_clamp_limit,

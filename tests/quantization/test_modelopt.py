@@ -1574,26 +1574,53 @@ def test_modelopt_nvfp4_moe_activation_override(quantization, per_token):
     if isinstance(config, ModelOptMixedPrecisionConfig):
         config = config.nvfp4_config
     assert isinstance(config, ModelOptNvFp4Config)
-    assert config.moe_activation_override == (kNvfp4DynamicToken if per_token else None)
+    if per_token:
+        assert config.moe_spec is not None
+        assert config.moe_spec.activation == kNvfp4DynamicToken
+    else:
+        assert config.moe_spec is None
     assert "_online_quantization_args" not in hf_config
 
 
 @pytest.mark.parametrize(
-    "quant_method,activation,backend,error",
+    "quant_method,activation,backend,sm100,error",
     [
-        ("NVFP4", kNvfp4DynamicToken, "FLASHINFER_TRTLLM", None),
-        ("W4A16_NVFP4", kNvfp4DynamicToken, "FLASHINFER_TRTLLM", "W4A4 checkpoint"),
+        ("NVFP4", kNvfp4DynamicToken, "FLASHINFER_TRTLLM", True, None),
+        ("NVFP4", None, "FLASHINFER_CUTLASS", True, None),
+        ("W4A16_NVFP4", None, "MARLIN", True, None),
+        (
+            "W4A16_NVFP4",
+            kNvfp4DynamicToken,
+            "FLASHINFER_TRTLLM",
+            True,
+            "W4A4 checkpoint",
+        ),
         (
             "NVFP4",
             kMxfp8Dynamic,
             "FLASHINFER_TRTLLM",
+            True,
             "Unsupported.*activation override",
         ),
-        ("NVFP4", kNvfp4DynamicToken, "MARLIN", "requires the FlashInfer TRTLLM"),
+        (
+            "NVFP4",
+            kNvfp4DynamicToken,
+            "MARLIN",
+            False,
+            "requires the FlashInfer TRTLLM",
+        ),
+        ("NVFP4", kNvfp4DynamicToken, "FLASHINFER_CUTEDSL", False, None),
+        (
+            "NVFP4",
+            kNvfp4DynamicToken,
+            "FLASHINFER_CUTEDSL",
+            True,
+            "requires the FlashInfer TRTLLM",
+        ),
     ],
 )
 def test_modelopt_nvfp4_moe_validates_activation_override(
-    quant_method, activation, backend, error
+    quant_method, activation, backend, sm100, error
 ):
     from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import NvFp4MoeBackend
     from vllm.model_executor.layers.quantization.modelopt import ModelOptNvFp4FusedMoE
@@ -1608,10 +1635,16 @@ def test_modelopt_nvfp4_moe_validates_activation_override(
             "vllm.model_executor.layers.quantization.modelopt.select_nvfp4_moe_backend",
             return_value=(NvFp4MoeBackend[backend], Mock()),
         ) as select_backend,
+        patch.object(
+            current_platform,
+            "is_device_capability_family",
+            lambda family, device_id=0: sm100 and family == 100,
+        ),
         expected,
     ):
         method = ModelOptNvFp4FusedMoE(config, Mock())
-        assert method.per_token_activation
+        assert method.use_a16 == (activation is None)
+        assert method.per_token_activation == (activation == kNvfp4DynamicToken)
         assert select_backend.call_args.kwargs["activation_key"] == activation
 
 

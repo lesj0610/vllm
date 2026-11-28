@@ -425,6 +425,17 @@ def map_mxfp4_backend(runner_backend: MoEBackend) -> list[Mxfp4MoeBackend]:
     )
 
 
+def _opt_in_trtllm_below_sm100(
+    backends: list[Mxfp4MoeBackend],
+) -> list[Mxfp4MoeBackend]:
+    """Below SM100 FlashInfer runs the TRT-LLM MXFP4 MoE on software kernels
+    (records): opt in with moe_backend rather than taking them over the native
+    backends."""
+    if current_platform.has_device_capability(100):
+        return backends
+    return [b for b in backends if b not in TRTLLM_BACKENDS]
+
+
 def _get_priority_backends_for_gpt_oss() -> list[Mxfp4MoeBackend]:
     """Available backends in priority order, BF16-act variant before
     activation-quantized variant within each vendor family."""
@@ -462,7 +473,7 @@ def _get_priority_backends_for_gpt_oss() -> list[Mxfp4MoeBackend]:
             _AVAILABLE_BACKENDS.index(Mxfp4MoeBackend.BATCHED_MARLIN) + 1,
             Mxfp4MoeBackend.TRITON,
         )
-    return prioritize_humming(_AVAILABLE_BACKENDS)
+    return _opt_in_trtllm_below_sm100(prioritize_humming(_AVAILABLE_BACKENDS))
 
 
 def _get_priority_backends() -> list[Mxfp4MoeBackend]:
@@ -489,7 +500,7 @@ def _get_priority_backends() -> list[Mxfp4MoeBackend]:
         Mxfp4MoeBackend.BATCHED_MARLIN,
         Mxfp4MoeBackend.HUMMING,
     ]
-    return prioritize_humming(_AVAILABLE_BACKENDS)
+    return _opt_in_trtllm_below_sm100(prioritize_humming(_AVAILABLE_BACKENDS))
 
 
 def _backend_activation_key(backend: Mxfp4MoeBackend) -> QuantKey | None:
@@ -899,8 +910,13 @@ def mxfp4_round_up_hidden_size_and_intermediate_size(
         else:
             hidden_size = round_up(hidden_size, 256)
     elif backend in TRTLLM_BACKENDS:
-        intermediate_size = round_up(intermediate_size, 128)
-        hidden_size = round_up(hidden_size, 256)
+        if current_platform.has_device_capability(100):
+            intermediate_size = round_up(intermediate_size, 128)
+            hidden_size = round_up(hidden_size, 256)
+        else:
+            # Records (gated activations only) take what they need unpadded.
+            intermediate_size = round_up(intermediate_size, 64)
+            hidden_size = round_up(hidden_size, 32)
     elif backend in (
         Mxfp4MoeBackend.FLASHINFER_CUTLASS_MXFP4_BF16,
         Mxfp4MoeBackend.FLASHINFER_CUTLASS_MXFP4_MXFP8,
@@ -956,6 +972,53 @@ def _interleave_gate_up_rows(t: torch.Tensor) -> torch.Tensor:
         .transpose(1, 2)
         .contiguous()
         .view(num_experts, two_n, inner)
+    )
+
+
+def _trtllm_mxfp4_records(
+    layer: torch.nn.Module,
+    w13: torch.Tensor,
+    w13_scale: torch.Tensor,
+    w2: torch.Tensor,
+    w2_scale: torch.Tensor,
+    w13_bias: torch.Tensor | None,
+    w2_bias: torch.Tensor | None,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor | None,
+    torch.Tensor | None,
+]:
+    """Below SM100 FlashInfer runs the TRT-LLM MXFP4 MoE on records of the
+    checkpoint weights (w13 rows and bias: up, then gate), which it takes in the
+    weight-scale slots; the weight slots, which it does not read, get views of
+    them. Their per-expert global scales go to the layer for the GEMM scalars
+    (make_mxfp4_moe_quant_config)."""
+    from flashinfer.fused_moe import prepare_records_mxfp4_weights
+
+    num_experts, rows, half_hidden = w13.shape
+    # Gated (the default activation): the TRT-LLM MXFP4 experts run no other.
+    records = prepare_records_mxfp4_weights(
+        w13,
+        w13_scale,
+        w2,
+        w2_scale,
+        num_local_experts=num_experts,
+        hidden_size=2 * half_hidden,
+        intermediate_size=rows // 2,
+    )
+    replace_parameter(layer, "w13_weight_scale_2", records["w1_global_scale"])
+    replace_parameter(layer, "w2_weight_scale_2", records["w2_global_scale"])
+    r1, r2 = records["w1"], records["w2"]
+    return (
+        r1.unsqueeze(1),
+        r2.unsqueeze(1),
+        r1,
+        r2,
+        None if w13_bias is None else w13_bias.float(),
+        None if w2_bias is None else w2_bias.float(),
     )
 
 
@@ -1041,6 +1104,21 @@ def convert_gpt_oss_weight_to_mxfp4_moe_kernel_format(
         )
 
     elif mxfp4_backend in TRTLLM_BACKENDS:
+        if not current_platform.has_device_capability(100):
+            # w13 rows alternate gate (even) and up (odd): up, then gate.
+            def up_gate(t: torch.Tensor) -> torch.Tensor:
+                return torch.cat([t[:, 1::2], t[:, ::2]], dim=1)
+
+            assert w13_bias is not None and w2_bias is not None
+            return _trtllm_mxfp4_records(
+                layer,
+                up_gate(w13_weight.data),
+                up_gate(w13_weight_scale.data),
+                w2_weight.data,
+                w2_weight_scale.data,
+                up_gate(w13_bias.data),
+                w2_bias.data,
+            )
         assert _cache_permute_indices is not None
         from flashinfer.fp4_quantization import nvfp4_block_scale_interleave
         from flashinfer.fused_moe.core import get_w2_permute_indices_with_cache
@@ -1702,6 +1780,20 @@ def convert_weight_to_mxfp4_moe_kernel_format(
     sf_block_size = 32  # mxfp4 block size
 
     if mxfp4_backend in TRTLLM_BACKENDS:
+        if not current_platform.has_device_capability(100):
+            # w13 rows are gate (w1), then up (w3): up, then gate.
+            def up_gate(t: torch.Tensor) -> torch.Tensor:
+                return t.data.roll(intermediate_size, 1)
+
+            return _trtllm_mxfp4_records(
+                layer,
+                up_gate(w13_weight),
+                up_gate(w13_weight_scale),
+                w2_weight.data,
+                w2_weight_scale.data,
+                None if w13_bias is None else up_gate(w13_bias),
+                None if w2_bias is None else w2_bias.data,
+            )
         assert _cache_permute_indices is not None
         from flashinfer.fp4_quantization import nvfp4_block_scale_interleave
         from flashinfer.fused_moe.core import get_w2_permute_indices_with_cache
@@ -2135,6 +2227,14 @@ def make_mxfp4_moe_quant_config(
     layer: "RoutedExperts | None" = None,
 ) -> FusedMoEQuantConfig | None:
     """Create a FusedMoEQuantConfig for the given MXFP4 backend."""
+    # Below SM100 the TRT-LLM backends run on records (_trtllm_mxfp4_records),
+    # which leave the hidden size unpadded and their global scales on the layer.
+    records = (
+        mxfp4_backend in TRTLLM_BACKENDS
+        and not current_platform.has_device_capability(100)
+    )
+    g1_alphas = getattr(layer, "w13_weight_scale_2", None) if records else None
+    g2_alphas = getattr(layer, "w2_weight_scale_2", None) if records else None
     if mxfp4_backend in FLASHINFER_MOE_EP_MXFP4_BACKENDS:
         # The megakernel quantizes activations itself and owns its scales.
         return FusedMoEQuantConfig.make("nvfp4", weight_dtype="mxfp4")
@@ -2176,8 +2276,10 @@ def make_mxfp4_moe_quant_config(
             gemm1_alpha=gemm1_alpha,
             gemm1_beta=gemm1_beta,
             gemm1_clamp_limit=swiglu_limit,
-            mx_alignment=256,
+            mx_alignment=0 if records else 256,
             is_scale_swizzled=False,
+            g1_alphas=g1_alphas,
+            g2_alphas=g2_alphas,
         )
     elif mxfp4_backend == Mxfp4MoeBackend.FLASHINFER_CUTLASS_MXFP4_MXFP8:
         # CUTLASS kernel expects swizzled mxfp8 activation scales.
@@ -2238,6 +2340,8 @@ def make_mxfp4_moe_quant_config(
             gemm1_alpha=gemm1_alpha,
             gemm1_beta=gemm1_beta,
             gemm1_clamp_limit=swiglu_limit,
+            g1_alphas=g1_alphas,
+            g2_alphas=g2_alphas,
         )
     elif mxfp4_backend == Mxfp4MoeBackend.HUMMING:
         from vllm.model_executor.layers.quantization.utils.humming import (

@@ -121,8 +121,17 @@ class TrtLlmMxfp4ExpertsBase:
 
     @staticmethod
     def _supports_current_device() -> bool:
+        """Supports SM100 and, on FlashInfer's records kernels, SM80 to SM89;
+        SM90 keeps its own MXFP4 MoE kernels (flashinfer_cutlass)."""
         p = current_platform
-        return p.is_cuda() and p.is_device_capability_family(100) and has_flashinfer()
+        return (
+            p.is_cuda()
+            and (
+                p.is_device_capability_family(100)
+                or (p.has_device_capability(80) and not p.has_device_capability(90))
+            )
+            and has_flashinfer()
+        )
 
     def output_hidden_dim(self, hidden_dim: int) -> int:
         return self.hidden_dim_unpadded
@@ -257,8 +266,9 @@ class TrtLlmMxfp4ExpertsMonolithic(
             gemm2_weights_scale=self.w2_scale,
             gemm2_bias=self.w2_bias,
             output1_scale_scalar=None,
-            output1_scale_gate_scalar=None,
-            output2_scale_scalar=None,
+            # The records' global scales below SM100, else None.
+            output1_scale_gate_scalar=self.quant_config.g1_alphas,
+            output2_scale_scalar=self.quant_config.g2_alphas,
             num_experts=global_num_experts,
             top_k=self.topk,
             n_group=(num_expert_group or 0),
@@ -393,8 +403,9 @@ class TrtLlmMxfp4ExpertsModularBase(TrtLlmMxfp4ExpertsBase, mk.FusedMoEExpertsMo
             gemm2_weights_scale=self.w2_scale,
             gemm2_bias=self.w2_bias,
             output1_scale_scalar=None,
-            output1_scale_gate_scalar=None,
-            output2_scale_scalar=None,
+            # The records' global scales below SM100, else None.
+            output1_scale_gate_scalar=self.quant_config.g1_alphas,
+            output2_scale_scalar=self.quant_config.g2_alphas,
             num_experts=global_num_experts,
             top_k=topk,
             n_group=None,
