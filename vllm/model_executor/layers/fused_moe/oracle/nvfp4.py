@@ -219,6 +219,12 @@ def nvfp4_backend_supports_csf_scales(
     backend: NvFp4MoeBackend, config: FusedMoEConfig, use_a16: bool
 ) -> bool:
     """Whether the backend keeps `csf` checkpoint scales compressed."""
+    if backend == NvFp4MoeBackend.FLASHINFER_CUTLASS:
+        from vllm.model_executor.layers.fused_moe.experts.flashinfer_cutlass_moe import (  # noqa: E501
+            FlashInferExperts,
+        )
+
+        return FlashInferExperts.supports_csf_scales(config)
     kernel_config = get_current_vllm_config().kernel_config
     if (
         backend != NvFp4MoeBackend.B12X
@@ -399,6 +405,19 @@ def convert_to_nvfp4_moe_kernel_format(
         nvfp4_backend in FLASHINFER_NVFP4_MOE_BACKENDS
         or nvfp4_backend == NvFp4MoeBackend.VLLM_CUTLASS
     ):
+        if csf_scales:
+            # The captured CUDA graphs expand the scales of the first load.
+            if hasattr(layer, "w13_weight_scale_csf"):
+                raise NotImplementedError(
+                    "NVFP4 MoE with resident CSF scales does not support "
+                    "weight reloading"
+                )
+            from vllm.utils.flashinfer import flashinfer_encode_csf_scales
+
+            # The experts keep the rank's scales compressed in checkpoint
+            # order and expand them into the layout prepared below.
+            layer.w13_weight_scale_csf = flashinfer_encode_csf_scales(w13_scale)
+            layer.w2_weight_scale_csf = flashinfer_encode_csf_scales(w2_scale)
         (
             w13,
             w13_scale,
