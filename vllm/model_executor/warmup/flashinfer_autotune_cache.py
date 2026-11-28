@@ -94,13 +94,20 @@ def flashinfer_autotune_cache_hash(runner: "GPUModelRunner") -> str:
 
 
 def runs_flashinfer_autotune(runner: "GPUModelRunner") -> bool:
-    """FlashInfer tunes its kernels from SM90, and below only its MoE experts,
-    which pick among their tactics per token count."""
+    """FlashInfer tunes its kernels from SM90, and below only its MoE experts
+    and NVFP4 GEMMs, which pick among their tactics per token count."""
     from vllm.platforms import current_platform
 
     if current_platform.has_device_capability(90):
         return True
 
+    from vllm.model_executor.kernels.linear import (
+        FlashInferCudnnNvFp4LinearKernel,
+        FlashInferCuteDslNvFp4LinearKernel,
+        FlashInferCuteDslNvFp4W4A16LinearKernel,
+        FlashInferCutlassNvFp4LinearKernel,
+        FlashInferTrtllmNvFp4LinearKernel,
+    )
     from vllm.model_executor.layers.fused_moe import MoERunner
     from vllm.model_executor.layers.fused_moe.experts.flashinfer_cutedsl_moe import (
         FlashInferCuteDSLExperts,
@@ -121,9 +128,20 @@ def runs_flashinfer_autotune(runner: "GPUModelRunner") -> bool:
         TrtLlmMxfp4ExpertsBase,
         TrtLlmNvFp4ExpertsBase,
     )
+    flashinfer_gemms = (
+        FlashInferCudnnNvFp4LinearKernel,
+        FlashInferCuteDslNvFp4LinearKernel,
+        FlashInferCuteDslNvFp4W4A16LinearKernel,
+        FlashInferCutlassNvFp4LinearKernel,
+        FlashInferTrtllmNvFp4LinearKernel,
+    )
     # The drafter is outside the target's module tree.
     for model in (runner.get_model(), runner.get_draft_model()):
         for module in model.modules() if model is not None else ():
+            for holder_name in ("quant_method", "scheme"):
+                holder = getattr(module, holder_name, None)
+                if isinstance(getattr(holder, "kernel", None), flashinfer_gemms):
+                    return True
             if isinstance(module, MoERunner):
                 kernel = getattr(module._quant_method, "moe_kernel", None)
                 if kernel is not None and isinstance(

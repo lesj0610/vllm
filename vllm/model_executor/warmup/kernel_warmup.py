@@ -418,8 +418,11 @@ def _flashinfer_autotune_skip_ops(runner: "GPUModelRunner") -> set[str] | None:
             kernel = getattr(getattr(module, holder_name, None), "kernel", None)
             # CuTe-DSL mm_fp4 tuning JIT-compiles every tactic and its
             # fallback is already the heuristic; all mm_fp4 backends share
-            # the "fp4_gemm" op name, so skip only when cute-dsl is selected.
-            if isinstance(kernel, FlashInferCuteDslNvFp4LinearKernel):
+            # the "fp4_gemm" op name, so skip only when cute-dsl is selected,
+            # on SM100+ where its CuTe-DSL kernels run.
+            if isinstance(
+                kernel, FlashInferCuteDslNvFp4LinearKernel
+            ) and current_platform.has_device_capability(100):
                 skip_ops.add("fp4_gemm")
     return skip_ops or None
 
@@ -598,8 +601,9 @@ def _load_shared_autotune_cache(cache_path: Path, tuner, tune_group) -> bool:
 
 
 def joins_flashinfer_autotune(runner: "GPUModelRunner") -> bool:
-    """Below SM90 only PP stages with FlashInfer MoE experts need the autotune,
-    but every rank joins it once one does: it ends in a world barrier."""
+    """Below SM90 only PP stages with FlashInfer MoE experts or NVFP4 GEMMs need
+    the autotune, but every rank joins it once one does: it ends in a world
+    barrier."""
     from vllm.distributed.parallel_state import get_pp_group, get_world_group
 
     runs = runs_flashinfer_autotune(runner)

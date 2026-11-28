@@ -18,6 +18,10 @@ import vllm.model_executor.warmup.kernel_warmup as warmup
 import vllm.utils.flashinfer as fi_utils
 from vllm.config import MultiModalConfig
 from vllm.config.utils import hash_config, hash_factors
+from vllm.model_executor.kernels.linear import (
+    FlashInferCuteDslNvFp4LinearKernel,
+    FlashInferCuteDslNvFp4W4A16LinearKernel,
+)
 from vllm.model_executor.warmup.flashinfer_autotune_cache import (
     _flashinfer_mm_encoder_autotune_hash,
     get_flashinfer_mm_encoder_autotune_config,
@@ -263,7 +267,7 @@ class _FakeKernelMoERunner(_FakeMoERunner):
     ],
 )
 @pytest.mark.parametrize("in_draft", [False, True])
-def test_flashinfer_autotunes_below_sm90_only_its_moe_experts(
+def test_flashinfer_autotunes_below_sm90_its_moe_experts(
     capability, experts, expected, in_draft
 ):
     moe = _FakeKernelMoERunner()
@@ -300,6 +304,22 @@ def test_flashinfer_autotunes_below_sm90_only_its_moe_experts(
         ),
     ):
         assert runs_flashinfer_autotune(runner) == expected
+
+
+@pytest.mark.parametrize(
+    "holder_name, kernel, expected",
+    [
+        ("scheme", Mock(spec=FlashInferCuteDslNvFp4LinearKernel), True),
+        ("quant_method", Mock(spec=FlashInferCuteDslNvFp4W4A16LinearKernel), True),
+        ("scheme", object(), False),
+    ],
+)
+def test_flashinfer_autotunes_below_sm90_its_nvfp4_gemms(holder_name, kernel, expected):
+    module = SimpleNamespace(**{holder_name: SimpleNamespace(kernel=kernel)})
+    with patch.object(
+        current_platform, "has_device_capability", lambda c, device_id=0: c <= 80
+    ):
+        assert runs_flashinfer_autotune(_make_runner([module])) == expected
 
 
 @pytest.mark.parametrize(
